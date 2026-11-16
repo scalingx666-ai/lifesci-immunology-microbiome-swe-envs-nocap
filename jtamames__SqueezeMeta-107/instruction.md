@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** run configure_nodb at the end of make_databases and download_databases
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `7f9b123ddec1`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

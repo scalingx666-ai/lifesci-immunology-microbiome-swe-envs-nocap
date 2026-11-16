@@ -1,0 +1,1924 @@
+diff --git a/NAMESPACE b/NAMESPACE
+index 27ef650b..1a7ce824 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -11,18 +11,17 @@ import(Rcpp)
+ import(dplyr)
+ import(ggplot2)
+ import(methods)
+-import(rstan)
+ import(tidybayes)
++import(tidyr)
+ importFrom(benchmarkme,get_ram)
+ importFrom(dplyr,enquo)
+-importFrom(foreach,"%do%")
+-importFrom(foreach,foreach)
+ importFrom(furrr,future_map)
+ importFrom(magrittr,"%$%")
+ importFrom(magrittr,divide_by)
+ importFrom(magrittr,equals)
+ importFrom(magrittr,multiply_by)
+ importFrom(magrittr,set_rownames)
++importFrom(purrr,as_mapper)
+ importFrom(purrr,map)
+ importFrom(purrr,map2)
+ importFrom(purrr,map2_lgl)
+@@ -30,6 +29,7 @@ importFrom(purrr,map_int)
+ importFrom(purrr,map_lgl)
+ importFrom(purrr,pmap)
+ importFrom(purrr,when)
++importFrom(rstan,extract)
+ importFrom(rstan,sampling)
+ importFrom(rstan,summary)
+ importFrom(rstan,vb)
+@@ -37,8 +37,6 @@ importFrom(stats,terms)
+ importFrom(tibble,as_tibble)
+ importFrom(tibble,enframe)
+ importFrom(tibble,rowid_to_column)
+-importFrom(tibble,tibble)
+-importFrom(tidybayes,gather_draws)
+ importFrom(tidybulk,scale_abundance)
+ importFrom(tidyr,drop_na)
+ importFrom(tidyr,gather)
+diff --git a/R/functions_dirichlet_multinomial.R b/R/functions_dirichlet_multinomial.R
+index 1f8b33d6..bf33d679 100755
+--- a/R/functions_dirichlet_multinomial.R
++++ b/R/functions_dirichlet_multinomial.R
+@@ -36,6 +36,8 @@
+ dirichlet_multinomial_glm = function(.data,
+                                      formula = ~ 1,
+                                      .sample,
++                                     .cell_type,
++                                     .count,
+                                      check_outliers = FALSE,
+                                      approximate_posterior_inference = T,
+                                      cores = detect_cores(), # For development purpose,
+@@ -43,41 +45,33 @@ dirichlet_multinomial_glm = function(.data,
+ ) {
+   # Prepare column same enquo
+   .sample = enquo(.sample)
+-
+-  # Produce data list
+-  covariate_names = parse_formula(formula)
+-  X = .data %>% select(!!.sample, covariate_names) %>% model.matrix(formula, data=.)
+-  cell_cluster_names = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% colnames()
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
+ 
+   data_for_model =
+-    list(
+-      N = .data %>% nrow(),
+-      M = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% ncol(),
+-      exposure = .data$exposure,
+-      y = .data %>% select(-covariate_names, -exposure) %>% nanny::as_matrix(rownames = !!.sample),
+-      X = X,
+-      C = ncol(X)
+-    )
++    data_to_spread (.data, formula, !!.sample, !!.cell_type, !!.count) %>%
++    data_spread_to_model_input(formula, !!.sample, !!.cell_type, !!.count)
+ 
++  # Produce data list
+   if(!check_outliers){
+ 
+     data_for_model %>%
+-      fit_model_and_parse(
+-        stanmodels$glm_dirichlet_multinomial,
+-        chains = 4
+-      ) %>%
++      # Run the first discovery phase with permissive false discovery rate
++      fit_model(stanmodels$glm_dirichlet_multinomial, censoring_iteration, chains= 4) %>%
++      parse_fit(data_for_model, ., censoring_iteration = 1, chains) %>%
++      beta_to_CI(censoring_iteration = 1 ) %>%
+ 
+       # Join filtered
+       mutate(
+         significant =
+-          !!as.symbol(sprintf(".lower_%s", colnames(X)[2])) *
+-          !!as.symbol(sprintf(".upper_%s", colnames(X)[2])) > 0
++          !!as.symbol(sprintf(".lower_%s", colnames(data_for_model$X)[2])) *
++          !!as.symbol(sprintf(".upper_%s", colnames(data_for_model$X)[2])) > 0
+       ) %>%
+ 
+       # Clesn
+       select(-M) %>%
+-      mutate(.cell = cell_cluster_names) %>%
+-      select(.cell, everything())
++      mutate(!!.cell_type := data_for_model$y %>% colnames()) %>%
++      select(!!.cell_type, everything())
+ 
+   }
+ 
+@@ -85,26 +79,27 @@ dirichlet_multinomial_glm = function(.data,
+ 
+     .data_1 =
+       .data %>%
+-      fit_model_and_parse_out_no_missing_data(!!.count, formula, X, exposure, iteration = 1, chains = 4)
++      fit_model_and_parse_out_no_missing_data(data_for_model, formula, !!.sample, !!.cell_type, !!.count, iteration = 1, chains = 4)
+ 
+     .data_2 =
+       .data_1 %>%
+       select(-contains("posterior")) %>%
+-      fit_model_and_parse_out_missing_data(!!.count, formula, X, exposure, iteration = 2)
++      fit_model_and_parse_out_missing_data(formula, !!.sample, !!.cell_type, !!.count, iteration = 2)
+ 
+     .data_2 %>%
+ 
+       # Join filtered
+-      mutate(significant = map_lgl(
+-        beta_quantiles_2,
+-        ~ .x$`2.5%` * .x$`97.5%` > 0
+-      )) %>%
++      mutate(
++        significant =
++          !!as.symbol(sprintf(".lower_%s", colnames(data_for_model$X)[2])) *
++          !!as.symbol(sprintf(".upper_%s", colnames(data_for_model$X)[2])) > 0
++      ) %>%
+ 
+-      #Join unfiltered
+-      mutate(significant_pre_filtering = map_lgl(
+-        beta_quantiles_1,
+-        ~ .x$`2.5%` * .x$`97.5%` > 0
+-      )) %>%
++      # #Join unfiltered
++      # mutate(significant_pre_filtering = map_lgl(
++      #   beta_quantiles_1,
++      #   ~ .x$`2.5%` * .x$`97.5%` > 0
++      # )) %>%
+ 
+       # Define outlier
+       rename(outlier = outlier_2 ) %>%
+@@ -116,3 +111,202 @@ dirichlet_multinomial_glm = function(.data,
+ 
+ 
+ }
++
++#' @importFrom purrr map2_lgl
++fit_model_and_parse_out_no_missing_data = function(.data, data_for_model, formula, .sample, .cell_type, .count, iteration = 1, chains){
++
++
++  # Prepare column same enquo
++  .sample = enquo(.sample)
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
++
++  # Run the first discovery phase with permissive false discovery rate
++  fit_and_generated  = fit_and_generate_quantities(data_for_model, stanmodels$glm_dirichlet_multinomial, iteration, chains= 4, output_samples = 5000)
++
++  # Integrate
++  .data %>%
++    left_join(tibble(.sample = rownames(data_for_model$y), N = 1:nrow(data_for_model$y)), by = ".sample" %>% setNames(quo_name(.sample))) %>%
++    left_join(tibble(.cell_type = colnames(data_for_model$y), M = 1:ncol(data_for_model$y)), by = ".cell_type" %>% setNames(quo_name(.cell_type))) %>%
++
++    # Add covariate from design
++    left_join(fit_and_generated, by = c("M", "N")) %>%
++
++    # Add theoretical data quantiles
++    mutate(!!as.symbol(sprintf("generated_data_quantiles_%s", iteration)) := map(
++      !!as.symbol(sprintf("generated_data_posterior_%s", iteration)),
++      ~ quantile(
++        .x$generated_quantity,
++        probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
++      ) %>%
++        enframe() %>%
++        spread(name, value)
++    )) %>%
++
++    # # Attach beta
++    # mutate(!!as.symbol(sprintf("beta_quantiles_%s", iteration)) := map(
++    #   !!as.symbol(sprintf("beta_posterior_%s", iteration)),
++    #   ~ quantile(
++    #     .x$.value,
++    #     probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
++    #   ) %>%
++    #     enframe() %>%
++    #     spread(name, value)
++    # ))   %>%
++
++  #     # Join slope
++  # left_join(  beta_posterior %>% select(M, !!as.symbol(sprintf("slope_%s", iteration)) := `50%`)  ) %>%
++
++  mutate(!!as.symbol(sprintf("outlier_%s", iteration)) := map2_lgl(
++    !!.count, !!as.symbol(sprintf("generated_data_quantiles_%s", iteration)),
++    ~ .x < .y$`5%` | .x > .y$`95%`)
++  ) %>%
++
++    # Add precision as attribute
++    add_attr( attr(fit_and_generated, "precision"), "precision" )
++
++
++
++}
++
++fit_model_and_parse_out_missing_data = function(.data, formula, .sample, .cell_type, .count, iteration){
++
++
++  # Prepare column same enquo
++  .sample = enquo(.sample)
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
++
++  # Produce data list
++  data_for_model =
++    .data %>%
++    data_to_spread (formula, !!.sample, !!.cell_type, !!.count) %>%
++    data_spread_to_model_input(formula, !!.sample, !!.cell_type, !!.count)
++
++  # .count = enquo(.count)
++  #
++  # .data_wide =
++  #   .my_data %>%
++  #   select(N, M, !!.count, parse_formula(formula)) %>%
++  #   distinct() %>%
++  #   spread(M, !!.count)
++
++  # .data_wide_no_covariates = .data_wide %>% select(-parse_formula(formula))
++
++  to_exclude =
++    .data %>%
++    filter(!!as.symbol(sprintf("outlier_%s", iteration - 1))  ) %>%
++    distinct(N, M)
++
++  to_include =
++    .data %>%
++    filter(!!as.symbol(sprintf("outlier_%s", iteration - 1)) %>% `!`  ) %>%
++    distinct(N, M)
++
++  # To mix with imputed data
++  .data_parsed_inliers =
++    .data %>%
++    anti_join(to_exclude,by = c("N", "M")) %>%
++    select(.value = count, N, M)
++
++  # Dirichlet with missing data
++  fit_imputation =
++    data_for_model %>%
++    do_inference_imputation(
++      formula,
++      approximate_posterior_inference,
++      approximate_posterior_analysis,
++      C,
++      X,
++      cores,
++      additional_parameters_to_save,
++      pass_fit = pass_fit,
++      to_include = to_include,
++      tol_rel_obj = tol_rel_obj,
++      #truncation_compensation = 0.7352941, # Taken by approximation study
++      seed = seed,
++      precision = .data %>% attr("precision")
++    )
++
++  beta_posterior_corrected =
++    fit_imputation %>%
++    draws_to_tibble_x_y("counts", "N", "M") %>%
++    rename(.draw_imputation = .draw) %>%
++    nest(data = -c(.chain ,.iteration, .draw_imputation ,.variable)) %>%
++    sample_n(100) %>%
++    mutate(fit = future_map(
++      data,
++      ~ {
++        data_for_model$y =
++          .x %>%
++          anti_join(to_include,by = c("N", "M")) %>%
++          bind_rows(.data_parsed_inliers) %>%
++          spread(M, .value) %>%
++          as_matrix(rownames = "N")
++
++        # Run model
++        fit_and_generate_quantities(data_for_model, stanmodels$glm_dirichlet_multinomial, iteration, chains=1, output_samples = 200)
++      }
++    )) %>%
++
++    # Add precision
++    mutate(precision = map(
++      fit,
++      ~ attr(.x, "precision")
++    ))
++
++  beta_posterior_corrected %>%
++
++    select(fit) %>%
++    unnest(fit) %>%
++    nanny::nest_subset(data = -c(N, M)) %>%
++
++    # Merge posterior data
++    mutate(!!as.symbol(sprintf("generated_data_posterior_%s", iteration)) := map(
++      data,
++      ~ .x %>%
++        select( !!as.symbol(sprintf("generated_data_posterior_%s", iteration))) %>%
++        unnest( !!as.symbol(sprintf("generated_data_posterior_%s", iteration)))
++    )) %>%
++
++    # Add theoretical data quantiles
++    mutate(!!as.symbol(sprintf("generated_data_quantiles_%s", iteration)) := map(
++      !!as.symbol(sprintf("generated_data_posterior_%s", iteration)),
++      ~ quantile(
++        .x$generated_quantity,
++        probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
++      ) %>%
++        enframe() %>%
++        spread(name, value)
++    )) %>%
++
++    # Merge posterior data
++    mutate(!!as.symbol(sprintf("beta_posterior_%s", iteration)) := map(
++      data,
++      ~ .x %>%
++        select( !!as.symbol(sprintf("beta_posterior_%s", iteration))) %>%
++        unnest( !!as.symbol(sprintf("beta_posterior_%s", iteration)))
++    )) %>%
++
++    left_join(
++      (.) %>% select(N, M, beta_posterior_2) %>% beta_to_CI(iteration)
++    ) %>%
++
++    select(-data) %>%
++
++    right_join( .data) %>%
++
++    mutate(!!as.symbol(sprintf("outlier_%s", iteration)) := map2_lgl(
++      !!.count, !!as.symbol(sprintf("generated_data_quantiles_%s", iteration)),
++      ~ .x < .y$`5%` | .x > .y$`95%`)
++    ) %>%
++
++    # Add precision as attribute
++    add_attr(
++      beta_posterior_corrected %>%
++        select(precision) %>%
++        unnest(precision) %>%
++        as.matrix(),
++      "precision" )
++
++}
+diff --git a/R/functions_multi_beta_binomial.R b/R/functions_multi_beta_binomial.R
+index 9cc9e1eb..bd679882 100755
+--- a/R/functions_multi_beta_binomial.R
++++ b/R/functions_multi_beta_binomial.R
+@@ -45,75 +45,166 @@ multi_beta_binomial_glm = function(.data,
+ ) {
+   # Prepare column same enquo
+   .sample = enquo(.sample)
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
+ 
+   # Produce data list
+   covariate_names = parse_formula(formula)
+-  X = .data %>% select(!!.sample, covariate_names) %>% model.matrix(formula, data=.)
+-  cell_cluster_names = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% colnames()
+ 
+   data_for_model =
+-    list(
+-      N = .data %>% nrow(),
+-      M = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% ncol(),
+-      exposure = .data$exposure,
+-      y = .data %>% select(-covariate_names, -exposure) %>% nanny::as_matrix(rownames = !!.sample),
+-      X = X,
+-      C = ncol(X)
+-    )
++    .data %>%
++    data_to_spread ( formula, !!.sample, !!.cell_type, !!.count) %>%
++    data_spread_to_model_input(formula, !!.sample, !!.cell_type, !!.count)
+ 
+ 
+   if(!check_outliers){
+ 
+     data_for_model %>%
+-      fit_model_and_parse(
+-        stanmodels$glm_multi_beta_binomial,
+-        chains = 4
+-      ) %>%
++      # Run the first discovery phase with permissive false discovery rate
++      fit_model(stanmodels$glm_multi_beta_binomial, chains= 4) %>%
++      parse_fit(data_for_model, .) %>%
++      beta_to_CI( ) %>%
+ 
+       # Join filtered
+       mutate(
+         significant =
+-          !!as.symbol(sprintf(".lower_%s", colnames(X)[2])) *
+-          !!as.symbol(sprintf(".upper_%s", colnames(X)[2])) > 0
++          !!as.symbol(sprintf(".lower_%s", colnames(data_for_model$X)[2])) *
++          !!as.symbol(sprintf(".upper_%s", colnames(data_for_model$X)[2])) > 0
+       ) %>%
+ 
+       # Clesn
+       select(-M) %>%
+-      mutate(.cell = cell_cluster_names) %>%
+-      select(.cell, everything())
++      mutate(!!.cell_type := data_for_model$y %>% colnames()) %>%
++      select(!!.cell_type, everything())
+ 
+ 
+   }
+ 
+   else{
+ 
+-    covariate_names = parse_formula(formula)
+-
+-    sampling(stanmodels$glm_multi_beta_binomial,
+-             data = list(
+-               N = .data %>% nrow(),
+-               M = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% ncol(),
+-               exposure = .data$exposure,
+-               y = .data %>% select(-covariate_names, -exposure) %>% nanny::as_matrix(rownames = !!.sample),
+-               X = .data %>% select(!!.sample, covariate_names) %>% model.matrix(formula, data=.),
+-               C = length(covariate_names)
+-             ),
+-             cores = 4
+-    )
++    fit =
++      data_for_model %>%
++      # Run the first discovery phase with permissive false discovery rate
++      fit_model(stanmodels$glm_multi_beta_binomial, chains= 4, output_samples = 500)
++    #fit_model(stan_model("inst/stan/glm_multi_beta_binomial.stan"), chains= 4, output_samples = 500)
+ 
+-    x =  rstan::gqs(
+-      #stanmodels$generated_quantities,
+-      rstan::stan_model("inst/stan/glm_multi_beta_binomial_generate_date.stan"),
++    rng =  rstan::gqs(
++      stanmodels$glm_multi_beta_binomial_generate_date,
++      #rstan::stan_model("inst/stan/glm_multi_beta_binomial_generate_date.stan"),
+       draws =  as.matrix(fit),
+-      data = list(
+-        N = .data %>% nrow(),
+-        M = .data %>% select(-!!.sample, -covariate_names, -exposure) %>% ncol(),
+-        exposure = .data$exposure,
+-        X = .data %>% select(!!.sample, covariate_names) %>% model.matrix(formula, data=.),
+-        C = length(covariate_names)
++      data = data_for_model
++    )
++
++    # Detect outliers
++    truncation_df =
++      .data %>%
++      left_join(
++        summary_to_tibble(rng, "counts", "N", "M") %>%
++          nest(data = -N) %>%
++          mutate(!!.sample := rownames(data_for_model$y)) %>%
++          unnest(data) %>%
++          nest(data = -M) %>%
++          mutate(!!.cell_type := colnames(data_for_model$y)) %>%
++          unnest(data) ,
++
++        by = c("sample", "cell_type")
++      ) %>%
++
++      # Add truncation
++      mutate(   truncation_down = `2.5%`,   truncation_up =  `97.5%`) %>%
++
++      # Add outlier stats
++      mutate( outlier = !(!!.count > `2.5%` & !!.count < `97.5%`) ) %>%
++      nest(data = -M) %>%
++      mutate(contains_outliers = map_lgl(data, ~ .x %>% filter(outlier) %>% nrow() %>% `>` (0))) %>%
++      unnest(data) %>%
++
++      mutate(
++        truncation_down = case_when( outlier ~ -1, TRUE ~ truncation_down),
++        truncation_up = case_when(outlier ~ -1, TRUE ~ truncation_up),
+       )
++
++    # Add censoring
++    data_for_model$is_truncated = 1
++    data_for_model$truncation_up = truncation_df %>% select(N, M, truncation_up) %>% spread(M, truncation_up) %>% as_matrix(rownames = "N") %>% apply(2, as.integer)
++    data_for_model$truncation_down = truncation_df %>% select(N, M, truncation_down) %>% spread(M, truncation_down) %>% as_matrix(rownames = "N") %>% apply(2, as.integer)
++
++    fit2 =
++      data_for_model %>%
++      # Run the first discovery phase with permissive false discovery rate
++      fit_model(stanmodels$glm_multi_beta_binomial, chains= 4, output_samples = 500)
++    #fit_model(stan_model("inst/stan/glm_multi_beta_binomial.stan"), chains= 4, output_samples = 500)
++
++    rng2 =  rstan::gqs(
++      stanmodels$glm_multi_beta_binomial_generate_date,
++      #rstan::stan_model("inst/stan/glm_multi_beta_binomial_generate_date.stan"),
++      draws =  as.matrix(fit2),
++      data = data_for_model
+     )
+ 
++    # Detect outliers
++    truncation_df2 =
++      .data %>%
++      left_join(
++        summary_to_tibble(rng2, "counts", "N", "M") %>%
++          nest(data = -N) %>%
++          mutate(!!.sample := rownames(data_for_model$y)) %>%
++          unnest(data) %>%
++          nest(data = -M) %>%
++          mutate(!!.cell_type := colnames(data_for_model$y)) %>%
++          unnest(data) ,
++
++        by = c("sample", "cell_type")
++      ) %>%
++
++      # Add truncation
++      mutate(   truncation_down = `2.5%`,   truncation_up =  `97.5%`) %>%
++
++      # Add outlier stats
++      mutate( outlier = !(!!.count > `2.5%` & !!.count < `97.5%`) ) %>%
++      nest(data = -M) %>%
++      mutate(contains_outliers = map_lgl(data, ~ .x %>% filter(outlier) %>% nrow() %>% `>` (0))) %>%
++      unnest(data) %>%
++
++      mutate(
++        truncation_down = case_when( outlier ~ -1, TRUE ~ truncation_down),
++        truncation_up = case_when(outlier ~ -1, TRUE ~ truncation_up),
++      )
++
++
++    data_for_model$truncation_up = truncation_df2 %>% select(N, M, truncation_up) %>% spread(M, truncation_up) %>% as_matrix(rownames = "N") %>% apply(2, as.integer)
++    data_for_model$truncation_down = truncation_df2 %>% select(N, M, truncation_down) %>% spread(M, truncation_down) %>% as_matrix(rownames = "N") %>% apply(2, as.integer)
++
++    fit3 =
++      data_for_model %>%
++      # Run the first discovery phase with permissive false discovery rate
++      fit_model(stanmodels$glm_multi_beta_binomial, chains= 4, output_samples = 500)
++    #fit_model(stan_model("inst/stan/glm_multi_beta_binomial.stan"), chains= 4, output_samples = 500)
++
++    fit3 %>%
++      parse_fit(data_for_model, .) %>%
++      beta_to_CI( ) %>%
++
++      # Join filtered
++      mutate(
++        significant =
++          !!as.symbol(sprintf(".lower_%s", colnames(data_for_model$X)[2])) *
++          !!as.symbol(sprintf(".upper_%s", colnames(data_for_model$X)[2])) > 0
++      ) %>%
++
++      # Clesn
++      select(-M) %>%
++      mutate(!!.cell_type := data_for_model$y %>% colnames()) %>%
++      select(!!.cell_type, everything()) %>%
++
++      # join outliers
++      left_join(
++        truncation_df2 %>%
++          select(!!.sample, !!.cell_type, outlier, `2.5%`, `97.5%`) %>%
++          nest(outliers = -!!.cell_type),
++        by = quo_name(.cell_type)
++      )
++
+   }
+ 
+ 
+diff --git a/R/methods.R b/R/methods.R
+index 674a7f44..e823936c 100755
+--- a/R/methods.R
++++ b/R/methods.R
+@@ -77,26 +77,18 @@ sccomp_glm = function(.data,
+ 
+ 
+   .data %>%
+-    nest(data = -!!.sample) %>%
+-    mutate(exposure = map_int(data, ~ .x %>% pull(!!.count) %>% sum() )) %>%
+-    unnest(data) %>%
+-    select(!!.sample, !!.cell_type, exposure, !!.count, parse_formula(formula)) %>%
+-    spread(!!.cell_type, !!.count) %>%
++
+     my_glm(
+       formula = formula,
+       .sample = !!.sample,
++      .cell_type = !!.cell_type,
++      .count = !!.count,
+       check_outliers = check_outliers,
+       approximate_posterior_inference = approximate_posterior_inference,
+       cores = cores,
+       # For development purpose,
+       seed = seed
+-    ) %>%
+-
+-
+-    # Polish
+-    rename(!!.cell_type := .cell)
+-
+-
++    )
+ 
+ 
+ }
+diff --git a/R/utilities.R b/R/utilities.R
+index 700f2699..7aef1afb 100755
+--- a/R/utilities.R
++++ b/R/utilities.R
+@@ -32,6 +32,29 @@ parse_formula <- function(fm) {
+ #' Get matrix from tibble
+ #'
+ #' @import dplyr
++#'
++#' @keywords internal
++#'
++#' @import dplyr
++#' @import tidyr
++#' @importFrom purrr as_mapper
++#'
++#' @param .x A tibble
++#' @param .p A boolean
++#' @param .f1 A function
++#' @param .f2 A function
++#'
++#' @return A tibble
++ifelse_pipe = function(.x, .p, .f1, .f2 = NULL) {
++  switch(.p %>% `!` %>% sum(1),
++         as_mapper(.f1)(.x),
++         if (.f2 %>% is.null %>% `!`)
++           as_mapper(.f2)(.x)
++         else
++           .x)
++
++}
++
+ #' @importFrom tidyr gather
+ #' @importFrom magrittr set_rownames
+ #'
+@@ -267,6 +290,7 @@ fit_to_counts_rng = function(fit, adj_prob_theshold){
+ #' draws_to_tibble_x_y
+ #'
+ #' @importFrom tidyr pivot_longer
++#' @importFrom rstan extract
+ draws_to_tibble_x_y = function(fit, par, x, y) {
+ 
+ 	par_names = names(fit) %>% grep(sprintf("%s", par), ., value = T)
+@@ -334,145 +358,42 @@ summary_to_tibble = function(fit, par, x, y = NULL) {
+ 			is.null(y) ~ (.) %>% tidyr::extract(col = .variable, into = c(".variable", x), "(.+)\\[(.+)\\]", convert = T),
+ 			~ (.) %>% tidyr::extract(col = .variable, into = c(".variable", x, y), "(.+)\\[(.+),(.+)\\]", convert = T)
+ 		) %>%
+-	  filter(.variable == "beta")
++	  filter(.variable == par)
+ 
+ }
+ 
+ #' @importFrom tibble enframe
+ #' @importFrom tidyr nest
+ #' @importFrom tidyr unnest
+-generate_quantities = function(fit, N, M, exposure){
++generate_quantities = function(fit, data_for_model){
+ 
+ 
+   rstan::gqs(
+     stanmodels$generated_quantities,
+     #rstan::stan_model("inst/stan/generated_quantities.stan"),
+-    draws =  as.matrix(fit)
++    draws =  as.matrix(fit),
++    data = list(
++     N = data_for_model$N,
++     M = data_for_model$M,
++     exposure = data_for_model$exposure
++    )
+   ) %>%
+ 
+     rstan::extract("counts") %$% counts %>%
+     as.data.frame() %>%
+     as_tibble(rownames = "draw") %>%
+     gather(N_M, generated_quantity, -draw) %>%
+-
++    nest(data = -N_M) %>%
+     separate(N_M, c("N", "M")) %>%
+-    mutate(N = as.integer(N), M = as.integer(M))
++    mutate(N = as.integer(N), M = as.integer(M)) %>%
++    unnest(data)
+ 
+ 
+ }
+ 
+-#' do_inference
+-#'
+-#' @description This function calls the stan model.
+-#'
+-#' @importFrom tibble tibble
+-#' @import rstan
+-#' @import dplyr
+-#' @importFrom tidyr spread
+-#' @import tidybayes
+-#' @importFrom foreach foreach
+-#' @importFrom foreach %do%
+-#' @importFrom magrittr %$%
+-#' @importFrom magrittr divide_by
+-#' @importFrom magrittr multiply_by
+-#' @importFrom purrr map2
+-#' @importFrom purrr map_int
+-#' @importFrom tidybulk scale_abundance
+-#' @importFrom tidybayes gather_draws
+-#'
+-#' @param my_df A tibble including a cell_type name column | sample name column | read counts column | covariates column
+-#' @param formula A formula
+-#' @param .sample A column name as symbol
+-#' @param .cell_type A column name as symbol
+-#' @param .count A column name as symbol
+-#' @param .significance A column name as symbol
+-#' @param .do_check A column name as symbol
+-#' @param approximate_posterior_inference A boolean
+-#' @param approximate_posterior_analysis A boolean
+-#' @param C An integer
+-#' @param X A tibble
+-#' @param lambda_mu_mu A real
+-#' @param cores An integer
+-#' @param exposure_rate_multiplier A real
+-#' @param intercept_shift_scale A real
+-#' @param additional_parameters_to_save A character vector
+-#' @param adj_prob_theshold A real
+-#' @param how_many_posterior_draws A real number of posterior draws needed
+-#' @param to_exclude A boolean
+-#' @param truncation_compensation A real
+-#' @param save_generated_quantities A boolean
+-#' @param inits_fx A function
+-#' @param prior_from_discovery A tibble
+-#' @param pass_fit A fit
+-#' @param tol_rel_obj A real
+-#' @param write_on_disk A boolean
+-#' @param seed an integer
+-#'
+-#' @return A tibble with additional columns
+-#'
+-do_inference = function(.data,
+-                        model,
+-												approximate_posterior_inference = F,
+-												approximate_posterior_analysis = F,
+-												additional_parameters_to_save,
+-												to_exclude = tibble(N = integer(), M = integer()),
+-												truncation_compensation = 1,
+-												save_generated_quantities = F,
+-												inits_fx = "random",
+-												prior_from_discovery = tibble(`.variable` = character(),
+-																											mean = numeric(),
+-																											sd = numeric()),
+-												pass_fit = F,
+-												tol_rel_obj = 0.01,
+-												write_on_disk = F,
+-												seed,
+-												output_samples= output_samples,
+-												chains = 4) {
+-
+-
+-
+-
+-	# # if analysis approximated
+-	# # If posterior analysis is approximated I just need enough
+-	# how_many_posterior_draws_practical = ifelse(approximate_posterior_analysis, 1000, how_many_posterior_draws)
+-	# additional_parameters_to_save = additional_parameters_to_save %>% c("lambda_log_param", "sigma_raw") %>% unique
+-
+-
+-  X =
+-  sampling(model,
+-           data = .data,
+-           chains = chains,
+-           cores = chains,
+-           iter = output_samples + 1000,
+-           warmup = 1000
+-  )
+-
+-  # fit =
+-  #   vb_iterative(
+-  #     stanmodels$glm_dirichlet_multinomial,
+-  #     #pcc_seq_model, #
+-  #     output_samples = output_samples,
+-  #     iter = 5000,
+-  #     tol_rel_obj = 0.01,
+-  #     data = list(
+-  #       N = nrow(.data),
+-  #       M = ncol(.data)-1,
+-  #       y = .data %>% dplyr::select(-N),
+-  #       X = X
+-  #     )
+-  #   )
+-
+-}
+-
+-
+-
+-
+ do_inference_imputation = function(.data,
+-                        formula,
+                         approximate_posterior_inference = F,
+                         approximate_posterior_analysis = F,
+-                        C,
+-                        X,
+                         cores,
+                         additional_parameters_to_save,
+                         to_include = tibble(N = integer(), M = integer()),
+@@ -486,8 +407,7 @@ do_inference_imputation = function(.data,
+                         tol_rel_obj = 0.01,
+                         write_on_disk = F,
+                         seed,
+-                        precision = precision,
+-                        exposure = exposure) {
++                        precision) {
+ 
+ 
+ 
+@@ -497,10 +417,6 @@ do_inference_imputation = function(.data,
+   # how_many_posterior_draws_practical = ifelse(approximate_posterior_analysis, 1000, how_many_posterior_draws)
+   # additional_parameters_to_save = additional_parameters_to_save %>% c("lambda_log_param", "sigma_raw") %>% unique
+ 
+-
+-
+-
+-
+   # Correct for 0 prop ##############################
+   ###################################################
+ 
+@@ -515,26 +431,12 @@ do_inference_imputation = function(.data,
+   ###################################################
+ 
+   # Convert to log ratios
+-  .data_clr =
+-    .data %>%
+-    tidybulk::as_matrix(rownames = N) %>%
+-    apply(1, function(x) x/sum(x)) %>%
+-    t() %>%
++  .data$y  =
++    .data$y %>%
++    divide_by(rowSums(.data$y )) %>%
+     fix_zeros() %>%
+-    as.data.frame() %>%
+-    as_tibble() %>%
+-    rowid_to_column("N") %>%
+-    gather(M, proportions, -N) %>%
+-    mutate(M = as.integer(M)) %>%
+-    group_by(N) %>%
+-    mutate(centered_log_ratio = proportions %>% boot::logit() %>% scale(scale = F) %>% as.numeric) %>%
+-    ungroup(N) %>%
+-    select(-proportions) %>%
+-    spread(M, centered_log_ratio)
+-
+-
+-  how_namy_to_include = to_include %>% nrow
+-  I  = precision %>% nrow
++    apply(1, function(x)  x %>% boot::logit() %>% scale(scale = F) %>% as.numeric) %>%
++    t()
+ 
+   # fit =
+   #   vb_iterative(
+@@ -551,16 +453,17 @@ do_inference_imputation = function(.data,
+   #     )
+   #   )
+ 
+-  fit =
++
+     sampling(
+       stanmodels$glm_imputation,
+       #stan_model("glm_dirichlet_multinomial.stan"),
+-      data = list(
+-        N = nrow(.data_clr),
+-        M = ncol(.data_clr)-1,
+-        y = .data_clr %>% dplyr::select(-N),
+-        X = X
+-      ),
++      data = .data %>%
++        c(list(
++          precision = precision,
++          to_include= to_include,
++          how_namy_to_include = to_include %>% nrow,
++          I = precision %>% nrow
++      )),
+       cores = 4
+       #, iter = 5000, warmup = 300
+     )
+@@ -580,7 +483,7 @@ do_inference_imputation = function(.data,
+   #   theme_bw() +
+   #   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ 
+-  fit
++
+ 
+ 
+ 
+@@ -614,74 +517,60 @@ label_deleterious_outliers = function(.my_data){
+ fit_model = function(data_for_model, model, censoring_iteration = 1, chains, output_samples = 5000){
+ 
+ 
++  # # if analysis approximated
++  # # If posterior analysis is approximated I just need enough
++  # how_many_posterior_draws_practical = ifelse(approximate_posterior_analysis, 1000, how_many_posterior_draws)
++  # additional_parameters_to_save = additional_parameters_to_save %>% c("lambda_log_param", "sigma_raw") %>% unique
+ 
+-  # Run the first discovery phase with permissive false discovery rate
+-  fit =
+-    data_for_model %>%
+-    do_inference(
+-      model,
+-      approximate_posterior_inference,
+-      approximate_posterior_analysis = F,
+-      additional_parameters_to_save,
+-      pass_fit = T,
+-      tol_rel_obj = tol_rel_obj,
+-      seed = seed,
+-      output_samples = output_samples,
+-      chains = chains
+-    )
+ 
+-  fit_discovery = fit %>%
+-    draws_to_tibble_x_y("beta", "C", "M") %>%
+-    left_join(tibble(C=1:ncol(data_for_model$X), C_name = colnames(data_for_model$X))) %>%
+-    nest(!!as.symbol(sprintf("beta_posterior_%s", censoring_iteration)) := -M)
++  sampling(model,
++           data = data_for_model,
++           chains = chains,
++           cores = chains,
++           iter = output_samples + 1000,
++           warmup = 1000
++  )
+ 
+-    # Add precision as attribute
+-      fit_discovery %>%
+-      add_attr(
+-        fit %>% extract("precision") %$% precision,
+-        "precision"
+-      )
++  # fit =
++  #   vb_iterative(
++  #     stanmodels$glm_dirichlet_multinomial,
++  #     #pcc_seq_model, #
++  #     output_samples = output_samples,
++  #     iter = 5000,
++  #     tol_rel_obj = 0.01,
++  #     data = list(
++  #       N = nrow(.data),
++  #       M = ncol(.data)-1,
++  #       y = .data %>% dplyr::select(-N),
++  #       X = X
++  #     )
++  #   )
+ 
+ 
+-}
+ 
+-fit_and_generate_quantities = function(.data_wide_no_covariates, formula, .sample, model, iteration, chains, output_samples = 2000){
+ 
+-  .sample = enquo(.sample)
+ 
+ 
+-  fit_discovery  = fit_model(.data_wide_no_covariates, formula, !!.sample, model,  iteration, chains= 4, output_samples = output_samples)
+ 
+-  # beta_posterior =
+-  #   fit_discovery %>%
+-  #   draws_to_tibble_x_y("beta", "C", "M") %>%
+-  #   filter(C==2) %>%
+-  #   nest(data = -M) %>%
+-  #   mutate(quantiles = map(
+-  #     data,
+-  #     ~ quantile(
+-  #       .x$.value,
+-  #       probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
+-  #     ) %>%
+-  #       enframe() %>%
+-  #       spread(name, value)
+-  #   )) %>%
+-  #   unnest(quantiles)
++}
++
++fit_and_generate_quantities = function(data_for_model, model, censoring_iteration, chains, output_samples = 2000){
++
++
++  # fit_discovery  = fit_model(data_for_model, model,  iteration, chains= 4, output_samples = output_samples)
++
++  # Run the first discovery phase with permissive false discovery rate
++  fit  = fit_model(data_for_model, model, censoring_iteration, chains= chains, output_samples = output_samples)
++  fitted = parse_fit(data_for_model, fit, censoring_iteration = censoring_iteration, chains)
+ 
+   # # For building some figure I just need the discovery run, return prematurely
+   # if(just_discovery) return(res_discovery %>% filter(.variable == "counts_rng"))
+ 
+   # Generate theoretical data
+-  generated_discovery =
+-    generate_quantities(
+-      fit_discovery ,
+-      nrow(.data_wide_no_covariates),
+-      ncol(.data_wide_no_covariates)-1,
+-      exposure = exposure
+-    )
++  generated_discovery = generate_quantities(fit,  data_for_model)
+ 
+   # Integrate
+-  X %>%
++  data_for_model$X %>%
+     as.data.frame %>%
+     as_tibble() %>%
+     rowid_to_column("N") %>%
+@@ -692,40 +581,51 @@ fit_and_generate_quantities = function(.data_wide_no_covariates, formula, .sampl
+     # Add theoretical data posteiror
+     left_join(
+       generated_discovery %>%
+-        nest(!!as.symbol(sprintf("generated_data_posterior_%s", iteration)) := -c(M, N)),
++        nest(!!as.symbol(sprintf("generated_data_posterior_%s", censoring_iteration)) := -c(M, N)),
+       by="N"
+     ) %>%
+ 
+     # Attach beta posterior
+-    left_join(fit_discovery,  by="M") %>%
++    left_join(fitted,  by="M") %>%
+ 
+     # label_deleterious_outliers()
+ 
+     # Add precision as attribute
+     add_attr(
+-      fit_discovery %>% extract("precision") %$% precision,
++      fit %>% extract("precision") %$% precision,
+       "precision"
+-    )  %>%
+-
+-    # Add precision as attribute
+-    add_attr( attr(fit_discovery, "precision"), "precision" )
+-
++    )
+ 
+ }
+ 
+ #' @importFrom purrr map2_lgl
+ #' @importFrom tidyr pivot_wider
+-fit_model_and_parse = function(data_for_model, model, censoring_iteration = 1, chains){
++#' @importFrom rstan extract
++parse_fit = function(data_for_model, fit, censoring_iteration = 1, chains){
++
++  fitted = fit %>%
++    draws_to_tibble_x_y("beta", "C", "M") %>%
++    left_join(tibble(C=1:ncol(data_for_model$X), C_name = colnames(data_for_model$X)), by = "C") %>%
++    nest(!!as.symbol(sprintf("beta_posterior_%s", censoring_iteration)) := -M)
++
++  # Add precision as attribute
++    fitted %>%
++    add_attr(
++      fit %>% rstan::extract("precision") %$% precision,
++      "precision"
++    )
+ 
+ 
+ 
+-  # Run the first discovery phase with permissive false discovery rate
+-  fitted  = fit_model(data_for_model, model, censoring_iteration, chains= 4)
++}
+ 
++#' @importFrom purrr map2_lgl
++#' @importFrom tidyr pivot_wider
++beta_to_CI = function(fitted, censoring_iteration = 1){
+ 
+-  credible_intervals =
+-    fitted %>%
+-    unnest(beta_posterior_1) %>%
++
++  fitted %>%
++    unnest(!!as.symbol(sprintf("beta_posterior_%s", censoring_iteration))) %>%
+     nest(data = -c(M, C, C_name)) %>%
+     # Attach beta
+     mutate(!!as.symbol(sprintf("beta_quantiles_%s", censoring_iteration)) := map(
+@@ -742,209 +642,11 @@ fit_model_and_parse = function(data_for_model, model, censoring_iteration = 1, c
+     select(-data, -C) %>%
+     pivot_wider(names_from = C_name, values_from=c(.lower , .median ,  .upper))
+ 
+-  # Integrate
+-  credible_intervals
+-
+-}
+-
+-#' @importFrom purrr map2_lgl
+-fit_model_and_parse_out_no_missing_data = function(.my_data, formula, .sample, iteration, chains){
+-
+-  .sample = enquo(.sample)
+-
+-
+-
+-  # Run the first discovery phase with permissive false discovery rate
+-  fit_and_generated  = fit_and_generate_quantities(.my_data, formula,  !!.sample, model, iteration, chains= 4, output_samples = 5000)
+-
+-  # Integrate
+-  .my_data %>%
+-
+-    # Add covariate from design
+-    left_join(fit_and_generated) %>%
+-
+-    # Add theoretical data quantiles
+-    mutate(!!as.symbol(sprintf("generated_data_quantiles_%s", iteration)) := map(
+-      !!as.symbol(sprintf("generated_data_posterior_%s", iteration)),
+-      ~ quantile(
+-        .x$generated_quantity,
+-        probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
+-      ) %>%
+-        enframe() %>%
+-        spread(name, value)
+-    )) %>%
+-
+-    # Attach beta
+-    mutate(!!as.symbol(sprintf("beta_quantiles_%s", iteration)) := map(
+-      !!as.symbol(sprintf("beta_posterior_%s", iteration)),
+-      ~ quantile(
+-        .x$.value,
+-        probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
+-      ) %>%
+-        enframe() %>%
+-        spread(name, value)
+-    ))   %>%
+-
+-    #     # Join slope
+-    # left_join(  beta_posterior %>% select(M, !!as.symbol(sprintf("slope_%s", iteration)) := `50%`)  ) %>%
+-
+-    mutate(!!as.symbol(sprintf("outlier_%s", iteration)) := map2_lgl(
+-      !!.count, !!as.symbol(sprintf("generated_data_quantiles_%s", iteration)),
+-      ~ .x < .y$`5%` | .x > .y$`95%`)
+-    ) %>%
+-
+-    # Add precision as attribute
+-    add_attr( attr(fit_and_generated, "precision"), "precision" )
+-
+ 
+ 
+ }
+ 
+-fit_model_and_parse_out_missing_data = function(.my_data, .count, formula, X, exposure, iteration){
+-
+-  .count = enquo(.count)
+-
+-  .data_wide =
+-    .my_data %>%
+-    select(N, M, !!.count, parse_formula(formula)) %>%
+-    distinct() %>%
+-    spread(M, !!.count)
+-
+-  .data_wide_no_covariates = .data_wide %>% select(-parse_formula(formula))
+-
+-  to_exclude =
+-    .my_data %>%
+-    filter(!!as.symbol(sprintf("outlier_%s", iteration - 1))  ) %>%
+-    distinct(N, M)
+-
+-  to_include =
+-    .my_data %>%
+-    filter(!!as.symbol(sprintf("outlier_%s", iteration - 1)) %>% `!`  ) %>%
+-    distinct(N, M)
+-
+-  # To mix with imputed data
+-  .data_parsed_inliers =
+-    .my_data %>%
+-    anti_join(to_exclude,by = c("N", "M")) %>%
+-    select(.value = count, N, M)
+-
+-  # Dirichlet with missing data
+-  fit_imputation =
+-    .data_wide_no_covariates %>%
+-    do_inference_imputation(
+-      formula,
+-      approximate_posterior_inference,
+-      approximate_posterior_analysis,
+-      C,
+-      X,
+-      cores,
+-      additional_parameters_to_save,
+-      pass_fit = pass_fit,
+-      to_include = to_include,
+-      tol_rel_obj = tol_rel_obj,
+-      #truncation_compensation = 0.7352941, # Taken by approximation study
+-      seed = seed,
+-      precision = .my_data %>% attr("precision"),
+-      exposure = exposure
+-    )
+-
+-  beta_posterior_corrected =
+-    fit_imputation %>%
+-    draws_to_tibble_x_y("counts", "N", "M") %>%
+-    rename(.draw_imputation = .draw) %>%
+-    nest(data = -c(.chain ,.iteration, .draw_imputation ,.variable)) %>%
+-    sample_n(100) %>%
+-    mutate(fit = future_map(
+-      data,
+-      ~ .x %>%
+-        anti_join(to_include,by = c("N", "M")) %>%
+-        bind_rows(.data_parsed_inliers) %>%
+-        spread(M, .value) %>%
+ 
+-        # Run model
+-        fit_and_generate_quantities(X, exposure, iteration, chains=1, output_samples = 200)
+-
+-    )) %>%
+-
+-    # Add precision
+-    mutate(precision = map(
+-      fit,
+-      ~ attr(.x, "precision")
+-    ))
+-
+-  beta_posterior_corrected %>%
+-
+-    select(fit) %>%
+-    unnest(fit) %>%
+-    nanny::nest_subset(data = -c(N, M)) %>%
+-
+-    # Merge posterior data
+-    mutate(!!as.symbol(sprintf("generated_data_posterior_%s", iteration)) := map(
+-      data,
+-      ~ .x %>%
+-        select( !!as.symbol(sprintf("generated_data_posterior_%s", iteration))) %>%
+-        unnest( !!as.symbol(sprintf("generated_data_posterior_%s", iteration)))
+-    )) %>%
+-
+-    # Add theoretical data quantiles
+-    mutate(!!as.symbol(sprintf("generated_data_quantiles_%s", iteration)) := map(
+-      !!as.symbol(sprintf("generated_data_posterior_%s", iteration)),
+-      ~ quantile(
+-          .x$generated_quantity,
+-          probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
+-        ) %>%
+-        enframe() %>%
+-        spread(name, value)
+-    )) %>%
+-
+-    # Merge posterior data
+-    mutate(!!as.symbol(sprintf("beta_posterior_%s", iteration)) := map(
+-      data,
+-      ~ .x %>%
+-        select( !!as.symbol(sprintf("beta_posterior_%s", iteration))) %>%
+-        unnest( !!as.symbol(sprintf("beta_posterior_%s", iteration)))
+-    )) %>%
+-
+-
+-    # Attach beta
+-    mutate(!!as.symbol(sprintf("beta_quantiles_%s", iteration)) := map(
+-      !!as.symbol(sprintf("beta_posterior_%s", iteration)),
+-      ~ quantile(
+-          .x %>% filter(C==2) %>% pull(.value),
+-          probs = c(0.025, 0.05, 0.25, 0.5, 0.75, 0.95, 0.975)
+-        ) %>%
+-        enframe() %>%
+-        spread(name, value)
+-    )) %>%
+-
+-    # Attach estimate for all parameters
+-    mutate(estimates := map(
+-      !!as.symbol(sprintf("beta_posterior_%s", iteration)),
+-      ~ .x %>% group_by(C_name) %>% summarise(value = median(.value))  %>%
+-        spread(C_name, value) %>%
+-        setNames(sprintf("estimate_%s", colnames(.)))
+-    )) %>%
+-    unnest(estimates) %>%
+-
+-
+-    select(-data) %>%
+-
+-    right_join( .my_data) %>%
+-
+-    mutate(!!as.symbol(sprintf("outlier_%s", iteration)) := map2_lgl(
+-      !!.count, !!as.symbol(sprintf("generated_data_quantiles_%s", iteration)),
+-      ~ .x < .y$`5%` | .x > .y$`95%`)
+-    ) %>%
+-
+-    # Add precision as attribute
+-    add_attr(
+-      beta_posterior_corrected %>%
+-        select(precision) %>%
+-        unnest(precision) %>%
+-        as.matrix(),
+-      "precision" )
+-
+-}
+ 
+ #' .formula parser
+ #'
+@@ -962,3 +664,51 @@ parse_formula <- function(fm) {
+   else
+     as.character(attr(terms(fm), "variables"))[-1]
+ }
++
++data_spread_to_model_input = function(.data_spread, formula, .sample, .cell_type, .count){
++
++  # Prepare column same enquo
++  .sample = enquo(.sample)
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
++
++  covariate_names = parse_formula(formula)
++  X = .data_spread %>% select(!!.sample, covariate_names) %>% model.matrix(formula, data=.)
++  cell_cluster_names = .data_spread %>% select(-!!.sample, -covariate_names, -exposure) %>% colnames()
++
++
++
++  data_for_model =
++    list(
++      N = .data_spread %>% nrow(),
++      M = .data_spread %>% select(-!!.sample, -covariate_names, -exposure) %>% ncol(),
++      exposure = .data_spread$exposure,
++      y = .data_spread %>% select(-covariate_names, -exposure) %>% nanny::as_matrix(rownames = !!.sample),
++      X = X,
++      C = ncol(X),
++      A = 2
++    )
++
++  # Add censoring
++  data_for_model$is_truncated = 0
++  data_for_model$truncation_up = matrix(rep(-1, data_for_model$M * data_for_model$N), ncol = data_for_model$M)
++  data_for_model$truncation_down = matrix(rep(-1, data_for_model$M * data_for_model$N), ncol = data_for_model$M)
++
++  # Return
++  data_for_model
++}
++
++data_to_spread = function(.data, formula, .sample, .cell_type, .count){
++
++  .sample = enquo(.sample)
++  .cell_type = enquo(.cell_type)
++  .count = enquo(.count)
++
++  .data %>%
++    nest(data = -!!.sample) %>%
++    mutate(exposure = map_int(data, ~ .x %>% pull(!!.count) %>% sum() )) %>%
++    unnest(data) %>%
++    select(!!.sample, !!.cell_type, exposure, !!.count, parse_formula(formula)) %>%
++    spread(!!.cell_type, !!.count)
++
++}
+diff --git a/dev/multi_beta.R b/dev/multi_beta.R
+old mode 100644
+new mode 100755
+index bc04ceb4..203fbba6
+--- a/dev/multi_beta.R
++++ b/dev/multi_beta.R
+@@ -99,9 +99,9 @@ f2 %>% plot(pars="precision")
+ # Real data
+ sccomp::cell_counts %>%
+   nest(data = -sample) %>%
+-  mutate(sample_tot = map_int(data, ~ sum(.x$count))) %>%
++  mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
+   unnest(data) %>%
+-  mutate(frac_logit = (count/sample_tot) %>% boot::logit() ) %>%
++  mutate(frac_logit = (count/exposure) %>% boot::logit() ) %>%
+ 
+   group_by(cell_type, type) %>%
+   summarise(m=mean(frac_logit), s=sd(frac_logit)) %>%
+@@ -114,10 +114,10 @@ input_df =
+   sccomp::cell_counts %>%
+   mutate(count = count + 1L) %>%
+   nest(data = -sample) %>%
+-  mutate(sample_tot = map_int(data, ~ sum(.x$count))) %>%
++  mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
+   unnest(data) %>%
+-  mutate(frac = (count/sample_tot) ) %>%
+-  select(-c(count, sample_tot, phenotype)) %>%
++  mutate(frac = (count/exposure) ) %>%
++  select(-c(count, exposure, phenotype)) %>%
+   spread(cell_type, frac)
+ 
+ f3 = stan(file = "inst/stan/glm_multi_beta.stan",
+diff --git a/dev/multi_beta_binomial.R b/dev/multi_beta_binomial.R
+old mode 100644
+new mode 100755
+index a6daaed4..61ed28ca
+--- a/dev/multi_beta_binomial.R
++++ b/dev/multi_beta_binomial.R
+@@ -11,9 +11,9 @@ library(tidybayes)
+ # Real data
+ sccomp::cell_counts %>%
+   nest(data = -sample) %>%
+-  mutate(sample_tot = map_int(data, ~ sum(.x$count))) %>%
++  mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
+   unnest(data) %>%
+-  mutate(frac_logit = (count/sample_tot) %>% boot::logit() ) %>%
++  mutate(frac_logit = (count/exposure) %>% boot::logit() ) %>%
+ 
+   group_by(cell_type, type) %>%
+   summarise(m=mean(frac_logit), s=sd(frac_logit)) %>%
+@@ -26,7 +26,7 @@ input_df =
+   sccomp::cell_counts %>%
+   mutate(count = count + 1L) %>%
+   nest(data = -sample) %>%
+-  mutate(sample_tot = map_int(data, ~ sum(.x$count))) %>%
++  mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
+   unnest(data) %>%
+   select(-c(phenotype)) %>%
+   spread(cell_type, count)
+@@ -35,8 +35,8 @@ f4 = stan(file = "inst/stan/glm_multi_beta_binomial.stan",
+           data = list(
+             N = 20,
+             M = 36,
+-            tot = input_df$sample_tot,
+-            y = input_df %>% select(-type, -sample_tot) %>% nanny::as_matrix(rownames = sample),
++            exposure = input_df$exposure,
++            y = input_df %>% select(-type, -exposure) %>% nanny::as_matrix(rownames = sample),
+             X = input_df %>% select(sample, type) %>% model.matrix(~ type, data=.)
+           ),
+           cores = 4
+diff --git a/dev/truncation_approximation.R b/dev/truncation_approximation.R
+new file mode 100644
+index 00000000..1eb3534e
+--- /dev/null
++++ b/dev/truncation_approximation.R
+@@ -0,0 +1,88 @@
++
++library(tidyverse)
++library(furrr)
++library(rstan)
++library(TailRank)
++plan(multisession, workers = 20)
++mo <- stan_model(model_code = 'data{ int N; int exposure[N]; int y[N];} parameters{ real<lower=0, upper=1> mu;  real<upper = 10> precision; } model{  target += beta_binomial_lpmf(y | exposure, mu * exp(precision), (1.0 - mu) * exp(precision) );   precision ~ gamma( 4, 2); mu ~ beta(2,2); }' )
++
++shrinkage =
++  expand_grid(
++    mu = seq(0,1, length.out=102) %>% tail(-1) %>% head(-1),
++    precision = seq(1, 6, length.out=100) %>% exp()
++  ) %>%
++
++  # Put plateau to shape
++  rowwise() %>%
++  mutate(correction_factor = 1.0/min(mu, 1-mu) * 0.5) %>%
++  ungroup() %>%
++  mutate(precision = precision * correction_factor) %>%
++  mutate(
++    alpha =  mu * precision,
++    beta = (1-mu) * precision
++  ) %>%
++  mutate(fit = future_map2(alpha, beta, ~ {
++
++    exposure = 1000
++    y =
++      rbb(1000, exposure, .x, .y) %>%
++      enframe() %>%
++      filter(value <= qbb(0.975, exposure, .x, .y)) %>%
++      filter(value >= qbb(0.025, exposure, .x, .y)) %>%
++      pull(value)
++
++    summary(sampling(
++      mo,
++      data=list(y = y, N = length(y), exposure = rep(exposure, length(y))),
++      chains=1
++      #,
++      #iter = 250, warmup = 150
++    ))$summary[1:2,"50%"] %>%
++      enframe() %>%
++      spread(name, value) %>%
++      setNames(c("mu_truncated", "precision_truncated")) %>%
++      mutate(precision_truncated = exp(precision_truncated))
++
++  })) %>%
++  unnest(fit) %>%
++  mutate(shrink = precision / precision_truncated)
++
++saveRDS(shrinkage, "dev/shrinkage_positive_control.rds")
++saveRDS(shrinkage, "dev/shrinkage.rds")
++
++
++
++library(viridis)
++my_theme =
++  theme_bw() +
++  theme(
++    panel.border = element_blank(),
++    axis.line = element_line(),
++    panel.grid.major = element_line(size = 0.2),
++    panel.grid.minor = element_line(size = 0.1),
++    text = element_text(size=12),
++    legend.position="bottom",
++    aspect.ratio=1,
++    strip.background = element_blank(),
++    axis.title.x  = element_text(margin = margin(t = 10, r = 10, b = 10, l = 10)),
++    axis.title.y  = element_text(margin = margin(t = 10, r = 10, b = 10, l = 10))
++  )
++(
++
++  shrinkage %>%
++    ggplot(aes(mu, precision)) +
++    geom_tile(aes(fill = shrink)) +
++    scale_fill_viridis(	option="magma") +
++    my_theme
++
++  ) %>%
++  ggsave(plot = .,
++         "dev/truncatin_approximation.pdf",
++         useDingbats=FALSE,
++         units = c("mm"),
++         width = 183
++  )
++
++
++ggplot(shrinkage %>% head(10000) , aes(log(precision), shrink)) +
++  geom_line(aes(color = mu)) + facet_wrap(~mu) + scale_y_log10()
+diff --git a/inst/stan/generated_quantities.stan b/inst/stan/generated_quantities.stan
+index d05462a3..58a03912 100644
+--- a/inst/stan/generated_quantities.stan
++++ b/inst/stan/generated_quantities.stan
+@@ -1,10 +1,3 @@
+-functions{
+-
+-	int[] dirichlet_multinomial_rng(vector alpha, int exposure) {
+-	    return multinomial_rng(dirichlet_rng(alpha), exposure);
+-	}
+-
+-}
+ data {
+ 	int<lower=0> N;
+ 	int<lower=0> M;
+@@ -20,6 +13,6 @@ generated quantities{
+   int counts[N, M];
+ 
+ 	for(n in 1:N)
+-	counts[n] = dirichlet_multinomial_rng(alpha[,n], exposure[n]) ;
++	counts[n] = multinomial_rng(dirichlet_rng(alpha[,n]), exposure[n]) ;
+ 
+ }
+diff --git a/inst/stan/glm_multi_beta_binomial.stan b/inst/stan/glm_multi_beta_binomial.stan
+index d8e61f93..8702b23d 100755
+--- a/inst/stan/glm_multi_beta_binomial.stan
++++ b/inst/stan/glm_multi_beta_binomial.stan
+@@ -23,18 +23,7 @@ functions{
+     return x;
+   }
+ 
+-  real beta_binomial_regression_lpmf(int[,] p, int[] exposure, matrix X, matrix beta, vector phi){
+ 
+-		real lp = 0;
+-    matrix[num_elements(p[1]), num_elements(p[,1])] mu = (X * beta)';
+-		for(i in 1:cols(mu)) mu[,i] = softmax(mu[,i]);
+-		for(i in 1:cols(mu)) {
+-
+-     	lp += beta_binomial_lpmf(p[i] | exposure[i], (mu[,i] .* phi), ((1.0 - mu[,i]) .* phi) );
+-
+-		}
+-		return (lp);
+-	}
+ 
+ }
+ data{
+@@ -45,14 +34,21 @@ data{
+ 	int y[N,M];
+ 	matrix[N, C] X;
+ 
++	// Truncation
++	int is_truncated;
++	int truncation_up[N,M];
++	int truncation_down[N,M];
++
++
+ }
+ transformed data{
++  int A = 2;
+ 	vector[2*M] Q_r = Q_sum_to_zero_QR(M);
+   real x_raw_sigma = inv_sqrt(1 - inv(M));
+ }
+ parameters{
+ 	matrix[C, M-1] beta_raw;
+-	vector[M] precision;
++	matrix[A, M] alpha;
+ 
+ 	// To exclude
+   real prec_coeff[2];
+@@ -60,19 +56,49 @@ parameters{
+ }
+ transformed parameters{
+ 		matrix[C,M] beta;
++		matrix[A,M] beta_intercept_slope;
++		matrix[A,M] alpha_intercept_slope;
++    matrix[num_elements(y[1]), num_elements(y[,1])] precision = (X[,1:A] * alpha)';
++
+ 	  for(c in 1:C)	beta[c,] =  sum_to_zero_QR(beta_raw[c,], Q_r);
+ 
++    beta_intercept_slope[1] = beta[1];
++    beta_intercept_slope[2] = beta[1] + beta[2];
++    alpha_intercept_slope[1] = alpha[1];
++    alpha_intercept_slope[2] = alpha[1] + alpha[2];
+ 
+ }
+ model{
+ 
++  // Calculate MU
++  matrix[num_elements(y[1]), num_elements(y[,1])] mu = (X * beta)';
++
++  for(i in 1:cols(mu)) { mu[,i] = softmax(mu[,i]); }
+ 
+-	 y ~ beta_binomial_regression(exposure, X, beta, exp(precision) );
++  // NON TRUNCATION
++  if(is_truncated == 0){
++    for(i in 1:cols(mu))
++      y[i,] ~ beta_binomial( exposure[i], (mu[,i] .* exp(precision[,i])), ((1.0 - mu[,i]) .* exp(precision[,i])) );
++  }
++
++  // YES TRUNCATION
++  else{
++    for(i in 1:cols(mu)) { // SAMPLE
++      for(j in 1:rows(mu)){ // CATEGORY
++        if(truncation_down[i, j] >=0)
++          y[i,j] ~ beta_binomial( exposure[i], (mu[j,i] .* exp(precision[j,i])), ((1.0 - mu[j,i]) .* exp(precision[j,i])) );
++      }
++    }
++  }
++
++  for(i in 1:C) to_vector(beta_raw[i]) ~ student_t (8, 0, x_raw_sigma );
+ 
+-	 precision ~ normal( beta[1] * prec_coeff[2] + prec_coeff[1], prec_sd);
+-   prec_sd ~ normal(0,2);
++  // PRECISION REGRESSION
++  to_vector(alpha_intercept_slope) ~ normal( to_vector(beta_intercept_slope) * prec_coeff[2] + prec_coeff[1], prec_sd);
++  prec_sd ~ normal(0,2);
++  prec_coeff ~ normal(0,5);
+ 
+-	 for(i in 1:C) to_vector(beta_raw[i]) ~ normal(0, x_raw_sigma * 5);
+ 
+ 
+ }
++
+diff --git a/inst/stan/glm_multi_beta_binomial_generate_date.stan b/inst/stan/glm_multi_beta_binomial_generate_date.stan
+index f217ddb5..0e090545 100755
+--- a/inst/stan/glm_multi_beta_binomial_generate_date.stan
++++ b/inst/stan/glm_multi_beta_binomial_generate_date.stan
+@@ -1,36 +1,26 @@
+-functions{
+-
+-  int[,] beta_binomial_regression_rng(int[] exposure, matrix X, matrix beta, vector phi){
+-
+-		int y[cols(beta),rows(X)];
+-    matrix[cols(beta),rows(X)] mu = (X * beta)';
+-		for(i in 1:cols(mu)) mu[,i] = softmax(mu[,i]);
+-		for(i in 1:cols(mu)) {
+-
+-     	y[,i] = beta_binomial_rng( exposure[i], (mu[,i] .* phi), ((1.0 - mu[,i]) .* phi) );
+-
+-		}
+-		return (y);
+-	}
+-
+-}
+ data {
+ 	int N;
+ 	int M;
+ 	int C;
++	int A;
+ 	int exposure[N];
+ 	matrix[N, C] X;
+ }
+ parameters {
+ 
+ 	matrix[C,M] beta;
+-  vector[M] precision;
++	matrix[A,M] alpha;
+ 
+ }
+ generated quantities{
+ 
+   int counts[N, M];
++  matrix[M,N] mu = (X * beta)';
++  matrix[M,N] precision = (X[,1:A] * alpha)';
+ 
+-	counts = beta_binomial_regression_rng(exposure, X, beta, exp(precision)) ;
++	for(i in 1:cols(mu)) mu[,i] = softmax(mu[,i]);
++	for(i in 1:cols(mu)) {
++    	counts[i,] = beta_binomial_rng( exposure[i], (mu[,i] .* precision[,i]), ((1.0 - mu[,i]) .* precision[,i]) );
++	}
+ 
+ }
+diff --git a/man/dirichlet_multinomial_glm.Rd b/man/dirichlet_multinomial_glm.Rd
+index 225c4512..df68d943 100644
+--- a/man/dirichlet_multinomial_glm.Rd
++++ b/man/dirichlet_multinomial_glm.Rd
+@@ -8,6 +8,8 @@ dirichlet_multinomial_glm(
+   .data,
+   formula = ~1,
+   .sample,
++  .cell_type,
++  .count,
+   check_outliers = FALSE,
+   approximate_posterior_inference = T,
+   cores = detect_cores(),
+@@ -21,15 +23,15 @@ dirichlet_multinomial_glm(
+ 
+ \item{.sample}{A column name as symbol. The sample identifier}
+ 
++\item{.cell_type}{A column name as symbol. The cell_type identifier}
++
++\item{.count}{A column name as symbol. The cell_type abundance (read count)}
++
+ \item{approximate_posterior_inference}{A boolean. Whether the inference of the joint posterior distribution should be approximated with variational Bayes. It confers execution time advantage.}
+ 
+ \item{cores}{An integer. How many cored to be used with parallel calculations.}
+ 
+ \item{seed}{An integer. Used for development and testing purposes}
+-
+-\item{.cell_type}{A column name as symbol. The cell_type identifier}
+-
+-\item{.count}{A column name as symbol. The cell_type abundance (read count)}
+ }
+ \value{
+ A nested tibble \code{tbl} with cell_type-wise information: \verb{sample wise data} | plot | \verb{ppc samples failed} | \verb{exposure deleterious outliers}
+diff --git a/man/do_inference.Rd b/man/do_inference.Rd
+deleted file mode 100644
+index 4432fe09..00000000
+--- a/man/do_inference.Rd
++++ /dev/null
+@@ -1,87 +0,0 @@
+-% Generated by roxygen2: do not edit by hand
+-% Please edit documentation in R/utilities.R
+-\name{do_inference}
+-\alias{do_inference}
+-\title{do_inference}
+-\usage{
+-do_inference(
+-  .data,
+-  model,
+-  approximate_posterior_inference = F,
+-  approximate_posterior_analysis = F,
+-  additional_parameters_to_save,
+-  to_exclude = tibble(N = integer(), M = integer()),
+-  truncation_compensation = 1,
+-  save_generated_quantities = F,
+-  inits_fx = "random",
+-  prior_from_discovery = tibble(.variable = character(), mean = numeric(), sd =
+-    numeric()),
+-  pass_fit = F,
+-  tol_rel_obj = 0.01,
+-  write_on_disk = F,
+-  seed,
+-  output_samples = output_samples,
+-  chains = 4
+-)
+-}
+-\arguments{
+-\item{approximate_posterior_inference}{A boolean}
+-
+-\item{approximate_posterior_analysis}{A boolean}
+-
+-\item{additional_parameters_to_save}{A character vector}
+-
+-\item{to_exclude}{A boolean}
+-
+-\item{truncation_compensation}{A real}
+-
+-\item{save_generated_quantities}{A boolean}
+-
+-\item{inits_fx}{A function}
+-
+-\item{prior_from_discovery}{A tibble}
+-
+-\item{pass_fit}{A fit}
+-
+-\item{tol_rel_obj}{A real}
+-
+-\item{write_on_disk}{A boolean}
+-
+-\item{seed}{an integer}
+-
+-\item{my_df}{A tibble including a cell_type name column | sample name column | read counts column | covariates column}
+-
+-\item{formula}{A formula}
+-
+-\item{.sample}{A column name as symbol}
+-
+-\item{.cell_type}{A column name as symbol}
+-
+-\item{.count}{A column name as symbol}
+-
+-\item{.significance}{A column name as symbol}
+-
+-\item{.do_check}{A column name as symbol}
+-
+-\item{C}{An integer}
+-
+-\item{X}{A tibble}
+-
+-\item{lambda_mu_mu}{A real}
+-
+-\item{cores}{An integer}
+-
+-\item{exposure_rate_multiplier}{A real}
+-
+-\item{intercept_shift_scale}{A real}
+-
+-\item{adj_prob_theshold}{A real}
+-
+-\item{how_many_posterior_draws}{A real number of posterior draws needed}
+-}
+-\value{
+-A tibble with additional columns
+-}
+-\description{
+-This function calls the stan model.
+-}
+diff --git a/man/as_matrix.Rd b/man/ifelse_pipe.Rd
+similarity index 50%
+rename from man/as_matrix.Rd
+rename to man/ifelse_pipe.Rd
+index 3ee972c6..fcd04826 100644
+--- a/man/as_matrix.Rd
++++ b/man/ifelse_pipe.Rd
+@@ -1,19 +1,24 @@
+ % Generated by roxygen2: do not edit by hand
+ % Please edit documentation in R/utilities.R
+-\name{as_matrix}
+-\alias{as_matrix}
++\name{ifelse_pipe}
++\alias{ifelse_pipe}
+ \title{Get matrix from tibble}
+ \usage{
+-as_matrix(tbl, rownames = NULL)
++ifelse_pipe(.x, .p, .f1, .f2 = NULL)
+ }
+ \arguments{
+-\item{tbl}{A tibble}
++\item{.x}{A tibble}
+ 
+-\item{rownames}{A character string of the rownames}
++\item{.p}{A boolean}
++
++\item{.f1}{A function}
++
++\item{.f2}{A function}
+ }
+ \value{
+-A matrix
++A tibble
+ }
+ \description{
+ Get matrix from tibble
+ }
++\keyword{internal}
+diff --git a/tests/testthat/test-ppcSeq.R b/tests/testthat/test-ppcSeq.R
+index ea1c35e0..f4137ed4 100755
+--- a/tests/testthat/test-ppcSeq.R
++++ b/tests/testthat/test-ppcSeq.R
+@@ -37,46 +37,59 @@ test_that("dirichlet multinomial",{
+       noise_model = "dirichlet_multinomial"
+     )
+ 
+-  expect_equal(
+-    res %>%
+-      distinct(cell_type, significant) %>%
+-      pull(significant) %>%
+-      digest(algo="md5"),
+-    "872b45dd0f77c8a355f767294fb44298"
+-  )
++  # [1]  TRUE  TRUE FALSE FALSE FALSE  TRUE  TRUE FALSE FALSE  TRUE FALSE FALSE FALSE FALSE FALSE  TRUE  TRUE FALSE  TRUE  TRUE  TRUE  TRUE FALSE  TRUE  TRUE  TRUE  TRUE  TRUE  TRUE FALSE FALSE FALSE  TRUE  TRUE FALSE  TRUE
+ 
+ })
+ 
+ 
+-test_that("multi beta",{
++# test_that("multi beta",{
++#
++#
++#   library(dplyr)
++#   library(tidyr)
++#   library(purrr)
++#   library(sccomp)
++#   library(digest)
++#   library(rstan)
++#
++#   # Get proportions
++#   res2 =
++#     sccomp::cell_counts %>%
++#     mutate(count = count + 1L) %>%
++#     nest(data = -sample) %>%
++#     mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
++#     unnest(data) %>%
++#     mutate(frac = (count/exposure) ) %>%
++#     select(-c(count, exposure, phenotype)) %>%
++#
++#     sccomp_glm(
++#       formula = ~ type,
++#       sample, cell_type, frac,
++#       noise_model = "multi_beta"
++#     )
++#
++# })
+ 
++test_that("multi beta binomial",{
+ 
+-  library(dplyr)
+-  library(tidyr)
+-  library(purrr)
+-  library(sccomp)
+-  library(digest)
+-  library(rstan)
++library(dplyr)
++library(tidyr)
++library(purrr)
++library(sccomp)
++library(digest)
++library(rstan)
+ 
+-  # Get proportions
+-  res2 =
++  res =
+     sccomp::cell_counts %>%
+-    mutate(count = count + 1L) %>%
+-    nest(data = -sample) %>%
+-    mutate(exposure = map_int(data, ~ sum(.x$count))) %>%
+-    unnest(data) %>%
+-    mutate(frac = (count/exposure) ) %>%
+-    select(-c(count, exposure, phenotype)) %>%
+-
+     sccomp_glm(
+       formula = ~ type,
+-      sample, cell_type, frac,
+-      noise_model = "multi_beta"
++      sample, cell_type, count,
++      noise_model = "multi_beta_binomial"
+     )
+ 
+ })
+ 
+-test_that("multi beta binomial",{
++test_that("multi beta binomial outliers",{
+ 
+   library(dplyr)
+   library(tidyr)
+@@ -90,7 +103,8 @@ test_that("multi beta binomial",{
+     sccomp_glm(
+       formula = ~ type,
+       sample, cell_type, count,
+-      noise_model = "multi_beta_binomial"
++      noise_model = "multi_beta_binomial",
++      check_outliers = TRUE
+     )
+ 
+ })
