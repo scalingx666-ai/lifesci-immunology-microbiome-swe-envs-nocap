@@ -1,0 +1,515 @@
+diff --git a/assets/schema_input.json b/assets/schema_input.json
+index ae4e225c..5843d215 100644
+--- a/assets/schema_input.json
++++ b/assets/schema_input.json
+@@ -21,7 +21,7 @@
+             },
+             "proteins_gff": {
+                 "type": "string",
+-                "pattern": "^\\S+\\.(gff)(\\.gz)?$",
++                "pattern": "^\\S+\\.(gff3?)(\\.gz)?$",
+                 "errorMessage": "The file with proteins detected for the assembly needs to be a gff3 file (optionally compressed with .gz)"
+             },
+             "proteins_faa": {
+diff --git a/bin/gff_mapping.py b/bin/gff_mapping.py
+index 5db3c210..336791ad 100755
+--- a/bin/gff_mapping.py
++++ b/bin/gff_mapping.py
+@@ -321,24 +321,20 @@ def gff_updater(
+                             output_extra.write(mge + "\n")
+                             output_full.write(mge + "\n")
+                 
+-                # full keeps every feature, appending the viphog and pathofact2 attributes
+-                # wherever they are available.
+                 has_viphog = composite_val in proteins_annot
+                 viphog_attr = proteins_annot[composite_val] if has_viphog else ""
+                 if has_viphog:
+                     proteins_with_extra_annot += 1
+-                    output_full.write(line.rstrip() + ";" + viphog_attr + pf_suffix + "\n")
+-                else:
+-                    output_full.write(line.rstrip() + pf_suffix + "\n")
+ 
+-                # Finding mobilome proteins in the user file and writing to clean/extra outputs
++                # Finding the mobilome proteins (passengers) in the user file. Done before the
++                # full write so the mobile_element_type attribute is available for every output.
+                 u_prot_start = int(start)
+                 u_prot_end = int(end)
+                 u_prot_range = range(u_prot_start, u_prot_end + 1)
+                 u_prot_len = u_prot_end - u_prot_start
+                 passenger_flag = 0
+                 mge_loc = []
+-                
++
+                 if contig in mobilome_annot:
+                     for coordinates in mges_dict[contig]:
+                         mge_start = coordinates[0]
+@@ -346,25 +342,32 @@ def gff_updater(
+                         mge_range = range(mge_start, mge_end + 1)
+                         mge_label = mob_types[(contig, mge_start, mge_end)]
+                         intersection = len(list(set(mge_range) & set(u_prot_range)))
+-                        
++
+                         if intersection > 0:
+                             u_prot_cov = float(intersection) / float(u_prot_len)
+                             if u_prot_cov > COV_THRESHOLD:
+                                 passenger_flag = 1
+                                 mge_loc.append(mge_label)
+-                
++
++                # Shared attribute suffix: viphog (when available), mobile_element_type (for
++                # passenger CDS), then pathofact2 (pf_suffix already begins with ";" or is "").
++                extra_attrs = ""
++                if has_viphog:
++                    extra_attrs += ";" + viphog_attr
++                if passenger_flag == 1:
++                    extra_attrs += ";" + "mobile_element_type=" + ",".join(mge_loc)
++                extra_attrs += pf_suffix
++
++                # full keeps every feature, carrying the viphog, mobile_element_type and pathofact2
++                # attributes wherever they are available.
++                output_full.write(line.rstrip() + extra_attrs + "\n")
++
+                 # clean keeps every MGE-covered (passenger) CDS; extra keeps the subset of
+                 # those passengers that carry a functional annotation (viphog and/or
+-                # pathofact2). Both share the same row format.
++                # pathofact2). Both share the same row format as the full passenger line.
+                 if passenger_flag == 1:
+                     passenger_proteins += 1
+-                    mge_loc = "mge_location=" + ",".join(mge_loc)
+-                    if has_viphog:
+-                        passenger_line = (
+-                            line.rstrip() + ";" + viphog_attr + ";" + mge_loc + pf_suffix
+-                        )
+-                    else:
+-                        passenger_line = line.rstrip() + ";" + mge_loc + pf_suffix
++                    passenger_line = line.rstrip() + extra_attrs
+                     output_clean.write(passenger_line + "\n")
+                     if has_viphog or pf_suffix:
+                         output_extra.write(passenger_line + "\n")
+diff --git a/bin/pathofact2_report.py b/bin/pathofact2_report.py
+index 50121f5b..31b78da7 100755
+--- a/bin/pathofact2_report.py
++++ b/bin/pathofact2_report.py
+@@ -43,6 +43,8 @@
+ from pathlib import Path
+ from typing import DefaultDict, Iterator
+ 
++from map_tools import mapping_names
++
+ OUTPUT_HEADER = [
+     "protein_id",
+     "contig_id",
+@@ -106,6 +108,15 @@ def parse_args() -> argparse.Namespace:
+         type=Path,
+         help="Optional InterProScan TSV file",
+     )
++    parser.add_argument(
++        "--contig_map",
++        required=False,
++        type=Path,
++        help="Optional contigID.map (renamed<TAB>original). When given, protein contig ids "
++        "are translated back to their original names so the report contig_id column and the "
++        "MGE-overlap matching use the original contig names. Only needed for the Prodigal "
++        "baseline; user-provided proteins already carry original names.",
++    )
+     parser.add_argument(
+         "--output",
+         required=True,
+@@ -401,6 +412,22 @@ def assign_mge_types(
+     return protein_mge_map
+ 
+ 
++def remap_contigs(
++    prots_coords: dict[str, tuple[str, int, int]],
++    names_equiv: dict[str, str],
++) -> dict[str, tuple[str, int, int]]:
++    """Translate protein contig ids (renamed) to their original names via names_equiv.
++
++    Proteins whose contig is not present in the map keep their contig id unchanged, so
++    inputs that already use original names (e.g. user-provided proteins) pass through
++    untouched.
++    """
++    return {
++        protein_id: (names_equiv.get(contig, contig), start, end)
++        for protein_id, (contig, start, end) in prots_coords.items()
++    }
++
++
+ def build_rows(
+     prots_coords: dict[str, tuple[str, int, int]],
+     pathofact_data: dict[str, tuple[str, str, str, str, str]],
+@@ -518,6 +545,16 @@ def main() -> None:
+         )
+         return
+ 
++    # Translate renamed protein contig ids back to their original names (Prodigal baseline).
++    # Done before mobilome parsing so contig_id and the MGE-overlap matching (which keys on
++    # the mobilome GFF's already-original contig names) are consistent.
++    if not path_is_missing_or_empty(args.contig_map):
++        names_equiv = mapping_names.names_map(str(args.contig_map))[0]
++        prots_coords = remap_contigs(prots_coords, names_equiv)
++        logging.info("Translated protein contig ids to original names using %s", args.contig_map)
++    else:
++        logging.info("No contig map provided; using contig ids as found in the input GFFs")
++
+     if not mobilome_missing:
+         mobilome_data = parse_mobilome_gff(args.mobilome)
+     else:
+diff --git a/docs/outputs.md b/docs/outputs.md
+index 78d21977..ad5a1db8 100644
+--- a/docs/outputs.md
++++ b/docs/outputs.md
+@@ -84,12 +84,12 @@ which genes from the baseline GFF they additionally include:
+   attribute (from the [combined report](#combined-report)).
+ - **`clean`** — mobilome features plus only the "passenger" CDSs that fall **inside** a mobile
+   element (>75% of the CDS length overlapping an MGE on the same contig). Each passenger CDS
+-  additionally carries an `mge_location=` attribute, plus ViPhOG and `pathofact2=` attributes
++  additionally carries an `mobile_element_type=` attribute, plus ViPhOG and `pathofact2=` attributes
+   when present.
+ - **`extra`** — a subset of `clean`: the mobilome features plus only those **passenger** CDSs
+   that also carry a **functional annotation** — a VIRify ViPhOG hit (`viphog` /
+   `viphog_taxonomy`) and/or a `pathofact2=` summary. Rows use the same format as in `clean`
+-  (including `mge_location=`). A passenger CDS with no functional annotation appears in
++  (including `mobile_element_type=`). A passenger CDS with no functional annotation appears in
+   `clean` but not in `extra`; a functionally-annotated CDS that is not a passenger appears in
+   `full` but not in `extra`.
+ 
+diff --git a/modules/local/combinereporter.nf b/modules/local/combinereporter.nf
+index d5170479..57705fe3 100755
+--- a/modules/local/combinereporter.nf
++++ b/modules/local/combinereporter.nf
+@@ -7,7 +7,7 @@ process COMBINEREPORTER {
+         'biocontainers/mgnify-pipelines-toolkit:1.5.1--pyhdfd78af_0'}"
+ 
+     input:
+-    tuple val(meta), path(mobilome_gff), path(pathofact_gff), path(arg_gff), path(bgcs_gff), path(ips_tsv)
++    tuple val(meta), path(mobilome_gff), path(pathofact_gff), path(arg_gff), path(bgcs_gff), path(ips_tsv), path(contig_map)
+ 
+     output:
+     tuple val(meta), path("*_combined_report.tsv"), optional: true, emit: tsv
+@@ -23,6 +23,7 @@ process COMBINEREPORTER {
+     def arg_param = arg_gff ? "--amr ${arg_gff}" : ""
+     def bgcs_param = bgcs_gff ? "--bgc ${bgcs_gff}" : ""
+     def ips_param = ips_tsv ? "--interproscan ${ips_tsv}" : ""
++    def contig_map_param = contig_map ? "--contig_map ${contig_map}" : ""
+     """
+     pathofact2_report.py \\
+         ${mobilome_param} \\
+@@ -30,6 +31,7 @@ process COMBINEREPORTER {
+         ${arg_param} \\
+         ${bgcs_param} \\
+         ${ips_param} \\
++        ${contig_map_param} \\
+         --output ${prefix}_combined_report.tsv
+     """
+ 
+diff --git a/tests/.nftignore b/tests/.nftignore
+index b41a0126..70b0ef52 100644
+--- a/tests/.nftignore
++++ b/tests/.nftignore
+@@ -10,3 +10,11 @@ pipeline_info/*
+ # not portable. The ICE call itself (ices.tsv + the feature in mobilome.gff) is stable
+ # and stays content-asserted; here we verify presence (stable_name) but not content.
+ **/*_ice_genes.tsv
++# pathofact2.gff and the combined report are assembled from multithreaded, tie-sensitive
++# tools (DIAMOND vs VFDB, hmmsearch, CD-search): among equal-scoring hits the order/selection
++# depends on thread scheduling (thread count follows task.cpus), so their md5 is not
++# reproducible across CPU allocations. The combined report is downstream of pathofact2.gff and
++# inherits the same noise. Presence (stable_name) and key content lines are asserted in the
++# pathofact test instead of the md5.
++**/*_pathofact2.gff
++**/*_combined_report.tsv
+diff --git a/tests/default.nf.test b/tests/default.nf.test
+index 53a2c38b..306bf7dd 100644
+--- a/tests/default.nf.test
++++ b/tests/default.nf.test
+@@ -135,6 +135,11 @@ nextflow_pipeline {
+             )
+             // stable_path: All files in ${params.outdir}/ with stable content
+             def stable_path = getAllFilesFromDir(params.outdir, ignoreFile: 'tests/.nftignore')
++            // pathofact2.gff and the combined report have thread/CPU-dependent md5s (excluded
++            // from stable_path via .nftignore). Assert they exist and carry the expected stable
++            // content: the report contig_id must be the original contig name, not the renamed id.
++            def combined_report = path("${params.outdir}/MGYG000528118_sub/MGYG000528118_sub_combined_report.tsv")
++            def pathofact_gff = path("${params.outdir}/MGYG000528118_sub/prediction/virulence/MGYG000528118_sub_pathofact2.gff")
+             assertAll(
+                 { assert workflow.success},
+                 { assert snapshot(
+@@ -144,7 +149,16 @@ nextflow_pipeline {
+                     stable_name,
+                     // All files with stable contents
+                     stable_path,
+-                ).match() }
++                ).match() },
++                // combined_report: exists, header intact, and uses original contig names
++                { assert combined_report.exists() },
++                { assert combined_report.readLines().first().startsWith("protein_id\tcontig_id\tsummary_string") },
++                { assert combined_report.readLines().any { it.contains("MGYG000528118_1_sub") } },
++                { assert !combined_report.text.contains("\tcontig_1\t") },
++                // pathofact2.gff: exists, valid GFF header, and a known Prodigal CDS is present
++                { assert pathofact_gff.exists() },
++                { assert pathofact_gff.readLines().first() == "##gff-version 3" },
++                { assert pathofact_gff.readLines().any { it.contains("ID=MGYG000528118_00989") } },
+             )
+         }
+     }
+diff --git a/tests/default.nf.test.snap b/tests/default.nf.test.snap
+index e8978bc0..4d3213e6 100644
+--- a/tests/default.nf.test.snap
++++ b/tests/default.nf.test.snap
+@@ -109,17 +109,16 @@
+                 "pipeline_info"
+             ],
+             [
+-                "MGYG000528118_sub_combined_report.tsv:md5,551b1840e332cc6ccb67049c6dd1e4bc",
+                 "MGYG000528118_sub_discarded_mge.txt:md5,d41d8cd98f00b204e9800998ecf8427e",
+                 "MGYG000528118_sub_mobilome.fasta.gz:md5,6c831a87595d8427b6c14fa64b7acd77",
+                 "MGYG000528118_sub_overlap_report.txt:md5,009fc7891415a47b1f07493101509b73",
+                 "MGYG000528118_sub_mobilome.gff.gz:md5,f778614ca5af1075d615603e15f0ac73",
+-                "MGYG000528118_sub_user_mobilome_clean.gff.gz:md5,a660aabfa5d3ddc0756667bcf9fc15a5",
+-                "MGYG000528118_sub_user_mobilome_clean.gff.gz.csi:md5,03238dc76728dc458709736cab53814c",
+-                "MGYG000528118_sub_user_mobilome_extra.gff.gz:md5,dfc20efd95619b0707598326349c128f",
+-                "MGYG000528118_sub_user_mobilome_extra.gff.gz.csi:md5,11bb5b1efee88c6f2969c3c37a032df6",
+-                "MGYG000528118_sub_user_mobilome_full.gff.gz:md5,5fe761f8cfcfd384c45dafefde1a91cc",
+-                "MGYG000528118_sub_user_mobilome_full.gff.gz.csi:md5,b2e1a9b28d015607fe5868fb18581b27",
++                "MGYG000528118_sub_user_mobilome_clean.gff.gz:md5,e01826ba9631b2acf4ad26d4beb8443f",
++                "MGYG000528118_sub_user_mobilome_clean.gff.gz.csi:md5,196b4feacceba8d7ea99bd7f1c30692e",
++                "MGYG000528118_sub_user_mobilome_extra.gff.gz:md5,ddae5b988addd6a6e9488e57b73db616",
++                "MGYG000528118_sub_user_mobilome_extra.gff.gz.csi:md5,bc192faa113a6bea4f291f45548d827f",
++                "MGYG000528118_sub_user_mobilome_full.gff.gz:md5,f10e64f2ec6cc8ea4dc455dc5b6cf12f",
++                "MGYG000528118_sub_user_mobilome_full.gff.gz.csi:md5,a21fddd93c5a9c815110825aa71b4c28",
+                 "MGYG000528118_sub.txt:md5,601f0a16c0e999c2c5272d81f61bdf2f",
+                 "MGYG000528118_sub_bgcs.gff:md5,85a5f38b14921b6256cf808d3e89c54b",
+                 "MGYG000528118_sub_100kb_contigs.1.bed:md5,ce61c2fc1ece2d1738d7cbb8fe5583bd",
+@@ -127,7 +126,6 @@
+                 "MGYG000528118_sub_5kb_contigs_virus_summary.tsv:md5,aafc334566eab51ff2ffb3f5a89dacdb",
+                 "contig_1.gbk:md5,4fa5d9684893b6e752413ad952da5866",
+                 "MGYG000528118_sub_1kb_contigs.fasta.tsv:md5,d41d8cd98f00b204e9800998ecf8427e",
+-                "MGYG000528118_sub_pathofact2.gff:md5,cd7b0d1cf432cda22ff826f7782a0579",
+                 "MGYG000528118_sub_100kb_contigs.fasta:md5,3bfa2eb92880a330da8d913fec58e2bb",
+                 "MGYG000528118_sub_1kb_contigs.fasta:md5,3bfa2eb92880a330da8d913fec58e2bb",
+                 "MGYG000528118_sub_5kb_contigs.fasta:md5,3bfa2eb92880a330da8d913fec58e2bb",
+@@ -135,10 +133,10 @@
+             ]
+         ],
+         "meta": {
+-            "nf-test": "0.9.2",
+-            "nextflow": "24.10.4"
++            "nf-test": "0.9.3",
++            "nextflow": "25.04.7"
+         },
+-        "timestamp": "2026-07-08T12:59:06.870494258"
++        "timestamp": "2026-07-15T15:54:50.869918"
+     },
+     "Positive test: mobilome-only run on the pos_test assembly covering IS, integron, ICE, plasmid, prophage (VIRify), and CO": {
+         "content": [
+@@ -185,12 +183,12 @@
+             ],
+             [
+                 "pos_test_mobilome.gff.gz:md5,2446229c56258ed546dbd266c90749fb",
+-                "pos_test_mobilome_clean.gff.gz:md5,67a57b5be047843b63b8347916ffe027",
+-                "pos_test_mobilome_clean.gff.gz.csi:md5,f7a115be3e7e1a4075ef62afa2299119",
++                "pos_test_mobilome_clean.gff.gz:md5,16d52e720260301752610e772e7bb05a",
++                "pos_test_mobilome_clean.gff.gz.csi:md5,c755e441043e6eced01ee93f98c70dbb",
+                 "pos_test_mobilome_extra.gff.gz:md5,f159be0e6bf696daafe21ea4e15ceaed",
+                 "pos_test_mobilome_extra.gff.gz.csi:md5,f47eb2fcc1ed57c8fe066bd356f7e506",
+-                "pos_test_mobilome_full.gff.gz:md5,5d5db8d52fefd1322e9075f9d0cc0d79",
+-                "pos_test_mobilome_full.gff.gz.csi:md5,d702d193e560196a6df48ad37a399b34",
++                "pos_test_mobilome_full.gff.gz:md5,936e2d5951387583d5c3e5f0d2dec5ba",
++                "pos_test_mobilome_full.gff.gz.csi:md5,91fe7a198f129cb6f7748c8de74d2697",
+                 "pos_test_discarded_mge.txt:md5,cb95cbdbde35c62c9ec7a7f7322f3a9d",
+                 "pos_test_mobilome.fasta.gz:md5,a2aef37a55f756b5a7ebc48065b165cc",
+                 "pos_test_overlap_report.txt:md5,dd99d385dd3d942b3a9d2cd89ccd726b",
+@@ -212,9 +210,9 @@
+             ]
+         ],
+         "meta": {
+-            "nf-test": "0.9.2",
+-            "nextflow": "24.10.4"
++            "nf-test": "0.9.3",
++            "nextflow": "25.04.7"
+         },
+-        "timestamp": "2026-07-10T10:03:47.680208496"
++        "timestamp": "2026-07-15T15:50:23.310039"
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/unit/test_gff_mapping.py b/tests/unit/test_gff_mapping.py
+index 6f10b8a3..a0ff1826 100644
+--- a/tests/unit/test_gff_mapping.py
++++ b/tests/unit/test_gff_mapping.py
+@@ -174,7 +174,7 @@ def test_update_with_mobilome(tmp_path):
+ 
+     assert "geNomad" in clean_content
+     assert "virus" in clean_content
+-    assert "mge_location=virus" in clean_content
++    assert "mobile_element_type=virus" in clean_content
+ 
+     # With no functional annotation, extra carries the mobilome feature but no genes
+     extra_content = (tmp_path / "output_user_mobilome_extra.gff").read_text()
+@@ -223,9 +223,9 @@ def test_passenger_protein_detection(tmp_path):
+     # Clean carries a minimal header
+     assert lines[0] == "##gff-version 3"
+ 
+-    # Check that prot001 is marked as passenger (has mge_location)
++    # Check that prot001 is marked as passenger (has mobile_element_type)
+     prot001_line = [l for l in lines if "prot001" in l][0]
+-    assert "mge_location=virus" in prot001_line
++    assert "mobile_element_type=virus" in prot001_line
+ 
+     # prot002 has no MGE overlap, so it must NOT appear in the clean output at all
+     assert not any("prot002" in l for l in lines)
+@@ -234,6 +234,13 @@ def test_passenger_protein_detection(tmp_path):
+     full_lines = (tmp_path / "output_user_mobilome_full.gff").read_text().splitlines()
+     assert any("prot002" in l for l in full_lines)
+ 
++    # full carries mobile_element_type on passenger CDS, matching clean/extra...
++    prot001_full = [l for l in full_lines if "prot001" in l][0]
++    assert "mobile_element_type=virus" in prot001_full
++    # ...but not on the non-passenger CDS, which has no MGE location
++    prot002_full = [l for l in full_lines if "prot002" in l][0]
++    assert "mobile_element_type=" not in prot002_full
++
+ 
+ def test_header_routing(tmp_path):
+     """
+@@ -339,7 +346,7 @@ def test_pathofact2_annotation(tmp_path):
+     # prot001: passenger + in report -> pathofact2 in both clean and full
+     prot001_clean = [l for l in clean if "ID=prot001" in l][0]
+     assert "pathofact2=vf,mge" in prot001_clean
+-    assert "mge_location=virus" in prot001_clean
++    assert "mobile_element_type=virus" in prot001_clean
+     prot001_full = [l for l in full if "ID=prot001" in l][0]
+     assert "pathofact2=vf,mge" in prot001_full
+ 
+@@ -350,7 +357,7 @@ def test_pathofact2_annotation(tmp_path):
+ 
+     # prot003: passenger but not in report -> present in clean, no pathofact2
+     prot003_clean = [l for l in clean if "ID=prot003" in l][0]
+-    assert "mge_location=virus" in prot003_clean
++    assert "mobile_element_type=virus" in prot003_clean
+     assert "pathofact2=" not in prot003_clean
+ 
+     # extra holds only annotated passengers (viphog and/or pathofact2)
+@@ -358,7 +365,7 @@ def test_pathofact2_annotation(tmp_path):
+     # prot001: passenger + in report -> qualifies, with the same row format as clean
+     prot001_extra = [l for l in extra if "ID=prot001" in l][0]
+     assert "pathofact2=vf,mge" in prot001_extra
+-    assert "mge_location=virus" in prot001_extra
++    assert "mobile_element_type=virus" in prot001_extra
+     # prot002: in report but not a passenger -> excluded from extra
+     assert not any("ID=prot002" in l for l in extra)
+     # prot003: passenger but no functional annotation -> excluded from extra
+@@ -370,7 +377,7 @@ def test_extra_holds_annotated_passengers(tmp_path):
+     `extra` holds the mobilome features plus the passenger CDSs (>75% inside an MGE) that
+     carry a functional annotation: a VIRify ViPhOG hit AND/OR a pathofact2 summary. A
+     passenger with neither, and an annotated CDS that is not a passenger, are both excluded.
+-    Rows mirror the clean formatting (including mge_location).
++    Rows mirror the clean formatting (including mobile_element_type).
+     """
+     user_gff = tmp_path / "user.gff"
+     user_gff.write_text(
+@@ -410,15 +417,15 @@ def test_extra_holds_annotated_passengers(tmp_path):
+     # The mobilome feature is always present
+     assert any("geNomad\tvirus" in l for l in extra)
+ 
+-    # prot001: passenger + viphog -> included, mirroring clean (viphog + mge_location)
++    # prot001: passenger + viphog -> included, mirroring clean (viphog + mobile_element_type)
+     prot001_extra = [l for l in extra if "ID=prot001" in l][0]
+     assert "viphog=VOG0001" in prot001_extra
+-    assert "mge_location=virus" in prot001_extra
++    assert "mobile_element_type=virus" in prot001_extra
+ 
+     # prot002: passenger + pathofact2 (no viphog) -> included
+     prot002_extra = [l for l in extra if "ID=prot002" in l][0]
+     assert "pathofact2=arg" in prot002_extra
+-    assert "mge_location=virus" in prot002_extra
++    assert "mobile_element_type=virus" in prot002_extra
+ 
+     # prot003: passenger but no annotation -> excluded
+     assert not any("ID=prot003" in l for l in extra)
+@@ -526,5 +533,5 @@ def test_contig_name_translation(tmp_path):
+     assert "contig_1" not in full
+     # Passenger gene (100% within the MGE) lands in clean under the original name
+     assert "NZ_real_1\tProdigal\tCDS\t1500\t1800" in clean
+-    assert "mge_location=virus" in clean
++    assert "mobile_element_type=virus" in clean
+     assert "contig_1" not in clean
+diff --git a/tests/unit/test_pathofact2_report.py b/tests/unit/test_pathofact2_report.py
+index 54084003..78f4ed1a 100644
+--- a/tests/unit/test_pathofact2_report.py
++++ b/tests/unit/test_pathofact2_report.py
+@@ -15,6 +15,7 @@
+     parse_mobilome_gff,
+     parse_pathofact2_gff,
+     path_is_missing_or_empty,
++    remap_contigs,
+     split_csv_value,
+ )
+ 
+@@ -454,6 +455,33 @@ def test_protein_on_different_contig(self):
+         assert result["prot1"] == "-"
+ 
+ 
++# ---------------------------------------------------------------------------
++# remap_contigs
++# ---------------------------------------------------------------------------
++
++
++class TestRemapContigs:
++    def test_renamed_contigs_translated_to_original(self):
++        prots = {"prot1": ("1", 100, 200), "prot2": ("2", 300, 400)}
++        names_equiv = {"1": "NZ_real_1", "2": "NZ_real_2"}
++        result = remap_contigs(prots, names_equiv)
++        assert result == {
++            "prot1": ("NZ_real_1", 100, 200),
++            "prot2": ("NZ_real_2", 300, 400),
++        }
++
++    def test_unmapped_contigs_pass_through_unchanged(self):
++        # Original names (e.g. user-provided proteins) are not map keys -> left untouched
++        prots = {"prot1": ("NZ_real_1", 100, 200)}
++        names_equiv = {"1": "NZ_real_1"}
++        result = remap_contigs(prots, names_equiv)
++        assert result == {"prot1": ("NZ_real_1", 100, 200)}
++
++    def test_empty_map_is_noop(self):
++        prots = {"prot1": ("1", 100, 200)}
++        assert remap_contigs(prots, {}) == prots
++
++
+ # ---------------------------------------------------------------------------
+ # build_rows
+ # ---------------------------------------------------------------------------
+diff --git a/workflows/mobilomeannotation.nf b/workflows/mobilomeannotation.nf
+index d2ba3e3c..a501d6aa 100755
+--- a/workflows/mobilomeannotation.nf
++++ b/workflows/mobilomeannotation.nf
+@@ -400,12 +400,25 @@ workflow MOBILOMEANNOTATION {
+ 
+     // Generating the Pathofact2-style combined report
+     def ch_combinereporter_input = INTEGRATOR.out.mobilome_gff
++        .join(RENAME.out.map_file)
++        .join(ch_user_proteins, remainder: true)
++        .map { row ->
++            // remainder:true appends a single null for the whole missing right side, so
++            // unmatched rows are [meta, mobilome, map_file, null] and matched rows are
++            // [meta, mobilome, map_file, user_gff, user_faa].
++            def (meta, mobilome, map_file) = [row[0], row[1], row[2]]
++            def user_gff = row[3]
++            // The PathoFact2/AMR/BGC GFFs follow the proteins source: user-provided proteins
++            // already carry original contig names (no map needed), while the Prodigal baseline
++            // uses renamed ids, so pass the map to translate them back in pathofact2_report.py.
++            tuple(meta, mobilome, user_gff ? [] : map_file)
++        }
+         .join(ch_pathofact_gff, remainder: true)
+         .join(AMR_ANNOTATION.out.gff, remainder: true)
+         .join(ch_bgc_gff, remainder: true)
+         .join(ch_user_ips, remainder: true)
+-        .map { meta, mobilome, pathofact, amr, bgc, ips ->
+-            tuple(meta, mobilome, pathofact ?: [], amr ?: [], bgc ?: [], ips ?: [])
++        .map { meta, mobilome, contig_map, pathofact, amr, bgc, ips ->
++            tuple(meta, mobilome, pathofact ?: [], amr ?: [], bgc ?: [], ips ?: [], contig_map)
+         }
+ 
+     COMBINEREPORTER( ch_combinereporter_input )

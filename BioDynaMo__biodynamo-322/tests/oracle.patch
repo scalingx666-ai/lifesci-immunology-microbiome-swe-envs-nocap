@@ -1,0 +1,481 @@
+diff --git a/src/core/diffusion/diffusion_grid.cc b/src/core/diffusion/diffusion_grid.cc
+index 56cead5a8..5ba0f06c2 100644
+--- a/src/core/diffusion/diffusion_grid.cc
++++ b/src/core/diffusion/diffusion_grid.cc
+@@ -306,56 +306,25 @@ void DiffusionGrid::CalculateGradient() {
+     return;
+   }
+ 
+-  real_t gd = 1 / (box_length_ * 2);
+-
+-  auto nx = resolution_;
+-  auto ny = resolution_;
+-  auto nz = resolution_;
+-
+ #pragma omp parallel for collapse(2)
+-  for (size_t z = 0; z < nz; z++) {
+-    for (size_t y = 0; y < ny; y++) {
+-      for (size_t x = 0; x < nx; x++) {
+-        int c, e, w, n, s, b, t;
+-        c = x + y * nx + z * nx * ny;
+-
+-        if (x == 0) {
+-          e = c;
+-          w = c + 2;
+-        } else if (x == nx - 1) {
+-          e = c - 2;
+-          w = c;
+-        } else {
+-          e = c - 1;
+-          w = c + 1;
+-        }
+-
+-        if (y == 0) {
+-          n = c + 2 * nx;
+-          s = c;
+-        } else if (y == ny - 1) {
+-          n = c;
+-          s = c - 2 * nx;
+-        } else {
+-          n = c + nx;
+-          s = c - nx;
+-        }
+-
+-        if (z == 0) {
+-          t = c + 2 * nx * ny;
+-          b = c;
+-        } else if (z == nz - 1) {
+-          t = c;
+-          b = c - 2 * nx * ny;
+-        } else {
+-          t = c + nx * ny;
+-          b = c - nx * ny;
+-        }
+-
+-        // Let the gradient point from low to high concentration
+-        gradients_[c][0] = (c1_[w] - c1_[e]) * gd;
+-        gradients_[c][1] = (c1_[n] - c1_[s]) * gd;
+-        gradients_[c][2] = (c1_[t] - c1_[b]) * gd;
++  for (uint32_t z = 0; z < resolution_; z++) {
++    for (uint32_t y = 0; y < resolution_; y++) {
++      for (uint32_t x = 0; x < resolution_; x++) {
++        size_t idx = x + y * resolution_ + z * resolution_ * resolution_;
++        const std::array<uint32_t, 3> box_coord = {x, y, z};
++        // Get the neighboring boxes
++        const auto neighbors = GetNeighboringBoxes(idx, box_coord);
++        std::array<int, 6> comparison;  // array to determine discretization h
++        std::transform(neighbors.begin(), neighbors.end(), comparison.begin(),
++                       [idx](size_t n) { return (n == idx) ? 0 : 1; });
++
++        // Calculate the gradient (no thread safety issues here)
++        gradients_[idx][0] = (c1_[neighbors[1]] - c1_[neighbors[0]]) /
++                             ((comparison[1] + comparison[0]) * box_length_);
++        gradients_[idx][1] = (c1_[neighbors[3]] - c1_[neighbors[2]]) /
++                             ((comparison[3] + comparison[2]) * box_length_);
++        gradients_[idx][2] = (c1_[neighbors[5]] - c1_[neighbors[4]]) /
++                             ((comparison[5] + comparison[4]) * box_length_);
+       }
+     }
+   }
+@@ -444,7 +413,32 @@ void DiffusionGrid::GetGradient(const Real3& position, Real3* gradient,
+                "the diffusion grid! Returning zero gradient.");
+     return;
+   }
+-  *gradient = gradients_[idx];
++  if (init_gradient_) {
++    *gradient = gradients_[idx];
++  } else {
++    // Get the neighboring boxes
++    const auto neighbors = GetNeighboringBoxes(idx);
++    std::array<int, 6> comparison;  // array to determine discretization h
++    std::transform(neighbors.begin(), neighbors.end(), comparison.begin(),
++                   [idx](size_t n) { return (n == idx) ? 0 : 1; });
++
++    // Calculate the gradient (GetConcentration for thread safety)
++    const real_t x_minus = GetConcentration(neighbors[0]);
++    const real_t x_plus = GetConcentration(neighbors[1]);
++    const real_t y_minus = GetConcentration(neighbors[2]);
++    const real_t y_plus = GetConcentration(neighbors[3]);
++    const real_t z_minus = GetConcentration(neighbors[4]);
++    const real_t z_plus = GetConcentration(neighbors[5]);
++
++    real_t grad_x =
++        (x_plus - x_minus) / ((comparison[1] + comparison[0]) * box_length_);
++    real_t grad_y =
++        (y_plus - y_minus) / ((comparison[3] + comparison[2]) * box_length_);
++    real_t grad_z =
++        (z_plus - z_minus) / ((comparison[5] + comparison[4]) * box_length_);
++
++    *gradient = Real3({grad_x, grad_y, grad_z});
++  }
+   if (normalize) {
+     auto norm = gradient->Norm();
+     if (norm > 1e-10) {
+@@ -470,9 +464,20 @@ std::array<uint32_t, 3> DiffusionGrid::GetBoxCoordinates(
+     // Get box coords (Note: conversion to uint32_t should be save for typical
+     // grid sizes)
+     box_coord[i] = static_cast<uint32_t>(
+-        (floor(position[i]) - grid_dimensions_[0]) / box_length_);
++        std::floor((position[i] - grid_dimensions_[0]) / box_length_));
+   }
++  return box_coord;
++}
+ 
++std::array<uint32_t, 3> DiffusionGrid::GetBoxCoordinates(
++    const size_t idx) const {
++  // Resolution must be smaller than uint32_t max for the box coordinates to be
++  // representable
++  assert(resolution_ < std::numeric_limits<uint32_t>::max());
++  std::array<uint32_t, 3> box_coord;
++  box_coord[0] = static_cast<uint32_t>(idx % resolution_);
++  box_coord[1] = static_cast<uint32_t>((idx / resolution_) % resolution_);
++  box_coord[2] = static_cast<uint32_t>(idx / (resolution_ * resolution_));
+   return box_coord;
+ }
+ 
+@@ -489,6 +494,27 @@ size_t DiffusionGrid::GetBoxIndex(const Real3& position) const {
+   return GetBoxIndex(box_coord);
+ }
+ 
++std::array<size_t, 6> DiffusionGrid::GetNeighboringBoxes(size_t index) const {
++  const auto box_coord = GetBoxCoordinates(index);
++  return GetNeighboringBoxes(index, box_coord);
++};
++
++std::array<size_t, 6> DiffusionGrid::GetNeighboringBoxes(
++    size_t index, const std::array<uint32_t, 3>& box_coord) const {
++  std::array<size_t, 6> neighbors;
++  neighbors[0] = (box_coord[0] == 0) ? index : index - 1;
++  neighbors[1] = (box_coord[0] == resolution_ - 1) ? index : index + 1;
++  neighbors[2] = (box_coord[1] == 0) ? index : index - resolution_;
++  neighbors[3] =
++      (box_coord[1] == resolution_ - 1) ? index : index + resolution_;
++  neighbors[4] =
++      (box_coord[2] == 0) ? index : index - resolution_ * resolution_;
++  neighbors[5] = (box_coord[2] == resolution_ - 1)
++                     ? index
++                     : index + resolution_ * resolution_;
++  return neighbors;
++}
++
+ void DiffusionGrid::SetBoundaryCondition(
+     std::unique_ptr<BoundaryCondition> bc) {
+   boundary_condition_ = std::move(bc);
+diff --git a/src/core/diffusion/diffusion_grid.h b/src/core/diffusion/diffusion_grid.h
+index 286cedd76..bd7e04d55 100644
+--- a/src/core/diffusion/diffusion_grid.h
++++ b/src/core/diffusion/diffusion_grid.h
+@@ -176,8 +176,19 @@ class DiffusionGrid : public ScalarField {
+   /// gradient is scaled to norm 1, but with `normalize = false` one can obtain
+   /// the full gradient information (e.g. the un-normalized gradient). If the
+   /// gradient is zero and `normalize = true`, this method returns a zero
+-  /// vector. Note that the gradient is computed via a central difference scheme
+-  /// on the underlying spatial discretization.
++  /// vector. The gradient is computed via a central difference scheme
++  /// on the underlying spatial discretization (central difference for inner
++  /// boxes, forward/backward difference for edge boxes). The gradients can
++  /// either be computed once for all boxes (set Param::calculate_gradients to
++  /// true) or on the fly (set Param::calculate_gradients to false). Depending
++  /// on the use case, one of the two options might be more efficient (e.g. if
++  /// the gradient is only needed for a few boxes, 'on the fly' might be more
++  /// efficient). Please note that the on the fly evaluation of the gradient
++  /// is done on the current state of the diffusion grid (c1_), thus, it
++  /// interferes with ChangeConcentrationBy() (e.g. Adding to the substance will
++  /// change the gradient: evaluating the gradient during the same iteration may
++  /// yield different results). Further, if you need to visualize the gradient
++  /// with Paraview, you must set Param::calculate_gradients to true.
+   Real3 GetGradient(const Real3& position) const override {
+     Real3 gradient;
+     GetGradient(position, &gradient, false);
+@@ -193,20 +204,38 @@ class DiffusionGrid : public ScalarField {
+   virtual void GetGradient(const Real3& position, Real3* gradient,
+                            bool normalize = true) const;
+ 
++  /// Get the coordinates of the box at the specified position
+   std::array<uint32_t, 3> GetBoxCoordinates(const Real3& position) const;
+ 
++  // Get the coordinates of the box at the specified index
++  std::array<uint32_t, 3> GetBoxCoordinates(const size_t idx) const;
++
++  /// Calculates the box index at specified box coordinates
+   size_t GetBoxIndex(const std::array<uint32_t, 3>& box_coord) const;
+ 
+   /// Calculates the box index of the substance at specified position
+   size_t GetBoxIndex(const Real3& position) const;
+ 
++  /// Determines the indices of the neighboring boxes of a given box index.
++  /// Order: x-, x+, y-, y+, z-, z+. If the box is on the edge of the grid, the
++  /// index itself is returned. E.g. if the box is on the left edge of the grid,
++  /// x- is the same as index.
++  std::array<size_t, 6> GetNeighboringBoxes(size_t index) const;
++
++  /// Determines the indices of the neighboring boxes of given box coordinates.
++  /// Order: x-, x+, y-, y+, z-, z+. If the box is on the edge of the grid, the
++  /// index itself is returned. E.g. if the box is on the left edge of the grid,
++  /// x- is the same as index.
++  std::array<size_t, 6> GetNeighboringBoxes(
++      size_t index, const std::array<uint32_t, 3>& box_coord) const;
++
+   void SetDecayConstant(real_t mu) {
+     // Check is done in ParametersCheck within the Diffuse(dt) method
+     mu_ = mu;
+   }
+ 
+   /// Return the last timestep `dt` that was used to run `Diffuse(dt)`
+-  real_t GetLastTimestep() { return last_dt_; }
++  real_t GetLastTimestep() const { return last_dt_; }
+ 
+   // Sets an upper threshold for allowed values in the diffusion grid.
+   void SetUpperThreshold(real_t t) { upper_threshold_ = t; }
+diff --git a/test/unit/core/diffusion_test.cc b/test/unit/core/diffusion_test.cc
+index 58eb19127..c7b5e3cda 100644
+--- a/test/unit/core/diffusion_test.cc
++++ b/test/unit/core/diffusion_test.cc
+@@ -319,6 +319,92 @@ TEST(DiffusionTest, CopyOldData) {
+   delete dgrid;
+ }
+ 
++TEST(DiffusionTest, GetBoxCoordinates) {
++  Simulation simulation(TEST_NAME);
++  auto* env = simulation.GetEnvironment();
++
++  std::vector<Real3> positions;
++  positions.push_back({-10, -10, -10});
++  positions.push_back({90, 90, 90});
++  CellFactory(positions);
++
++  DiffusionGrid* dgrid = new EulerGrid(0, "Kalium", 0.4, 0, 6);
++
++  env->ForcedUpdate();
++  dgrid->Initialize();
++  auto res = dgrid->GetResolution();
++
++  for (uint32_t x = 0; x < res; x++) {
++    for (uint32_t y = 0; y < res; y++) {
++      for (uint32_t z = 0; z < res; z++) {
++        std::array<uint32_t, 3> box_coordinates_true{x, y, z};
++        auto box_index = dgrid->GetBoxIndex(box_coordinates_true);
++        auto box_coordinates_computed = dgrid->GetBoxCoordinates(box_index);
++        EXPECT_EQ(box_coordinates_computed[0], x);
++        EXPECT_EQ(box_coordinates_computed[1], y);
++        EXPECT_EQ(box_coordinates_computed[2], z);
++      }
++    }
++  }
++
++  delete dgrid;
++}
++
++TEST(DiffusionTest, GetNeighboringBoxes) {
++  Simulation simulation(TEST_NAME);
++  auto* env = simulation.GetEnvironment();
++
++  std::vector<Real3> positions;
++  positions.push_back({-10, -10, -10});
++  positions.push_back({90, 90, 90});
++  CellFactory(positions);
++
++  DiffusionGrid* dgrid = new EulerGrid(0, "Kalium", 0.4, 0, 6);
++
++  env->ForcedUpdate();
++  dgrid->Initialize();
++  auto res = dgrid->GetResolution();
++
++  for (uint32_t x = 0; x < res; x++) {
++    for (uint32_t y = 0; y < res; y++) {
++      for (uint32_t z = 0; z < res; z++) {
++        std::array<uint32_t, 3> box_coordinates_true{x, y, z};
++        auto box_index = dgrid->GetBoxIndex(box_coordinates_true);
++        /// Get the box coordinates of the neighbors
++        auto x_minus = (x == 0) ? x : x - 1;
++        auto x_plus = (x == res - 1) ? x : x + 1;
++        auto y_minus = (y == 0) ? y : y - 1;
++        auto y_plus = (y == res - 1) ? y : y + 1;
++        auto z_minus = (z == 0) ? z : z - 1;
++        auto z_plus = (z == res - 1) ? z : z + 1;
++        std::array<uint32_t, 3> box_coordinates_x_minus{x_minus, y, z};
++        std::array<uint32_t, 3> box_coordinates_x_plus{x_plus, y, z};
++        std::array<uint32_t, 3> box_coordinates_y_minus{x, y_minus, z};
++        std::array<uint32_t, 3> box_coordinates_y_plus{x, y_plus, z};
++        std::array<uint32_t, 3> box_coordinates_z_minus{x, y, z_minus};
++        std::array<uint32_t, 3> box_coordinates_z_plus{x, y, z_plus};
++        auto box_index_x_minus = dgrid->GetBoxIndex(box_coordinates_x_minus);
++        auto box_index_x_plus = dgrid->GetBoxIndex(box_coordinates_x_plus);
++        auto box_index_y_minus = dgrid->GetBoxIndex(box_coordinates_y_minus);
++        auto box_index_y_plus = dgrid->GetBoxIndex(box_coordinates_y_plus);
++        auto box_index_z_minus = dgrid->GetBoxIndex(box_coordinates_z_minus);
++        auto box_index_z_plus = dgrid->GetBoxIndex(box_coordinates_z_plus);
++        /// Get the neighbors of the box
++        auto neighbors = dgrid->GetNeighboringBoxes(box_index);
++        /// Check if the neighbors are correct
++        EXPECT_EQ(neighbors[0], box_index_x_minus);
++        EXPECT_EQ(neighbors[1], box_index_x_plus);
++        EXPECT_EQ(neighbors[2], box_index_y_minus);
++        EXPECT_EQ(neighbors[3], box_index_y_plus);
++        EXPECT_EQ(neighbors[4], box_index_z_minus);
++        EXPECT_EQ(neighbors[5], box_index_z_plus);
++      }
++    }
++  }
++
++  delete dgrid;
++}
++
+ // Create a 5x5x5 diffusion grid, with a substance being
+ // added at center box 2,2,2, causing a symmetrical diffusion
+ TEST(DiffusionTest, Thresholds) {
+@@ -1208,7 +1294,7 @@ TEST(DiffusionTest, GradientComputation) {
+ 
+   // Define the substance for our simulation
+   DiffusionGrid* d_grid = nullptr;
+-  d_grid = new EulerGrid(0, "Substance", 0.0, 0.0, 100);
++  d_grid = new EulerGrid(0, "Substance", 0.0, 0.0, 200);
+   rm->AddContinuum(d_grid);
+   d_grid->SetLowerThreshold(-1e15);
+ 
+@@ -1235,43 +1321,110 @@ TEST(DiffusionTest, GradientComputation) {
+   simulation.GetScheduler()->Simulate(1);
+   d_grid->CalculateGradient();
+ 
+-  // Define a few dummy positions where to evaluate the gradient
+-  Real3 pos1{20, 50, 230};
+-  Real3 pos2{100, 200, 150};
+-  Real3 pos3{200, 100, 20};
+-
+-  // Get analytic and numerical gradients
+-  Real3 grad1, grad2, grad3;
+-  Real3 expected_grad1 = gradient_field(pos1);
+-  Real3 expected_grad2 = gradient_field(pos2);
+-  Real3 expected_grad3 = gradient_field(pos3);
+-  d_grid->GetGradient(pos1, &grad1, false);
+-  d_grid->GetGradient(pos2, &grad2, false);
+-  d_grid->GetGradient(pos3, &grad3, false);
+-  Real3 err1 = grad1 - expected_grad1;
+-  Real3 err2 = grad2 - expected_grad2;
+-  Real3 err3 = grad3 - expected_grad3;
+-  std::vector<Real3> results{err1, err2, err3};
+-  std::vector<Real3> expected_gradients{expected_grad1, expected_grad2,
+-                                        expected_grad3};
+-
+-  // Compare analytic and numeric gradient
+-  for (size_t i = 0; i < results.size(); i++) {
+-    auto res = results[i];
+-    auto grad = expected_gradients[i];
+-    EXPECT_LT(abs(res[0] / grad[0]), 1e-5);  // This gradient is very easy
+-    EXPECT_LT(abs(res[1] / grad[1]), 0.05);  // Require 5 precent accuracy
+-    EXPECT_LT(abs(res[2] / grad[2]), 0.03);  // Require 3 precent accuracy
++  const auto res = d_grid->GetResolution();
++  const auto box_length = d_grid->GetBoxLength();
++
++  for (u_int32_t x = 0; x < res; x++) {
++    for (u_int32_t y = 0; y < res; y++) {
++      for (u_int32_t z = 0; z < res; z++) {
++        // for (u_int32_t x = 1; x < res - 1; x++) {
++        //   for (u_int32_t y = 1; y < res - 1; y++) {
++        //     for (u_int32_t z = 1; z < res - 1; z++) {
++        const real_t xx = (x + 0.5) * box_length + param->min_bound;
++        const real_t yy = (y + 0.5) * box_length + param->min_bound;
++        const real_t zz = (z + 0.5) * box_length + param->min_bound;
++        Real3 pos({xx, yy, zz});
++        Real3 grad = d_grid->GetGradient(pos);
++        Real3 expected_grad = gradient_field(pos);
++        Real3 err = grad - expected_grad;
++        // relative error
++        Real3 rel_err({std::abs(err[0] / expected_grad[0]),
++                       std::abs(err[1] / expected_grad[1]),
++                       std::abs(err[2] / expected_grad[2])});
++
++        EXPECT_NEAR(err[0], 0, 1e-5);
++        EXPECT_NEAR(err[1], 0, 1e-4);
++        EXPECT_NEAR(err[2], 0, 1e-4);
++      }
++    }
+   }
++}
++
++TEST(DiffusionTest, LazyGradientComputation) {
++  // Define closed space with bounds
++  auto set_param = [](auto* param) {
++    param->bound_space = Param::BoundSpaceMode::kClosed;
++    param->min_bound = 0;
++    param->max_bound = 250;
++    param->calculate_gradients = false;
++  };
++
++  // Standard simulation objects
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* param = simulation.GetParam();
++
++  // Create a number of cells at a random position
++  uint64_t num_cells = 30;
++  auto construct = [](const Real3& position) {
++    Cell* cell = new Cell(position);
++    cell->SetDiameter(10);
++    return cell;
++  };
++  ModelInitializer::CreateAgentsRandom(param->min_bound, param->max_bound,
++                                       num_cells, construct);
++
++  // Define the substance for our simulation
++  DiffusionGrid* d_grid = nullptr;
++  d_grid = new EulerGrid(0, "Substance", 0.0, 0.0, 200);
++  rm->AddContinuum(d_grid);
++  d_grid->SetLowerThreshold(-1e15);
++
++  // Define scalar field for initialization
++  auto scalar_field = [&](real_t x, real_t y, real_t z) {
++    return 2 * x / param->max_bound + 4 * std::pow((y / param->max_bound), 2) +
++           std::sin(2 * Math::kPi * z / param->max_bound);
++  };
++
++  // Define the analytic gradient as a reference solution
++  auto gradient_field = [&](const Real3& pos) {
++    real_t y = pos[1];
++    real_t z = pos[2];
++    Real3 gradient;
++    gradient[0] = 2 / param->max_bound;
++    gradient[1] = 8 * y / std::pow(param->max_bound, 2);
++    gradient[2] = (2 * Math::kPi / param->max_bound) *
++                  std::cos(2 * Math::kPi * z / param->max_bound);
++    return gradient;
++  };
+ 
+-  // Check alternative GetGradient method
+-  Real3 grad4 = d_grid->GetGradient(pos1);
+-  Real3 grad5 = d_grid->GetGradient(pos2);
+-  Real3 grad6 = d_grid->GetGradient(pos3);
+-  for (size_t i = 0; i < 3; i++) {
+-    EXPECT_REAL_EQ(grad1[i], grad4[i]);
+-    EXPECT_REAL_EQ(grad2[i], grad5[i]);
+-    EXPECT_REAL_EQ(grad3[i], grad6[i]);
++  // Compute the gradient the scalar field.
++  ModelInitializer::InitializeSubstance(0, scalar_field);
++  simulation.GetScheduler()->Simulate(1);
++
++  const auto res = d_grid->GetResolution();
++  const auto box_length = d_grid->GetBoxLength();
++
++  for (u_int32_t x = 0; x < res; x++) {
++    for (u_int32_t y = 0; y < res; y++) {
++      for (u_int32_t z = 0; z < res; z++) {
++        const real_t xx = (x + 0.5) * box_length + param->min_bound;
++        const real_t yy = (y + 0.5) * box_length + param->min_bound;
++        const real_t zz = (z + 0.5) * box_length + param->min_bound;
++        Real3 pos({xx, yy, zz});
++        Real3 grad = d_grid->GetGradient(pos);
++        Real3 expected_grad = gradient_field(pos);
++        Real3 err = grad - expected_grad;
++        // relative error
++        Real3 rel_err({std::abs(err[0] / expected_grad[0]),
++                       std::abs(err[1] / expected_grad[1]),
++                       std::abs(err[2] / expected_grad[2])});
++
++        EXPECT_NEAR(err[0], 0, 1e-5);
++        EXPECT_NEAR(err[1], 0, 1e-4);
++        EXPECT_NEAR(err[2], 0, 1e-4);
++      }
++    }
+   }
+ }
+ 

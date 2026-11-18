@@ -1,0 +1,1352 @@
+diff --git a/src/ganon-build/GanonBuild.cpp b/src/ganon-build/GanonBuild.cpp
+index 5190e756..f7839374 100644
+--- a/src/ganon-build/GanonBuild.cpp
++++ b/src/ganon-build/GanonBuild.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <utils/SafeQueue.hpp>
+ #include <utils/StopClock.hpp>
++#include <utils/adjust_seed.hpp>
+ #include <utils/dna4_traits.hpp>
+ 
+ #include <cereal/archives/binary.hpp>
+@@ -100,7 +101,7 @@ void parse_sequences( auto& reference_files, TSeqBin& seq_bin, TBinLen& bin_len,
+     uint64_t binid = parse_sequences;
+     for ( auto const& reference_file : reference_files )
+     {
+-        seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
++        seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
+             reference_file
+         };
+ 
+@@ -127,7 +128,7 @@ void parse_refs( SafeQueue< detail::Seqs >& queue_refs,
+     for ( auto const& reference_file : config.reference_files )
+     {
+         // Open file (type define by extension)
+-        seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
++        seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
+             reference_file
+         };
+ 
+@@ -192,7 +193,7 @@ uint64_t count_hashes( auto& reference_files, TSeqBin& seq_bin, TBinLen& bin_len
+     uint64_t bin_count  = bin_len.size();
+     for ( auto const& reference_file : reference_files )
+     {
+-        seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
++        seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin{
+             reference_file
+         };
+ 
+@@ -278,9 +279,12 @@ uint64_t get_max_hashes( GanonBuild::Config& config, detail::TSeqBin& seq_bin, T
+         // count hashes for minimizers or kmers
+         if ( config.window_size > 0 )
+         {
+-            auto minimiser_hash = seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ config.kmer_size } },
+-                                                                 seqan3::window_size{ config.window_size } );
+-            max_hashes          = count_hashes( config.reference_files, seq_bin, bin_len, minimiser_hash );
++
++            auto minimiser_hash =
++                seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ config.kmer_size } },
++                                               seqan3::window_size{ config.window_size },
++                                               seqan3::seed{ raptor::adjust_seed( config.kmer_size ) } );
++            max_hashes = count_hashes( config.reference_files, seq_bin, bin_len, minimiser_hash );
+         }
+         else
+         {
+@@ -572,8 +576,10 @@ bool run( Config config )
+     {
+         for ( uint16_t taskNo = 0; taskNo < config.threads_build; ++taskNo )
+         {
+-            auto minimiser_hash = seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ config.kmer_size } },
+-                                                                 seqan3::window_size{ config.window_size } );
++            auto minimiser_hash =
++                seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ config.kmer_size } },
++                                               seqan3::window_size{ config.window_size },
++                                               seqan3::seed{ raptor::adjust_seed( config.kmer_size ) } );
+             tasks.emplace_back( std::async( std::launch::async, [&filter, &queue_refs, minimiser_hash]() {
+                 detail::build( filter, queue_refs, minimiser_hash );
+             } ) );
+diff --git a/src/ganon-classify/CommandLineParser.cpp b/src/ganon-classify/CommandLineParser.cpp
+index 3aa31809..0bd92076 100644
+--- a/src/ganon-classify/CommandLineParser.cpp
++++ b/src/ganon-classify/CommandLineParser.cpp
+@@ -37,6 +37,7 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         ( "u,output-unclassified", "Output unclassified read ids (prefix.unc)", cxxopts::value< bool >() )
+         ( "s,output-single", "Do not split output files (lca and all) with multiple hierarchy levels", cxxopts::value< bool >() )
+         
++        ( "hibf", "Input is an Hierarchical IBF (.hibf) generated from raptor https://github.com/seqan/raptor. Experimental.", cxxopts::value< bool >())
+         ( "t,threads", "Number of threads", cxxopts::value< uint16_t >())
+         ( "n-reads", "Number of reads for each batch. Default: 400", cxxopts::value< uint32_t >())
+         ( "n-batches", "Number of batches of n-reads to hold in memory. Default: 1000", cxxopts::value< uint32_t >())
+@@ -108,6 +109,8 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+     if ( args.count( "output-single" ) )
+         config.output_single = args["output-single"].as< bool >();
+ 
++    if ( args.count( "hibf" ) )
++        config.hibf = args["hibf"].as< bool >();
+     if ( args.count( "threads" ) )
+         config.threads = args["threads"].as< uint16_t >();
+     if ( args.count( "n-reads" ) )
+diff --git a/src/ganon-classify/GanonClassify.cpp b/src/ganon-classify/GanonClassify.cpp
+index d2e96dce..4906cd44 100644
+--- a/src/ganon-classify/GanonClassify.cpp
++++ b/src/ganon-classify/GanonClassify.cpp
+@@ -1,10 +1,12 @@
+ #include "GanonClassify.hpp"
++#include "hierarchical_interleaved_bloom_filter.hpp"
+ 
+ #include <robin_hood.h>
+ 
+ #include <utils/LCA.hpp>
+ #include <utils/SafeQueue.hpp>
+ #include <utils/StopClock.hpp>
++#include <utils/adjust_seed.hpp>
+ #include <utils/dna4_traits.hpp>
+ 
+ #include <cereal/archives/binary.hpp>
+@@ -32,10 +34,9 @@ namespace GanonClassify
+ namespace detail
+ {
+ 
+-typedef seqan3::interleaved_bloom_filter<>                                  TFilter;
+-typedef seqan3::interleaved_bloom_filter<>::counting_agent_type< uint16_t > TAgent;
+-typedef robin_hood::unordered_map< std::string, uint16_t >                  TMatches;
+-
++typedef raptor::hierarchical_interleaved_bloom_filter< seqan3::data_layout::uncompressed > THIBF;
++typedef seqan3::interleaved_bloom_filter< seqan3::data_layout::uncompressed >              TIBF;
++typedef robin_hood::unordered_map< std::string, uint16_t >                                 TMatches;
+ 
+ struct Node
+ {
+@@ -158,11 +159,13 @@ struct Stats
+     }
+ };
+ 
++template < typename TFilter >
+ struct Filter
+ {
+     TFilter      ibf;
+     TMap         map;
+     TTax         tax;
++    size_t       bin_count = 0;
+     FilterConfig filter_config;
+ };
+ 
+@@ -197,16 +200,17 @@ inline uint16_t get_abs_error( uint16_t kmers, uint8_t k, uint8_t o, uint8_t cou
+     return std::ceil( ( o * ( -count + kmers ) ) / static_cast< double >( k ) );
+ }
+ 
+-void select_matches( TMatches& matches,
+-                     auto&     counts_f,
+-                     auto&     counts_r,
+-                     Filter&   filter,
+-                     uint16_t  threshold_cutoff,
+-                     uint16_t& max_kmer_count_read )
++void select_matches( Filter< TIBF >&        filter,
++                     TMatches&              matches,
++                     std::vector< size_t >& hashes_f,
++                     std::vector< size_t >& hashes_r,
++                     auto&                  agent,
++                     uint16_t               threshold_cutoff,
++                     uint16_t&              max_kmer_count_read )
+ {
+-    // reset low threshold_cutoff to just one kmer (0 would match everywhere)
+-    if ( threshold_cutoff == 0 )
+-        threshold_cutoff = 1;
++    // count matches
++    seqan3::counting_vector< uint16_t > counts_f = agent.bulk_count( hashes_f );
++    seqan3::counting_vector< uint16_t > counts_r = agent.bulk_count( hashes_r );
+ 
+     // for each bin
+     // for ( uint32_t bin_n = 0; bin_n < filter.ibf.noOfBins; ++bin_n )
+@@ -232,6 +236,33 @@ void select_matches( TMatches& matches,
+     }
+ }
+ 
++void select_matches( Filter< THIBF >&       filter,
++                     TMatches&              matches,
++                     std::vector< size_t >& hashes_f,
++                     std::vector< size_t >& hashes_r,
++                     auto&                  agent,
++                     uint16_t               threshold_cutoff,
++                     uint16_t&              max_kmer_count_read )
++{
++    // count matches, return only above threhsold
++    seqan3::counting_vector< uint16_t > counts_f = agent.bulk_count( hashes_f, threshold_cutoff );
++
++    // on HIBF, returns user bins
++    for ( auto const& [bin_n, target] : filter.map )
++    {
++        if ( counts_f[bin_n] > 0 )
++        {
++            // keep check on target in case of multiple filters with same target
++            if ( matches.count( target ) == 0 || counts_f[bin_n] > matches[target] )
++            {
++                // store match to target
++                matches[target] = counts_f[bin_n];
++                if ( counts_f[bin_n] > max_kmer_count_read )
++                    max_kmer_count_read = counts_f[bin_n];
++            }
++        }
++    }
++}
+ 
+ auto get_offset_hashes( auto& hashes, uint8_t offset )
+ {
+@@ -255,19 +286,18 @@ void get_hashes( std::vector< seqan3::dna4 >& seq,
+ 
+     if ( window_size > 0 )
+     {
+-        // minimizers
+-        hashes_f = { seq | minimiser_hash | seqan3::views::to< std::vector > };
+-        hashes_r = hashes_f;
++        // minimizers - no need to calculate reverse hashes
++        hashes_f = seq | minimiser_hash | seqan3::views::to< std::vector >;
+     }
+     else
+     {
+         if ( offset > 1 )
+         {
+             // offset
+-            auto h   = seq | kmer_hash | seqan3::views::to< std::vector >;
+-            hashes_f = get_offset_hashes( h, offset );
+-            h = seq | std::views::reverse | seqan3::views::complement | kmer_hash | seqan3::views::to< std::vector >;
+-            hashes_r = get_offset_hashes( h, offset );
++            auto hf  = seq | kmer_hash;
++            hashes_f = get_offset_hashes( hf, offset );
++            auto hr  = seq | std::views::reverse | seqan3::views::complement | kmer_hash;
++            hashes_r = get_offset_hashes( hr, offset );
+         }
+         else
+         {
+@@ -279,6 +309,49 @@ void get_hashes( std::vector< seqan3::dna4 >& seq,
+     }
+ }
+ 
++void get_hashes( std::vector< seqan3::dna4 >& seq,
++                 std::vector< seqan3::dna4 >& seq2,
++                 std::vector< size_t >&       hashes_f,
++                 std::vector< size_t >&       hashes_r,
++                 uint8_t                      window_size,
++                 uint8_t                      offset,
++                 auto&                        kmer_hash,
++                 auto&                        minimiser_hash )
++{
++
++    // first pair
++    get_hashes( seq, hashes_f, hashes_r, window_size, offset, kmer_hash, minimiser_hash );
++
++    // hashes are inserted in the same vector for the second pair in the rev.comp.
++    if ( window_size > 0 )
++    {
++        // minimizers - no need to calculate reverse hashes
++        auto hf = seq2 | minimiser_hash | std::views::common;
++        hashes_f.insert( hashes_f.end(), hf.begin(), hf.end() );
++    }
++    else
++    {
++        if ( offset > 1 )
++        {
++            // offset
++            auto hf        = seq2 | std::views::reverse | seqan3::views::complement | kmer_hash;
++            auto hashes_f2 = get_offset_hashes( hf, offset );
++            hashes_f.insert( hashes_f.end(), hashes_f2.begin(), hashes_f2.end() );
++            auto hr        = seq2 | kmer_hash;
++            auto hashes_r2 = get_offset_hashes( hr, offset );
++            hashes_r.insert( hashes_r.end(), hashes_r2.begin(), hashes_r2.end() );
++        }
++        else
++        {
++            // kmer
++            auto hf = seq2 | std::views::reverse | seqan3::views::complement | kmer_hash | std::views::common;
++            hashes_f.insert( hashes_f.end(), hf.begin(), hf.end() );
++            auto hr = seq2 | kmer_hash | std::views::common;
++            hashes_r.insert( hashes_r.end(), hr.begin(), hr.end() );
++        }
++    }
++}
++
+ uint16_t get_threshold_filter( HierarchyConfig const& hierarchy_config,
+                                uint16_t               kmers,
+                                uint16_t               max_kmer_count_read,
+@@ -331,35 +404,41 @@ void lca_matches( ReadOut& read_out, ReadOut& read_out_lca, uint16_t max_kmer_co
+ }
+ 
+ 
+-void classify( std::vector< Filter >&    filters,
+-               LCA&                      lca,
+-               TRep&                     rep,
+-               Total&                    total,
+-               SafeQueue< ReadOut >&     classified_all_queue,
+-               SafeQueue< ReadOut >&     classified_lca_queue,
+-               SafeQueue< ReadOut >&     unclassified_queue,
+-               Config const&             config,
+-               SafeQueue< ReadBatches >* pointer_current,
+-               SafeQueue< ReadBatches >* pointer_helper,
+-               HierarchyConfig const&    hierarchy_config,
+-               bool                      hierarchy_first,
+-               bool                      hierarchy_last,
+-               bool                      run_lca )
++template < typename TFilter >
++void classify( std::vector< Filter< TFilter > >& filters,
++               LCA&                              lca,
++               TRep&                             rep,
++               Total&                            total,
++               SafeQueue< ReadOut >&             classified_all_queue,
++               SafeQueue< ReadOut >&             classified_lca_queue,
++               SafeQueue< ReadOut >&             unclassified_queue,
++               Config const&                     config,
++               SafeQueue< ReadBatches >*         pointer_current,
++               SafeQueue< ReadBatches >*         pointer_helper,
++               HierarchyConfig const&            hierarchy_config,
++               bool                              hierarchy_first,
++               bool                              hierarchy_last,
++               bool                              run_lca )
+ {
+ 
+     // get max from kmer/window size
+     uint16_t wk_size = ( hierarchy_config.window_size > 0 ) ? hierarchy_config.window_size : hierarchy_config.kmer_size;
+ 
+     // oner hash adaptor per thread
+-    auto kmer_hash      = seqan3::views::kmer_hash( seqan3::ungapped{ hierarchy_config.kmer_size } );
+-    auto minimiser_hash = seqan3::views::minimiser_hash(
+-        seqan3::shape{ seqan3::ungapped{ hierarchy_config.kmer_size } }, seqan3::window_size{ wk_size } );
++    auto kmer_hash = seqan3::views::kmer_hash( seqan3::ungapped{ hierarchy_config.kmer_size } );
++    auto minimiser_hash =
++        seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ hierarchy_config.kmer_size } },
++                                       seqan3::window_size{ wk_size },
++                                       seqan3::seed{ raptor::adjust_seed( hierarchy_config.kmer_size ) } );
+ 
+     // one agent per thread per filter
++    using TAgent = std::conditional_t< std::same_as< TFilter, THIBF >,
++                                       THIBF::counting_agent_type< uint16_t >,
++                                       TIBF::counting_agent_type< uint16_t > >;
+     std::vector< TAgent > agents;
+-    for ( Filter& filter : filters )
++    for ( Filter< TFilter >& filter : filters )
+     {
+-        agents.push_back( filter.ibf.counting_agent< uint16_t >() );
++        agents.push_back( filter.ibf.counting_agent() );
+     }
+ 
+     while ( true )
+@@ -386,8 +465,6 @@ void classify( std::vector< Filter >&    filters,
+             // Retrieve hashes from kmers/minimizers
+             std::vector< size_t > hashes_f;
+             std::vector< size_t > hashes_r;
+-            std::vector< size_t > hashes_f2;
+-            std::vector< size_t > hashes_r2;
+ 
+             // hash count
+             uint16_t kmers = 0;
+@@ -395,29 +472,34 @@ void classify( std::vector< Filter >&    filters,
+             uint16_t max_kmer_count_read = 0;
+             if ( read1_len >= wk_size )
+             {
+-                // Count hashes from first pair
+-                get_hashes( rb.seqs[readID],
+-                            hashes_f,
+-                            hashes_r,
+-                            hierarchy_config.window_size,
+-                            hierarchy_config.offset,
+-                            kmer_hash,
+-                            minimiser_hash );
+-                kmers = hashes_f.size();
+-
+-                // Count hashes from second pair if given
++                // Count hashes from both pairs if second is given
+                 if ( read2_len >= wk_size )
+                 {
+-                    // Send r and f reversed to calculate FR --> RF <-- reads
+-                    get_hashes( rb.seqs2[readID],
+-                                hashes_r2,
+-                                hashes_f2,
++                    // FR --> RF <-- reads
++                    // Get hashes of the first pair (forward and reverse strand)
++                    // get hashed of the seconf pair in the opposite direction
++                    get_hashes( rb.seqs[readID],
++                                rb.seqs2[readID],
++                                hashes_f,
++                                hashes_r,
+                                 hierarchy_config.window_size,
+                                 hierarchy_config.offset,
+                                 kmer_hash,
+                                 minimiser_hash );
+-                    kmers += hashes_f2.size();
+                 }
++                else
++                {
++                    // single read
++                    get_hashes( rb.seqs[readID],
++                                hashes_f,
++                                hashes_r,
++                                hierarchy_config.window_size,
++                                hierarchy_config.offset,
++                                kmer_hash,
++                                minimiser_hash );
++                }
++                kmers = hashes_f.size();
++
+ 
+                 // Sum sequence to totals
+                 if ( hierarchy_first )
+@@ -429,15 +511,7 @@ void classify( std::vector< Filter >&    filters,
+                 // For each filter in the hierarchy
+                 for ( uint8_t i = 0; i < filters.size(); ++i )
+                 {
+-                    // count matches
+-                    seqan3::counting_vector< uint16_t > counts_f = agents[i].bulk_count( hashes_f );
+-                    seqan3::counting_vector< uint16_t > counts_r = agents[i].bulk_count( hashes_r );
+ 
+-                    if ( rb.paired )
+-                    {
+-                        counts_f += agents[i].bulk_count( hashes_f2 );
+-                        counts_r += agents[i].bulk_count( hashes_r2 );
+-                    }
+ 
+                     // Calculate threshold for cutoff (keep matches above)
+                     uint16_t threshold_cutoff = 0;
+@@ -449,8 +523,13 @@ void classify( std::vector< Filter >&    filters,
+                                                           hierarchy_config.kmer_size,
+                                                           hierarchy_config.offset );
+ 
+-                    // select matches based on threshold cutoff
+-                    select_matches( matches, counts_f, counts_r, filters[i], threshold_cutoff, max_kmer_count_read );
++                    // reset low threshold_cutoff to just one kmer (0 would match everywhere)
++                    if ( threshold_cutoff == 0 )
++                        threshold_cutoff = 1;
++
++                    // count and select matches
++                    select_matches(
++                        filters[i], matches, hashes_f, hashes_r, agents[i], threshold_cutoff, max_kmer_count_read );
+                 }
+             }
+ 
+@@ -544,14 +623,36 @@ void write_report( TRep& rep, TTax& tax, std::ofstream& out_rep, std::string hie
+     }
+ }
+ 
+-TFilter load_filter( std::string const& input_filter_file )
++size_t load_filter( THIBF& filter, std::string const& input_filter_file )
+ {
++    std::ifstream              is( input_filter_file, std::ios::binary );
++    cereal::BinaryInputArchive archive( is );
+ 
+-    TFilter                    filter;
++    uint32_t                                  parsed_version;
++    uint64_t                                  window_size;
++    seqan3::shape                             shape{};
++    uint8_t                                   parts;
++    bool                                      compressed;
++    std::vector< std::vector< std::string > > bin_path{};
++
++    archive( parsed_version );
++    archive( window_size );
++    archive( shape );
++    archive( parts );
++    archive( compressed );
++    archive( bin_path );
++    archive( filter );
++
++    return filter.user_bins.num_user_bins();
++}
++
++size_t load_filter( TIBF& filter, std::string const& input_filter_file )
++{
+     std::ifstream              is( input_filter_file, std::ios::binary );
+     cereal::BinaryInputArchive archive( is );
+     archive( filter );
+-    return filter;
++
++    return filter.bin_count();
+ }
+ 
+ TMap load_map( std::string map_file )
+@@ -593,14 +694,16 @@ TTax load_tax( std::string tax_file )
+     return tax;
+ }
+ 
+-bool load_files( std::vector< Filter >& filters, std::string hierarchy_label, Config& config, bool run_lca )
++template < typename TFilter >
++bool load_files( std::vector< Filter< TFilter > >& filters, std::string hierarchy_label, Config& config, bool run_lca )
+ {
+     uint16_t filter_cnt = 0;
+     for ( auto const& filter_config : config.parsed_hierarchy[hierarchy_label].filters )
+     {
+         TMap    map;
+         TTax    tax;
+-        TFilter filter = load_filter( filter_config.ibf_file );
++        TFilter filter;
++        auto    bin_count = load_filter( filter, filter_config.ibf_file );
+ 
+         if ( !filter_config.map_file.empty() )
+         {
+@@ -615,7 +718,7 @@ bool load_files( std::vector< Filter >& filters, std::string hierarchy_label, Co
+                 binid_prefix = hierarchy_label + "-" + std::to_string( filter_cnt ) + "-";
+             }
+             // fill map with binids as targets
+-            for ( uint32_t binid = 0; binid < filter.bin_count(); ++binid )
++            for ( uint32_t binid = 0; binid < bin_count; ++binid )
+             {
+                 map[binid] = binid_prefix + std::to_string( binid );
+             }
+@@ -623,7 +726,7 @@ bool load_files( std::vector< Filter >& filters, std::string hierarchy_label, Co
+ 
+         // Check consistency of map file and ibf file
+         // map.size can be smaller than bins set on IBF if sequences were removed
+-        if ( map.size() > filter.bin_count() )
++        if ( map.size() > bin_count )
+         {
+             std::cerr << "ERROR: .ibf and .map files are inconsistent." << std::endl;
+             return false;
+@@ -632,7 +735,8 @@ bool load_files( std::vector< Filter >& filters, std::string hierarchy_label, Co
+         if ( run_lca )
+             tax = load_tax( filter_config.tax_file );
+ 
+-        filters.push_back( Filter{ std::move( filter ), std::move( map ), std::move( tax ), filter_config } );
++        filters.push_back(
++            Filter< TFilter >{ std::move( filter ), std::move( map ), std::move( tax ), bin_count, filter_config } );
+         filter_cnt++;
+     }
+ 
+@@ -720,16 +824,16 @@ void print_stats( Stats& stats, const Config& config, const StopClock& timeClass
+     }
+ }
+ 
+-void parse_reads( SafeQueue< detail::ReadBatches >& queue1, Stats& stats, Config const& config )
++void parse_reads( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config )
+ {
+     for ( auto const& reads_file : config.single_reads )
+     {
+-        seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin1{
++        seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin1{
+             reads_file
+         };
+         for ( auto&& rec : fin1 | seqan3::views::chunk( config.n_reads ) )
+         {
+-            detail::ReadBatches rb{ false };
++            ReadBatches rb{ false };
+             for ( auto& [id, seq] : rec )
+             {
+                 rb.ids.push_back( std::move( id ) );
+@@ -743,15 +847,13 @@ void parse_reads( SafeQueue< detail::ReadBatches >& queue1, Stats& stats, Config
+     {
+         for ( uint16_t pair_cnt = 0; pair_cnt < config.paired_reads.size(); pair_cnt += 2 )
+         {
+-            seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin1{
+-                config.paired_reads[pair_cnt]
+-            };
+-            seqan3::sequence_file_input< dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > > fin2{
+-                config.paired_reads[pair_cnt + 1]
+-            };
++            seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > >
++                fin1{ config.paired_reads[pair_cnt] };
++            seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > >
++                fin2{ config.paired_reads[pair_cnt + 1] };
+             for ( auto&& rec : fin1 | seqan3::views::chunk( config.n_reads ) )
+             {
+-                detail::ReadBatches rb{ true };
++                ReadBatches rb{ true };
+                 for ( auto& [id, seq] : rec )
+                 {
+                     rb.ids.push_back( std::move( id ) );
+@@ -770,11 +872,11 @@ void parse_reads( SafeQueue< detail::ReadBatches >& queue1, Stats& stats, Config
+     queue1.notify_push_over();
+ }
+ 
+-void write_classified( SafeQueue< detail::ReadOut >& classified_queue, std::ofstream& out )
++void write_classified( SafeQueue< ReadOut >& classified_queue, std::ofstream& out )
+ {
+     while ( true )
+     {
+-        detail::ReadOut ro = classified_queue.pop();
++        ReadOut ro = classified_queue.pop();
+         if ( ro.readID != "" )
+         {
+             for ( uint32_t i = 0; i < ro.matches.size(); ++i )
+@@ -789,12 +891,12 @@ void write_classified( SafeQueue< detail::ReadOut >& classified_queue, std::ofst
+     }
+ }
+ 
+-void write_unclassified( SafeQueue< detail::ReadOut >& unclassified_queue, std::string out_unclassified_file )
++void write_unclassified( SafeQueue< ReadOut >& unclassified_queue, std::string out_unclassified_file )
+ {
+     std::ofstream out_unclassified( out_unclassified_file );
+     while ( true )
+     {
+-        detail::ReadOut rou = unclassified_queue.pop();
++        ReadOut rou = unclassified_queue.pop();
+         if ( rou.readID != "" )
+         {
+             out_unclassified << rou.readID << '\n';
+@@ -807,7 +909,8 @@ void write_unclassified( SafeQueue< detail::ReadOut >& unclassified_queue, std::
+     }
+ }
+ 
+-TTax merge_tax( std::vector< detail::Filter > const& filters )
++template < typename TFilter >
++TTax merge_tax( std::vector< Filter< TFilter > > const& filters )
+ {
+     if ( filters.size() == 1 )
+     {
+@@ -825,7 +928,8 @@ TTax merge_tax( std::vector< detail::Filter > const& filters )
+     }
+ }
+ 
+-void validate_targets_tax( std::vector< detail::Filter > const& filters, TTax& tax, bool quiet )
++template < typename TFilter >
++void validate_targets_tax( std::vector< Filter< TFilter > > const& filters, TTax& tax, bool quiet )
+ {
+     for ( auto const& filter : filters )
+     {
+@@ -853,17 +957,10 @@ void pre_process_lca( LCA& lca, TTax& tax )
+ 
+ } // namespace detail
+ 
+-bool run( Config config )
++template < typename TFilter >
++bool ganon_classify( Config config )
+ {
+ 
+-    // Validate configuration input
+-    if ( !config.validate() )
+-        return false;
+-
+-    // Print config
+-    if ( config.verbose )
+-        std::cerr << config;
+-
+     // Start time count
+     StopClock timeGanon;
+     timeGanon.start();
+@@ -924,11 +1021,11 @@ bool run( Config config )
+     for ( auto const& [hierarchy_label, hierarchy_config] : config.parsed_hierarchy )
+     {
+         ++hierarchy_id;
+-        bool                          hierarchy_first = ( hierarchy_id == 1 );
+-        bool                          hierarchy_last  = ( hierarchy_id == hierarchy_size );
+-        std::vector< detail::Filter > filters;
+-        detail::TTax                  tax;
+-        LCA                           lca;
++        bool                                     hierarchy_first = ( hierarchy_id == 1 );
++        bool                                     hierarchy_last  = ( hierarchy_id == hierarchy_size );
++        std::vector< detail::Filter< TFilter > > filters;
++        detail::TTax                             tax;
++        LCA                                      lca;
+ 
+         timeLoadFilters.start();
+         bool loaded = detail::load_files( filters, hierarchy_label, config, run_lca );
+@@ -1015,7 +1112,7 @@ bool run( Config config )
+         {
+ 
+             tasks.emplace_back( std::async( std::launch::async,
+-                                            detail::classify,
++                                            detail::classify< TFilter >,
+                                             std::ref( filters ),
+                                             std::ref( lca ),
+                                             std::ref( reports[taskNo] ),
+@@ -1102,7 +1199,25 @@ bool run( Config config )
+         }
+         detail::print_stats( stats, config, timeClassPrint );
+     }
++
+     return true;
+ }
+ 
++bool run( Config config )
++{
++
++    // Validate configuration input
++    if ( !config.validate() )
++        return false;
++
++    // Print config
++    if ( config.verbose )
++        std::cerr << config;
++
++    if ( config.hibf )
++        return ganon_classify< detail::THIBF >( config );
++    else
++        return ganon_classify< detail::TIBF >( config );
++}
++
+ } // namespace GanonClassify
+diff --git a/src/ganon-classify/include/ganon-classify/Config.hpp b/src/ganon-classify/include/ganon-classify/Config.hpp
+index 75be51ae..46e22310 100644
+--- a/src/ganon-classify/include/ganon-classify/Config.hpp
++++ b/src/ganon-classify/include/ganon-classify/Config.hpp
+@@ -74,6 +74,7 @@ struct Config
+     bool        output_unclassified = false;
+     bool        output_single       = false;
+ 
++    bool     hibf      = false;
+     uint16_t threads   = 3;
+     uint32_t n_batches = 1000;
+     uint32_t n_reads   = 400;
+@@ -496,6 +497,7 @@ inline std::ostream& operator<<( std::ostream& stream, const Config& config )
+     stream << "--output-all          " << config.output_all << newl;
+     stream << "--output-unclassified " << config.output_unclassified << newl;
+     stream << "--output-single       " << config.output_single << newl;
++    stream << "--hibf                " << config.hibf << newl;
+     stream << "--threads             " << config.threads << newl;
+     stream << "--n-batches           " << config.n_batches << newl;
+     stream << "--n-reads             " << config.n_reads << newl;
+diff --git a/src/ganon-classify/include/ganon-classify/hierarchical_interleaved_bloom_filter.hpp b/src/ganon-classify/include/ganon-classify/hierarchical_interleaved_bloom_filter.hpp
+new file mode 100644
+index 00000000..681ee993
+--- /dev/null
++++ b/src/ganon-classify/include/ganon-classify/hierarchical_interleaved_bloom_filter.hpp
+@@ -0,0 +1,506 @@
++// -----------------------------------------------------------------------------------------------------
++// Copyright (c) 2006-2022, Knut Reinert & Freie Universität Berlin
++// Copyright (c) 2016-2022, Knut Reinert & MPI für molekulare Genetik
++// This file may be used, modified and/or redistributed under the terms of the 3-clause BSD-License
++// shipped with this file and also available at: https://github.com/seqan/raptor/blob/master/LICENSE.md
++// -----------------------------------------------------------------------------------------------------
++
++#pragma once
++
++#include <seqan3/std/ranges>
++
++#include <seqan3/search/dream_index/interleaved_bloom_filter.hpp>
++
++//#ifndef RAPTOR_HIBF_HAS_COUNT
++//#define RAPTOR_HIBF_HAS_COUNT 0
++//#endif
++#define RAPTOR_HIBF_HAS_COUNT 1
++
++namespace raptor
++{
++
++/*!\brief The HIBF binning directory. A data structure that efficiently answers set-membership queries for multiple
++ *        bins.
++ * \tparam data_layout_mode_ Indicates whether the underlying data type is compressed. See
++ *                           [seqan3::data_layout](https://docs.seqan.de/seqan/3.0.3/group__submodule__dream__index.html#gae9cb143481c46a1774b3cdf5d9fdb518).
++ * \see [seqan3::interleaved_bloom_filter][1]
++ * \details
++ *
++ * This class improves the [seqan3::interleaved_bloom_filter][1] by adding additional bookkeeping that allows
++ * to establish a hierarchical structure. This structure can then be used to split or merge user bins and distribute
++ * them over a variable number of technical bins. In the [seqan3::interleaved_bloom_filter][1], the number of user bins
++ * and technical bins is always the same. This causes performance degradation when there are many user bins or the user
++ * bins are unevenly distributed.
++ *
++ * # Terminology
++ *
++ * ## Technical Bin
++ * A Technical Bin represents an actual bin in the binning directory. In the IBF, it stores its kmers in a single Bloom
++ * Filter (which is interleaved with all the other BFs).
++ *
++ * ## User Bin
++ * The user may impose a structure on his sequence data in the form of logical groups (e.g. species). When querying the
++ * IBF, the user is interested in an answer that differentiates between these groups.
++ *
++ * # Hierarchical Interleaved Bloom Filter (HIBF)
++ *
++ * In constrast to the [seqan3::interleaved_bloom_filter][1], the user bins may be split across multiple technical bins
++ * , or multiple user bins may be merged into one technical bin. When merging multiple user bins, the HIBF stores
++ * another IBF that is built over the user bins constituting the merged bin. This lower-level IBF can then be used
++ * to further distinguish between merged bins.
++ *
++ * In this example, user bin 1 was split into two technical bins. Bins 3, 4, and 5 were merged into a single technical
++ * bin, and another IBF was added for the merged bin.
++ * \image html hibf.svg
++ *
++ * The individual IBFs may have a different number of technical bins and differ in their sizes, allowing an efficient
++ * distribution of the user bins.
++ *
++ * ## Querying
++ * To query the Hierarchical Interleaved Bloom Filter for values, call
++ * hibf::hierarchical_interleaved_bloom_filter::membership_agent() and use the returned
++ * hibf::hierarchical_interleaved_bloom_filter::membership_agent.
++ * In contrast to the [seqan3::interleaved_bloom_filter][1], the result will consist of indices of user bins.
++ *
++ * To count the occurrences in each user bin of a range of values in the Hierarchical Interleaved Bloom Filter, call
++ * hibf::hierarchical_interleaved_bloom_filter::counting_agent() and use
++ * the returned hibf::hierarchical_interleaved_bloom_filter::counting_agent_type.
++ *
++ * ## Thread safety
++ *
++ * The Interleaved Bloom Filter promises the basic thread-safety by the STL that all
++ * calls to `const` member functions are safe from multiple threads (as long as no thread calls
++ * a non-`const` member function at the same time).
++ *
++ * [1]: https://docs.seqan.de/seqan/3.0.3/classseqan3_1_1interleaved__bloom__filter.html
++ */
++template < seqan3::data_layout data_layout_mode_ = seqan3::data_layout::uncompressed >
++class hierarchical_interleaved_bloom_filter
++{
++public:
++    // Forward declaration
++    class user_bins;
++
++    // Forward declaration
++    class membership_agent;
++
++#if RAPTOR_HIBF_HAS_COUNT
++    // Forward declaration
++    template < std::integral value_t >
++    class counting_agent_type;
++#endif
++
++    //!\brief Indicates whether the Interleaved Bloom Filter is compressed.
++    static constexpr seqan3::data_layout data_layout_mode = data_layout_mode_;
++
++    //!\brief The type of an individual Bloom filter.
++    using ibf_t = seqan3::interleaved_bloom_filter< data_layout_mode_ >;
++
++    /*!\name Constructors, destructor and assignment
++     * \{
++     */
++    hierarchical_interleaved_bloom_filter()                                               = default; //!< Defaulted.
++    hierarchical_interleaved_bloom_filter( hierarchical_interleaved_bloom_filter const& ) = default; //!< Defaulted.
++    hierarchical_interleaved_bloom_filter& operator=( hierarchical_interleaved_bloom_filter const& ) =
++        default;                                                                                //!< Defaulted.
++    hierarchical_interleaved_bloom_filter( hierarchical_interleaved_bloom_filter&& ) = default; //!< Defaulted.
++    hierarchical_interleaved_bloom_filter& operator=( hierarchical_interleaved_bloom_filter&& ) =
++        default;                                        //!< Defaulted.
++    ~hierarchical_interleaved_bloom_filter() = default; //!< Defaulted.
++
++    //!\}
++
++    //!\brief The individual interleaved Bloom filters.
++    std::vector< ibf_t > ibf_vector;
++
++    /*!\brief Stores for each bin in each IBF of the HIBF the ID of the next IBF.
++     * \details
++     * Assume we look up a bin `b` in IBF `i`, i.e. `next_ibf_id[i][b]`.
++     * If `i` is returned, there is no lower level IBF, bin `b` is hence not a merged bin.
++     * If `j != i` is returned, there is a lower level IBF, bin `b` is a merged bin, and `j` is the ID of the lower
++     * level IBF in ibf_vector.
++     */
++    std::vector< std::vector< int64_t > > next_ibf_id;
++
++    //!\brief The underlying user bins.
++    user_bins user_bins;
++
++    //!\brief Returns a membership_agent to be used for counting.
++    membership_agent membership_agent() const
++    {
++        return typename hierarchical_interleaved_bloom_filter< data_layout_mode >::membership_agent{ *this };
++    }
++
++#if RAPTOR_HIBF_HAS_COUNT
++    /*!\brief Returns a counting_agent_type to be used for counting.
++     * \tparam value_t The type to use for the counters; must model std::integral.
++     */
++    template < std::integral value_t = uint16_t >
++    counting_agent_type< value_t > counting_agent() const
++    {
++        return counting_agent_type< value_t >{ *this };
++    }
++#endif
++
++    /*!\cond DEV
++     * \brief Serialisation support function.
++     * \tparam archive_t Type of `archive`; must satisfy seqan3::cereal_archive.
++     * \param[in] archive The archive being serialised from/to.
++     *
++     * \attention These functions are never called directly, see \ref serialisation for more details.
++     */
++    template < seqan3::cereal_archive archive_t >
++    void CEREAL_SERIALIZE_FUNCTION_NAME( archive_t& archive )
++    {
++        archive( ibf_vector );
++        archive( next_ibf_id );
++        archive( user_bins );
++    }
++    //!\endcond
++};
++
++/*!\brief Bookkeeping for user and technical bins.
++ */
++template < seqan3::data_layout data_layout_mode >
++class hierarchical_interleaved_bloom_filter< data_layout_mode >::user_bins
++{
++private:
++    //!\brief Contains filenames of all user bins.
++    std::vector< std::string > user_bin_filenames;
++
++    /*!\brief Stores for each bin in each IBF of the HIBF the ID of the filename.
++     * \details
++     * Assume we look up a bin `b` in IBF `i`, i.e. `ibf_bin_to_filename_position[i][b]`.
++     * If `-1` is returned, bin `b` is a merged bin, and there is no filename, we need to look into the lower level IBF.
++     * Otherwise, the returned value `j` can be used to access the corresponding filename `user_bin_filenames[j]`.
++     */
++    std::vector< std::vector< int64_t > > ibf_bin_to_filename_position{};
++
++public:
++    //!\brief Returns the number of managed user bins.
++    size_t num_user_bins() const noexcept
++    {
++        return user_bin_filenames.size();
++    }
++
++    //!\brief Changes the number of managed IBFs.
++    void set_ibf_count( size_t const size )
++    {
++        ibf_bin_to_filename_position.resize( size );
++    }
++
++    //!\brief Changes the number of managed user bins.
++    void set_user_bin_count( size_t const size )
++    {
++        user_bin_filenames.resize( size );
++    }
++
++    //!\brief Returns a vector containing user bin indices for each bin in the `idx`th IBF.
++    std::vector< int64_t >& bin_indices_of_ibf( size_t const idx )
++    {
++        return ibf_bin_to_filename_position[idx];
++    }
++
++    //!\brief Returns the filename of the `idx`th user bin.
++    std::string& filename_of_user_bin( size_t const idx )
++    {
++        return user_bin_filenames[idx];
++    }
++
++    //!\brief For a pair `(a,b)`, returns a const reference to the filename of the user bin at IBF `a`, bin `b`.
++    std::string const& operator[]( std::pair< size_t, size_t > const& index_pair ) const
++    {
++        return user_bin_filenames[ibf_bin_to_filename_position[index_pair.first][index_pair.second]];
++    }
++
++    /*!\brief Returns a view over the user bin filenames for the `ibf_idx`th IBF.
++     *        An empty string is returned for merged bins.
++     */
++    auto operator[]( size_t const ibf_idx ) const
++    {
++        return ibf_bin_to_filename_position[ibf_idx] | std::views::transform( [this]( int64_t i ) {
++                   if ( i == -1 )
++                       return std::string{};
++                   else
++                       return user_bin_filenames[i];
++               } );
++    }
++
++    //!\brief Returns the filename index of the `ibf_idx`th IBF for bin `bin_idx`.
++    int64_t filename_index( size_t const ibf_idx, size_t const bin_idx ) const
++    {
++        return ibf_bin_to_filename_position[ibf_idx][bin_idx];
++    }
++
++    /*!\brief Writes all filenames to a stream. Index and filename are tab-separated.
++     * \details
++     * 0	\<path_to_user_bin_0\>
++     * 1	\<path_to_user_bin_1\>
++     */
++    template < typename stream_t >
++    void write_filenames( stream_t& out_stream ) const
++    {
++        size_t      position{};
++        std::string line{};
++        for ( auto const& filename : user_bin_filenames )
++        {
++            line.clear();
++            line = '#';
++            line += std::to_string( position );
++            line += '\t';
++            line += filename;
++            line += '\n';
++            out_stream << line;
++            ++position;
++        }
++    }
++
++    /*!\cond DEV
++     * \brief Serialisation support function.
++     * \tparam archive_t Type of `archive`; must satisfy seqan3::cereal_archive.
++     * \param[in] archive The archive being serialised from/to.
++     *
++     * \attention These functions are never called directly, see \ref serialisation for more details.
++     */
++    template < typename archive_t >
++    void serialize( archive_t& archive )
++    {
++        archive( user_bin_filenames );
++        archive( ibf_bin_to_filename_position );
++    }
++    //!\endcond
++};
++
++/*!\brief Manages membership queries for the hibf::hierarchical_interleaved_bloom_filter.
++ * \see hibf::hierarchical_interleaved_bloom_filter::user_bins::filename_of_user_bin
++ * \details
++ * In contrast to the [seqan3::interleaved_bloom_filter][1], the result will consist of indices of user bins.
++ */
++template < seqan3::data_layout data_layout_mode > // TODO: value_t as template?
++class hierarchical_interleaved_bloom_filter< data_layout_mode >::membership_agent
++{
++private:
++    //!\brief The type of the augmented hierarchical_interleaved_bloom_filter.
++    using hibf_t = hierarchical_interleaved_bloom_filter< data_layout_mode >;
++
++    //!\brief A pointer to the augmented hierarchical_interleaved_bloom_filter.
++    hibf_t const* const hibf_ptr{ nullptr };
++
++    //!\brief Helper for recursive membership querying.
++    template < std::ranges::forward_range value_range_t >
++    void bulk_contains_impl( value_range_t&& values, int64_t const ibf_idx, size_t const threshold )
++    {
++        auto  agent  = hibf_ptr->ibf_vector[ibf_idx].template counting_agent< uint16_t >();
++        auto& result = agent.bulk_count( values );
++
++        uint16_t sum{};
++
++        for ( size_t bin{}; bin < result.size(); ++bin )
++        {
++            sum += result[bin];
++
++            auto const current_filename_index = hibf_ptr->user_bins.filename_index( ibf_idx, bin );
++
++            if ( current_filename_index < 0 ) // merged bin
++            {
++                if ( sum >= threshold )
++                    bulk_contains_impl( values, hibf_ptr->next_ibf_id[ibf_idx][bin], threshold );
++                sum = 0u;
++            }
++            else if ( bin + 1u == result.size() || // last bin
++                      current_filename_index
++                          != hibf_ptr->user_bins.filename_index( ibf_idx, bin + 1 ) ) // end of split bin
++            {
++                if ( sum >= threshold )
++                    result_buffer.emplace_back( current_filename_index );
++                sum = 0u;
++            }
++        }
++    }
++
++public:
++    /*!\name Constructors, destructor and assignment
++     * \{
++     */
++    membership_agent()                          = default;            //!< Defaulted.
++    membership_agent( membership_agent const& ) = default;            //!< Defaulted.
++    membership_agent& operator=( membership_agent const& ) = default; //!< Defaulted.
++    membership_agent( membership_agent&& )                 = default; //!< Defaulted.
++    membership_agent& operator=( membership_agent&& ) = default;      //!< Defaulted.
++    ~membership_agent()                               = default;      //!< Defaulted.
++
++    /*!\brief Construct a membership_agent for an existing hierarchical_interleaved_bloom_filter.
++     * \private
++     * \param hibf The hierarchical_interleaved_bloom_filter.
++     */
++    explicit membership_agent( hibf_t const& hibf )
++    : hibf_ptr( std::addressof( hibf ) )
++    {
++    }
++    //!\}
++
++    //!\brief Stores the result of bulk_contains().
++    std::vector< int64_t > result_buffer;
++
++    /*!\name Lookup
++     * \{
++     */
++    /*!\brief Determines set membership of given values, and returns the user bin indices of occurrences.
++     * \param[in] values The values to process; must model std::ranges::forward_range.
++     * \param[in] threshold Report a user bin if there are at least this many hits.
++     *
++     * \attention The result of this function must always be bound via reference, e.g. `auto &`, to prevent copying.
++     * \attention Sequential calls to this function invalidate the previously returned reference.
++     *
++     * \details
++     *
++     * ### Thread safety
++     *
++     * Concurrent invocations of this function are not thread safe, please create a
++     * hibf::hierarchical_interleaved_bloom_filter::membership_agent for each thread.
++     */
++    template < std::ranges::forward_range value_range_t >
++    [[nodiscard]] std::vector< int64_t > const& bulk_contains( value_range_t&& values,
++                                                               size_t const    threshold ) & noexcept
++    {
++        assert( hibf_ptr != nullptr );
++
++        static_assert( std::ranges::forward_range< value_range_t >, "The values must model forward_range." );
++        static_assert( std::unsigned_integral< std::ranges::range_value_t< value_range_t > >,
++                       "An individual value must be an unsigned integral." );
++
++        result_buffer.clear();
++
++        bulk_contains_impl( values, 0, threshold );
++
++        std::ranges::sort( result_buffer ); // TODO: necessary?
++
++        return result_buffer;
++    }
++
++    // `bulk_contains` cannot be called on a temporary, since the object the returned reference points to
++    // is immediately destroyed.
++    template < std::ranges::range value_range_t >
++    [[nodiscard]] std::vector< int64_t > const& bulk_contains( value_range_t&& values,
++                                                               size_t const    threshold ) && noexcept = delete;
++    //!\}
++};
++
++#if RAPTOR_HIBF_HAS_COUNT
++/*!\brief Manages counting ranges of values for the hibf::hierarchical_interleaved_bloom_filter.
++ */
++template < seqan3::data_layout data_layout_mode >
++template < std::integral value_t >
++class hierarchical_interleaved_bloom_filter< data_layout_mode >::counting_agent_type
++{
++private:
++    //!\brief The type of the augmented hierarchical_interleaved_bloom_filter.
++    using hibf_t = hierarchical_interleaved_bloom_filter< data_layout_mode >;
++
++    //!\brief A pointer to the augmented hierarchical_interleaved_bloom_filter.
++    hibf_t const* const hibf_ptr{ nullptr };
++
++    //!\brief Helper for recursive bulk counting.
++    template < std::ranges::forward_range value_range_t >
++    void bulk_count_impl( value_range_t&& values, int64_t const ibf_idx, size_t const threshold )
++    {
++        auto  agent  = hibf_ptr->ibf_vector[ibf_idx].template counting_agent< value_t >();
++        auto& result = agent.bulk_count( values );
++
++        value_t sum{};
++
++        for ( size_t bin{}; bin < result.size(); ++bin )
++        {
++            sum += result[bin];
++            auto const current_filename_index = hibf_ptr->user_bins.filename_index( ibf_idx, bin );
++
++            if ( current_filename_index < 0 ) // merged bin
++            {
++                if ( sum >= threshold )
++                    bulk_count_impl( values, hibf_ptr->next_ibf_id[ibf_idx][bin], threshold );
++                sum = 0u;
++            }
++            else if ( bin + 1u == result.size() || // last bin
++                      current_filename_index
++                          != hibf_ptr->user_bins.filename_index( ibf_idx, bin + 1 ) ) // end of split bin
++            {
++                if ( sum >= threshold )
++                    result_buffer[current_filename_index] = sum;
++                sum = 0u;
++            }
++        }
++    }
++
++public:
++    /*!\name Constructors, destructor and assignment
++     * \{
++     */
++    counting_agent_type()                             = default;            //!< Defaulted.
++    counting_agent_type( counting_agent_type const& ) = default;            //!< Defaulted.
++    counting_agent_type& operator=( counting_agent_type const& ) = default; //!< Defaulted.
++    counting_agent_type( counting_agent_type&& )                 = default; //!< Defaulted.
++    counting_agent_type& operator=( counting_agent_type&& ) = default;      //!< Defaulted.
++    ~counting_agent_type()                                  = default;      //!< Defaulted.
++
++    /*!\brief Construct a counting_agent_type for an existing hierarchical_interleaved_bloom_filter.
++     * \private
++     * \param hibf The hierarchical_interleaved_bloom_filter.
++     */
++    explicit counting_agent_type( hibf_t const& hibf )
++    : hibf_ptr( std::addressof( hibf ) )
++    , result_buffer( hibf_ptr->user_bins.num_user_bins() )
++    {
++    }
++    //!\}
++
++    //!\brief Stores the result of bulk_count().
++    seqan3::counting_vector< value_t > result_buffer;
++
++    /*!\name Counting
++     * \{
++     */
++    /*!\brief Counts the occurrences in each bin for all values in a range.
++     * \tparam value_range_t The type of the range of values. Must model std::ranges::forward_range. The reference type
++     *                       must model std::unsigned_integral.
++     * \param[in] values The range of values to process.
++     * \param[in] threshold Do not recurse into merged bins with less than this many hits. Default: 1.
++     *
++     * \attention The result of this function must always be bound via reference, e.g. `auto &`, to prevent copying.
++     * \attention Sequential calls to this function invalidate the previously returned reference.
++     *
++     * \details
++     *
++     * ### Thread safety
++     *
++     * Concurrent invocations of this function are not thread safe, please create a
++     * hibf::hierarchical_interleaved_bloom_filter::counting_agent_type for each thread.
++     */
++    template < std::ranges::forward_range value_range_t >
++    [[nodiscard]] seqan3::counting_vector< value_t > const& bulk_count( value_range_t&& values,
++                                                                        size_t const    threshold = 1u ) & noexcept
++    {
++        assert( hibf_ptr != nullptr );
++        assert( threshold > 0u );
++        assert( result_buffer.size() == hibf_ptr->user_bins.num_user_bins() );
++
++        static_assert( std::ranges::forward_range< value_range_t >, "The values must model forward_range." );
++        static_assert( std::unsigned_integral< std::ranges::range_value_t< value_range_t > >,
++                       "An individual value must be an unsigned integral." );
++
++        std::ranges::fill( result_buffer, static_cast< value_t >( 0u ) );
++
++        bulk_count_impl( values, 0, threshold );
++
++        return result_buffer;
++    }
++
++    // `bulk_count` cannot be called on a temporary, since the object the returned reference points to
++    // is immediately destroyed.
++    template < std::ranges::range value_range_t >
++    [[nodiscard]] seqan3::counting_vector< value_t > const& bulk_count(
++        value_range_t&& values, size_t const threshold = 1u ) && noexcept = delete;
++    //!\}
++};
++#endif // RAPTOR_HIBF_HAS_COUNT
++
++} // namespace raptor
+diff --git a/src/utils/include/utils/adjust_seed.hpp b/src/utils/include/utils/adjust_seed.hpp
+new file mode 100644
+index 00000000..3751d0dc
+--- /dev/null
++++ b/src/utils/include/utils/adjust_seed.hpp
+@@ -0,0 +1,39 @@
++// -----------------------------------------------------------------------------------------------------
++// Copyright (c) 2006-2022, Knut Reinert & Freie Universität Berlin
++// Copyright (c) 2016-2022, Knut Reinert & MPI für molekulare Genetik
++// This file may be used, modified and/or redistributed under the terms of the 3-clause BSD-License
++// shipped with this file and also available at: https://github.com/seqan/raptor/blob/master/LICENSE.md
++// -----------------------------------------------------------------------------------------------------
++
++#pragma once
++
++#include <cstdint>
++
++namespace raptor
++{
++
++/*\brief Adjust the default seed such that it does not interfere with the IBF's hashing.
++ *\param kmer_size The used k-mer size. For gapped shapes, this corresponds to the number of set bits (count()).
++ *\param seed The seed.
++ *\details
++ *
++ * The hashing used with the IBF assumes that the input values are uniformly distributed.
++ * However, we use a 64 bit seed, and unless the `kmer_size` is 32, not all 64 bits of the k-mers change.
++ * Hence, we need to shift the seed to the right.
++ *
++ * For example, using 2-mers and a seed of length 8 bit, the values for the k-mers will only change for the last 4 bits:
++ *
++ * ```
++ * seed = 1111'1011
++ * kmer = 0000'XXXX
++ * ```
++ *
++ * `seed XOR kmer` will then always have 4 leading ones.
++ */
++inline constexpr static uint64_t adjust_seed( uint8_t const  kmer_size,
++                                              uint64_t const seed = 0x8F3F73B5CF1C9ADEULL ) noexcept
++{
++    return seed >> ( 64u - 2u * kmer_size );
++}
++
++} // namespace raptor
+diff --git a/src/utils/include/utils/dna4_traits.hpp b/src/utils/include/utils/dna4_traits.hpp
+index 561dbae1..f66f28c3 100644
+--- a/src/utils/include/utils/dna4_traits.hpp
++++ b/src/utils/include/utils/dna4_traits.hpp
+@@ -1,6 +1,20 @@
++// -----------------------------------------------------------------------------------------------------
++// Copyright (c) 2006-2022, Knut Reinert & Freie Universität Berlin
++// Copyright (c) 2016-2022, Knut Reinert & MPI für molekulare Genetik
++// This file may be used, modified and/or redistributed under the terms of the 3-clause BSD-License
++// shipped with this file and also available at: https://github.com/seqan/raptor/blob/master/LICENSE.md
++// -----------------------------------------------------------------------------------------------------
++
+ #pragma once
++
+ #include <seqan3/io/sequence_file/input.hpp>
++
++namespace raptor
++{
++
+ struct dna4_traits : seqan3::sequence_file_input_default_traits_dna
+ {
+     using sequence_alphabet = seqan3::dna4;
+ };
++
++} // namespace raptor
+diff --git a/tests/ganon-build/GanonBuild.test.cpp b/tests/ganon-build/GanonBuild.test.cpp
+index 503104ab..3786e6a3 100644
+--- a/tests/ganon-build/GanonBuild.test.cpp
++++ b/tests/ganon-build/GanonBuild.test.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <ganon-build/Config.hpp>
+ #include <ganon-build/GanonBuild.hpp>
++#include <utils/adjust_seed.hpp>
+ 
+ #include <catch2/catch.hpp>
+ 
+@@ -59,11 +60,10 @@ bool validate_elements( const GanonBuild::Config cfg, const sequences_type& seqs
+     seqan3::interleaved_bloom_filter<> filter = aux::load_ibf( cfg.output_filter_file );
+     auto                               agent  = filter.counting_agent< uint16_t >();
+ 
+-    auto kmer_adaptor = seqan3::views::kmer_hash( seqan3::ungapped{ cfg.kmer_size } );
+-    // auto minimizer_adaptor = seqan3::views::minimiser_hash(seqan3::shape{ seqan3::ungapped{ cfg.kmer_size } },
+-    // seqan3::window_size{ cfg.window_size }, seqan3::seed{ 0 } );
++    auto kmer_adaptor      = seqan3::views::kmer_hash( seqan3::ungapped{ cfg.kmer_size } );
+     auto minimizer_adaptor = seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ cfg.kmer_size } },
+-                                                            seqan3::window_size{ cfg.window_size } );
++                                                            seqan3::window_size{ cfg.window_size },
++                                                            seqan3::seed{ raptor::adjust_seed( cfg.kmer_size ) } );
+ 
+     std::vector< uint16_t >             expected_output( filter.bin_count(), 0 );
+     seqan3::counting_vector< uint16_t > output( filter.bin_count(), 0 );
+diff --git a/tests/ganon-classify/GanonClassify.test.cpp b/tests/ganon-classify/GanonClassify.test.cpp
+index a5dde819..447dcc4a 100644
+--- a/tests/ganon-classify/GanonClassify.test.cpp
++++ b/tests/ganon-classify/GanonClassify.test.cpp
+@@ -1799,7 +1799,7 @@ SCENARIO( "classifying reads with errors", "[ganon-classify][with-errors]" )
+ 
+                 // Should match only e0
+                 REQUIRE( res.all["readF"].size() == 1 );
+-                REQUIRE( res.all["readF"]["e0"] == 7 );
++                REQUIRE( res.all["readF"]["e0"] == 8 );
+             }
+         }
+ 
+@@ -1819,13 +1819,11 @@ SCENARIO( "classifying reads with errors", "[ganon-classify][with-errors]" )
+             config_classify::Res res{ cfg };
+             config_classify::sanity_check( cfg, res );
+ 
+-            REQUIRE( res.all["readF"].size() == 6 );
++            REQUIRE( res.all["readF"].size() == 4 );
+             REQUIRE( res.all["readF"]["e0"] == 4 );
+-            REQUIRE( res.all["readF"]["e1F"] == 3 );
+-            REQUIRE( res.all["readF"]["e1F_e1R"] == 3 );
+-            REQUIRE( res.all["readF"]["e1F_e2R"] == 3 );
+-            REQUIRE( res.all["readF"]["e2F_e1R"] == 1 );
+-            REQUIRE( res.all["readF"]["e2F_e2R"] == 1 );
++            REQUIRE( res.all["readF"]["e1F"] == 2 );
++            REQUIRE( res.all["readF"]["e1F_e1R"] == 2 );
++            REQUIRE( res.all["readF"]["e1F_e2R"] == 2 );
+ 
+             SECTION( "--paired-reads" )
+             {
+@@ -1837,13 +1835,12 @@ SCENARIO( "classifying reads with errors", "[ganon-classify][with-errors]" )
+                 config_classify::Res res{ cfg };
+                 config_classify::sanity_check( cfg, res );
+ 
+-                REQUIRE( res.all["readF"].size() == 6 );
+-                REQUIRE( res.all["readF"]["e0"] == 7 );
++                REQUIRE( res.all["readF"].size() == 5 );
++                REQUIRE( res.all["readF"]["e0"] == 8 );
+                 REQUIRE( res.all["readF"]["e1F"] == 6 );
+-                REQUIRE( res.all["readF"]["e1F_e1R"] == 5 );
+-                REQUIRE( res.all["readF"]["e1F_e2R"] == 3 );
+-                REQUIRE( res.all["readF"]["e2F_e1R"] == 3 );
+-                REQUIRE( res.all["readF"]["e2F_e2R"] == 1 );
++                REQUIRE( res.all["readF"]["e1F_e1R"] == 4 );
++                REQUIRE( res.all["readF"]["e1F_e2R"] == 2 );
++                REQUIRE( res.all["readF"]["e2F_e1R"] == 2 );
+             }
+         }
+     }

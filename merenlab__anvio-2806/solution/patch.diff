@@ -1,0 +1,316 @@
+diff --git a/anvio/dbops.py b/anvio/dbops.py
+index 313cc0a2c3..942237eb23 100644
+--- a/anvio/dbops.py
++++ b/anvio/dbops.py
+@@ -5712,8 +5712,14 @@ def get_date(self):
+         return time.time()
+ 
+ 
+-    def get_hash(self):
+-        return 'hash' + str('%08x' % random.randrange(16**8))
++    def get_hash(self, contig_digests=None):
++        """Returns the deterministic hash that describes the identity of this contigs database.
++
++        Please see `utils.get_contigs_db_hash` to learn what goes into this hash. The database
++        must have its contig sequences, splits, and gene calls in place before this is called.
++        """
++
++        return utils.get_contigs_db_hash(self.db, contig_digests=contig_digests)
+ 
+ 
+     def touch(self, db_variant='unknown'):
+@@ -6025,10 +6031,6 @@ def create(self, args):
+         self.db.set_meta_value('project_name', project_name)
+         self.db.set_meta_value('description', description)
+ 
+-        # this will be the unique information that will be passed downstream whenever this db is used:
+-        contigs_db_hash = self.get_hash()
+-        self.db.set_meta_value('contigs_db_hash', contigs_db_hash)
+-
+         # set split length variable in the meta table
+         self.db.set_meta_value('split_length', split_length)
+ 
+@@ -6090,6 +6092,13 @@ def create(self, args):
+         fasta = u.SequenceSource(contigs_fasta)
+         db_entries_contig_sequences = []
+ 
++        # here we define a variable to keep per-contig digests so we can compute a structurally
++        # deterministic / meaningful hash for this contigs database once it is created. we will
++        # collect the digest in the South Loop below (so it is more ridiculously expensive)
++        # rather than reading all sequences back from the database later since we are already
++        # going through every sequence there anyway
++        contig_digests = []
++
+         contigs_kmer_table = KMerTablesForContigsAndSplits('kmer_contigs', k=kmer_size)
+         splits_kmer_table = KMerTablesForContigsAndSplits('kmer_splits', k=kmer_size)
+         nt_positions_table = TableForNtPositions()
+@@ -6151,6 +6160,7 @@ def create(self, args):
+                 splits_info_table.append(split_name, contig_sequence[start:end], order, start, end, contig_gc_content, contig_name)
+ 
+             db_entries_contig_sequences.append((contig_name, contig_sequence), )
++            contig_digests.append(utils.get_digest_for_contig_sequence(contig_name, contig_sequence))
+ 
+         self.progress.end()
+ 
+@@ -6163,6 +6173,12 @@ def create(self, args):
+ 
+         self.db._exec_many('''INSERT INTO %s VALUES (?,?)''' % t.contig_sequences_table_name, db_entries_contig_sequences)
+ 
++        # at this point we know the contig sequences, the splits, and the gene calls, and we are
++        # read to compute the hash that describes the identity of this contigs-db, and set it
++        # for good
++        contigs_db_hash = self.get_hash(contig_digests=contig_digests)
++        self.db.set_meta_value('contigs_db_hash', contigs_db_hash)
++
+         # set some useful meta values:
+         self.db.set_meta_value('num_contigs', contigs_info_table.total_contigs)
+         self.db.set_meta_value('total_length', contigs_info_table.total_nts)
+@@ -6190,7 +6206,8 @@ def create(self, args):
+         if not skip_gene_calling:
+             gene_calls_tables.populate_genes_in_splits_tables()
+ 
+-        self.run.info('Contigs database', 'A new database, %s, has been created.' % (self.db_path), quiet=self.quiet)
++        self.run.info('Contigs database', f'A new db has been created at {self.db_path}', quiet=self.quiet)
++        self.run.info('Identity hash', contigs_db_hash, quiet=self.quiet)
+         self.run.info('Number of contigs', contigs_info_table.total_contigs, quiet=self.quiet)
+         self.run.info('Number of splits', splits_info_table.total_splits, quiet=self.quiet)
+         self.run.info('Total number of nucleotides', contigs_info_table.total_nts, quiet=self.quiet)
+@@ -6391,7 +6408,13 @@ def create(self, meta_values={}):
+             self.db.set_meta_value(key, meta_values[key])
+ 
+         self.db.set_meta_value('creation_date', time.time())
+-        self.db.set_meta_value(self.db_type + '_db_hash', 'hash' + str('%08x' % random.randrange(16**8)))
++
++        # here we set the hash for the trnaseq-db. unlike the way we do it for contigs-db
++        # files (which allows us to be extremely specific to the content and structure), the
++        # hash for trnaseq-db is just random. that is OK, but if we end up generating
++        # hundreds of thousands of these databases at some point, we may want to be a bit
++        # more careful here to avoid unintended collisions
++        self.db.set_meta_value(self.db_type + '_db_hash', utils.get_random_hash())
+ 
+         # know thyself
+         self.db.set_meta_value('db_type', self.db_type)
+diff --git a/anvio/docs/artifacts/contigs-db.md b/anvio/docs/artifacts/contigs-db.md
+index e5d499f6d1..eccee37b42 100644
+--- a/anvio/docs/artifacts/contigs-db.md
++++ b/anvio/docs/artifacts/contigs-db.md
+@@ -33,6 +33,14 @@ Other programs you can run to populate a contigs database with functions include
+ 
+ * %(anvi-run-kegg-kofams)s (which annotates the genes in the database with the KEGG KOfam database)
+ 
++### The identity of a contigs database
++
++Every contigs database carries a hash value in its `self` table under the key `contigs_db_hash`, which looks like this: `0a1b2c3d4e5f6789blah`. Every anvi'o database that is generated from a contigs database (such as a %(profile-db)s, a %(genes-db)s, or a %(structure-db)s) keeps a copy of this value so anvi'o can make sure you are not accidentally using them together with a contigs database they have nothing to do with.
++
++This hash is *deterministic*, since anvi'o computes it from the content as well as the structure of the database itself (i.e. the names and the sequences of its contigs, the split boundaries, the gene calls, etc). Which means running %(anvi-gen-contigs-database)s twice on the same %(contigs-fasta)s with the same parameters will give you two databases with the same hash. Thus, if you have accidentally delete a contigs database, regenerating it the very same way will make it compatible with the profile databases you had generated from the original one, and will contribute to %(contigs-db)s provenance. Conversely, anything that would invalidate those downstream databases (a different split length, a different gene caller, or of course different sequences) will change the hash, and anvi'o will tell you that your databases are not compatible.
++
++Things that are added to a contigs database after its creation, such as functional annotations, HMM hits, or taxonomy, do not change its hash, since none of them invalidate anything that is linked to it.
++
+ ### Analysis on a populated contigs database
+ 
+ Other essential programs that read from a contigs database and yield key information include %(anvi-estimate-genome-completeness)s, %(anvi-get-sequences-for-hmm-hits)s, and %(anvi-estimate-scg-taxonomy)s.
+diff --git a/anvio/genomestorage.py b/anvio/genomestorage.py
+index c9ee6515f9..77a471b3f9 100644
+--- a/anvio/genomestorage.py
++++ b/anvio/genomestorage.py
+@@ -265,13 +265,16 @@ def get_genomes_dict(self):
+ 
+ 
+     def update_storage_hash(self):
+-        # here we create a signature for the storage itself by concatenating all hash values from all genomes. even if one
+-        # split is added or removed to any of these genomes will change this signature. since we will tie this information
+-        # to the profile database we will generate for the pangenome analysis, even if one split is added or removed from any
+-        # of the genomes will make sure that the profile databases from this storage and storage itself are not compatible:
++        """Create a signature for the storage itself by concatenating all hash values from all genomes.
++
++        Thanks to this strategy, even if one split is added or removed to any of these genomes we will
++        haev a different hash for the genomes-storage-db. Since we will tie this information to the
++        profile database we will generate for the pangenome analysis, even if one split is added or
++        removed from any of the genomes will make sure that the profile databases from this storage
++        and storage itself are not compatible. A bit like rocket science here."""
+ 
+         concatenated_genome_hashes = '_'.join(sorted(map(str, self.db.get_single_column_from_table(t.genome_info_table_name, 'genome_hash'))))
+-        new_hash = 'hash' + str(hashlib.sha224(concatenated_genome_hashes.encode('utf-8')).hexdigest()[0:8])
++        new_hash = str(hashlib.sha224(concatenated_genome_hashes.encode('utf-8')).hexdigest()[0:16])
+ 
+         self.db.set_meta_value('hash', new_hash)
+ 
+diff --git a/anvio/splitter.py b/anvio/splitter.py
+index e1295880a1..328183aadd 100644
+--- a/anvio/splitter.py
++++ b/anvio/splitter.py
+@@ -328,13 +328,15 @@ def do_contigs_db(self):
+         bin_contigs_db.db.copy_paste(table_name='hmm_hits_info', source_db_path=self.contigs_db_path)
+         bin_contigs_db.db.copy_paste(table_name='taxon_names', source_db_path=self.contigs_db_path)
+ 
+-        # update some variables in the self table:
+-        self.contigs_db_hash = bin_contigs_db.get_hash()
++        # update some variables in the self table. please note that the `contigs_db_hash` of this new
++        # database is not one of them: since the hash of a contigs database is a function of its
++        # content, it can only be computed after the data migration below is done (until then this
++        # database will carry the hash of the contigs database it is coming from, which is inherited
++        # through the `self` table copy-paste above)
+         bin_contigs_db.db.update_meta_value('num_contigs', self.num_contigs)
+         bin_contigs_db.db.update_meta_value('num_splits', self.num_splits)
+         bin_contigs_db.db.update_meta_value('total_length', self.total_length)
+         bin_contigs_db.db.update_meta_value('creation_date', bin_contigs_db.get_date())
+-        bin_contigs_db.db.update_meta_value('contigs_db_hash', self.contigs_db_hash)
+         bin_contigs_db.db.update_meta_value('project_name', self.bin_id)
+         # reaction network tables are not populated after splitting, so we clear the corresponding self values
+         bin_contigs_db.db.update_meta_value('reaction_network_ko_annotations_hash', None)
+@@ -405,6 +407,12 @@ def do_contigs_db(self):
+         bin_contigs_db.db.update_meta_value('contig_classification_sources',
+                                     ','.join(sorted(actual_sources)) if actual_sources else None)
+ 
++        # everything that describes the identity of this new contigs database is now in place, so this
++        # is the right moment to compute its hash. the profile and auxiliary databases that may be
++        # generated for this bin later will link themselves to this database through this very hash
++        self.contigs_db_hash = bin_contigs_db.get_hash()
++        bin_contigs_db.db.update_meta_value('contigs_db_hash', self.contigs_db_hash)
++
+         bin_contigs_db.disconnect()
+ 
+         self.progress.end()
+diff --git a/anvio/trnaseq.py b/anvio/trnaseq.py
+index 6f290f1aec..14d3e2f619 100644
+--- a/anvio/trnaseq.py
++++ b/anvio/trnaseq.py
+@@ -106,7 +106,6 @@
+ import math
+ import time
+ import queue
+-import random
+ import shutil
+ import argparse
+ import numpy as np
+@@ -5345,7 +5344,7 @@ def sanity_check(self):
+         self.out_dir = os.path.abspath(self.out_dir)
+ 
+         self.contigs_db_path = os.path.join(self.out_dir, 'CONTIGS.db')
+-        self.contigs_db_hash = 'hash' + str('%08x' % random.randrange(16**8))
++        self.contigs_db_hash = utils.get_random_hash()
+ 
+         self.spec_out_dir = filesnpaths.check_output_directory(os.path.join(self.out_dir, 'SPECIFIC_COVERAGE'), ok_if_exists=self.overwrite_out_dest)
+         self.spec_profile_db_path = os.path.join(self.spec_out_dir, 'PROFILE.db')
+diff --git a/anvio/utils.py b/anvio/utils.py
+index eb66cedac0..4e9338358b 100644
+--- a/anvio/utils.py
++++ b/anvio/utils.py
+@@ -15,6 +15,7 @@
+     import gzip
+     import time
+     import copy
++    import random
+     import socket
+     import shutil
+     import tarfile
+@@ -5233,8 +5234,107 @@ def accept_chain(self, chain_obj):
+     return output_path
+ 
+ 
+-def get_hash_for_list(l):
+-    return 'hash' + str(hashlib.sha224(''.join(sorted(list(l))).encode('utf-8')).hexdigest()[0:8])
++def get_hash_for_list(l, num_hex_digits=24):
++    return str(hashlib.sha224(''.join(sorted(list(l))).encode('utf-8')).hexdigest()[0:num_hex_digits])
++
++
++def get_random_hash(num_hex_digits=24):
++    """Returns a random hash for anvi'o databases that need a unique identifier.
++
++    Please note that the number of hexadecimal digits here is not a cosmetic choice: the
++    probability of two independently generated hashes colliding is governed by the birthday
++    problem, and with the 8 hexadecimal digits anvi'o used to use (i.e., a space of only 32
++    bits), someone who generated tens of thousands of databases over the years would have been
++    more likely than not to end up with two databases that had the exact same hash. Which did
++    happen. Twice. Hence these 16 digits.
++
++    Parameters
++    ==========
++    num_hex_digits : int
++        The number of hexadecimal digits the hash will be composed of.
++
++    Returns
++    =======
++    hash : str
++        A string that looks like `hash0a1b2c3d4e5f6789`.
++    """
++
++    return f'{random.getrandbits(num_hex_digits * 4):0{num_hex_digits}x}'
++
++
++def get_digest_for_contig_sequence(contig_name, contig_sequence):
++    """Returns the raw digest of a single contig for `get_contigs_db_hash`"""
++
++    return hashlib.sha256(f"{contig_name}\n{contig_sequence}".encode('utf-8')).digest()
++
++
++def get_contigs_db_hash(contigs_db, contig_digests=None, num_hex_digits=24):
++    """Compute a deterministic hash that describes the identity of a contigs database.
++
++    The hash is a function of everything that defines the contigs-db cotnent AND structure:
++    contig names and sequences, split boundaries, gene calls, and the k-mer size. Which means two
++    contigs databases that are generated from the same FASTA file with the same parameters (and
++    with the same versions of the same gene caller) WILL HAVE the same hash, and any difference
++    that would invalidate a profile database that was generated from one of themm, will change it.
++
++    Notes
++    =====
++    - The hash of a contigs database is computed once, when the database is created. Things that
++      are added to a contigs database later (functions, HMM hits, taxonomy, and even the additional
++      gene calls that come from HMM sources that find rRNAs) do not change it, since none of them
++      invalidate the databases that are linked to a contigs database through this hash.
++    - The order in which contigs occur in the input FASTA file does not influence the hash, but
++      contig names do (since they influence BAMs that have emerged from and everything downstream).
++
++    Parameters
++    ==========
++    contigs_db : anvio.db.DB
++        A `db.DB` instance for a contigs database the contig sequences, splits, and gene calls of
++        which are already in place.
++    contig_digests : list
++        An optional list of per-contig digests that are generated by the function
++        `get_digest_for_contig_sequence`. When this is not None, contig sequences will not be read
++        from `contigs_db`, which is much more memory friendly for callers that already have all the
++        sequences at hand (see how `dbops.ContigsDatabase.create` uses this function).
++    num_hex_digits : int
++        The number of hexadecimal digits the hash will be composed of. None means use all digits.
++
++    Returns
++    =======
++    hash : str
++        A string that looks like gibberish to the untrained eye (yas -- some of us can read SHA sums thx).
++    """
++
++    if contig_digests is None:
++        contig_digests = [get_digest_for_contig_sequence(contig_name, sequence) for contig_name, sequence \
++                                in contigs_db.get_some_columns_from_table(t.contig_sequences_table_name, 'contig, sequence')]
++
++    hasher = hashlib.sha256()
++
++    # digests are sorted here so the hash does not depend on the order in which
++    # the contigs occurred in the input FASTA file
++    for digest in sorted(contig_digests):
++        hasher.update(digest)
++
++    # split boundaries. this is what distinguishes an otherwise identical contigs database that was
++    # generated with a different split length, or without paying attention to gene calls
++    splits = contigs_db.get_some_columns_from_table(t.splits_info_table_name, 'split, parent, start, end')
++    for entry in sorted(splits, key=lambda x: x[0]):
++        hasher.update(('\t'.join([str(f) for f in entry]) + '\n').encode('utf-8'))
++
++    # gene calls. gene caller ids are the currency of every downstream database, so a contigs
++    # database with different gene calls must have a different hash even if its sequences are
++    # identical
++    gene_calls = contigs_db.get_some_columns_from_table(t.genes_in_contigs_table_name, 'gene_callers_id, contig, start, stop, direction, partial, call_type, source, version')
++    for entry in sorted(gene_calls, key=lambda x: x[0]):
++        hasher.update(('\t'.join([str(f) for f in entry]) + '\n').encode('utf-8'))
++
++    hasher.update(f"kmer_size:{contigs_db.get_meta_value('kmer_size')}\n".encode('utf-8'))
++
++    if num_hex_digits:
++        return hasher.hexdigest()[:num_hex_digits]
++    else:
++        return hasher.hexdigest()
+ 
+ 
+ def get_file_md5(file_path):

@@ -1,0 +1,752 @@
+diff --git a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+index 9540209bcd..e8119b6f19 100644
+--- a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
++++ b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+@@ -113,6 +113,17 @@ class RowDiff : public IRowDiff, public BinaryMatrix {
+ 
+     std::vector<SetBitPositions> get_rows(const std::vector<Row> &row_ids) const override;
+ 
++    /**
++     * Return rows (in arbitrary order) and update the row indexes in |rows|
++     * to point to their respective rows in the vector returned.
++     *
++     * In contrast to get_rows_dict in most other classes, the rows here
++     * are not deduplicated. Benchmarks on real queries showed that merging
++     * identical reconstructed rows rarely shrinks the batch size by much
++     * (only a few percent on dense annotation rows; occasionally on the order
++     * of ~40% when duplication was high), while hashing requires a critical
++     * section that dominates the query time. Hence, we skip deduplication.
++     */
+     std::vector<SetBitPositions>
+     get_rows_dict(std::vector<Row> *rows, size_t num_threads) const override;
+ 
+@@ -206,18 +217,6 @@ void IRowDiff::call_rows(const std::vector<BinaryMatrix::Row> &row_ids, F call_r
+     #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+     for (size_t g = 0; g < groups.size(); ++g) {
+         RowType result;
+-        // accumulate and call results in small batches to avoid locking overhead
+-        std::vector<std::pair<size_t, RowType>> results;
+-        results.reserve(100);
+-        auto call_rows_batch = [&]() {
+-            #pragma omp critical
+-            {
+-                for (const auto &[idx, result] : results) {
+-                    call_row(idx, result);
+-                }
+-            }
+-            results.resize(0);
+-        };
+         for (size_t i : groups[g]) {
+             auto it = rd_paths_trunc[i].rbegin();
+             result = rd_rows[*it];
+@@ -231,11 +230,8 @@ void IRowDiff::call_rows(const std::vector<BinaryMatrix::Row> &row_ids, F call_r
+                     RowType().swap(rd_rows[*it]);
+                 }
+             }
+-            results.emplace_back(i, result);
+-            if (results.size() == results.capacity())
+-                call_rows_batch();
++            call_row(i, result);
+         }
+-        call_rows_batch();
+     }
+ 
+     common::logger->trace("RD query [threads: {}, rows: {} -> {} ({:.1f}x)] -- "
+@@ -267,19 +263,19 @@ RowDiff<BaseMatrix>::get_rows(const std::vector<Row> &row_ids) const {
+ template <class BaseMatrix>
+ std::vector<BinaryMatrix::SetBitPositions>
+ RowDiff<BaseMatrix>::get_rows_dict(std::vector<Row> *rows, size_t num_threads) const {
+-    VectorSet<SetBitPositions, utils::VectorHash> unique_rows;
++    std::vector<SetBitPositions> rows_dict(rows->size());
+     call_rows(*rows,
+         [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+             return diffs_.get_rows(rd_ids, num_threads);
+         },
+         add_diff, [](SetBitPositions *row) {},
+         [&](size_t i, const SetBitPositions &row) {
+-            auto it = unique_rows.emplace(row).first;
+-            (*rows)[i] = it - unique_rows.begin();
++            rows_dict[i] = row;
++            (*rows)[i] = i;
+         },
+         num_threads
+     );
+-    return to_vector(std::move(unique_rows));
++    return rows_dict;
+ }
+ 
+ template <class BaseMatrix>
+diff --git a/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.cpp b/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.cpp
+index 5dd416e155..42b0af3d6d 100644
+--- a/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.cpp
++++ b/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.cpp
+@@ -1,10 +1,13 @@
+ #include "unique_row_binmat.hpp"
+ 
+ #include <tsl/hopscotch_set.h>
++#include <tsl/hopscotch_map.h>
+ #include <sdsl/int_vector.hpp>
++#include <ips4o.hpp>
+ 
+ #include "common/hashers/hash.hpp"
+ #include "common/vector_set.hpp"
++#include "common/utils/template_utils.hpp"
+ #include "common/algorithms.hpp"
+ #include "common/serialization.hpp"
+ 
+@@ -69,6 +72,70 @@ std::vector<UniqueRowBinmat::Row> UniqueRowBinmat::get_column(Column j) const {
+     return result;
+ }
+ 
++std::vector<std::pair<UniqueRowBinmat::Column, size_t /* count */>>
++UniqueRowBinmat::sum_rows(const std::vector<std::pair<Row, size_t>> &index_counts,
++                          size_t min_count) const {
++    if (index_counts.empty())
++        return {};
++
++    min_count = std::max<size_t>(min_count, 1);
++
++    tsl::hopscotch_map<size_t, size_t> code_counts;
++    size_t total_sum_count = 0;
++    for (const auto &[row, count] : index_counts) {
++        code_counts[get_code(row)] += count;
++        total_sum_count += count;
++    }
++    if (total_sum_count < min_count)
++        return {};
++
++    auto call_bits = [&](const auto &callback) {
++        for (const auto &[code, count] : code_counts) {
++            for (Column j : unique_rows_[code]) {
++                callback(j, count);
++            }
++        }
++    };
++    return utils::accumulate_counts(call_bits, num_columns(), min_count);
++}
++
++std::vector<BinaryMatrix::SetBitPositions>
++UniqueRowBinmat::get_rows_dict(std::vector<Row> *rows, size_t num_threads) const {
++    assert(rows);
++
++    std::vector<std::pair<uint64_t, /* code */
++                          uint64_t /* row */>> row_codes(rows->size());
++
++    #pragma omp parallel for num_threads(num_threads)
++    for (size_t i = 0; i < rows->size(); ++i) {
++        row_codes[i] = { get_code((*rows)[i]), i };
++    }
++
++    ips4o::parallel::sort(row_codes.begin(), row_codes.end(),
++                          utils::LessFirst(), num_threads);
++
++    std::vector<uint64_t> codes;
++    codes.reserve(row_codes.size());
++    uint64_t last_code = std::numeric_limits<uint64_t>::max();
++    for (const auto &[code, i] : row_codes) {
++        if (code != last_code) {
++            codes.push_back(code);
++            last_code = code;
++        }
++        (*rows)[i] = codes.size() - 1;
++    }
++    decltype(row_codes)().swap(row_codes);
++
++    std::vector<SetBitPositions> unique_rows(codes.size());
++
++    #pragma omp parallel for num_threads(num_threads)
++    for (size_t r = 0; r < codes.size(); ++r) {
++        unique_rows[r] = unique_rows_[codes[r]];
++    }
++
++    return unique_rows;
++}
++
+ bool UniqueRowBinmat::load(std::istream &instream) {
+     if (!instream.good())
+         return false;
+diff --git a/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.hpp b/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.hpp
+index c410c938c2..ee2d120622 100644
+--- a/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.hpp
++++ b/metagraph/src/annotation/binary_matrix/row_vector/unique_row_binmat.hpp
+@@ -10,7 +10,7 @@ namespace mtg {
+ namespace annot {
+ namespace matrix {
+ 
+-class UniqueRowBinmat : public RainbowMatrix {
++class UniqueRowBinmat : public RowMajor {
+   public:
+     explicit UniqueRowBinmat(uint64_t num_rows = 0);
+ 
+@@ -23,9 +23,15 @@ class UniqueRowBinmat : public RainbowMatrix {
+ 
+     uint64_t num_columns() const { return num_columns_; }
+     uint64_t num_rows() const { return row_rank_.size(); }
+-    uint64_t num_distinct_rows() const { return unique_rows_.size(); }
+ 
+     std::vector<Row> get_column(Column column) const;
++    SetBitPositions get_row(Row row) const { return unique_rows_[row_rank_[row]]; }
++    const SetBitPositions& get_row_ref(Row row) const { return unique_rows_[row_rank_[row]]; }
++    // Return all columns for which counts are greater than or equal to |min_count|.
++    std::vector<std::pair<Column, size_t /* count */>>
++    sum_rows(const std::vector<std::pair<Row, size_t>> &index_counts, size_t min_count = 1) const;
++    std::vector<SetBitPositions>
++    get_rows_dict(std::vector<Row> *rows, size_t num_threads) const;
+ 
+     bool load(std::istream &in);
+     void serialize(std::ostream &out) const;
+@@ -37,13 +43,6 @@ class UniqueRowBinmat : public RainbowMatrix {
+ 
+   private:
+     uint64_t get_code(Row row) const { return row_rank_[row]; }
+-    std::vector<SetBitPositions> codes_to_rows(const std::vector<uint64_t> &rows) const {
+-        std::vector<SetBitPositions> result(rows.size());
+-        for (size_t i = 0; i < rows.size(); ++i) {
+-            result[i] = unique_rows_[rows[i]];
+-        }
+-        return result;
+-    }
+ 
+     uint32_t num_columns_ = 0;
+     uint32_t num_relations_ = 0;
+diff --git a/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.cpp b/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.cpp
+index c5166be752..f6aff700d0 100644
+--- a/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.cpp
++++ b/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.cpp
+@@ -3,7 +3,8 @@
+ #include <algorithm>
+ #include <numeric>
+ 
+-#include "common/logger.hpp"
++#include "common/algorithms.hpp"
++#include "common/utils/template_utils.hpp"
+ 
+ 
+ namespace mtg {
+@@ -39,12 +40,31 @@ uint64_t CSRMatrix::num_relations() const {
+ 
+ CSRMatrix::SetBitPositions CSRMatrix::get_row(Row row) const {
+     assert(row < vector_.size());
+-    SetBitPositions result;
+-    result.reserve(vector_[row].size());
+-    for (const auto &[j, _] : vector_[row]) {
+-        result.push_back(j);
++    return utils::get_firsts<SetBitPositions>(vector_[row]);
++}
++
++std::vector<std::pair<CSRMatrix::Column, size_t /* count */>>
++CSRMatrix::sum_rows(const std::vector<std::pair<Row, size_t>> &index_counts, size_t min_count) const {
++    if (index_counts.empty())
++        return {};
++
++    min_count = std::max<size_t>(min_count, 1);
++
++    size_t total_sum_count = 0;
++    for (const auto &[row, count] : index_counts) {
++        total_sum_count += count;
+     }
+-    return result;
++    if (total_sum_count < min_count)
++        return {};
++
++    auto call_bits = [&](const auto &callback) {
++        for (const auto &[row, count] : index_counts) {
++            for (const auto &[j, _] : vector_[row]) {
++                callback(j, count);
++            }
++        }
++    };
++    return utils::accumulate_counts(call_bits, num_columns(), min_count);
+ }
+ 
+ std::vector<CSRMatrix::Row> CSRMatrix::get_column(Column column) const {
+diff --git a/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.hpp b/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.hpp
+index 02d6e1de5b..03f95a44f6 100644
+--- a/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.hpp
++++ b/metagraph/src/annotation/int_matrix/csr_matrix/csr_matrix.hpp
+@@ -25,6 +25,8 @@ class CSRMatrix : public RowMajor, public IntMatrix {
+     std::vector<RowValues> get_row_values(const std::vector<Row> &rows,
+                                           size_t num_threads = 1) const;
+ 
++    const RowValues& get_row_values(Row row) const { return vector_[row]; }
++
+     uint64_t num_columns() const { return num_columns_; }
+     uint64_t num_rows() const { return vector_.size(); }
+     uint64_t num_relations() const;
+@@ -32,6 +34,9 @@ class CSRMatrix : public RowMajor, public IntMatrix {
+     // row is in [0, num_rows), column is in [0, num_columns)
+     SetBitPositions get_row(Row row) const;
+     std::vector<Row> get_column(Column column) const;
++    // Return all columns for which counts are greater than or equal to |min_count|.
++    std::vector<std::pair<Column, size_t /* count */>>
++    sum_rows(const std::vector<std::pair<Row, size_t>> &index_counts, size_t min_count = 1) const;
+ 
+     bool load(std::istream &in);
+     void serialize(std::ostream &out) const;
+diff --git a/metagraph/src/annotation/int_matrix/row_diff/int_row_diff.hpp b/metagraph/src/annotation/int_matrix/row_diff/int_row_diff.hpp
+index feb1f21f24..e6b92a0832 100644
+--- a/metagraph/src/annotation/int_matrix/row_diff/int_row_diff.hpp
++++ b/metagraph/src/annotation/int_matrix/row_diff/int_row_diff.hpp
+@@ -52,6 +52,7 @@ class IntRowDiff : public IRowDiff, public BinaryMatrix, public IntMatrix {
+ 
+     std::vector<Row> get_column(Column j) const override;
+     std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows) const override;
++    // no deduplication: see class comment on RowDiff::get_rows_dict (speed vs limited size win)
+     std::vector<SetBitPositions>
+     get_rows_dict(std::vector<Row> *rows, size_t num_threads) const override;
+     // query integer values
+@@ -115,19 +116,19 @@ IntRowDiff<BaseMatrix>::get_rows(const std::vector<Row> &row_ids) const {
+ template <class BaseMatrix>
+ std::vector<BinaryMatrix::SetBitPositions>
+ IntRowDiff<BaseMatrix>::get_rows_dict(std::vector<Row> *rows, size_t num_threads) const {
+-    VectorSet<SetBitPositions, utils::VectorHash> unique_rows;
++    std::vector<SetBitPositions> rows_dict(rows->size());
+     call_rows(*rows,
+         [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+             return diffs_.get_row_values(rd_ids, num_threads);
+         },
+         add_diff, decode_diffs,
+         [&](size_t i, const RowValues &row) {
+-            auto it = unique_rows.emplace(utils::get_firsts<SetBitPositions>(row)).first;
+-            (*rows)[i] = it - unique_rows.begin();
++            rows_dict[i] = utils::get_firsts<SetBitPositions>(row);
++            (*rows)[i] = i;
+         },
+         num_threads
+     );
+-    return to_vector(std::move(unique_rows));
++    return rows_dict;
+ }
+ 
+ template <class BaseMatrix>
+diff --git a/metagraph/src/annotation/int_matrix/row_diff/tuple_row_diff.hpp b/metagraph/src/annotation/int_matrix/row_diff/tuple_row_diff.hpp
+index 20c01f19ed..bde76d433e 100644
+--- a/metagraph/src/annotation/int_matrix/row_diff/tuple_row_diff.hpp
++++ b/metagraph/src/annotation/int_matrix/row_diff/tuple_row_diff.hpp
+@@ -35,6 +35,7 @@ class TupleRowDiff : public IRowDiff, public BinaryMatrix, public MultiIntMatrix
+ 
+     std::vector<Row> get_column(Column j) const override;
+     std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows) const override;
++    // no deduplication: see class comment on RowDiff::get_rows_dict (speed vs limited size win)
+     std::vector<SetBitPositions>
+     get_rows_dict(std::vector<Row> *rows, size_t num_threads) const override;
+     std::vector<RowValues> get_row_values(const std::vector<Row> &rows,
+@@ -100,19 +101,19 @@ TupleRowDiff<BaseMatrix>::get_rows(const std::vector<Row> &row_ids) const {
+ template <class BaseMatrix>
+ std::vector<BinaryMatrix::SetBitPositions>
+ TupleRowDiff<BaseMatrix>::get_rows_dict(std::vector<Row> *rows, size_t num_threads) const {
+-    VectorSet<SetBitPositions, utils::VectorHash> unique_rows;
++    std::vector<SetBitPositions> rows_dict(rows->size());
+     call_rows(*rows,
+         [this](const std::vector<Row> &rd_ids, size_t num_threads) {
+             return diffs_.get_row_tuples(rd_ids, num_threads);
+         },
+         add_diff, decode_diffs,
+         [&](size_t i, const RowTuples &row) {
+-            auto it = unique_rows.emplace(utils::get_firsts<SetBitPositions>(row)).first;
+-            (*rows)[i] = it - unique_rows.begin();
++            rows_dict[i] = utils::get_firsts<SetBitPositions>(row);
++            (*rows)[i] = i;
+         },
+         num_threads
+     );
+-    return to_vector(std::move(unique_rows));
++    return rows_dict;
+ }
+ 
+ template <class BaseMatrix>
+diff --git a/metagraph/src/cli/query.cpp b/metagraph/src/cli/query.cpp
+index 25d4293c06..8d4a1033c8 100644
+--- a/metagraph/src/cli/query.cpp
++++ b/metagraph/src/cli/query.cpp
+@@ -620,11 +620,13 @@ slice_annotation(const AnnotatedDBG::Annotator &full_annotation,
+         row_indexes[i] = full_to_small[i].first;
+     }
+ 
+-    // get unique rows and set pointers to them in |row_indexes|
++    // One decoded row per entry; row_indexes[i] becomes an index into this vector.
++    // Row-diff matrices skip hash dedup here (see RowDiff::get_rows_dict); other
++    // matrices still return deduplicated rows with remapped indexes.
+     auto unique_rows = full_annotation.get_matrix().get_rows_dict(&row_indexes, num_threads);
+ 
+     if (unique_rows.size() >= std::numeric_limits<uint32_t>::max()) {
+-        throw std::runtime_error("There must be less than 2^32 unique rows."
++        throw std::runtime_error("There must be less than 2^32 rows in a batch."
+                                  " Reduce the query batch size.");
+     }
+ 
+@@ -1350,9 +1352,10 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
+ 
+             logger->trace("Batch of {} bp from '{}': Query graph constructed in {:.5f} sec,"
+                           " redundancy: {:.2f} bp/kmer,"
+-                          " queried in {:.5f} sec. Batch query time: {:.5f} sec, {:.1f} bp/s",
++                          " queried with {} threads in {:.5f} sec. Batch query time: {:.5f} sec, {:.1f} bp/s",
+                           num_bytes_read, fasta_parser.get_filename(), query_graph_construction,
+                           (double)num_bytes_read / query_graph->get_graph().num_nodes(),
++                          threads_per_batch,
+                           query_time, query_graph_construction + query_time,
+                           num_bytes_read / (query_graph_construction + query_time));
+         }
+diff --git a/metagraph/src/common/algorithms.hpp b/metagraph/src/common/algorithms.hpp
+index 93a4c9a502..da1e5374ee 100644
+--- a/metagraph/src/common/algorithms.hpp
++++ b/metagraph/src/common/algorithms.hpp
+@@ -12,6 +12,8 @@
+ #include <set>
+ #include <stdexcept>
+ 
++#include <tsl/hopscotch_map.h>
++
+ #include "common/vector_map.hpp"
+ #include "common/vector.hpp"
+ 
+@@ -523,6 +525,47 @@ namespace utils {
+         return item_counts;
+     }
+ 
++    template <typename T, typename ValueType>
++    class ValueStore {
++      public:
++        ValueStore(size_t universe_size, size_t reserve_size = 0)
++              : use_dense_(universe_size < kMaxDenseSize) {
++            if (use_dense_) {
++                // For a small universe size, using a dense vector is faster than a hash table.
++                ids_.resize(universe_size);
++                dense_values_.reserve(reserve_size);
++            } else {
++                sparse_values_.reserve(reserve_size);
++            }
++        }
++
++        template <typename... Args>
++        void emplace(T j, Args&&... args) {
++            if (use_dense_) {
++                dense_values_.emplace_back(std::forward<Args>(args)...);
++                ids_[j] = dense_values_.size();
++            } else {
++                sparse_values_.emplace(j, std::forward<Args>(args)...);
++            }
++        }
++
++        ValueType* get(T j) {
++            if (use_dense_)
++                return ids_[j] ? &dense_values_[ids_[j] - 1] : nullptr;
++            auto it = sparse_values_.find(j);
++            return it != sparse_values_.end() ? &it.value() : nullptr;
++        }
++
++      private:
++        static constexpr size_t kMaxDenseSize = 1'000'000;
++        bool use_dense_;
++        // if dense, then dense_values_[ids_[j] - 1] is the value for j
++        Vector<ValueType> dense_values_;
++        std::vector<size_t> ids_;
++        // if sparse, then sparse_values_[j] is the value for j
++        tsl::hopscotch_map<T, ValueType> sparse_values_;
++    };
++
+ } // namespace utils
+ 
+ #endif // __ALGORITHMS_HPP__
+diff --git a/metagraph/src/graph/annotated_dbg.cpp b/metagraph/src/graph/annotated_dbg.cpp
+index 0a849f0a22..ab7a60aea9 100644
+--- a/metagraph/src/graph/annotated_dbg.cpp
++++ b/metagraph/src/graph/annotated_dbg.cpp
+@@ -7,7 +7,9 @@
+ #include <tsl/hopscotch_map.h>
+ 
+ #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
++#include "annotation/binary_matrix/row_vector/unique_row_binmat.hpp"
+ #include "annotation/int_matrix/base/int_matrix.hpp"
++#include "annotation/int_matrix/csr_matrix/csr_matrix.hpp"
+ #include "graph/representation/canonical_dbg.hpp"
+ #include "annotation/coord_to_header.hpp"
+ #include "common/algorithms.hpp"
+@@ -22,8 +24,12 @@ namespace mtg {
+ namespace graph {
+ 
+ using mtg::common::logger;
++using mtg::annot::matrix::BinaryMatrix;
+ using mtg::annot::matrix::IntMatrix;
+ using mtg::annot::matrix::MultiIntMatrix;
++using mtg::annot::matrix::CSRMatrix;
++using mtg::annot::matrix::RowMajor;
++using mtg::annot::matrix::UniqueRowBinmat;
+ using Column = mtg::annot::matrix::BinaryMatrix::Column;
+ using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
+ 
+@@ -405,8 +411,8 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
+ }
+ 
+ 
+-template <class Result, class Container>
+-Result filter_and_aggregate(Container&& rows,
++template <class Result, class RowEnumerator>
++Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
+                             const annot::LabelEncoder<Label> &label_encoder,
+                             size_t min_count,
+                             size_t num_top_labels,
+@@ -416,14 +422,13 @@ Result filter_and_aggregate(Container&& rows,
+                     std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>,
+                     std::vector<std::tuple<Label, size_t, std::vector<size_t>>>,
+                     std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>>);
+-    using ValueType = std::tuple_element_t<2, typename Result::value_type>;
+ 
+     auto call_bits = [&](const auto &callback) {
+-        for (const auto &row : rows) {
++        enumerate_rows([&](const auto &row) {
+             for (const auto &j : row) {
+                 callback(utils::get_first(j), 1);
+             }
+-        }
++        });
+     };
+     std::vector<std::pair<Column, size_t>> counts
+             = utils::accumulate_counts(call_bits, label_encoder.size(), min_count);
+@@ -431,35 +436,36 @@ Result filter_and_aggregate(Container&& rows,
+     if (counts.size() > num_top_labels)
+         top_n_sorted(counts, num_top_labels);
+ 
+-    // Aggregate results (group by labels)
+-    tsl::hopscotch_map<Column, ValueType> values;
+-    values.reserve(counts.size());
++    if (counts.empty())
++        return {};
++
++    using ValueType = std::tuple_element_t<2, typename Result::value_type>;
++    utils::ValueStore<Column, ValueType> value_store(label_encoder.size(), counts.size());
+     for (const auto &[j, count] : counts) {
+-        values.emplace(j, num_kmers);
++        value_store.emplace(j, num_kmers);
+     }
+ 
+-    for (size_t i = 0; i < rows.size(); ++i) {
+-        for (auto &item : rows[i]) {
++    size_t i = 0;
++    enumerate_rows([&](const auto &row) {
++        for (const auto &item : row) {
+             auto j = utils::get_first(item);
+-            auto it = values.find(j);
+-            if (it != values.end()) {
++            ValueType *value_p = value_store.get(j);
++            if (value_p) {
+                 if constexpr(std::is_same_v<ValueType, sdsl::bit_vector>) {
+-                    it.value()[kmer_positions[i]] = true;
++                    (*value_p)[kmer_positions[i]] = true;
+                 } else {
+-                    it.value()[kmer_positions[i]] = std::move(item.second);
++                    (*value_p)[kmer_positions[i]] = std::move(item.second);
+                 }
+             }
+         }
+-        rows[i].clear();
+-    }
+-    rows.clear();
++        i++;
++    });
+ 
+     Result result;
+     result.reserve(counts.size());
+     for (const auto &[j, count] : counts) {
+-        result.emplace_back(label_encoder.decode(j), count, std::move(values[j]));
++        result.emplace_back(label_encoder.decode(j), count, std::move(*value_store.get(j)));
+     }
+-
+     return result;
+ }
+ 
+@@ -482,6 +488,32 @@ void map_to_rows(const DeBruijnGraph &graph, std::string_view sequence,
+     assert(j == num_kmers);
+ }
+ 
++#ifndef NDEBUG
++// A sanity check to ensure the same matches are for get_top_label_signatures and get_top_labels
++template <typename ValueType>
++bool same_results(const std::vector<std::tuple<Label, size_t, ValueType>> &result,
++                  const std::vector<StringCountPair> &top_labels) {
++    assert(top_labels.size() == result.size());
++    std::unordered_map<Label, uint64_t> check(top_labels.begin(), top_labels.end());
++    for (const auto &[label, count, value] : result) {
++        if constexpr(std::is_same_v<ValueType, sdsl::bit_vector>) {
++            assert(count == sdsl::util::cnt_one_bits(value));
++        } else if constexpr(std::is_same_v<ValueType, std::vector<size_t>>) {
++            assert(count == (size_t)std::count_if(value.begin(), value.end(), [](const auto &v) { return v > 0; }));
++        } else if constexpr(std::is_same_v<ValueType, std::vector<SmallVector<uint64_t>>>) {
++            assert(count == (size_t)std::count_if(value.begin(), value.end(), [](const auto &v) { return v.size() > 0; }));
++        } else {
++            static_assert(utils::dependent_false<ValueType>::value, "Unsupported value type");
++        }
++        auto find = check.find(label);
++        assert(find != check.end());
++        assert(find->second == count);
++        check.erase(find);
++    }
++    return check.empty();
++}
++#endif // NDEBUG
++
+ std::vector<std::tuple<std::string, size_t, std::vector<size_t>>>
+ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
+                               size_t num_top_labels,
+@@ -529,10 +561,29 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
+         exit(1);
+     }
+ 
+-    auto row_values = int_matrix->get_row_values(row_indices);
++    auto get_results = [&](const auto &enumerate_rows) {
++        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, std::vector<size_t>>>>(
++            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++        assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
++        return results;
++    };
++
++    // Per-index get_row_values is cheap for CSRMatrix; other matrices get rows in a batch.
++    if (const auto *mat = dynamic_cast<const CSRMatrix *>(int_matrix)) {
++        auto enumerate_row_values = [mat, &row_indices](const auto &callback) {
++            for (row_index row : row_indices) {
++                callback(mat->get_row_values(row));
++            }
++        };
++        return get_results(enumerate_row_values);
++    }
+ 
+-    return filter_and_aggregate<std::vector<std::tuple<std::string, size_t, std::vector<size_t>>>>(
+-        row_values, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++    // Get rows in a batch for other matrices.
++    auto row_values = int_matrix->get_row_values(row_indices);
++    auto enumerate_row_values = [rows = std::move(row_values)](const auto &callback) {
++        std::for_each(rows.begin(), rows.end(), callback);
++    };
++    return get_results(enumerate_row_values);
+ }
+ 
+ std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>
+@@ -643,26 +694,15 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+         return result;
+     }
+ 
+-    return filter_and_aggregate<std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>>(
+-        rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
+-}
++    auto call_rows_tuples = [&](const auto &callback) {
++        std::for_each(rows_tuples.begin(), rows_tuples.end(), callback);
++    };
+ 
+-#ifndef NDEBUG
+-// A sanity check to ensure the same matches are for get_top_label_signatures and get_top_labels
+-bool same_results(const std::vector<std::tuple<Label, size_t, sdsl::bit_vector>> &result,
+-                  const std::vector<StringCountPair> &top_labels) {
+-    assert(top_labels.size() == result.size());
+-    std::unordered_map<Label, uint64_t> check(top_labels.begin(), top_labels.end());
+-    for (const auto &[label, count, mask] : result) {
+-        assert(count == sdsl::util::cnt_one_bits(mask));
+-        auto find = check.find(label);
+-        assert(find != check.end());
+-        assert(find->second == sdsl::util::cnt_one_bits(mask));
+-        check.erase(find);
+-    }
+-    return check.empty();
++    auto results = filter_and_aggregate<std::vector<std::tuple<Label, size_t, std::vector<SmallVector<uint64_t>>>>>(
++        call_rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++    assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
++    return results;
+ }
+-#endif // NDEBUG
+ 
+ std::vector<std::tuple<Label, size_t, sdsl::bit_vector>>
+ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+@@ -722,31 +762,41 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+     if (row_indices.size() < min_count)
+         return {};
+ 
+-    auto rows = annotator_->get_matrix().get_rows(row_indices);
+-
+-    auto result = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, sdsl::bit_vector>>>(
+-        rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
+-
+-    assert(same_results(result, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
++    const auto &matrix = annotator_->get_matrix();
++    auto get_results = [&](const auto &enumerate_rows) {
++        auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, sdsl::bit_vector>>>(
++            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++        assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
++        return results;
++    };
+ 
+-    return result;
++    // Per-index get_row is cheap for these RowMajor types; other matrices get rows in a batch.
++    if (const auto *mat = dynamic_cast<const UniqueRowBinmat *>(&matrix)) {
++        auto enumerate_rows = [mat, &row_indices](const auto &callback) {
++            for (row_index row : row_indices) {
++                callback(mat->get_row_ref(row));
++            }
++        };
++        return get_results(enumerate_rows);
++    } else if (const auto *mat = dynamic_cast<const CSRMatrix *>(&matrix)) {
++        auto enumerate_rows = [mat, &row_indices](const auto &callback) {
++            for (row_index row : row_indices) {
++                callback(mat->get_row_values(row));
++            }
++        };
++        return get_results(enumerate_rows);
++    }
++    auto rows = matrix.get_rows(row_indices);
++    auto enumerate_rows = [rows = std::move(rows)](const auto &callback) {
++        std::for_each(rows.begin(), rows.end(), callback);
++    };
++    return get_results(enumerate_rows);
+ }
+ 
+ bool AnnotatedSequenceGraph::label_exists(const Label &label) const {
+     return annotator_->get_label_encoder().label_exists(label);
+ }
+ 
+-void AnnotatedSequenceGraph
+-::call_annotated_nodes(const Label &label,
+-                       std::function<void(node_index)> callback) const {
+-    assert(check_compatibility());
+-
+-    annotator_->call_objects(
+-        label,
+-        [&](row_index index) { callback(anno_to_graph_index(index)); }
+-    );
+-}
+-
+ bool AnnotatedSequenceGraph::check_compatibility() const {
+     // TODO: what if CanonicalDBG is not the highest level? find a better way to do this
+     if (const auto *canonical = dynamic_cast<const CanonicalDBG *>(graph_.get()))
+diff --git a/metagraph/src/graph/annotated_dbg.hpp b/metagraph/src/graph/annotated_dbg.hpp
+index 13e174b822..fb6fe48223 100644
+--- a/metagraph/src/graph/annotated_dbg.hpp
++++ b/metagraph/src/graph/annotated_dbg.hpp
+@@ -38,9 +38,6 @@ class AnnotatedSequenceGraph {
+     virtual void annotate_sequences(
+         const std::vector<std::pair<std::string, std::vector<Label>>> &data);
+ 
+-    virtual void call_annotated_nodes(const Label &label,
+-                                      std::function<void(node_index)> callback) const;
+-
+     virtual bool label_exists(const Label &label) const;
+ 
+     virtual bool check_compatibility() const;
+diff --git a/metagraph/tests/annotation/test_annotated_dbg.cpp b/metagraph/tests/annotation/test_annotated_dbg.cpp
+index 1a84b6cf66..c3c9649594 100644
+--- a/metagraph/tests/annotation/test_annotated_dbg.cpp
++++ b/metagraph/tests/annotation/test_annotated_dbg.cpp
+@@ -41,11 +41,13 @@ void check_labels(const AnnotatedDBG &anno_graph,
+ 
+     for (const auto &label : labels_present) {
+         std::set<SequenceGraph::node_index> cur_indices;
+-        anno_graph.call_annotated_nodes(
++        assert(anno_graph.check_compatibility());
++        anno_graph.get_annotator().call_objects(
+             label,
+             [&](const auto &index) {
+-                ASSERT_NE(SequenceGraph::npos, index);
+-                cur_indices.insert(index);
++                auto node = anno_graph.anno_to_graph_index(index);
++                ASSERT_NE(SequenceGraph::npos, node);
++                cur_indices.insert(node);
+             }
+         );
+         std::vector<SequenceGraph::node_index> diff;

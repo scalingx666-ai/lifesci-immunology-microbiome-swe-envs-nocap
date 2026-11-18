@@ -1,0 +1,292 @@
+diff --git a/metagraph/src/cli/query.cpp b/metagraph/src/cli/query.cpp
+index f1d75edec6..2a9f0a5e5f 100644
+--- a/metagraph/src/cli/query.cpp
++++ b/metagraph/src/cli/query.cpp
+@@ -945,21 +945,26 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
+                                },
+                                num_threads,
+                                // pull only primary contigs when building canonical query graph
+-                               full_dbg.get_mode() == DeBruijnGraph::CANONICAL);
++                               full_dbg.get_mode() == DeBruijnGraph::CANONICAL,
++                               false);
+ 
+     logger->trace("[Query graph construction] Contig extraction took {} sec", timer.elapsed());
+     timer.reset();
+ 
+     logger->trace("[Query graph construction] Mapping k-mers back to full graph...");
+     // map from nodes in query graph to full graph
++    std::atomic<uint64_t> num_kmers = 0;
++    std::atomic<uint64_t> num_found_kmers = 0;
+     #pragma omp parallel for num_threads(num_threads)
+     for (size_t i = 0; i < contigs.size(); ++i) {
+         contigs[i].second.reserve(contigs[i].first.length() - graph_init->get_k() + 1);
+         full_dbg.map_to_nodes(contigs[i].first,
+-                              [&](node_index node) { contigs[i].second.push_back(node); });
++                              [&](node_index node) { contigs[i].second.push_back(node);
++                                                     num_found_kmers += node != DeBruijnGraph::npos; });
++        num_kmers += contigs[i].second.size();
+     }
+-    logger->trace("[Query graph construction] Contigs mapped to the full graph in {} sec",
+-                  timer.elapsed());
++    logger->trace("[Query graph construction] Contigs mapped to the full graph (found {} / {} k-mers) in {} sec",
++                  num_found_kmers, num_kmers, timer.elapsed());
+     timer.reset();
+ 
+     size_t original_size = contigs.size();
+@@ -1071,8 +1076,8 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
+                                        std::move(from_full_to_small),
+                                        num_threads);
+ 
+-    logger->trace("[Query graph construction] Query annotation with {} labels"
+-                  " and {} set bits constructed in {} sec",
++    logger->trace("[Query graph construction] Query annotation with {} rows, {} labels,"
++                  " and {} set bits constructed in {} sec", annotation->num_objects(),
+                   annotation->num_labels(), annotation->num_relations(), timer.elapsed());
+     timer.reset();
+ 
+@@ -1286,7 +1291,6 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
+ 
+         thread_pool.enqueue([&](std::vector<QuerySequence> seq_batch, uint64_t num_bytes_read) {
+             Timer batch_timer;
+-
+             std::vector<Alignment> alignments_batch;
+             // Align sequences ahead of time on full graph if we don't have batch_align
+             if (aligner_config_ && !config_.batch_align) {
+@@ -1340,6 +1344,7 @@ QueryExecutor::batched_query_fasta(seq_io::FastaParser &fasta_parser,
+ 
+         num_bp += num_bytes_read;
+     }
++    thread_pool.join();
+ 
+     return num_bp;
+ }
+diff --git a/metagraph/src/graph/representation/base/sequence_graph.cpp b/metagraph/src/graph/representation/base/sequence_graph.cpp
+index 043e135790..3214d5a78b 100644
+--- a/metagraph/src/graph/representation/base/sequence_graph.cpp
++++ b/metagraph/src/graph/representation/base/sequence_graph.cpp
+@@ -341,7 +341,8 @@ void call_sequences(const DeBruijnGraph &graph,
+                     size_t num_threads,
+                     bool call_unitigs,
+                     uint64_t min_tip_size,
+-                    bool kmers_in_single_form) {
++                    bool kmers_in_single_form,
++                    bool verbose = common::get_verbose()) {
+     // TODO: port over the implementation from BOSS
+     std::ignore = num_threads;
+ 
+@@ -351,7 +352,7 @@ void call_sequences(const DeBruijnGraph &graph,
+ 
+     ProgressBar progress_bar(visited.size() - sdsl::util::cnt_one_bits(visited),
+                              "Traverse graph",
+-                             std::cerr, !common::get_verbose());
++                             std::cerr, !verbose);
+ 
+     auto call_paths_from = [&](node_index node) {
+         call_sequences_from(graph,
+@@ -417,8 +418,9 @@ void call_sequences(const DeBruijnGraph &graph,
+ 
+ void DeBruijnGraph::call_sequences(const CallPath &callback,
+                                    size_t num_threads,
+-                                   bool kmers_in_single_form) const {
+-    ::mtg::graph::call_sequences(*this, callback, num_threads, false, 0, kmers_in_single_form);
++                                   bool kmers_in_single_form,
++                                   bool verbose) const {
++    ::mtg::graph::call_sequences(*this, callback, num_threads, false, 0, kmers_in_single_form, verbose);
+ }
+ 
+ void DeBruijnGraph::call_unitigs(const CallPath &callback,
+diff --git a/metagraph/src/graph/representation/base/sequence_graph.hpp b/metagraph/src/graph/representation/base/sequence_graph.hpp
+index 5561bf33db..c0bf4bfb57 100644
+--- a/metagraph/src/graph/representation/base/sequence_graph.hpp
++++ b/metagraph/src/graph/representation/base/sequence_graph.hpp
+@@ -191,7 +191,8 @@ class DeBruijnGraph : public SequenceGraph {
+      */
+     virtual void call_sequences(const CallPath &callback,
+                                 size_t num_threads = 1,
+-                                bool kmers_in_single_form = false) const;
++                                bool kmers_in_single_form = false,
++                                bool verbose = common::get_verbose()) const;
+     /**
+      * Call all unitigs except short tips, where tips are
+      * the unitigs with InDegree(first) + OutDegree(last) < 2.
+diff --git a/metagraph/src/graph/representation/canonical_dbg.cpp b/metagraph/src/graph/representation/canonical_dbg.cpp
+index c4aeeec359..4bade1c820 100644
+--- a/metagraph/src/graph/representation/canonical_dbg.cpp
++++ b/metagraph/src/graph/representation/canonical_dbg.cpp
+@@ -424,12 +424,13 @@ size_t CanonicalDBG::indegree(node_index node) const {
+ 
+ void CanonicalDBG::call_sequences(const CallPath &callback,
+                                   size_t num_threads,
+-                                  bool kmers_in_single_form) const {
++                                  bool kmers_in_single_form,
++                                  bool verbose) const {
+     if (kmers_in_single_form) {
+-        graph_->call_sequences(callback, num_threads, true);
++        graph_->call_sequences(callback, num_threads, true, verbose);
+     } else {
+         // TODO: port over implementation from DBGSuccinct to DeBruijnGraph
+-        DeBruijnGraph::call_sequences(callback, num_threads, false);
++        DeBruijnGraph::call_sequences(callback, num_threads, false, verbose);
+     }
+ }
+ 
+diff --git a/metagraph/src/graph/representation/canonical_dbg.hpp b/metagraph/src/graph/representation/canonical_dbg.hpp
+index 4762b71d7e..c0841d6eec 100644
+--- a/metagraph/src/graph/representation/canonical_dbg.hpp
++++ b/metagraph/src/graph/representation/canonical_dbg.hpp
+@@ -84,7 +84,8 @@ class CanonicalDBG : public DBGWrapper<DeBruijnGraph> {
+ 
+     virtual void call_sequences(const CallPath &callback,
+                                 size_t num_threads = 1,
+-                                bool kmers_in_single_form = false) const override final;
++                                bool kmers_in_single_form = false,
++                                bool verbose = common::get_verbose()) const override final;
+ 
+     virtual void call_unitigs(const CallPath &callback,
+                               size_t num_threads = 1,
+diff --git a/metagraph/src/graph/representation/masked_graph.cpp b/metagraph/src/graph/representation/masked_graph.cpp
+index 2af9d9f108..cc3dd0787f 100644
+--- a/metagraph/src/graph/representation/masked_graph.cpp
++++ b/metagraph/src/graph/representation/masked_graph.cpp
+@@ -106,7 +106,8 @@ bit_vector_stat get_boss_mask(const DBGSuccinct &dbg_succ,
+ 
+ void MaskedDeBruijnGraph::call_sequences(const CallPath &callback,
+                                          size_t num_threads,
+-                                         bool kmers_in_single_form) const {
++                                         bool kmers_in_single_form,
++                                         bool verbose) const {
+     if (auto *dbg_succ = dynamic_cast<const DBGSuccinct*>(graph_.get())) {
+         bit_vector_stat mask = get_boss_mask(*dbg_succ, *kmers_in_graph_,
+                                              only_valid_nodes_in_mask_);
+@@ -117,10 +118,10 @@ void MaskedDeBruijnGraph::call_sequences(const CallPath &callback,
+             }
+             callback(sequence, path);
+ 
+-        }, num_threads, kmers_in_single_form, &mask);
++        }, num_threads, kmers_in_single_form, verbose, &mask);
+ 
+     } else {
+-        DeBruijnGraph::call_sequences(callback, num_threads, kmers_in_single_form);
++        DeBruijnGraph::call_sequences(callback, num_threads, kmers_in_single_form, verbose);
+     }
+ }
+ 
+diff --git a/metagraph/src/graph/representation/masked_graph.hpp b/metagraph/src/graph/representation/masked_graph.hpp
+index 2d2fdd2e62..192c88017c 100644
+--- a/metagraph/src/graph/representation/masked_graph.hpp
++++ b/metagraph/src/graph/representation/masked_graph.hpp
+@@ -75,7 +75,8 @@ class MaskedDeBruijnGraph : public DBGWrapper<DeBruijnGraph> {
+ 
+     virtual void call_sequences(const CallPath &callback,
+                                 size_t num_threads = 1,
+-                                bool kmers_in_single_form = false) const override;
++                                bool kmers_in_single_form = false,
++                                bool verbose = common::get_verbose()) const override;
+ 
+     virtual void call_unitigs(const CallPath &callback,
+                               size_t num_threads = 1,
+diff --git a/metagraph/src/graph/representation/succinct/boss.cpp b/metagraph/src/graph/representation/succinct/boss.cpp
+index f55e7b6a52..41f64b19ae 100644
+--- a/metagraph/src/graph/representation/succinct/boss.cpp
++++ b/metagraph/src/graph/representation/succinct/boss.cpp
+@@ -2081,6 +2081,7 @@ void BOSS::call_paths(Call<std::vector<edge_index> &&, std::vector<TAlphabet> &&
+                       size_t num_threads,
+                       bool split_to_unitigs,
+                       bool kmers_in_single_form,
++                      bool verbose,
+                       const bitmap *subgraph_mask,
+                       bool trim_sentinels) const {
+     assert(!subgraph_mask || subgraph_mask->size() == W_->size());
+@@ -2106,7 +2107,7 @@ void BOSS::call_paths(Call<std::vector<edge_index> &&, std::vector<TAlphabet> &&
+ 
+     ProgressBar progress_bar(visited.size() - sdsl::util::cnt_one_bits(visited),
+                              "Traverse BOSS",
+-                             std::cerr, !common::get_verbose());
++                             std::cerr, !verbose);
+ 
+     ThreadPool thread_pool(num_threads ? num_threads : 1, TASK_POOL_SIZE);
+     bool async = true;
+@@ -2693,6 +2694,7 @@ call_path(const BOSS &boss,
+ void BOSS::call_sequences(Call<std::string&&, std::vector<edge_index>&&> callback,
+                           size_t num_threads,
+                           bool kmers_in_single_form,
++                          bool verbose,
+                           const bitmap *subgraph_mask) const {
+     call_paths([&](std::vector<edge_index>&& edges, std::vector<TAlphabet>&& path) {
+         assert(path.size() >= k_ + 1);
+@@ -2705,7 +2707,7 @@ void BOSS::call_sequences(Call<std::string&&, std::vector<edge_index>&&> callbac
+ 
+         callback(std::move(sequence), std::move(edges));
+ 
+-    }, num_threads, false, kmers_in_single_form, subgraph_mask, true);
++    }, num_threads, false, kmers_in_single_form, verbose, subgraph_mask, true);
+ }
+ 
+ // Reach all k-mers that merge into anchor |edge| by following their diff paths.
+@@ -3046,7 +3048,7 @@ void BOSS::call_unitigs(Call<std::string&&, std::vector<edge_index>&&> callback,
+         // this is not a tip
+         callback(std::move(sequence), std::move(edges));
+ 
+-    }, num_threads, true, kmers_in_single_form, subgraph_mask, true);
++    }, num_threads, true, kmers_in_single_form, common::get_verbose(), subgraph_mask, true);
+ }
+ 
+ /**
+diff --git a/metagraph/src/graph/representation/succinct/boss.hpp b/metagraph/src/graph/representation/succinct/boss.hpp
+index dce2d6c568..a6e51fbe71 100644
+--- a/metagraph/src/graph/representation/succinct/boss.hpp
++++ b/metagraph/src/graph/representation/succinct/boss.hpp
+@@ -136,6 +136,7 @@ class BOSS {
+                     size_t num_threads = 1,
+                     bool unitigs = false,
+                     bool kmers_in_single_form = false,
++                    bool verbose = common::get_verbose(),
+                     const bitmap *subgraph_mask = NULL,
+                     bool trim_sentinels = false) const;
+ 
+@@ -145,6 +146,7 @@ class BOSS {
+     void call_sequences(Call<std::string&&, std::vector<edge_index>&&> callback,
+                         size_t num_threads = 1,
+                         bool kmers_in_single_form = false,
++                        bool verbose = common::get_verbose(),
+                         const bitmap *subgraph_mask = NULL) const;
+ 
+     /**
+diff --git a/metagraph/src/graph/representation/succinct/dbg_succinct.cpp b/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
+index 20c6d17fc8..4b9f480eae 100644
+--- a/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
++++ b/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
+@@ -499,7 +499,8 @@ void DBGSuccinct::map_to_nodes(std::string_view sequence,
+ 
+ void DBGSuccinct::call_sequences(const CallPath &callback,
+                                  size_t num_threads,
+-                                 bool kmers_in_single_form) const {
++                                 bool kmers_in_single_form,
++                                 bool verbose) const {
+     assert(boss_graph_.get());
+     boss_graph_->call_sequences(
+         [&](std::string&& seq, auto&& path) {
+@@ -509,7 +510,8 @@ void DBGSuccinct::call_sequences(const CallPath &callback,
+             callback(std::move(seq), std::move(path));
+         },
+         num_threads,
+-        kmers_in_single_form
++        kmers_in_single_form,
++        verbose
+     );
+ }
+ 
+diff --git a/metagraph/src/graph/representation/succinct/dbg_succinct.hpp b/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
+index 940c26313c..2f243189f4 100644
+--- a/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
++++ b/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
+@@ -68,7 +68,8 @@ class DBGSuccinct : public DeBruijnGraph {
+ 
+     virtual void call_sequences(const CallPath &callback,
+                                 size_t num_threads = 1,
+-                                bool kmers_in_single_form = false) const override final;
++                                bool kmers_in_single_form = false,
++                                bool verbose = common::get_verbose()) const override final;
+ 
+     virtual void call_unitigs(const CallPath &callback,
+                               size_t num_threads = 1,

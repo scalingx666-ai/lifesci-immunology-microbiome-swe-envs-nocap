@@ -1,0 +1,728 @@
+diff --git a/empress/__init__.py b/empress/__init__.py
+index 568808583..386f56021 100644
+--- a/empress/__init__.py
++++ b/empress/__init__.py
+@@ -6,6 +6,6 @@
+ # The full license is in the file LICENSE, distributed with this software.
+ # ----------------------------------------------------------------------------
+ 
+-from empress.tree import Tree
++from empress.core import Empress
+ 
+-__all__ = ['Tree']
++__all__ = ['Empress']
+diff --git a/empress/core.py b/empress/core.py
+index 5a31a4211..994e28666 100644
+--- a/empress/core.py
++++ b/empress/core.py
+@@ -6,10 +6,9 @@
+ # The full license is in the file LICENSE, distributed with this software.
+ # ----------------------------------------------------------------------------
+ 
+-from empress.tree import Tree
++from empress.tree import validate_tree
+ from empress.tools import (
+-    fill_missing_node_names, match_inputs, shifting,
+-    filter_feature_metadata_to_tree
++    match_inputs, shifting, filter_feature_metadata_to_tree
+ )
+ from empress.compression_utils import (
+     remove_empty_samples_and_features, compress_table,
+@@ -22,7 +21,6 @@
+ 
+ from shutil import copytree
+ from emperor import Emperor
+-from bp import to_skbio_treenode
+ from jinja2 import Environment, FileSystemLoader
+ 
+ SUPPORT_FILES = pkg_resources.resource_filename('empress', 'support_files')
+@@ -186,11 +184,7 @@ def _validate_and_match_data(self, ignore_missing_samples,
+                     self.tip_md, self.int_md, self.tree
+                 )
+ 
+-        # extract balance parenthesis
+-        self._bp_tree = list(self.tree.B)
+-
+-        self.tree = Tree.from_tree(to_skbio_treenode(self.tree))
+-        fill_missing_node_names(self.tree)
++        validate_tree(self.tree)
+ 
+     def copy_support_files(self, target=None):
+         """Copies the support files to a target directory
+@@ -279,26 +273,30 @@ def _to_dict(self):
+         # bptree indices start at one, hence we pad the arrays
+         names = [-1]
+         lengths = [-1]
+-        for i, node in enumerate(self.tree.postorder(include_self=True), 1):
+-            names.append(node.name)
+-            lengths.append(node.length)
+-            if node.name in fid2idxs_t:
+-                fid2idxs[i] = fid2idxs_t[node.name]
++        for i in range(1, len(self.tree) + 1):
++            node = self.tree.postorderselect(i)
++            name = self.tree.name(node)
++
++            names.append(name)
++            lengths.append(self.tree.length(node))
++
++            if name in fid2idxs_t:
++                fid2idxs[i] = fid2idxs_t[name]
+                 f_ids[fid2idxs[i]] = i
+ 
+-            if node.name in compressed_tm_tmp:
+-                compressed_tm[i] = compressed_tm_tmp[node.name]
++            if name in compressed_tm_tmp:
++                compressed_tm[i] = compressed_tm_tmp[name]
+ 
+             # Note: for internal metadata, node names may not be unique. Thus,
+             # we duplicate the internal node metadata for each node in the
+             # metadata with the same name.
+-            if node.name in compressed_im_tmp:
+-                compressed_im[i] = compressed_im_tmp[node.name]
++            if name in compressed_im_tmp:
++                compressed_im[i] = compressed_im_tmp[name]
+ 
+         data_to_render = {
+             'base_url': self.base_url,
+             # tree info
+-            'tree': shifting(self._bp_tree),
++            'tree': shifting(self.tree.B),
+             'lengths': lengths,
+             'names': names,
+             # feature table
+diff --git a/empress/support_files/js/drawer.js b/empress/support_files/js/drawer.js
+index d6ac9cc3a..47fb97b45 100644
+--- a/empress/support_files/js/drawer.js
++++ b/empress/support_files/js/drawer.js
+@@ -319,8 +319,7 @@ define(["glMatrix", "Camera"], function (gl, Camera) {
+     /**
+      * Display the tree nodes.
+      * Note: Currently Empress will only display the nodes that had an assigned
+-     * name in the newick string. (I.E. Empress will not show any node that
+-     * starts with EmpressNode)
++     * name in the newick string.
+      *
+      * Note: this will only take effect after draw() is called.
+      *
+diff --git a/empress/support_files/js/empress.js b/empress/support_files/js/empress.js
+index 39e119bd7..b6452c70a 100644
+--- a/empress/support_files/js/empress.js
++++ b/empress/support_files/js/empress.js
+@@ -356,7 +356,7 @@ define([
+         this._drawer.initialize();
+         this._events.setMouseEvents();
+         var nodeNames = this._tree.getAllNames();
+-        nodeNames = nodeNames.filter((n) => !n.startsWith("EmpressNode"));
++        nodeNames = nodeNames.filter((n) => n !== null);
+         nodeNames.sort();
+         this._events.autocomplete(nodeNames);
+ 
+@@ -694,7 +694,7 @@ define([
+             if (!this.getNodeInfo(node, "visible")) {
+                 continue;
+             }
+-            if (!this.getNodeInfo(node, "name").startsWith("EmpressNode")) {
++            if (this.getNodeInfo(node, "name") !== null) {
+                 coords.push(
+                     this.getX(node),
+                     this.getY(node),
+@@ -1875,8 +1875,7 @@ define([
+     /**
+      * Display the tree nodes.
+      * Note: Currently Empress will only display the nodes that had an assigned
+-     * name in the newick string. (I.E. Empress will not show any node that
+-     * starts with EmpressNode)
++     * name in the newick string.
+      *
+      * @param{Boolean} showTreeNodes If true then empress will display the tree
+      *                               nodes.
+diff --git a/empress/tools.py b/empress/tools.py
+index 2b4dbde9c..35ac15c32 100644
+--- a/empress/tools.py
++++ b/empress/tools.py
+@@ -23,28 +23,6 @@ class DataMatchingWarning(Warning):
+     pass
+ 
+ 
+-def fill_missing_node_names(tree):
+-    """ Names nodes in the tree without a name.
+-
+-     Parameters
+-     ----------
+-     tree : skbio.TreeNode or empress.Tree
+-        Input tree with potentially unnamed nodes (i.e. nodes' .name attributes
+-        can be None).
+-
+-    Returns
+-    -------
+-    skbio.TreeNode or empress.Tree
+-        Tree with all nodes assigned a name.
+-    """
+-    current_unlabeled_node = 0
+-    for n in tree.postorder(include_self=True):
+-        if n.name is None:
+-            new_name = 'EmpressNode{}'.format(current_unlabeled_node)
+-            n.name = new_name
+-            current_unlabeled_node += 1
+-
+-
+ def read(file_name, file_format='newick'):
+     """ Reads in contents from a file.
+     """
+diff --git a/empress/tree.py b/empress/tree.py
+index d7abf1a1d..9ee147ea3 100644
+--- a/empress/tree.py
++++ b/empress/tree.py
+@@ -7,130 +7,81 @@
+ # ----------------------------------------------------------------------------
+ 
+ import warnings
+-from skbio import TreeNode
+ 
+ 
+ class TreeFormatWarning(Warning):
+     pass
+ 
+ 
+-class Tree(TreeNode):
+-    """
+-    Attributes
++def validate_tree(tree):
++    """Check for the validty of the tree
++
++    Parameters
+     ----------
+-    length
+-    leafcount
+-    height
+-    depth
+-
+-    Notes
+-    -----
+-    `length` refers to the branch length of a node to its parent.
+-    `leafcount` is the number of tips within a subtree. `height` refers
+-    to the longest path from root to the deepst leaf in that subtree.
+-    `depth` is the number of nodes found in the longest path.
++    tree : bp.BPTree
++        The tree to validate
+     """
+ 
+-    def __init__(self, use_lengths=False, **kwargs):
+-        """ Constructs a Dendrogram object for visualization.
+-
+-        Parameters
+-        ----------
+-        use_lengths: bool
+-            Specifies if the branch lengths should be included in the
+-            resulting visualization (default True).
+-
+-        Returns
+-        -------
+-
+-        """
+-        super().__init__(**kwargs)
+-        self.childRem = -1
+-
+-    @classmethod
+-    def from_tree(cls, tree, use_lengths=True):
+-        """ Creates an Tree object from a skbio tree.
+-
+-        Parameters
+-        ----------
+-        tree : skbio.TreeNode
+-            Input skbio tree
+-        use_lengths: Boolean
+-            Specify if the branch length should be incorporated into
+-            the geometry calculations for visualization.
+-        Returns
+-        -------
+-        Tree
+-
+-        """
+-        if tree.count() <= 1:
+-            raise ValueError("Tree must contain at least 2 nodes.")
+-
+-        # While traversing the tree, record tip / internal node names
+-        # (Nodes without names are ignored, since we'll assign those later
+-        # using tools.fill_missing_node_names())
+-        tip_names = []
+-        internal_node_names = []
+-        max_branch_length = 0
+-        for n in tree.postorder(include_self=False):
+-            if n.name is not None:
+-                # NOTE: This should eventually be taken out when
+-                # fill_missing_node_names() is refactored. However, for now,
+-                # this makes sure that users can't accidentally break things by
+-                # naming nodes identical to our default names for missing nodes
+-                if n.name.startswith("EmpressNode"):
+-                    raise ValueError(
+-                        'Node names can\'t start with "EmpressNode".'
+-                    )
+-                if n.is_tip():
+-                    tip_names.append(n.name)
+-                else:
+-                    internal_node_names.append(n.name)
+-            if n.length is None:
+-                raise ValueError(
+-                    "Non-root branches of the tree must have lengths."
+-                )
+-
+-            if n.length < 0:
+-                raise ValueError(
+-                    "Non-root branches of the tree must have nonnegative "
+-                    "lengths."
+-                )
+-            max_branch_length = max(n.length, max_branch_length)
+-
+-        # We didn't consider the root node in the above traversal since we
+-        # don't care about its length. However, we do care about its name,
+-        # so we add the root's name to internal_node_names.
+-        internal_node_names.append(tree.name)
+-
+-        if max_branch_length == 0:
+-            raise ValueError(
+-                "At least one non-root branch of the tree must have a "
+-                "positive length."
+-            )
+-
+-        unique_tip_name_set = set(tip_names)
+-        if len(unique_tip_name_set) != len(tip_names):
+-            raise ValueError("Tip names in the tree must be unique.")
+-
+-        unique_internal_node_name_set = set(internal_node_names)
+-        if len(unique_tip_name_set & unique_internal_node_name_set) > 0:
++    # this is currently untested since we can't actually parse a tree of this
++    # nature: https://github.com/wasade/improved-octo-waddle/issues/29
++    if len(tree) <= 1:
++        raise ValueError("Tree must contain at least 2 nodes.")
++
++    # While traversing the tree, record tip / internal node names
++    # (Nodes without names are ignored, since we'll assign those later
++    # using tools.fill_missing_node_names())
++    tip_names = []
++    internal_node_names = []
++    max_branch_length = 0
++
++    # do not include the root in these checks
++    for i in range(1, len(tree)):
++        node = tree.postorderselect(i)
++        name = tree.name(node)
++        length = tree.length(node)
++
++        if name is not None:
++            if isleaf(tree, node):
++                tip_names.append(name)
++            else:
++                internal_node_names.append(name)
++
++        if length < 0:
+             raise ValueError(
+-                "Tip names in the tree cannot overlap with internal node "
+-                "names."
++                "Non-root branches of the tree must have nonnegative "
++                "lengths."
+             )
+-
+-        if len(unique_internal_node_name_set) != len(internal_node_names):
+-            warnings.warn(
+-                "Internal node names in the tree are not unique.",
+-                TreeFormatWarning
+-            )
+-
+-        for n in tree.postorder():
+-            n.__class__ = Tree
+-            n.tip_count = 0
+-
+-        return tree
++        max_branch_length = max(length, max_branch_length)
++
++    # We didn't consider the root node in the above traversal since we
++    # don't care about its length. However, we do care about its name,
++    # so we add the root's name to internal_node_names.
++    internal_node_names.append(tree.name(tree.postorderselect(i + 1)))
++
++    if max_branch_length == 0:
++        raise ValueError(
++            "At least one non-root branch of the tree must have a "
++            "positive length."
++        )
++
++    unique_tip_name_set = set(tip_names)
++    if len(unique_tip_name_set) != len(tip_names):
++        raise ValueError("Tip names in the tree must be unique.")
++
++    unique_internal_node_name_set = set(internal_node_names)
++    if len(unique_tip_name_set & unique_internal_node_name_set) > 0:
++        raise ValueError(
++            "Tip names in the tree cannot overlap with internal node "
++            "names."
++        )
++
++    if len(unique_internal_node_name_set) != len(internal_node_names):
++        warnings.warn(
++            "Internal node names in the tree are not unique.",
++            TreeFormatWarning
++        )
++
++    return
+ 
+ 
+ def bp_tree_tips(bp_tree):
+diff --git a/tests/python/test_core.py b/tests/python/test_core.py
+index d1bb4db6d..0f01ada7b 100644
+--- a/tests/python/test_core.py
++++ b/tests/python/test_core.py
+@@ -139,13 +139,13 @@ def test_init(self):
+                       filter_unobserved_features_from_phylogeny=False)
+ 
+         self.assertEqual(viz.base_url, 'support_files')
+-        self.assertEqual(viz._bp_tree, [1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1,
+-                                        0, 1, 0, 0, 0])
++        self.assertEqual(list(viz.tree.B), [1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1,
++                                            1, 0, 1, 0, 0, 0])
+ 
+-        names = ['a', 'e', 'EmpressNode0', 'b', 'g', 'EmpressNode1', 'd', 'h',
+-                 'EmpressNode2']
+-        for i, node in enumerate(viz.tree.postorder()):
+-            self.assertEqual(node.name, names[i])
++        names = ['a', 'e', None, 'b', 'g', None, 'd', 'h', None]
++        for i in range(1, len(viz.tree) + 1):
++            node = viz.tree.postorderselect(i)
++            self.assertEqual(viz.tree.name(node), names[i - 1])
+ 
+         # table should be unchanged and be a different id instance
+         self.assertEqual(self.table, viz.table)
+@@ -164,13 +164,13 @@ def test_init_with_ordination(self):
+                       filter_unobserved_features_from_phylogeny=False)
+ 
+         self.assertEqual(viz.base_url, 'support_files')
+-        self.assertEqual(viz._bp_tree, [1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1,
+-                                        0, 1, 0, 0, 0])
++        self.assertEqual(list(viz.tree.B), [1, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1,
++                                            1, 0, 1, 0, 0, 0])
+ 
+-        names = ['a', 'e', 'EmpressNode0', 'b', 'g', 'EmpressNode1', 'd', 'h',
+-                 'EmpressNode2']
+-        for i, node in enumerate(viz.tree.postorder()):
+-            self.assertEqual(node.name, names[i])
++        names = ['a', 'e', None, 'b', 'g', None, 'd', 'h', None]
++        for i in range(1, len(viz.tree) + 1):
++            node = viz.tree.postorderselect(i)
++            self.assertEqual(viz.tree.name(node), names[i - 1])
+ 
+         # table should be unchanged and be a different id instance
+         self.assertEqual(self.table, viz.table)
+@@ -337,12 +337,13 @@ def test_filter_unobserved_features_from_phylogeny(self):
+         viz = Empress(self.tree, self.filtered_table,
+                       self.filtered_sample_metadata,
+                       filter_unobserved_features_from_phylogeny=True)
+-        self.assertEqual(viz._bp_tree, [1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1,
+-                                        0, 0, 0])
++        self.assertEqual(list(viz.tree.B), [1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1,
++                                            0, 0, 0])
+ 
+-        names = ['a', 'EmpressNode0', 'b', 'g', 'd', 'h', 'EmpressNode1']
+-        for i, node in enumerate(viz.tree.postorder()):
+-            self.assertEqual(node.name, names[i])
++        names = ['a', None, 'b', 'g', 'd', 'h', None]
++        for i in range(1, len(viz.tree) + 1):
++            node = viz.tree.postorderselect(i)
++            self.assertEqual(viz.tree.name(node), names[i - 1])
+ 
+         # table should be unchanged and be a different id instance
+         self.assertEqual(self.filtered_table, viz.table)
+@@ -364,12 +365,13 @@ def test_fm_filtering_post_shearing(self):
+                       filter_unobserved_features_from_phylogeny=True)
+         # Same as with the shearing test above, check that the tree was handled
+         # as expected
+-        self.assertEqual(viz._bp_tree, [1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1,
+-                                        0, 0, 0])
++        self.assertEqual(list(viz.tree.B), [1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1,
++                                            0, 0, 0])
+ 
+-        names = ['a', 'EmpressNode0', 'b', 'g', 'd', 'h', 'EmpressNode1']
+-        for i, node in enumerate(viz.tree.postorder()):
+-            self.assertEqual(node.name, names[i])
++        names = ['a', None, 'b', 'g', 'd', 'h', None]
++        for i in range(1, len(viz.tree) + 1):
++            node = viz.tree.postorderselect(i)
++            self.assertEqual(viz.tree.name(node), names[i - 1])
+ 
+         # Now, the point of this test: verify that the feature metadata was
+         # filtered to just stuff in the sheared tree ("e" was removed from the
+@@ -527,15 +529,15 @@ def test_ordination_integration_callbacks(self):
+         -1,
+         "a",
+         "e",
+-        "EmpressNode0",
++        None,
+         "b",
+         "g",
+-        "EmpressNode1",
++        None,
+         "d",
+         "h",
+-        "EmpressNode2"
++        None
+     ],
+-    "lengths": [-1, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 3.0, 2.0, None],
++    "lengths": [-1, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 3.0, 2.0, 1.0],
+     "s_ids": ["Sample1", "Sample2", "Sample3", "Sample4"],
+     "f_ids": [1, 4, 2, 7],
+     "s_ids_to_indices": {
+diff --git a/tests/python/test_tools.py b/tests/python/test_tools.py
+index 7656c5117..6777626ef 100644
+--- a/tests/python/test_tools.py
++++ b/tests/python/test_tools.py
+@@ -11,7 +11,7 @@
+ import biom
+ import numpy as np
+ from skbio import TreeNode, OrdinationResults
+-from empress import Tree, tools
++from empress import tools
+ from empress.taxonomy_utils import split_taxonomy
+ from bp import parse_newick, from_skbio_treenode
+ 
+@@ -96,14 +96,6 @@ def setUp(self):
+                 samples_df,
+                 proportion_explained=proportion_explained)
+ 
+-    def test_fill_missing_node_names(self):
+-        t = Tree.from_tree(self.tree)
+-        tools.fill_missing_node_names(t)
+-        names = ['a', 'e', 'EmpressNode0', 'b', 'g', 'EmpressNode1', 'd', 'h',
+-                 'EmpressNode2']
+-        for i, node in enumerate(t.postorder()):
+-            self.assertEqual(node.name, names[i])
+-
+     def test_match_inputs_nothing_dropped(self):
+         filtered_table, filtered_sample_md, t_md, i_md = tools.match_inputs(
+             self.bp_tree, self.table, self.sample_metadata
+diff --git a/tests/python/test_tree.py b/tests/python/test_tree.py
+index 0b2b2f9e0..d6f401939 100644
+--- a/tests/python/test_tree.py
++++ b/tests/python/test_tree.py
+@@ -7,43 +7,41 @@
+ # ----------------------------------------------------------------------------
+ 
+ import unittest
+-from skbio import TreeNode
+-from empress import Tree
+-from empress.tree import TreeFormatWarning
++from bp import parse_newick
++from empress.tree import TreeFormatWarning, validate_tree
+ 
+ 
+ class TestTree(unittest.TestCase):
+ 
+-    def mock_tree_from_nwk(self):
+-        return TreeNode.read(['(((a:1,e:2)f:1,b:2)g:1,(c:1,d:3)h:2)i:1;'])
+-
+     def setUp(self):
+-        self.tree = self.mock_tree_from_nwk()
+-
+-    def test_from_tree(self):
+-        t = Tree.from_tree(self.tree)
+-        self.assertEqual(t.__class__, Tree)
+-        # Check that trees match by iterating over original and Empress trees
+-        # simultaneously: see https://stackoverflow.com/a/20910242/10730311
+-        for n1, n2 in zip(t.preorder(), self.tree.preorder()):
+-            self.assertEqual(n1.name, n2.name)
+-            self.assertEqual(n1.length, n2.length)
+-
+-    def test_from_tree_singlenode(self):
+-        st = TreeNode.read(['i:1;'])
+-        with self.assertRaisesRegex(
+-            ValueError, "must contain at least 2 nodes"
+-        ):
+-            Tree.from_tree(st)
++        self.nwk = '(((a:1,e:2)f:1,b:2)g:1,(c:1,d:3)h:2)i:1;'
++        self.tree = parse_newick(self.nwk)
++
++    def test_validate_tree(self):
++        validate_tree(self.tree)
++
++        # check the tree is still equivalent
++        obs = self.tree
++        exp = parse_newick(self.nwk)
++
++        self.assertEqual(len(obs), len(exp))
++
++        for i in range(1, len(exp) + 1):
++            node_o = obs.postorderselect(i)
++            node_e = exp.postorderselect(i)
++
++            self.assertEqual(node_o, node_e)
++            self.assertEqual(obs.length(node_o), exp.length(node_e))
++            self.assertEqual(obs.name(node_o), exp.name(node_e))
+ 
+-    def test_from_tree_duplicate_tip_names(self):
+-        t = TreeNode.read(['((i:1,a:3)b:2,i:5)r:2;'])
++    def test_validate_tree_duplicate_tip_names(self):
++        t = parse_newick('((i:1,a:3)b:2,i:5)r:2;')
+         with self.assertRaisesRegex(
+             ValueError, "Tip names in the tree must be unique"
+         ):
+-            Tree.from_tree(t)
++            validate_tree(t)
+ 
+-    def test_from_tree_overlapping_tip_and_internal_node_names(self):
++    def test_validate_tree_overlapping_tip_and_internal_node_names(self):
+         bad_newicks = [
+             # Tip overlaps with non-root internal node
+             '((a:1,b:3)a:2,d:5)e:2;',
+@@ -53,14 +51,14 @@ def test_from_tree_overlapping_tip_and_internal_node_names(self):
+             '((a:1,b:3)a:2,d:5)a:2;'
+         ]
+         for nwk in bad_newicks:
+-            t = TreeNode.read([nwk])
++            t = parse_newick(nwk)
+             with self.assertRaisesRegex(
+                 ValueError,
+                 "Tip names in the tree cannot overlap with internal node names"
+             ):
+-                Tree.from_tree(t)
++                validate_tree(t)
+ 
+-    def test_from_tree_duplicate_internal_node_names(self):
++    def test_validate_tree_duplicate_internal_node_names(self):
+         bad_newicks = [
+             # Two non-root internal nodes have same name
+             '((a:1,b:3)c:2,(d:2,e:3)c:5)r:2;',
+@@ -68,40 +66,12 @@ def test_from_tree_duplicate_internal_node_names(self):
+             '((a:1,b:3)c:2,(d:2,e:3)f:5)c:2;'
+         ]
+         for nwk in bad_newicks:
+-            t = TreeNode.read([nwk])
++            t = parse_newick(nwk)
+             with self.assertWarnsRegex(
+                 TreeFormatWarning,
+                 "Internal node names in the tree are not unique"
+             ):
+-                Tree.from_tree(t)
+-
+-    def test_from_tree_node_starts_with_EmpressNode(self):
+-        t = TreeNode.read(['((a:1,b:3)c:2,EmpressNode1:5)e:2;'])
+-        with self.assertRaisesRegex(
+-            ValueError, 'Node names can\'t start with "EmpressNode"'
+-        ):
+-            Tree.from_tree(t)
+-
+-    def test_nonroot_missing_branchlengths(self):
+-        # Note about the fourth test tree here: the reason this triggers a
+-        # missing-branch-length error before a negative-branch-length error is
+-        # because the tree is checked in postorder. This sort of "precedence"
+-        # can be changed in the future if desired.
+-        bad_newicks = [
+-            '((b)a:1)root:1;', '((b:1)a)root:0;', '(b,c)a;',
+-            '((b)a:-1)root:3;', '((b:0,c)a:0)root:0;'
+-        ]
+-        for nwk in bad_newicks:
+-            st = TreeNode.read([nwk])
+-            with self.assertRaisesRegex(ValueError, "must have lengths"):
+-                Tree.from_tree(st)
+-
+-        # Check that roots *with* missing branch lengths don't trigger an error
+-        # on tree creation
+-        ok_newicks = ['((b:0,c:1)a:0)root;']
+-        for nwk in ok_newicks:
+-            st = TreeNode.read([nwk])
+-            Tree.from_tree(st)
++                validate_tree(t)
+ 
+     def test_nonroot_negative_branchlengths(self):
+         newicks = [
+@@ -109,22 +79,22 @@ def test_nonroot_negative_branchlengths(self):
+             '(b:1,c:-1)a:2;', '((b:-1)a:0)root;'
+         ]
+         for nwk in newicks:
+-            st = TreeNode.read([nwk])
++            st = parse_newick(nwk)
+             with self.assertRaisesRegex(
+                 ValueError,
+                 "must have nonnegative lengths"
+             ):
+-                Tree.from_tree(st)
++                validate_tree(st)
+ 
+-    def test_all_nonroot_branchlengths_0(self):
++    def test_all_nonroot_branchlengths_zero(self):
+         newicks = ['((b:0)a:0)root:0;', '((b:0)a:0)root:1;']
+         for nwk in newicks:
+-            st = TreeNode.read([nwk])
++            st = parse_newick(nwk)
+             with self.assertRaisesRegex(
+                 ValueError,
+                 "must have a positive length"
+             ):
+-                Tree.from_tree(st)
++                validate_tree(st)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test-circular-layout-computation.js b/tests/test-circular-layout-computation.js
+index 60ac6d6aa..e4a96b0cc 100644
+--- a/tests/test-circular-layout-computation.js
++++ b/tests/test-circular-layout-computation.js
+@@ -128,7 +128,7 @@ require(["jquery", "BPTree", "BiomTable", "Empress"], function (
+                 // the BarplotPanel can call Empress.getSampleCategories()
+                 // without crashing.
+                 var sIDs = ["s1", "s2", "s3", "s4", "s5", "s6", "s7"];
+-                var fIDs = ["EmpressNode6", "1", "2", "3"];
++                var fIDs = [null, "1", "2", "3"];
+                 var sID2Idx = {
+                     s1: 0,
+                     s2: 1,
+@@ -139,7 +139,7 @@ require(["jquery", "BPTree", "BiomTable", "Empress"], function (
+                     s7: 6,
+                 };
+                 var fID2Idx = {
+-                    EmpressNode6: 0,
++                    null: 0,
+                     1: 1,
+                     2: 2,
+                     3: 3,
+diff --git a/tests/test-empress.js b/tests/test-empress.js
+index 439f7aede..6f72acbf5 100644
+--- a/tests/test-empress.js
++++ b/tests/test-empress.js
+@@ -56,7 +56,7 @@ require(["jquery", "UtilitiesForTesting", "util", "chroma"], function (
+         });
+ 
+         test("Test getNodeCoords", function () {
+-            // Note: node 6's name is EmpressNode6 which means it will not be
++            // Note: node 6's name is null which means it will not be
+             // included in the getNodeCoords()
+             // prettier-ignore
+             var rectCoords = new Float32Array([
+@@ -989,7 +989,7 @@ require(["jquery", "UtilitiesForTesting", "util", "chroma"], function (
+                 new Set(f1Info.uniqueValueToFeatures["1"]),
+                 new Set([2, 3])
+             );
+-            // Tips 1 and EmpressNode6 have a f1 value of 2
++            // Tips 1 and null have a f1 value of 2
+             deepEqual(
+                 new Set(f1Info.uniqueValueToFeatures["2"]),
+                 new Set([1, 6])
+@@ -1005,7 +1005,7 @@ require(["jquery", "UtilitiesForTesting", "util", "chroma"], function (
+                 new Set(f1Info.uniqueValueToFeatures["1"]),
+                 new Set([4, 5, 2, 3])
+             );
+-            // Tips 1 and EmpressNode6 have a f1 value of 2
++            // Tips 1 and null have a f1 value of 2
+             deepEqual(
+                 new Set(f1Info.uniqueValueToFeatures["2"]),
+                 new Set([1, 6])
+diff --git a/tests/utilities-for-testing.js b/tests/utilities-for-testing.js
+index 41d9aee42..f5ac5172d 100644
+--- a/tests/utilities-for-testing.js
++++ b/tests/utilities-for-testing.js
+@@ -25,7 +25,7 @@ define(["Empress", "BPTree", "BiomTable"], function (
+         var tree = new BPTree(
+             new Uint8Array([1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 0]),
+             // see https://github.com/biocore/empress/issues/311
+-            ["", "1", "2", "3", "internal", "internal", "EmpressNode6", "root"],
++            ["", "1", "2", "3", "internal", "internal", null, "root"],
+             [0, 1, 2, 3, 4, 5, 6, 7],
+             null
+         );

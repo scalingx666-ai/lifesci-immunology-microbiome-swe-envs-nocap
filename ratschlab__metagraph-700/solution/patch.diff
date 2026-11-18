@@ -1,0 +1,152 @@
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index 2d3346c7b8..b4231c0d80 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -1030,7 +1030,7 @@ if (advanced) {
+             fprintf(stderr, "\t   --count-kmers \tcount k-mers and build weighted graph [off]\n");
+             fprintf(stderr, "\t   --count-width \tnumber of bits used to represent k-mer abundance [8]\n");
+             fprintf(stderr, "\t   --index-ranges [INT]\tindex all node ranges in BOSS for suffixes of given length [%zu]\n", kDefaultIndexSuffixLen);
+-            fprintf(stderr, "\t   --num-chars [INT]\tif the number of characters is known beforehand, enter it here [0]\n");
++            fprintf(stderr, "\t   --num-chars [INT]\tnumber of input characters, sets the SSHash minimizer length [0: count them]\n");
+             fprintf(stderr, "\t-k --kmer-length [INT] \tlength of the k-mer to use [3]\n");
+ #if ! _PROTEIN_GRAPH
+             fprintf(stderr, "\t   --mode \t\tk-mer indexing mode: basic / canonical / primary [basic]\n");
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index 32f288a649..ca14e89d20 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -22,7 +22,9 @@
+ #include "common/algorithms.hpp"
+ #include "common/threads/threading.hpp"
+ #include "common/utils/file_utils.hpp"
++#include "common/unix_tools.hpp"
+ #include "kmer/kmer_extractor.hpp"
++#include "seq_io/sequence_io.hpp"
+ 
+ 
+ namespace mtg {
+@@ -175,6 +177,29 @@ generate_succ_pred(const DBGSSHash& graph, uint64_t num_nodes) {
+                            has_duplicates.load());
+ }
+ 
++// Total length of the sequences in a FASTA file, read like SSHash reads it:
++// gzipped if the name ends with .gz, plain otherwise
++static uint64_t count_input_chars(const std::string& input_filename) {
++    using namespace seq_io;
++
++    std::ifstream file(input_filename, std::ios::binary);
++    if (!file)
++        throw std::runtime_error("Cannot read SSHash input " + input_filename);
++
++    boost::iostreams::filtering_istream in;
++    if (std::string_view(input_filename).ends_with(".gz"))
++        in.push(boost::iostreams::gzip_decompressor(), 1 << 20);
++    in.push(file, 1 << 20);
++
++    std::unique_ptr<kseq_t, decltype(&kseq_destroy)> read_stream(
++            kseq_init(compFile::open_read(in)), kseq_destroy);
++    uint64_t num_chars = 0;
++    while (kseq_read(read_stream.get()) >= 0) {
++        num_chars += read_stream->seq.l;
++    }
++    return num_chars;
++}
++
+ DBGSSHash::DBGSSHash(const std::string& input_filename,
+                      size_t k,
+                      Mode mode,
+@@ -190,9 +215,18 @@ DBGSSHash::DBGSSHash(const std::string& input_filename,
+     sshash::build_configuration build_config;
+     build_config.k = k;
+ 
++    // the minimizer length depends on the input size, so count it if not given
++    bool num_chars_counted = !num_chars;
++    if (num_chars_counted) {
++        Timer timer;
++        num_chars = count_input_chars(input_filename);
++        common::logger->trace("Counted {} characters in {} in {} sec",
++                              num_chars, input_filename, timer.elapsed());
++    }
++
+     // use a value of m recommended here:
+     // https://twitter.com/giulio_pibiri/status/1803417277213114501
+-    // otherwise, use the next odd value greater than or equal to floor(k / 2)
++    // for an empty input, use the next odd value greater than or equal to floor(k / 2)
+     build_config.m
+             = std::min({ (num_chars > 0
+                                   ? uint64_t(ceil(log(static_cast<double>(num_chars))
+@@ -207,6 +241,9 @@ DBGSSHash::DBGSSHash(const std::string& input_filename,
+                                  dict_),
+                          uint64_t(k - 2) })
+             | 1;
++    common::logger->info("SSHash minimizer length m = {} for {} input characters ({})",
++                         build_config.m, num_chars,
++                         num_chars_counted ? "counted" : "given");
+ 
+     build_config.verbose = common::get_verbose();
+     build_config.num_threads = get_num_threads();
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.hpp b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+index f635fc6574..4204fc43ca 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.hpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+@@ -33,6 +33,8 @@ class DBGSSHash : public DeBruijnGraph {
+                                 sshash::dictionary<kmer_t<KmerInt256>, sshash::decoded_offsets>>;
+ 
+     explicit DBGSSHash(size_t k, Mode mode = BASIC);
++    // |num_chars| is the number of input characters the minimizer length is chosen
++    // from; 0 counts them in the input.
+     // |ram_limit_gb| (in GB) is SSHash's construction budget, never below its default
+     DBGSSHash(const std::string& input_filename,
+               size_t k,
+diff --git a/metagraph/tests/graph/test_dbg_sshash.cpp b/metagraph/tests/graph/test_dbg_sshash.cpp
+index 979ce8be60..e33a543f6e 100644
+--- a/metagraph/tests/graph/test_dbg_sshash.cpp
++++ b/metagraph/tests/graph/test_dbg_sshash.cpp
+@@ -1,6 +1,8 @@
+ #include <fstream>
++#include <random>
+ #include <stdexcept>
+ #include <string>
++#include <vector>
+ 
+ #include <sys/resource.h>
+ 
+@@ -118,4 +120,38 @@ TEST_F(DBGSSHashInput, AcceptsOneSequencePerLine) {
+     EXPECT_EQ(10u + 2u, graph.num_nodes());
+ }
+ 
++#if ! _PROTEIN_GRAPH
++size_t minimizer_length(const DBGSSHash &graph) {
++    return std::visit([](const auto &dict) -> size_t { return dict.m(); }, graph.data());
++}
++
++// random records of the given lengths
++void write_random_input(const std::vector<size_t> &lengths) {
++    std::mt19937 gen(42);
++    std::uniform_int_distribution<int> base(0, 3);
++    std::string input;
++    for (size_t i = 0; i < lengths.size(); ++i) {
++        input += ">" + std::to_string(i) + "\n";
++        for (size_t j = 0; j < lengths[i]; ++j) {
++            input += "ACGT"[base(gen)];
++        }
++        input += "\n";
++    }
++    write_input(input);
++}
++
++TEST_F(DBGSSHashInput, ChoosesMinimizerLengthFromInputSize) {
++    // m = ceil(log_4(num_chars)) + 1, made odd, which steps from 7 to 9 at 4^6 = 4096
++    write_random_input({ 2000, 2095 });
++    EXPECT_EQ(7u, minimizer_length(DBGSSHash(test_input, 21, DeBruijnGraph::BASIC)));
++
++    write_random_input({ 2000, 2097 });
++    EXPECT_EQ(9u, minimizer_length(DBGSSHash(test_input, 21, DeBruijnGraph::BASIC)));
++
++    // a given number of characters overrides the count: ceil(log_4(1e9)) + 1 = 16, made odd
++    EXPECT_EQ(17u, minimizer_length(DBGSSHash(test_input, 21, DeBruijnGraph::BASIC,
++                                              1'000'000'000)));
++}
++#endif
++
+ } // namespace

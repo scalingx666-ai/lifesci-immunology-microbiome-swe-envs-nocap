@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Finished investigating @shopify/react-i18n- for handling translations
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `c21d75c76f91`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

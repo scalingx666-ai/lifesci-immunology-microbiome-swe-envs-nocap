@@ -1,0 +1,173 @@
+diff --git a/modules/checkm2.nf b/modules/checkm2.nf
+index f2e00ae0..29a35565 100644
+--- a/modules/checkm2.nf
++++ b/modules/checkm2.nf
+@@ -5,7 +5,7 @@ process CHECKM2 {
+     errorStrategy = { task.attempt <= 3 ? 'retry' : 'finish' }
+ 
+     input:
+-    path assemblies_folder
++    path(genomes, stageAs: 'assemblies_folder/*')
+     path ch_checkm2_db
+ 
+     output:
+@@ -13,13 +13,13 @@ process CHECKM2 {
+ 
+     script:
+     """
+-    change_extensions.py -i ${assemblies_folder}
++    change_extensions.py -i assemblies_folder
+     
+     mkdir -p checkm_tmp
+     
+     checkm2 predict \
+     --threads ${task.cpus} \
+-    --input ${assemblies_folder} \
++    --input assemblies_folder \
+     -x fa \
+     --output-directory checkm_output \
+     --database_path ${ch_checkm2_db} \
+@@ -34,7 +34,7 @@ process CHECKM2 {
+     done
+     
+     # add in extensions #
+-    add_extensions_to_checkm.py -i checkm_output -d ${assemblies_folder}
++    add_extensions_to_checkm.py -i checkm_output -d assemblies_folder
+     
+     # to csv #
+     checkm2csv.py -i checkm_output/quality_report.tsv --checkm2 > checkm_quality.csv
+diff --git a/nextflow.config b/nextflow.config
+index 50c00bb9..ed82ee72 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -32,6 +32,8 @@ params {
+ 
+     xlarge = ''
+     xlarge_chunk_size = 25000
++    
++    checkm2_chunk_size = 2000
+ 
+     pangenome_panaroo_limit_threshold = 1000
+     
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 3f962d03..3bfcde0e 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -80,6 +80,10 @@
+             "type": "integer",
+             "default": 25000
+         },
++        "checkm2_chunk_size": {
++            "type": "integer",
++            "default": 2000
++        },
+         "pangenome_panaroo_limit_threshold": {
+             "type": "integer",
+             "default": 1000
+diff --git a/subworkflows/prepare_data.nf b/subworkflows/prepare_data.nf
+index 9e130996..25994ece 100644
+--- a/subworkflows/prepare_data.nf
++++ b/subworkflows/prepare_data.nf
+@@ -12,9 +12,9 @@ include { CALCULATE_ASSEMBLY_STATS } from '../modules/precompute_assembly_stats'
+ 
+ workflow PREPARE_DATA {
+     take:
+-        ena_assemblies              // channel: path
++        ena_assemblies_dir          // channel: path
+         ena_genomes_checkm          // channel: file
+-        ncbi_assemblies             // channel: path
++        ncbi_assemblies_dir         // channel: path
+         genomes_name_start          // val
+         genomes_name_end            // val
+         preassigned_accessions      // channel: file | empty
+@@ -26,30 +26,51 @@ workflow PREPARE_DATA {
+         genomes_ch = channel.empty()
+         genomes_checkm_ch = channel.empty()
+         genomes_busco_ch = file("NO_BUSCO_FILE")
++        
++        // If ncbi folder is present, prepare genome chunks for CheckM2
++        if ( ncbi_assemblies_dir ) {
++            // Create a channel of individual genome files from the ncbi_genomes folder
++            ch_genomes_for_checkm2 = channel.fromPath("${params.ncbi_genomes}/*")
++            // Buffer into chunks of N files
++            ch_genome_checkm2_chunks = ch_genomes_for_checkm2
++                .buffer(size: params.checkm2_chunk_size, remainder: true) 
++        }
+ 
+-        if ( ncbi_assemblies && ena_assemblies ) {
++        if ( ncbi_assemblies_dir && ena_assemblies_dir ) {
+             CHECKM2_NCBI(
+-                ncbi_assemblies,
++                ch_genome_checkm2_chunks,
+                 ch_checkm2_db
+             )
++            checkm2_csv = CHECKM2_NCBI.out.checkm_csv
++                .collectFile(
++                    name: 'checkm2_results_merged.csv',
++                    keepHeader: true,
++                    skip: 1
++            )
+             MERGE_NCBI_ENA(
+-                ena_assemblies,
+-                ncbi_assemblies,
+-                CHECKM2_NCBI.out.checkm_csv,
++                ena_assemblies_dir,
++                ncbi_assemblies_dir,
++                checkm2_csv,
+                 ena_genomes_checkm
+             )
+             // Merged genomes folders and checkm values //
+             genomes_ch = MERGE_NCBI_ENA.out.genomes
+             genomes_checkm_ch = MERGE_NCBI_ENA.out.merged_checkm_csv
+-        } else if ( ncbi_assemblies ) {
++        } else if ( ncbi_assemblies_dir ) {
+             CHECKM2_NCBI(
+-                ncbi_assemblies,
++                ch_genome_checkm2_chunks,
+                 ch_checkm2_db
+             )
+-            genomes_ch = ncbi_assemblies
+-            genomes_checkm_ch = CHECKM2_NCBI.out.checkm_csv
+-        } else if ( ena_assemblies ) {
+-            genomes_ch = ena_assemblies
++            checkm2_csv = CHECKM2_NCBI.out.checkm_csv
++                .collectFile(
++                    name: 'checkm2_results_merged.csv',
++                    keepHeader: true,
++                    skip: 1
++            )
++            genomes_ch = ncbi_assemblies_dir
++            genomes_checkm_ch = checkm2_csv
++        } else if ( ena_assemblies_dir ) {
++            genomes_ch = ena_assemblies_dir
+             genomes_checkm_ch = ena_genomes_checkm
+         }
+ 
+diff --git a/subworkflows/prepare_update.nf b/subworkflows/prepare_update.nf
+index 189b1688..e7d4b7f6 100644
+--- a/subworkflows/prepare_update.nf
++++ b/subworkflows/prepare_update.nf
+@@ -55,11 +55,22 @@ workflow PREPARE_UPDATE {
+         )
+         
+         if ( rerun_checkm2 ) {
++            // Create a channel of individual genome files from the folder
++            ch_genomes = channel.fromPath("${previous_catalogue_location}/additional_data/mgyg_genomes/*")
++            // Buffer into chunks of N files
++            ch_genome_checkm2_chunks = ch_genomes
++                .buffer(size: params.checkm2_chunk_size, remainder: true)
+             CHECKM2_CATALOGUE(
+-                "${previous_catalogue_location}/additional_data/mgyg_genomes/",
++                ch_genome_checkm2_chunks,
+                 ch_checkm2_db
+             )
+             previous_version_quality = CHECKM2_CATALOGUE.out.checkm_csv
++                .collectFile(
++                    name: 'checkm2_results_merged.csv',
++                    keepHeader: true,
++                    skip: 1
++                )
++                .first()
+         }
+         else {
+             previous_version_quality = EXTRACT_METADATA_FROM_TABLE.out.quality_csv

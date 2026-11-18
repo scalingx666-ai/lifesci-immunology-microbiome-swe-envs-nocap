@@ -1,0 +1,773 @@
+diff --git a/metagraph/docs/source/quick_start.rst b/metagraph/docs/source/quick_start.rst
+index 1db5760b0f..d02cd7730e 100644
+--- a/metagraph/docs/source/quick_start.rst
++++ b/metagraph/docs/source/quick_start.rst
+@@ -888,6 +888,26 @@ The row map is built in ``moved.rowmap`` and read from it without loading it who
+ Building it needs temporary files of about twice its size, in the output directory or in the directory passed with ``--disk-swap``.
+ Pass ``--disk-swap ""`` to build and keep the row map in memory instead, which avoids the temporary files.
+ 
++If the new graph is not built yet, convert the old graph with ``transform --graph sshash``.
++It writes the SSHash graph and the row map, so the remap skips matching the rows::
++
++    metagraph transform -v -p 36 --graph sshash -o moved graph.dbg
++    metagraph transform_anno -v -p 36 --remap-graph graph.dbg -i moved.sshashdbg \
++                             -o moved annotation.row_diff_brwt.annodbg
++
++The first command writes ``moved.sshashdbg`` and ``moved.rowmap``.
++It keeps the mode of the old graph, which must be ``basic`` or ``primary``.
++The contigs go to a temporary file in the output directory or in the directory passed with ``--disk-swap``.
++
++To build the SSHash graph in a separate step, for example on another machine, write the row map together with the contigs::
++
++    metagraph transform -v -p 36 --to-fasta --row-map -o moved graph.dbg
++    metagraph build -v -p 36 --graph sshash -k 31 -o moved moved.fasta.gz
++
++Pass the ``-k`` of the old graph.
++This row map is valid only for an SSHash graph built from exactly ``moved.fasta.gz``.
++For a graph in ``primary`` mode, build the SSHash graph with ``--mode primary``.
++
+ .. _query_index:
+ 
+ Query index
+diff --git a/metagraph/integration_tests/test_remap_anno.py b/metagraph/integration_tests/test_remap_anno.py
+index 3831b49564..0bd1089526 100644
+--- a/metagraph/integration_tests/test_remap_anno.py
++++ b/metagraph/integration_tests/test_remap_anno.py
+@@ -223,6 +223,90 @@ def test_remap_primary_to_sshash(self, anno_repr):
+         self.assertNotEqual(res.returncode, 0)
+         self.assertIn('other orientation', res.stderr.decode() + res.stdout.decode())
+ 
++    @parameterized.expand([
++        ('basic', 'brwt', False),
++        ('basic', 'row_diff_brwt', False),
++        ('primary', 'row_diff_brwt', False),
++        ('basic', 'row_diff_brwt', True),
++        ('primary', 'row_diff_brwt', True),
++    ])
++    def test_row_map_from_extraction(self, mode, anno_repr, convert):
++        """`transform --to-fasta --row-map` and `transform --graph sshash` write
++        the row map that the remap computes."""
++        source = self.source if mode == 'basic' else self.primary_source
++        prefix = f'{self.tempdir.name}/extract_{mode}_{anno_repr}_{int(convert)}'
++        target = prefix + '.sshashdbg'
++        if convert:
++            self._run_command(
++                f'{METAGRAPH} transform -p {NUM_THREADS} --graph sshash'
++                f' -o {prefix} {source}', 'Transform command', shell=True)
++            self.assertEqual(glob.glob(f'{self.tempdir.name}/**/temp_convert_*', recursive=True), [])
++        else:
++            self._run_command(
++                f'{METAGRAPH} transform -p {NUM_THREADS} --to-fasta --row-map'
++                f' -o {prefix} {source}', 'Transform command', shell=True)
++            self._run_command(
++                f'{METAGRAPH} build -p {NUM_THREADS} --mode {mode} --graph sshash'
++                f' -k {K} -o {target} {prefix}.fasta.gz', 'Build command', shell=True)
++        self.assertEqual(glob.glob(f'{self.tempdir.name}/**/bucket.*', recursive=True), [])
++        # In primary mode, the SSHash graph also has a node for every reverse complement.
++        self.assertEqual(self._get_stats(target)['nodes (k)'],
++                         self._get_stats(self.target if mode == 'basic'
++                                         else self.primary_target)['nodes (k)'])
++
++        self._annotate_graph(INPUT, source, prefix + '_anno', anno_repr,
++                             num_threads=NUM_THREADS)
++        anno = prefix + '_anno' + anno_file_extension[anno_repr]
++
++        # Match the rows by k-mer, as without a row map.
++        matched = prefix + '_matched'
++        res = self._remap(anno, matched, target, source=source)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        with open(matched + '.rowmap', 'rb') as f:
++            expected_row_map = f.read()
++        with open(prefix + '.rowmap', 'rb') as f:
++            self.assertEqual(expected_row_map, f.read())
++
++        # The remap accepts the row map written with the contigs.
++        res = self._remap(anno, prefix, target, source=source)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        with open(prefix + '.rowmap', 'rb') as f:
++            self.assertEqual(expected_row_map, f.read())
++        with open(matched + anno_file_extension[anno_repr], 'rb') as f:
++            expected = f.read()
++        with open(prefix + anno_file_extension[anno_repr], 'rb') as f:
++            self.assertEqual(expected, f.read())
++        for query_mode in ['labels', 'matches']:
++            self.assertEqual(self._query(source, anno, query_mode),
++                             self._query(target, prefix + anno_file_extension[anno_repr],
++                                         query_mode))
++
++    @parameterized.expand(['--to-fasta --row-map', '--graph sshash'])
++    def test_row_map_rejects_canonical(self, flags):
++        prefix = self.tempdir.name + '/canonical'
++        self._build_graph(INPUT, prefix + '.dbg', K, 'succinct', 'canonical')
++        res = subprocess.run(
++            f'{METAGRAPH} transform {flags} -o {prefix}_out {prefix}.dbg',
++            shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('basic or primary', res.stderr.decode() + res.stdout.decode())
++
++    @parameterized.expand([
++        ('--graph sshash --to-fasta', '--to-fasta --row-map'),
++        ('--graph sshash --initialize-bloom', 'cannot be combined'),
++        ('--graph sshash --clear-dummy', 'cannot be combined'),
++        ('--graph sshash --to-adj-list', 'cannot be combined'),
++        ('--graph sshash --mode primary', 'keeps the mode'),
++        ('--graph hash', 'only with'),
++    ])
++    def test_convert_rejects_options(self, flags, message):
++        out = self.tempdir.name + '/rejected'
++        res = subprocess.run(f'{METAGRAPH} transform {flags} -o {out} {self.source}',
++                             shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn(message, res.stderr.decode() + res.stdout.decode())
++        self.assertEqual(glob.glob(out + '*'), [])
++
+     def test_remap_rejects_mixed_modes(self):
+         prefix = f'{self.tempdir.name}/mixed'
+         self._annotate_graph(INPUT, self.source, prefix, 'brwt', num_threads=NUM_THREADS)
+diff --git a/metagraph/src/annotation/annotation_remap.cpp b/metagraph/src/annotation/annotation_remap.cpp
+index 311d9ef659..c4903e5f2d 100644
+--- a/metagraph/src/annotation/annotation_remap.cpp
++++ b/metagraph/src/annotation/annotation_remap.cpp
+@@ -1,6 +1,7 @@
+ #include "annotation_remap.hpp"
+ 
+ #include <atomic>
++#include <cassert>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -135,112 +136,126 @@ sdsl::int_vector<> map_rows_to_graph(const DeBruijnGraph &source,
+     return row_map;
+ }
+ 
+-void map_rows_to_graph(const DeBruijnGraph &source,
+-                       const DeBruijnGraph &target,
+-                       const std::string &filename,
+-                       const std::filesystem::path &tmp_dir,
+-                       size_t num_threads) {
+-    const uint64_t num_rows = source.max_index();
+-    const uint64_t width = width_for(target.max_index());
+-
+-    // The walk visits source rows in no particular order. Each pair is appended to
+-    // the file of its bucket, a range of 2^bucket_bits source rows, so that every
+-    // bucket can then be placed in memory on its own. A bucket spans a whole
+-    // number of 64-bit words of the row map.
+-    constexpr uint64_t kMaxBuckets = 256;
+-    constexpr size_t kBufferSize = 1 << 16;
+-    uint64_t bucket_bits = 6;
+-    while (((num_rows + (1ull << bucket_bits) - 1) >> bucket_bits) > kMaxBuckets) {
+-        ++bucket_bits;
++// Each pair is appended to the file of its bucket, a range of 2^bucket_bits_ source
++// rows, so that every bucket can then be placed in memory on its own. A bucket
++// spans a whole number of 64-bit words of the row map.
++static constexpr uint64_t kMaxBuckets = 256;
++static constexpr size_t kBufferSize = 1 << 16;
++
++RowMapWriter::RowMapWriter(uint64_t num_rows, uint64_t max_target_node,
++                           const std::filesystem::path &tmp_dir)
++      : num_rows_(num_rows), width_(width_for(max_target_node)), bucket_bits_(6) {
++    while (((num_rows_ + (1ull << bucket_bits_) - 1) >> bucket_bits_) > kMaxBuckets) {
++        ++bucket_bits_;
+     }
+-    const uint64_t num_buckets = (num_rows + (1ull << bucket_bits) - 1) >> bucket_bits;
+-    const size_t record_size = (bucket_bits + width + 7) / 8;
+-
+-    struct Bucket {
+-        std::mutex mutex;
+-        std::string filename;
+-        std::ofstream out;
+-        std::vector<char> buffer;
+-    };
+-    std::vector<Bucket> buckets(num_buckets);
+-
+-    auto remove_buckets = [&]() {
+-        for (auto &bucket : buckets) {
+-            bucket.out.close();
+-            std::error_code ec;
+-            std::filesystem::remove(bucket.filename, ec);
+-        }
+-    };
++    record_size_ = (bucket_bits_ + width_ + 7) / 8;
+ 
++    buckets_ = std::vector<Bucket>((num_rows_ + (1ull << bucket_bits_) - 1) >> bucket_bits_);
+     try {
+-        for (uint64_t b = 0; b < num_buckets; ++b) {
+-            buckets[b].filename = (tmp_dir / fmt::format("bucket.{}", b)).string();
+-            buckets[b].out.open(buckets[b].filename, std::ios::binary);
+-            buckets[b].buffer.reserve(kBufferSize + record_size);
++        for (uint64_t b = 0; b < buckets_.size(); ++b) {
++            buckets_[b].filename = (tmp_dir / fmt::format("bucket.{}", b)).string();
++            buckets_[b].out.open(buckets_[b].filename, std::ios::binary);
++            buckets_[b].buffer.reserve(kBufferSize + record_size_);
+         }
++    } catch (...) {
++        // the destructor does not run for a partially constructed writer
++        remove_buckets();
++        throw;
++    }
++}
+ 
+-        match_rows(source, target, num_threads, [&](uint64_t row, node_index target_node) {
+-            unsigned __int128 record = row & ((1ull << bucket_bits) - 1);
+-            record = (record << width) | target_node;
+-            Bucket &bucket = buckets[row >> bucket_bits];
+-            std::lock_guard<std::mutex> lock(bucket.mutex);
+-            const char *bytes = reinterpret_cast<const char *>(&record);
+-            bucket.buffer.insert(bucket.buffer.end(), bytes, bytes + record_size);
+-            if (bucket.buffer.size() >= kBufferSize) {
+-                bucket.out.write(bucket.buffer.data(), bucket.buffer.size());
+-                bucket.buffer.clear();
+-            }
+-        });
++RowMapWriter::~RowMapWriter() {
++    remove_buckets();
++}
+ 
+-        for (auto &bucket : buckets) {
+-            bucket.out.write(bucket.buffer.data(), bucket.buffer.size());
+-            bucket.buffer = {};
+-            bucket.out.close();
+-            if (!bucket.out)
+-                throw std::runtime_error("Cannot write to " + bucket.filename);
+-        }
++void RowMapWriter::remove_buckets() {
++    for (auto &bucket : buckets_) {
++        if (bucket.filename.empty())
++            continue;
++        bucket.out.close();
++        std::error_code ec;
++        std::filesystem::remove(bucket.filename, ec);
++    }
++}
+ 
+-        {
+-            std::ofstream out(filename, std::ios::binary);
+-            sdsl::int_vector<>::write_header(num_rows * width, width, out);
+-            if (!out)
+-                throw std::runtime_error("Cannot write to " + filename);
+-        }
+-        const uint64_t header_size = std::filesystem::file_size(filename);
+-        std::filesystem::resize_file(filename, header_size + ((num_rows * width + 63) / 64) * 8);
+-
+-        // Each thread holds one bucket of the row map in memory.
+-        std::atomic<bool> failed(false);
+-        #pragma omp parallel for num_threads(std::min<size_t>(std::max<size_t>(1, num_threads), 16)) schedule(dynamic)
+-        for (uint64_t b = 0; b < num_buckets; ++b) {
+-            const uint64_t begin = b << bucket_bits;
+-            sdsl::int_vector<> rows(std::min<uint64_t>(num_rows - begin, 1ull << bucket_bits), 0, width);
+-
+-            std::ifstream in(buckets[b].filename, std::ios::binary);
+-            std::vector<char> buffer(record_size * (kBufferSize / record_size));
+-            while (in.read(buffer.data(), buffer.size()) || in.gcount()) {
+-                for (std::streamsize i = 0; i + record_size <= static_cast<size_t>(in.gcount()); i += record_size) {
+-                    unsigned __int128 record = 0;
+-                    std::memcpy(&record, buffer.data() + i, record_size);
+-                    rows[static_cast<uint64_t>(record >> width)]
+-                        = static_cast<uint64_t>(record) & sdsl::bits::lo_set[width];
+-                }
+-            }
++void RowMapWriter::add(uint64_t row, uint64_t target_node) {
++    assert(row < num_rows_);
++    assert(target_node && width_for(target_node) <= width_);
++    unsigned __int128 record = row & ((1ull << bucket_bits_) - 1);
++    record = (record << width_) | target_node;
++    Bucket &bucket = buckets_[row >> bucket_bits_];
++    std::lock_guard<std::mutex> lock(bucket.mutex);
++    const char *bytes = reinterpret_cast<const char *>(&record);
++    bucket.buffer.insert(bucket.buffer.end(), bytes, bytes + record_size_);
++    if (bucket.buffer.size() >= kBufferSize) {
++        bucket.out.write(bucket.buffer.data(), bucket.buffer.size());
++        bucket.buffer.clear();
++    }
++}
++
++void RowMapWriter::write(const std::string &filename, uint64_t target_max_index,
++                         size_t num_threads) {
++    const uint64_t width = width_for(target_max_index);
++    if (width > width_)
++        throw std::invalid_argument("Row map entries are wider than declared");
++
++    for (auto &bucket : buckets_) {
++        bucket.out.write(bucket.buffer.data(), bucket.buffer.size());
++        bucket.buffer = {};
++        bucket.out.close();
++        if (!bucket.out)
++            throw std::runtime_error("Cannot write to " + bucket.filename);
++    }
+ 
+-            std::fstream out(filename, std::ios::binary | std::ios::in | std::ios::out);
+-            out.seekp(header_size + (begin * width) / 8);
+-            out.write(reinterpret_cast<const char *>(rows.data()), ((rows.size() * width + 63) / 64) * 8);
+-            out.close();
+-            if (!out || !in.is_open() || !in.eof())
+-                failed = true;
++    {
++        std::ofstream out(filename, std::ios::binary);
++        sdsl::int_vector<>::write_header(num_rows_ * width, width, out);
++        if (!out)
++            throw std::runtime_error("Cannot write to " + filename);
++    }
++    const uint64_t header_size = std::filesystem::file_size(filename);
++    std::filesystem::resize_file(filename, header_size + ((num_rows_ * width + 63) / 64) * 8);
++
++    // Each thread holds one bucket of the row map in memory.
++    std::atomic<bool> failed(false);
++    #pragma omp parallel for num_threads(std::min<size_t>(std::max<size_t>(1, num_threads), 16)) schedule(dynamic)
++    for (uint64_t b = 0; b < buckets_.size(); ++b) {
++        const uint64_t begin = b << bucket_bits_;
++        sdsl::int_vector<> rows(std::min<uint64_t>(num_rows_ - begin, 1ull << bucket_bits_), 0, width);
++
++        std::ifstream in(buckets_[b].filename, std::ios::binary);
++        std::vector<char> buffer(record_size_ * (kBufferSize / record_size_));
++        while (in.read(buffer.data(), buffer.size()) || in.gcount()) {
++            for (std::streamsize i = 0; i + record_size_ <= static_cast<size_t>(in.gcount()); i += record_size_) {
++                unsigned __int128 record = 0;
++                std::memcpy(&record, buffer.data() + i, record_size_);
++                rows[static_cast<uint64_t>(record >> width_)]
++                    = static_cast<uint64_t>(record) & sdsl::bits::lo_set[width_];
++            }
+         }
+-        if (failed)
+-            throw std::runtime_error("Cannot write row map to " + filename);
+-    } catch (...) {
+-        remove_buckets();
+-        throw;
++
++        std::fstream out(filename, std::ios::binary | std::ios::in | std::ios::out);
++        out.seekp(header_size + (begin * width) / 8);
++        out.write(reinterpret_cast<const char *>(rows.data()), ((rows.size() * width + 63) / 64) * 8);
++        out.close();
++        if (!out || !in.is_open() || !in.eof())
++            failed = true;
+     }
+-    remove_buckets();
++    if (failed)
++        throw std::runtime_error("Cannot write row map to " + filename);
++}
++
++void map_rows_to_graph(const DeBruijnGraph &source,
++                       const DeBruijnGraph &target,
++                       const std::string &filename,
++                       const std::filesystem::path &tmp_dir,
++                       size_t num_threads) {
++    // The walk visits source rows in no particular order.
++    RowMapWriter writer(source.max_index(), target.max_index(), tmp_dir);
++    match_rows(source, target, num_threads, [&](uint64_t row, node_index target_node) {
++        writer.add(row, target_node);
++    });
++    writer.write(filename, target.max_index(), num_threads);
+ }
+ 
+ // A row map held in memory. Every thread reads the same vector.
+diff --git a/metagraph/src/annotation/annotation_remap.hpp b/metagraph/src/annotation/annotation_remap.hpp
+index a8b54d2de8..62f1d82a65 100644
+--- a/metagraph/src/annotation/annotation_remap.hpp
++++ b/metagraph/src/annotation/annotation_remap.hpp
+@@ -2,8 +2,11 @@
+ #define __ANNOTATION_REMAP_HPP__
+ 
+ #include <filesystem>
++#include <fstream>
+ #include <memory>
++#include <mutex>
+ #include <string>
++#include <vector>
+ 
+ #include <sdsl/int_vector.hpp>
+ 
+@@ -45,6 +48,43 @@ void map_rows_to_graph(const graph::DeBruijnGraph &source,
+                        const std::filesystem::path &tmp_dir,
+                        size_t num_threads = 1);
+ 
++/**
++ * Writes a row map file from pairs (source row, target node) added in any order,
++ * without holding the map in memory. Uses temporary files in `tmp_dir` of about
++ * twice the size of the result and removes them when destroyed.
++ */
++class RowMapWriter {
++  public:
++    // `max_target_node` is an upper bound on the target nodes passed to add().
++    RowMapWriter(uint64_t num_rows, uint64_t max_target_node,
++                 const std::filesystem::path &tmp_dir);
++    ~RowMapWriter();
++
++    // Thread-safe. Every source row can be added at most once, with
++    // target_node >= 1 (0 marks a dropped row), and only before write().
++    void add(uint64_t row, uint64_t target_node);
++
++    // Write the map in the sdsl::int_vector<> format with entries wide enough
++    // for `target_max_index`. Rows that were not added get 0.
++    void write(const std::string &filename, uint64_t target_max_index, size_t num_threads = 1);
++
++  private:
++    struct Bucket {
++        std::mutex mutex;
++        std::string filename;
++        std::ofstream out;
++        std::vector<char> buffer;
++    };
++
++    void remove_buckets();
++
++    const uint64_t num_rows_;
++    const uint64_t width_;
++    uint64_t bucket_bits_;
++    size_t record_size_;
++    std::vector<Bucket> buckets_;
++};
++
+ /**
+  * Check a saved row map against both graphs. Returns false if the row counts
+  * differ, or if a kept row maps to another target row than its k-mer. The
+diff --git a/metagraph/src/cli/clean.cpp b/metagraph/src/cli/clean.cpp
+index 76bc166213..52f0e95544 100644
+--- a/metagraph/src/cli/clean.cpp
++++ b/metagraph/src/cli/clean.cpp
+@@ -2,9 +2,11 @@
+ 
+ #include <ips4o.hpp>
+ 
++#include "annotation/annotation_remap.hpp"
+ #include "common/logger.hpp"
+ #include "common/algorithms.hpp"
+ #include "common/unix_tools.hpp"
++#include "common/utils/file_utils.hpp"
+ #include "common/utils/template_utils.hpp"
+ #include "common/threads/threading.hpp"
+ #include "common/vectors/vector_algorithm.hpp"
+@@ -27,24 +29,36 @@ using mtg::seq_io::ExtendedFastaWriter;
+ 
+ int clean_graph(Config *config) {
+     assert(config);
++    assert(config->fnames.size() == 1);
++
++    if (!config->to_fasta) {
++        logger->error("Clean graph can be serialized only in form "
++                      "of its contigs or unitigs. Add flag --to-fasta");
++        exit(1);
++    }
++
++    logger->trace("Loading graph...");
++
++    return clean_graph(config, load_critical_dbg(config->fnames.at(0)));
++}
++
++int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
++    assert(config);
+ 
+     const auto &files = config->fnames;
+ 
+     assert(files.size() == 1);
+     assert(config->outfbase.size());
++    assert(config->to_fasta);
+ 
+     config->min_count = std::max(1u, config->min_count);
+ 
+-    if (!config->to_fasta) {
+-        logger->error("Clean graph can be serialized only in form "
+-                      "of its contigs or unitigs. Add flag --to-fasta");
+-        exit(1);
+-    }
+-
+     Timer timer;
+-    logger->trace("Loading graph...");
+ 
+-    auto graph = load_critical_dbg(files.at(0));
++    if (config->row_map && graph->get_mode() == graph::DeBruijnGraph::CANONICAL) {
++        logger->error("--row-map supports only graphs in basic or primary mode");
++        exit(1);
++    }
+     // try loading k-mer counts
+     auto node_weights = graph->load_extension<graph::NodeWeights>(files.at(0));
+ 
+@@ -161,6 +175,29 @@ int clean_graph(Config *config) {
+         uint64_t num_kmers = 0;
+         std::string fasta_fname;
+ 
++        // An SSHash graph built from the written file numbers its k-mers in file
++        // order, so the row of every k-mer in that graph is known here.
++        std::unique_ptr<annot::RowMapWriter> row_map;
++        std::filesystem::path row_map_tmp_dir;
++        if (config->row_map) {
++            row_map_tmp_dir = utils::create_temp_dir(
++                    config->tmp_dir.empty() ? std::filesystem::path(outfbase).remove_filename()
++                                            : config->tmp_dir,
++                    "rowmap");
++            // in primary mode, an SSHash graph has a second node for every reverse complement
++            row_map = std::make_unique<annot::RowMapWriter>(graph->max_index(),
++                                                            2 * graph->max_index(),
++                                                            row_map_tmp_dir);
++        }
++        // `first` is the number of k-mers written before this contig
++        auto add_rows = [&](const auto &path, uint64_t first) {
++            if (row_map) {
++                for (auto node : path) {
++                    row_map->add(node - 1, ++first);
++                }
++            }
++        };
++
+         if (node_weights) {
+             if (!node_weights->is_compatible(*graph)) {
+                 logger->error("k-mer counts are not compatible with the subgraph");
+@@ -182,10 +219,15 @@ int clean_graph(Config *config) {
+                 // smooth k-mer counts in the unitig
+                 utils::smooth_vector(config->smoothing_window, &kmer_counts);
+ 
+-                std::lock_guard<std::mutex> lock(seq_mutex);
+-                writer.write(contig, kmer_counts);
+-                num_bp += contig.size();
+-                num_kmers += contig.size() - graph->get_k() + 1;
++                uint64_t first;
++                {
++                    std::lock_guard<std::mutex> lock(seq_mutex);
++                    writer.write(contig, kmer_counts);
++                    num_bp += contig.size();
++                    first = num_kmers;
++                    num_kmers += contig.size() - graph->get_k() + 1;
++                }
++                add_rows(path, first);
+             }, get_num_threads());
+ 
+             fasta_fname = writer.get_fasta_fname();
+@@ -195,17 +237,43 @@ int clean_graph(Config *config) {
+                                config->enumerate_out_sequences,
+                                get_num_threads() > 1);
+ 
+-            call_contigs([&](const std::string &contig, const auto &) {
+-                std::lock_guard<std::mutex> lock(seq_mutex);
+-                writer.write(contig);
+-                num_bp += contig.size();
+-                num_kmers += contig.size() - graph->get_k() + 1;
++            call_contigs([&](const std::string &contig, const auto &path) {
++                uint64_t first;
++                {
++                    std::lock_guard<std::mutex> lock(seq_mutex);
++                    writer.write(contig);
++                    num_bp += contig.size();
++                    first = num_kmers;
++                    num_kmers += contig.size() - graph->get_k() + 1;
++                }
++                add_rows(path, first);
+             }, get_num_threads());
+ 
+             fasta_fname = writer.get_fname();
+         }
+         logger->trace("Extracted {} bp of sequences with {} k-mers and wrote to {}",
+                       num_bp, num_kmers, fasta_fname);
++
++        if (row_map) {
++            const std::string row_map_fname = outfbase + ".rowmap";
++            try {
++                row_map->write(row_map_fname,
++                               graph->get_mode() == graph::DeBruijnGraph::PRIMARY
++                                    ? 2 * num_kmers : num_kmers,
++                               get_num_threads());
++            } catch (const std::exception &e) {
++                logger->error("{}", e.what());
++                row_map.reset();
++                utils::remove_temp_dir(row_map_tmp_dir);
++                std::error_code ec;
++                std::filesystem::remove(row_map_fname, ec);
++                exit(1);
++            }
++            row_map.reset();
++            utils::remove_temp_dir(row_map_tmp_dir);
++            logger->trace("Row map for an SSHash graph built from {} saved to {}",
++                          fasta_fname, row_map_fname);
++        }
+     };
+ 
+     assert(config->count_slice_quantiles.size() >= 2);
+diff --git a/metagraph/src/cli/clean.hpp b/metagraph/src/cli/clean.hpp
+index 4f8593d044..cdf16b6569 100644
+--- a/metagraph/src/cli/clean.hpp
++++ b/metagraph/src/cli/clean.hpp
+@@ -2,13 +2,24 @@
+ #define __CLEAN_GRAPH_HPP__
+ 
+ 
++#include <memory>
++
++
+ namespace mtg {
++
++namespace graph {
++class DeBruijnGraph;
++} // namespace graph
++
+ namespace cli {
+ 
+ class Config;
+ 
+ int clean_graph(Config *config);
+ 
++// Same, for a graph that is already loaded from config->fnames[0]
++int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph);
++
+ } // namespace cli
+ } // namespace mtg
+ 
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index f377bffb02..0f48aa5d8e 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -373,6 +373,8 @@ Config::Config(int argc, char *argv[]) {
+             unitigs = true;
+         } else if (!strcmp(argv[i], "--primary-kmers")) {
+             kmers_in_single_form = true;
++        } else if (!strcmp(argv[i], "--row-map")) {
++            row_map = true;
+         } else if (!strcmp(argv[i], "--header")) {
+             header = std::string(get_value(i++));
+         } else if (!strcmp(argv[i], "--prune-tips")) {
+@@ -649,6 +651,30 @@ Config::Config(int argc, char *argv[]) {
+                     && outfbase.empty())
+         print_usage_and_exit = true;
+ 
++    if (identity == TRANSFORM && graph_type != SUCCINCT && graph_type != SSHASH) {
++        std::cerr << "transform can change the graph representation only with"
++                     " '--graph sshash'" << std::endl;
++        print_usage_and_exit = true;
++    }
++    if (identity == TRANSFORM && graph_type == SSHASH
++            && (initialize_bloom || clear_dummy || to_adj_list)) {
++        std::cerr << "'--graph sshash' only converts the graph and cannot be combined with"
++                     " --initialize-bloom, --clear-dummy or --to-adj-list" << std::endl;
++        print_usage_and_exit = true;
++    }
++    // 'transform --to-fasta' runs as CLEAN and writes only the sequences
++    if (identity == CLEAN && graph_type != SUCCINCT) {
++        std::cerr << "--graph cannot be combined with --to-fasta. To get the row map with"
++                     " the sequences, use '--to-fasta --row-map'" << std::endl;
++        print_usage_and_exit = true;
++    }
++
++    // 'transform --to-fasta' runs as CLEAN
++    if (row_map && !(identity == CLEAN && to_fasta)) {
++        std::cerr << "--row-map needs 'transform --to-fasta'" << std::endl;
++        print_usage_and_exit = true;
++    }
++
+     if (identity == TRANSFORM_ANNOTATION && remap_graph.size()) {
+         if (infbase.empty() || fnames.size() != 1) {
+             std::cerr << "--remap-graph needs one annotation and the target graph"
+@@ -1218,9 +1244,15 @@ if (advanced) {
+             fprintf(stderr, "\t   --clear-dummy \terase all redundant dummy edges and build an edgemask for non-redundant [off]\n");
+             fprintf(stderr, "\t   --prune-tips [INT] \tprune all dead ends shorter than this many k-mers [1]\n");
+             fprintf(stderr, "\t   --state [STR] \tchange state of succinct graph: small / dynamic / stat / fast [stat]\n");
++            fprintf(stderr, "\t   --graph [STR] \tconvert the graph to another representation: sshash [off]\n");
++            fprintf(stderr, "\t                 \tAlso writes <OUT>.rowmap, the row map that 'transform_anno --remap-graph'\n");
++            fprintf(stderr, "\t                 \tneeds to move annotations to the new graph\n");
+             fprintf(stderr, "\t   --to-adj-list \twrite adjacency list to file [off]\n");
+             fprintf(stderr, "\t   --to-fasta \t\textract sequences from graph and dump to compressed FASTA file [off]\n");
+             fprintf(stderr, "\t   --enumerate \t\tenumerate sequences in FASTA [off]\n");
++            fprintf(stderr, "\t   --row-map \t\twith --to-fasta, also write <OUT>.rowmap: the row map that\n");
++            fprintf(stderr, "\t             \t\t'transform_anno --remap-graph' needs for an SSHash graph built\n");
++            fprintf(stderr, "\t             \t\tfrom the written file [off]\n");
+             fprintf(stderr, "\t   --initialize-bloom \tconstruct a Bloom filter for faster detection of non-existing k-mers [off]\n");
+             fprintf(stderr, "\t   --unitigs \t\textract all unitigs from graph and dump to compressed FASTA file [off]\n");
+ #if ! _PROTEIN_GRAPH
+diff --git a/metagraph/src/cli/config/config.hpp b/metagraph/src/cli/config/config.hpp
+index c618fc2691..c5fce88392 100644
+--- a/metagraph/src/cli/config/config.hpp
++++ b/metagraph/src/cli/config/config.hpp
+@@ -33,6 +33,7 @@ class Config {
+     bool to_adj_list = false;
+     bool to_fasta = false;
+     bool enumerate_out_sequences = false;
++    bool row_map = false;
+     bool to_gfa = false;
+     bool output_compacted = false;
+     bool unitigs = false;
+diff --git a/metagraph/src/cli/transform_graph.cpp b/metagraph/src/cli/transform_graph.cpp
+index 0c21abb66f..8857840da3 100644
+--- a/metagraph/src/cli/transform_graph.cpp
++++ b/metagraph/src/cli/transform_graph.cpp
+@@ -6,9 +6,11 @@
+ #include "common/unix_tools.hpp"
+ #include "common/utils/file_utils.hpp"
+ #include "common/threads/threading.hpp"
++#include "graph/representation/hash/dbg_sshash.hpp"
+ #include "graph/representation/succinct/dbg_succinct.hpp"
+ #include "config/config.hpp"
+ #include "load/load_graph.hpp"
++#include "clean.hpp"
+ 
+ 
+ namespace mtg {
+@@ -17,6 +19,64 @@ namespace cli {
+ using mtg::common::logger;
+ 
+ 
++// Build an SSHash graph from the contigs of `graph` and save it with the row map
++// that `transform_anno --remap-graph` needs to move annotations to it.
++static int convert_to_sshash(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
++    using graph::DBGSSHash;
++
++    if (graph->get_mode() == graph::DeBruijnGraph::CANONICAL) {
++        logger->error("Only graphs in basic or primary mode can be converted to SSHash");
++        exit(1);
++    }
++    const size_t k = graph->get_k();
++    const auto mode = graph->get_mode();
++    // without --mode, config->graph_mode is basic
++    if (config->graph_mode != graph::DeBruijnGraph::BASIC && config->graph_mode != mode) {
++        logger->error("The SSHash graph keeps the mode of the input graph."
++                      " Change the mode of the input graph first");
++        exit(1);
++    }
++
++    auto tmp_dir = utils::create_temp_dir(
++            config->tmp_dir.empty() ? std::filesystem::path(config->outfbase).remove_filename()
++                                    : config->tmp_dir,
++            "convert");
++
++    // Extract the contigs as `transform --to-fasta --row-map` does
++    Config extract(*config);
++    extract.to_fasta = true;
++    extract.row_map = true;
++    extract.outfbase = tmp_dir / "contigs";
++    clean_graph(&extract, std::move(graph));
++
++    Timer timer;
++    try {
++        DBGSSHash sshash(extract.outfbase + ".fasta.gz", k, mode,
++                         config->num_chars, config->memory_available);
++        logger->trace("SSHash graph built in {} sec", timer.elapsed());
++        sshash.serialize(config->outfbase);
++
++        const std::string row_map_fname
++                = utils::remove_suffix(config->outfbase, DBGSSHash::kExtension) + ".rowmap";
++        std::error_code ec;
++        std::filesystem::rename(extract.outfbase + ".rowmap", row_map_fname, ec);
++        // the temporary directory can be on another file system
++        if (ec) {
++            std::filesystem::copy_file(extract.outfbase + ".rowmap", row_map_fname,
++                                       std::filesystem::copy_options::overwrite_existing);
++        }
++        logger->trace("Row map saved to {}", row_map_fname);
++    } catch (const std::exception &e) {
++        logger->error("{}", e.what());
++        utils::remove_temp_dir(tmp_dir);
++        exit(1);
++    }
++    utils::remove_temp_dir(tmp_dir);
++
++    return 0;
++}
++
++
+ int transform_graph(Config *config) {
+     assert(config);
+ 
+@@ -35,6 +95,9 @@ int transform_graph(Config *config) {
+ 
+     logger->trace("Graph loaded in {} sec", timer.elapsed());
+ 
++    if (config->graph_type == Config::GraphType::SSHASH)
++        return convert_to_sshash(config, std::move(graph));
++
+     auto dbg_succ = std::dynamic_pointer_cast<graph::DBGSuccinct>(graph);
+ 
+     if (!dbg_succ.get()) {

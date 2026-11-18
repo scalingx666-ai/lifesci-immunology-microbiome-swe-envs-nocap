@@ -1,0 +1,552 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 639241c..d8a9be9 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -1,6 +1,6 @@
+ Package: radEmu
+ Title: Using Relative Abundance Data to Estimate of Multiplicative Differences in Mean Absolute Abundance 
+-Version: 2.3.2.1
++Version: 2.4.0.0
+ Authors@R: c(person("David", "Clausen", role = c("aut")),
+              person("Amy D", "Willis", email = "adwillis@uw.edu", role = c("aut", "cre"), comment = c(ORCID = "0000-0002-2802-4317")),
+              person("Sarah", "Teichman", role = "aut"))
+@@ -10,7 +10,6 @@ License: MIT + file LICENSE
+ Encoding: UTF-8
+ LazyData: true
+ Roxygen: list(markdown = TRUE)
+-RoxygenNote: 7.3.3
+ Depends: 
+     MASS,
+     Matrix,
+@@ -33,3 +32,4 @@ Suggests:
+     rmarkdown
+ Config/testthat/edition: 3
+ VignetteBuilder: knitr
++Config/roxygen2/version: 8.0.0
+diff --git a/NEWS.md b/NEWS.md
+index 44cb5ce..428d230 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,3 +1,11 @@
++# radEmu 2.4.0.0
++
++This is a minor release with some speed-ups and additional flexibility. 
++
++For designs with only discrete covariates, estimates are now computed in closed form rather than iteratively. 
++
++There is also a new argument `estimates_only` in `emuFit()`: `estimates_only = TRUE` returns parameter estimates without confidence intervals or score tests. 
++
+ # radEmu 2.3.0.0
+ 
+ This is a minor release that updates the algorithms to estimate parameters under the alternate and null hypotheses for designs with only discrete covariates. These new algorithms are faster and more stable in most cases. Initial code was developed with assistance from ChatGPT, although final code and responsibility remain with the package owners.
+diff --git a/R/discrete_groups.R b/R/discrete_groups.R
+new file mode 100644
+index 0000000..25c4ac8
+--- /dev/null
++++ b/R/discrete_groups.R
+@@ -0,0 +1,10 @@
++#group rows of a design matrix by covariate pattern
++#returns the distinct rows of X (in order of first appearance) and, for each
++#row of X, the index of its pattern among the distinct rows
++discrete_groups <- function(X){
++  key <- apply(X, 1, paste, collapse = "_")
++  first <- !duplicated(key)
++  list(distinct_X = X[first, , drop = FALSE],
++       group = match(key, key[first]))
++}
++
+diff --git a/R/emuFit.R b/R/emuFit.R
+index 1767843..661676d 100644
+--- a/R/emuFit.R
++++ b/R/emuFit.R
+@@ -80,7 +80,10 @@
+ #' small p-values and are not thought to have scientifically interesting signals. We recommend removing them before analyzing data further. 
+ #' If TRUE, all zero-comparison parameter p-values will be set to NA. If FALSE no zero-comparison parameter p-values will be set to NA.
+ #' If a value between 0 and 1, all zero-comparison p-values below the value will be set to NA. 
+-#' Default is \code{0.01}. 
++#' Default is \code{0.01}.
++#' @param estimates_only logical: return parameter estimates only? If \code{TRUE}, confidence intervals
++#' and score tests are not computed (overriding \code{compute_cis} and \code{run_score_tests}), and
++#' \code{test_kj} is not required. Default is \code{FALSE}.
+ #' @param control A list of control parameters, to have more control over estimation and hypothesis testing. See \code{control_fn} for details.
+ #' @param ... Additional arguments. Arguments matching the names of \code{control_fn()} options are forwarded to that function and override
+ #' defaults. Unknown arguments are ignored with a warning.
+@@ -163,6 +166,7 @@ emuFit <- function(Y,
+                    null_window = 5,
+                    null_diagnostic_plots = FALSE, 
+                    remove_zero_comparison_pvals = 0.01,
++                   estimates_only = FALSE,
+                    control = NULL,
+                    ...) {
+   
+@@ -191,6 +195,15 @@ emuFit <- function(Y,
+     control <- control_fn(utils::modifyList(control, control_dots))
+   }
+   
++  if (estimates_only) {
++    if ((!missing(run_score_tests) && run_score_tests) |
++        (!missing(compute_cis) && compute_cis)) {
++      warning("`estimates_only = TRUE`: confidence intervals and score tests will not be computed.")
++    }
++    compute_cis <- FALSE
++    run_score_tests <- FALSE
++  }
++  
+   # run checks on arguments in function emuFit_check
+   check_results <- emuFit_check(Y = Y,
+                                 X = X,
+@@ -229,7 +242,12 @@ emuFit <- function(Y,
+   # check for zero-comparison parameters
+   zero_comparison_res <- zero_comparison_check(X = X, Y = Y)
+   
+-  X_cup <- X_cup_from_X_fast(X,J)
++  # expanded design matrix, needed for confidence intervals and score tests
++  # (emuFit_micro_penalized constructs it when needed for estimation)
++  X_cup <- NULL
++  if (compute_cis | run_score_tests) {
++    X_cup <- X_cup_from_X_fast(X,J)
++  }
+   
+   #choose ref taxon for fitting constrained models / performing wald and score tests
+   j_ref <- get_j_ref(Y)
+@@ -305,9 +323,19 @@ emuFit <- function(Y,
+     } else {
+       fitted_B <- B
+       if (penalize) {
+-        G <- get_G_for_augmentations_fast(X, J, n, X_cup)
+-        Y_test <- Y_augmented <- Y + 
+-          get_augmentations(X = X, G = G, Y = Y, B = fitted_B)
++        groups <- discrete_groups(X)
++        if (nrow(groups$distinct_X) == p) {
++          # discrete design: augmentations in closed form
++          Y_test <- Y_augmented <- Y +
++            get_augmentations_discrete(X = X, Y = Y, B = fitted_B, groups = groups)
++        } else {
++          if (is.null(X_cup)) {
++            X_cup <- X_cup_from_X_fast(X,J)
++          }
++          G <- get_G_for_augmentations_fast(X, J, n, X_cup)
++          Y_test <- Y_augmented <- Y +
++            get_augmentations(X = X, G = G, Y = Y, B = fitted_B)
++        }
+       } else {
+         Y_augmented <- NULL
+         Y_test <- Y
+@@ -322,25 +350,22 @@ emuFit <- function(Y,
+   
+   if (p == 1) {
+     message("You are running an intercept-only model. In this model the intercept beta_0^j is an unidentifiable combination of intercept for category j and the detection efficiency of category j. Therefore this parameter is not interpretable.")
+-    
+     coefficients <- expand.grid(1:J, 1)
+     coefficients <- data.frame(j = coefficients[ , 1],
+                                k = coefficients[ ,2])
+     coefficients$estimate <- fitted_B[1, ]
+-    coefficients$lower <- NA
+-    coefficients$upper <- NA
+-    coefficients$pval <- coefficients$score_stat <- NA
+   } else {
+     coefficients <- expand.grid(1:J, 2:p)
+     coefficients <- data.frame(j = coefficients[ , 1],
+                                k = coefficients[ ,2])
+     coefficients$estimate <- do.call(c, lapply(2:p, function(k) fitted_B[k,]))
+-    coefficients$lower <- NA
+-    coefficients$upper <- NA
+-    coefficients$pval <- coefficients$score_stat <- NA
+   }
++  coefficients$se <- NA
++  coefficients$lower <- NA
++  coefficients$upper <- NA
++  coefficients$pval <- coefficients$score_stat <- NA
+   
+-  if (compute_cis) {
++  if (compute_cis | return_wald_p) {
+     if (verbose %in% c(TRUE, "development")) {
+       message("Performing Wald tests and constructing CIs.")
+     }
+@@ -372,13 +397,10 @@ emuFit <- function(Y,
+   }
+   
+   if (return_wald_p) {
+-    if (!compute_cis) {
+-      warning("Wald p-values cannot be returned if compute_cis = FALSE.")
+-    } else {
+-      coefficients$wald_p <- coefficients$pval}
++    coefficients$wald_p <- coefficients$pval
+   }
+   
+-  coefficients$pval <- NA
++  coefficients$pval <- NA # AW: why?
+   
+   if (is.null(test_kj)) {
+     test_kj <- coefficients
+@@ -396,7 +418,7 @@ emuFit <- function(Y,
+     if(control$use_both_cov){
+       I_inv <- Matrix::solve(just_wald_things$I[-indexes_to_remove,-indexes_to_remove],  method = "cholmod_solve")
+     } else{
+-    I_inv <- NULL
++      I_inv <- NULL
+     }
+   }
+   
+@@ -453,9 +475,9 @@ emuFit <- function(Y,
+           # check if symmetric or symmetric subset
+           v3 <- rnorm(J)
+           if (isTRUE(all.equal(constraint_fn[[k]](v3), mean(v3)))) {
+-              constraint_type <- "discrete:mean"
++            constraint_type <- "discrete:mean"
+           } else if (any(grepl("pseudohuber_median", deparse(body(constraint_fn[[k]]))))) {
+-              constraint_type <- "discrete:pseudohuber"
++            constraint_type <- "discrete:pseudohuber"
+           } else {
+             constraint_type <- "other"
+           }
+@@ -525,14 +547,14 @@ emuFit <- function(Y,
+       # using augmented lagrangian algorithm, so we don't care about constraint_type
+       for (k in unique(test_kj$k)) {
+         attr(constraint_fn[[k]], "constraint_type") <- "other"
+-       }
++      }
+     }
+     
+     for(test_ind in 1:nrow(test_kj)) {
+       
+       if (verbose %in% c(TRUE, "development")) {
+         message(paste("Running score test ", test_ind, " of ", nrow(test_kj)," (row of B k = ", test_kj$k[test_ind], "; column of B j = ",
+-                    test_kj$j[test_ind],").",sep = ""))
++                      test_kj$j[test_ind],").",sep = ""))
+         start <- proc.time()
+       }
+       
+@@ -668,7 +690,7 @@ emuFit <- function(Y,
+           time <- paste0(hour, " hours")
+         }
+         message(paste("Score test ", test_ind, " of ", nrow(test_kj)," (row of B k = ", test_kj$k[test_ind], "; column of B j = ",
+-                    test_kj$j[test_ind],") has completed in approximately ", time, ".",sep = ""))
++                      test_kj$j[test_ind],") has completed in approximately ", time, ".",sep = ""))
+         start <- proc.time()
+         
+       }
+@@ -677,12 +699,7 @@ emuFit <- function(Y,
+   
+   if (!is.null(colnames(X))) {
+     if (length(unique(colnames(X))) == ncol(X)) {
+-      k_to_covariates <- data.frame(k = 1:p,
+-                                    covariate = colnames(X))
+-      
+-      coefficients$covariate <- do.call(c,
+-                                        lapply(  coefficients$k,
+-                                                 function(d) k_to_covariates$covariate[k_to_covariates$k ==d]))
++      coefficients$covariate <- colnames(X)[coefficients$k]
+     } else {
+       coefficients$covariate <- NA
+     }
+@@ -691,30 +708,17 @@ emuFit <- function(Y,
+   }
+   
+   if (!is.null(colnames(Y))) {
+-    j_to_categories <- data.frame(j = 1:J,
+-                                  category = colnames(Y))
+-    coefficients$category <- do.call(c,
+-                                     lapply(coefficients$j,
+-                                            function(d) j_to_categories$category[
+-                                              j_to_categories$j ==d
+-                                            ]))
++    coefficients$category <- colnames(Y)[coefficients$j]
+   } else {
+     coefficients$category <- NA
+   }
+   
+-  if (!compute_cis) {
+-    coef_df <-
+-          cbind(data.frame(covariate = coefficients$covariate,
+-                           category = coefficients$category,
+-                           category_num = coefficients$j),
+-                coefficients[ , c("estimate","lower","upper")])
+-  } else {
+-    coef_df <-
+-      cbind(data.frame(covariate = coefficients$covariate,
+-                       category = coefficients$category,
+-                       category_num = coefficients$j),
+-            coefficients[ , c("estimate","se", "lower","upper")])
+-  }
++  coef_df <-
++    cbind(data.frame(covariate = coefficients$covariate,
++                     category = coefficients$category,
++                     category_num = coefficients$j),
++          coefficients[ , c("estimate","se", "lower","upper")])
++  
+   if (control$use_both_cov) {
+     coef_df <- cbind(coef_df, coefficients[ , c("score_stat","pval","score_fullcov_p")])
+   } else {
+diff --git a/R/emuFit_micro_penalized.R b/R/emuFit_micro_penalized.R
+index 86a9eae..e2e159c 100644
+--- a/R/emuFit_micro_penalized.R
++++ b/R/emuFit_micro_penalized.R
+@@ -23,8 +23,10 @@
+ #' during optimization. Default is NULL, in which case this column is chosen based
+ #' on characteristics of Y (i.e., j_ref chosen to maximize number of entries of
+ #' Y_j_ref greater than zero).
+-#' @param use_discrete If discrete design matrix, use fast discrete implementation.
+-#' 
++#' @param use_discrete logical: if the design matrix is discrete (it has exactly p distinct
++#' rows), compute the penalized estimate and data augmentations in closed form rather than
++#' iteratively. Default is TRUE.
++#'
+ #' @return A p x J matrix containing regression coefficients (under constraint
+ #' g(B_k) = 0)
+ #'
+@@ -55,6 +57,46 @@ emuFit_micro_penalized <-
+     }
+     converged <- FALSE
+     counter <- 0
++
++    #for discrete designs, the penalized estimate is available in closed form:
++    #the unpenalized discrete estimate from covariate-pattern-by-category totals
++    #with 1/2 added to each total. 
++    groups <- discrete_groups(X)
++    
++    if (use_discrete & nrow(groups$distinct_X) == p) {
++      
++      if (qr(groups$distinct_X)$rank < p) {
++        
++        stop(
++          "Design matrix X inputted for the model is rank-deficient, preventing proper model fitting.
++  This might be due to multicollinearity, overparameterization, or redundant factor levels included in covariates.
++  Consider removing highly correlated covariates or adjusting factor levels to ensure a full-rank design. \n"
++        )
++      }
++      if (is.null(constraint_fn)) {
++        constraint_fn <- rep(list(function(x) pseudohuber_median(x, 0.1)), p)
++      }
++      totals <- rowsum(Y, groups$group, reorder = TRUE)
++      if (anyNA(totals)) { # integer overflow
++        totals <- rowsum(1 * Y, groups$group, reorder = TRUE)
++      }
++      B <- emuFit_micro_discrete(X = groups$distinct_X,
++                                 Y = totals + 0.5,
++                                 j_ref = j_ref)
++      B[B < -max_abs_B] <- -max_abs_B
++      B[B > max_abs_B] <- max_abs_B
++      for (k in 1:p) {
++        B[k, ] <- B[k, ] - constraint_fn[[k]](B[k, ])
++      }
++      Y_augmented <- Y + get_augmentations_discrete(X = X, Y = Y, B = B,
++                                                    groups = groups)
++      return(list(
++        "Y_augmented" = Y_augmented,
++        "B" = B,
++        "convergence" = TRUE
++      ))
++    }
++
+     #get design matrix we'll use for computing augmentations
+ 
+     if (verbose) {
+diff --git a/R/get_augmentations.R b/R/get_augmentations.R
+index 76dfe9a..1b54a25 100644
+--- a/R/get_augmentations.R
++++ b/R/get_augmentations.R
+@@ -55,11 +55,7 @@ get_augmentations <- function(X,
+       Matrix::rowSums(Matrix::Diagonal(x = exp(log_means[(i - 1)*J + 1:J, ])) %*% (G_i^2) )/2
+ 
+   }
+-
+-
+-
++  
+   return(augmentations)
+ 
+-
+-
+ }
+diff --git a/R/get_augmentations_discrete.R b/R/get_augmentations_discrete.R
+new file mode 100644
+index 0000000..d820593
+--- /dev/null
++++ b/R/get_augmentations_discrete.R
+@@ -0,0 +1,24 @@
++#get data augmentations for Firth penalized estimation in closed form, for
++#designs with only discrete covariates (X has exactly p distinct rows)
++#equal to get_augmentations(X, G, Y, B) for such designs: with z restricted as
++#in get_augmentations, the hat value for observation (i, j) is
++#p_ij + (1 - p_ij) * ||Y_i||_1 / N_g, where p_ij is the fitted proportion of
++#category j for sample i and N_g is the total of Y over samples sharing
++#sample i's covariate pattern g
++get_augmentations_discrete <- function(X,
++                                       Y,
++                                       B,
++                                       groups = discrete_groups(X)){
++
++  #fitted proportions, one row per covariate pattern
++  log_props <- groups$distinct_X %*% B
++  props <- exp(log_props - apply(log_props, 1, max))
++  props <- props / rowSums(props)
++
++  Y_rowsums <- rowSums(Y)
++  group_totals <- as.numeric(rowsum(Y_rowsums, groups$group, reorder = TRUE))
++  w <- Y_rowsums / group_totals[groups$group]
++
++  #hat values are props * (1 - w) + w; augmentations are half the hat values
++  (props[groups$group, , drop = FALSE] * (1 - w) + w) / 2
++}
+diff --git a/man/emuFit.Rd b/man/emuFit.Rd
+index 46c56a0..b123d4c 100644
+--- a/man/emuFit.Rd
++++ b/man/emuFit.Rd
+@@ -38,6 +38,7 @@ emuFit(
+   null_window = 5,
+   null_diagnostic_plots = FALSE,
+   remove_zero_comparison_pvals = 0.01,
++  estimates_only = FALSE,
+   control = NULL,
+   ...
+ )
+@@ -157,6 +158,10 @@ If TRUE, all zero-comparison parameter p-values will be set to NA. If FALSE no z
+ If a value between 0 and 1, all zero-comparison p-values below the value will be set to NA.
+ Default is \code{0.01}.}
+ 
++\item{estimates_only}{logical: return parameter estimates only? If \code{TRUE}, confidence intervals
++and score tests are not computed (overriding \code{compute_cis} and \code{run_score_tests}), and
++\code{test_kj} is not required. Default is \code{FALSE}.}
++
+ \item{control}{A list of control parameters, to have more control over estimation and hypothesis testing. See \code{control_fn} for details.}
+ 
+ \item{...}{Additional arguments. Arguments matching the names of \code{control_fn()} options are forwarded to that function and override
+diff --git a/man/emuFit_micro_penalized.Rd b/man/emuFit_micro_penalized.Rd
+index ee65ca8..017bc1c 100644
+--- a/man/emuFit_micro_penalized.Rd
++++ b/man/emuFit_micro_penalized.Rd
+@@ -56,7 +56,9 @@ during optimization. Default is NULL, in which case this column is chosen based
+ on characteristics of Y (i.e., j_ref chosen to maximize number of entries of
+ Y_j_ref greater than zero).}
+ 
+-\item{use_discrete}{If discrete design matrix, use fast discrete implementation.}
++\item{use_discrete}{logical: if the design matrix is discrete (it has exactly p distinct
++rows), compute the penalized estimate and data augmentations in closed form rather than
++iteratively. Default is TRUE.}
+ }
+ \value{
+ A p x J matrix containing regression coefficients (under constraint
+diff --git a/man/radEmu.Rd b/man/radEmu.Rd
+index 98bc860..417c5a6 100644
+--- a/man/radEmu.Rd
++++ b/man/radEmu.Rd
+@@ -21,6 +21,7 @@ Useful links:
+ 
+ Authors:
+ \itemize{
++  \item Amy D Willis \email{adwillis@uw.edu} (\href{https://orcid.org/0000-0002-2802-4317}{ORCID})
+   \item David Clausen
+   \item Sarah Teichman
+ }
+diff --git a/tests/testthat/test-emuFit_micro_penalized_discrete.R b/tests/testthat/test-emuFit_micro_penalized_discrete.R
+new file mode 100644
+index 0000000..3b99ee7
+--- /dev/null
++++ b/tests/testthat/test-emuFit_micro_penalized_discrete.R
+@@ -0,0 +1,105 @@
++test_that("closed-form discrete augmentations equal get_augmentations at arbitrary B", {
++  set.seed(1)
++  n <- 15
++  J <- 6
++  g <- sample(rep(1:3, c(3, 5, 7)))
++  X <- cbind(1, g == 2, g == 3)
++  Y <- matrix(rpois(n * J, 5), n, J)
++  B <- matrix(rnorm(3 * J), 3, J)
++  G <- get_G_for_augmentations_fast(X, J, n, X_cup_from_X_fast(X, J))
++  expect_lt(max(abs(get_augmentations(X = X, G = G, Y = Y, B = B) -
++                      get_augmentations_discrete(X = X, Y = Y, B = B))), 1e-10)
++})
++
++test_that("closed-form discrete penalized fit matches iterative fit, binary design with separation", {
++  set.seed(2)
++  n <- 20
++  J <- 8
++  X <- cbind(1, rep(0:1, each = n / 2))
++  Y <- matrix(rpois(n * J, 5), n, J)
++  Y[X[, 2] == 0, 1] <- 0
++  Y[X[, 2] == 1, 2] <- 0
++  closed_form <- emuFit_micro_penalized(X, Y, verbose = FALSE)
++  iterative <- emuFit_micro_penalized(X, Y, verbose = FALSE, use_discrete = FALSE,
++                                      tolerance = 1e-8)
++  expect_true(closed_form$convergence)
++  expect_lt(max(abs(closed_form$B - iterative$B)), 1e-6)
++  expect_lt(max(abs(closed_form$Y_augmented - iterative$Y_augmented)), 1e-6)
++  # 1/2 added to each covariate-pattern-by-category total
++  expect_equal(unname(closed_form$B[2, 1] - closed_form$B[2, 3]),
++               log((sum(Y[X[, 2] == 1, 1]) + 0.5) / 0.5) -
++                 log((sum(Y[X[, 2] == 1, 3]) + 0.5) / (sum(Y[X[, 2] == 0, 3]) + 0.5)))
++})
++
++test_that("closed-form discrete penalized fit matches iterative fit, unbalanced three-level design with shuffled rows", {
++  set.seed(3)
++  J <- 10
++  g <- sample(rep(1:3, c(4, 7, 11)))
++  n <- length(g)
++  X <- cbind(1, g == 2, g == 3)
++  Y <- matrix(rpois(n * J, 3), n, J)
++  Y[g == 3, 4] <- 0
++  constraint_fn <- rep(list(function(x) mean(x)), 3)
++  closed_form <- emuFit_micro_penalized(X, Y, constraint_fn = constraint_fn,
++                                        verbose = FALSE)
++  iterative <- emuFit_micro_penalized(X, Y, constraint_fn = constraint_fn,
++                                      verbose = FALSE, use_discrete = FALSE,
++                                      tolerance = 1e-8)
++  expect_lt(max(abs(closed_form$B - iterative$B)), 1e-6)
++  expect_lt(max(abs(closed_form$Y_augmented - iterative$Y_augmented)), 1e-6)
++})
++
++test_that("closed-form discrete penalized fit errors on rank-deficient design", {
++  # three distinct rows, third column twice the second
++  X <- cbind(1, c(0, 0, 1, 1, 2), c(0, 0, 2, 2, 4))
++  Y <- matrix(1:15, 5, 3)
++  expect_error(emuFit_micro_penalized(X, Y, verbose = FALSE), "rank-deficient")
++})
++
++test_that("emuFit with estimates_only returns the same estimates without test_kj", {
++  set.seed(4)
++  n <- 20
++  J <- 12
++  X <- cbind(1, rep(0:1, each = n / 2))
++  colnames(X) <- c("(Intercept)", "group")
++  Y <- matrix(rpois(n * J, 5), n, J)
++  Y[1, colSums(Y) == 0] <- 1
++  colnames(Y) <- paste0("cat", 1:J)
++  est_only <- emuFit(Y = Y, X = X, estimates_only = TRUE)
++  full <- emuFit(Y = Y, X = X, run_score_tests = FALSE, compute_cis = TRUE)
++  expect_equal(est_only$B, full$B)
++  expect_equal(est_only$z_hat, full$z_hat)
++  expect_equal(est_only$coef$estimate, full$coef$estimate)
++  expect_equal(est_only$coef$category, colnames(Y))
++  expect_equal(est_only$coef$covariate, rep("group", J))
++  expect_null(est_only$I)
++  expect_true(all(is.na(est_only$coef$pval)))
++  expect_warning(emuFit(Y = Y, X = X, estimates_only = TRUE, run_score_tests = TRUE),
++                 "estimates_only")
++})
++
++test_that("emuFit with estimates_only matches full fit for a continuous covariate", {
++  set.seed(5)
++  n <- 15
++  J <- 6
++  X <- cbind(1, rnorm(n))
++  Y <- matrix(rpois(n * J, 5), n, J)
++  Y[1, colSums(Y) == 0] <- 1
++  est_only <- emuFit(Y = Y, X = X, estimates_only = TRUE)
++  full <- emuFit(Y = Y, X = X, run_score_tests = FALSE, compute_cis = TRUE)
++  expect_equal(est_only$B, full$B)
++  expect_equal(est_only$z_hat, full$z_hat)
++})
++
++test_that("emuFit with refit = FALSE uses closed-form augmentations for discrete designs", {
++  set.seed(6)
++  n <- 20
++  J <- 8
++  X <- cbind(1, rep(0:1, each = n / 2))
++  Y <- matrix(rpois(n * J, 5), n, J)
++  Y[1, colSums(Y) == 0] <- 1
++  fit <- emuFit(Y = Y, X = X, estimates_only = TRUE)
++  refit <- emuFit(Y = Y, X = X, B = fit$B, refit = FALSE, estimates_only = TRUE)
++  expect_lt(max(abs(refit$Y_augmented - fit$Y_augmented)), 1e-10)
++  expect_lt(max(abs(refit$z_hat - fit$z_hat)), 1e-10)
++})

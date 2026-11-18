@@ -1,0 +1,239 @@
+diff --git a/metagraph/docs/source/traverse.rst b/metagraph/docs/source/traverse.rst
+index 6ca612f14c..af118676ae 100644
+--- a/metagraph/docs/source/traverse.rst
++++ b/metagraph/docs/source/traverse.rst
+@@ -277,11 +277,12 @@ The response
+             "right": {
+               "status": "complete",
+               "complete_to_bp": 5000,
+-              "frontier_remaining": {"live_paths": 0},
++              "frontier_remaining": {"live_paths": 0, "live_labels": 0},
+               "segments": [
+                 {"id": 0, "parents": [], "from_bp": 0, "length_bp": 1200, "sequence": "GCAT...",
+                  "labels": [0], "labels_at_end": [0],
+-                 "events": [{"at_bp": 1200, "type": "label_end", "label": 0, "reason": "record_end"}]}
++                 "events": [{"at_bp": 1200, "type": "label_end", "label": 0, "reason": "record_end",
++                             "successors": 1}]}
+               ],
+               "splits": [],
+               "paths": [{"id": 0, "segments": [0], "length_bp": 1200,
+@@ -317,7 +318,12 @@ An arm:
+ - A split has the kind ``divergence`` when its labels part. It has the kind ``ambiguous`` when
+   one label goes on along several children.
+ - ``cap_trigger`` gives the ``reason``, ``at_bp`` and ``demand`` of the bound that stopped a
+-  ``truncated`` arm.
++  ``truncated`` arm, and the ``segment`` of the first path it stopped.
++- ``frontier_remaining`` counts the paths a bound stopped before the extension length, and the
++  distinct labels on them.
++- An event's ``successors`` is the number of successors the node has in the graph, whatever
++  their labels. It is absent where the walk did not look at them: at the extension length, and
++  where a bound stopped the arm. An end by the split limit states it.
+ 
+ A seed whose labels cannot be determined gets an error in its place. The other seeds are still
+ walked.
+diff --git a/metagraph/integration_tests/test_traverse.py b/metagraph/integration_tests/test_traverse.py
+index 86f02c1725..2e56b35e9a 100644
+--- a/metagraph/integration_tests/test_traverse.py
++++ b/metagraph/integration_tests/test_traverse.py
+@@ -119,6 +119,9 @@ def test_fork(self):
+             self.assertEqual(len(flank), path['length_bp'])
+             self.assertEqual(1, len(path['end_labels']))
+             self.assertEqual('dead_end', path['end_labels'][0]['reason'])
++            # the label ends at a node without successors
++            events = right['segments'][path['segments'][-1]]['events']
++            self.assertEqual([0], [event['successors'] for event in events])
+             flanks[result['label_dict'][path['end_labels'][0]['label']]['name']] = flank
+         self.assertEqual({'A': self.P, 'B': self.Q}, flanks)
+ 
+diff --git a/metagraph/src/cli/traverse.cpp b/metagraph/src/cli/traverse.cpp
+index 5344017a49..25878440d6 100644
+--- a/metagraph/src/cli/traverse.cpp
++++ b/metagraph/src/cli/traverse.cpp
+@@ -280,10 +280,12 @@ Json::Value arm_to_json(const ArmResult &arm) {
+     j["status"] = status_name(arm.status);
+     j["complete_to_bp"] = uint_json(arm.complete_to_bp);
+     j["frontier_remaining"]["live_paths"] = uint_json(arm.frontier_live_paths);
++    j["frontier_remaining"]["live_labels"] = uint_json(arm.frontier_live_labels);
+     if (arm.cap_trigger) {
+         j["cap_trigger"]["reason"] = to_string(arm.cap_trigger->reason);
+         j["cap_trigger"]["at_bp"] = uint_json(arm.cap_trigger->at_bp);
+         j["cap_trigger"]["demand"] = arm.cap_trigger->demand;
++        j["cap_trigger"]["segment"] = uint_json(arm.cap_trigger->segment);
+     }
+ 
+     Json::Value segments(Json::arrayValue);
+@@ -307,6 +309,8 @@ Json::Value arm_to_json(const ArmResult &arm) {
+             ej["type"] = "label_end";
+             ej["label"] = e.label;
+             ej["reason"] = reason_name(e.reason, e.text);
++            if (e.successors)
++                ej["successors"] = uint_json(*e.successors);
+             events.append(std::move(ej));
+         }
+         sj["events"] = std::move(events);
+diff --git a/metagraph/src/graph/traversal/walker.cpp b/metagraph/src/graph/traversal/walker.cpp
+index 761478b64d..8fab7d4e76 100644
+--- a/metagraph/src/graph/traversal/walker.cpp
++++ b/metagraph/src/graph/traversal/walker.cpp
+@@ -302,7 +302,8 @@ class Walker {
+     void mark_ancestors(ArmState &arm, size_t segment);
+     bool is_ancestor_or_self(const ArmState &arm, size_t anc, size_t segment) const;
+     void record_edge(ArmState &arm, size_t segment, const Cand &c);
+-    void end_label(ArmState &arm, Item &item, Entry &e, EndReason reason, const char *text);
++    void end_label(ArmState &arm, Item &item, Entry &e, EndReason reason, const char *text,
++                   std::optional<size_t> successors = std::nullopt);
+     void finish_path(ArmState &arm, Item &item, std::optional<EndReason> path_reason);
+     void censor_item(ArmState &arm, Item &item, EndReason reason);
+ 
+@@ -875,10 +876,10 @@ void Walker::record_edge(ArmState &arm, size_t segment, const Cand &c) {
+ }
+ 
+ void Walker::end_label(ArmState &arm, Item &item, Entry &e, EndReason reason,
+-                       const char *text) {
++                       const char *text, std::optional<size_t> successors) {
+     e.reason = reason;
+     arm.result.segments[item.segment].label_ends.push_back(
+-            LabelEnd{ item.ext_bp, e.label, reason, text });
++            LabelEnd{ item.ext_bp, e.label, reason, text, successors });
+ }
+ 
+ // |item| is a leaf: every label on it has ended
+@@ -981,7 +982,7 @@ std::optional<EndReason> Walker::process_item(ArmState &arm, Item &item,
+     const uint64_t at = item.ext_bp;
+     if (succs.empty()) {
+         for (Entry &e : item.state) {
+-            end_label(arm, item, e, EndReason::DEAD_END, "");
++            end_label(arm, item, e, EndReason::DEAD_END, "", succs.size());
+         }
+         finish_path(arm, item, std::nullopt);
+         return std::nullopt;
+@@ -1083,7 +1084,8 @@ std::optional<EndReason> Walker::process_item(ArmState &arm, Item &item,
+         split_capped = true;
+         if (!arm.result.cap_trigger) {
+             arm.result.cap_trigger = CapTrigger{ EndReason::MAX_SPLITS, at,
+-                                                 static_cast<double>(item.splits + 1) };
++                                                 static_cast<double>(item.splits + 1),
++                                                 item.segment };
+         }
+         arm.boundary = std::min(arm.boundary, at);
+         arm.result.status = ArmResult::TRUNCATED;
+@@ -1116,19 +1118,19 @@ std::optional<EndReason> Walker::process_item(ArmState &arm, Item &item,
+         if (continues)
+             continue;
+         if (excluded.count(l)) {
+-            end_label(arm, item, src, EndReason::BRANCH, "");
++            end_label(arm, item, src, EndReason::BRANCH, "", succs.size());
+         } else if (split_limited) {
+-            end_label(arm, item, src, EndReason::MAX_SPLITS, "");
++            end_label(arm, item, src, EndReason::MAX_SPLITS, "", succs.size());
+         } else if (blocked) {
+             end_label(arm, item, src, blocked == 3 ? EndReason::REACHED_SEED
+                                      : blocked == 2 ? EndReason::EDGE_REUSE_RC
+-                                                    : EndReason::EDGE_REUSE, "");
++                                                    : EndReason::EDGE_REUSE, "", succs.size());
+         } else if (hairpin) {
+-            end_label(arm, item, src, EndReason::DEAD_END, "hairpin");
++            end_label(arm, item, src, EndReason::DEAD_END, "hairpin", succs.size());
+         } else if (src.step && at_record_end(src)) {
+-            end_label(arm, item, src, EndReason::RECORD_END, "");
++            end_label(arm, item, src, EndReason::RECORD_END, "", succs.size());
+         } else {
+-            end_label(arm, item, src, EndReason::LABEL_LOST, "");
++            end_label(arm, item, src, EndReason::LABEL_LOST, "", succs.size());
+         }
+     }
+ 
+@@ -1190,19 +1192,29 @@ void Walker::stop_arm(ArmState &arm, EndReason reason, std::vector<Item> *items,
+         return;
+     const uint64_t radius = strategy_.max_extension_bp;
+     size_t live = 0;
++    tsl::hopscotch_set<LabelId> live_labels;
++    auto count_live = [&](const Item &item) {
++        if (item.ext_bp >= radius)
++            return;
++        live++;
++        for (const Entry &e : item.state) {
++            live_labels.insert(e.label);
++        }
++    };
+     for (const Item &item : arm.next) {
+-        live += item.ext_bp < radius;
++        count_live(item);
+     }
+     if (items) {
+         for (size_t j = from; j < items->size(); ++j) {
+-            live += (*items)[j].ext_bp < radius;
++            count_live((*items)[j]);
+         }
+     }
+     const Item &first = items && from < items->size() ? (*items)[from] : arm.next.front();
+     if (!arm.result.cap_trigger)
+-        arm.result.cap_trigger = CapTrigger{ reason, first.ext_bp, cap_demand_ };
++        arm.result.cap_trigger = CapTrigger{ reason, first.ext_bp, cap_demand_, first.segment };
+     arm.boundary = std::min(arm.boundary, first.ext_bp);
+     arm.result.frontier_live_paths = live;
++    arm.result.frontier_live_labels = live_labels.size();
+     arm.result.status = ArmResult::TRUNCATED;
+     auto censor = [&](Item &item) {
+         censor_item(arm, item, item.ext_bp >= radius ? EndReason::MAX_EXTENSION : reason);
+diff --git a/metagraph/src/graph/traversal/walker.hpp b/metagraph/src/graph/traversal/walker.hpp
+index 903e4bb017..045c17b8cc 100644
+--- a/metagraph/src/graph/traversal/walker.hpp
++++ b/metagraph/src/graph/traversal/walker.hpp
+@@ -174,6 +174,10 @@ struct LabelEnd {
+     // why a DEAD_END: "hairpin" (the label's only continuation was a skipped hairpin);
+     // otherwise empty
+     const char *text = "";
++    // how many successors the node has in the graph, where the walk looked at them: unset
++    // at an end by the extension length or by a cap that stopped the arm, set at an end by
++    // the split limit
++    std::optional<size_t> successors;
+ };
+ 
+ struct Segment {
+@@ -218,6 +222,7 @@ struct CapTrigger {
+     // what the cap compared at the trip, which exceeded its limit (steps, bases, paths,
+     // live paths, or elapsed milliseconds)
+     double demand = 0;
++    size_t segment = 0;              // the segment of that head
+ };
+ 
+ struct ArmResult {
+@@ -227,6 +232,7 @@ struct ArmResult {
+     bool requested = true;
+     Status status = COMPLETE;
+     size_t frontier_live_paths = 0;  // heads below the extension length when stopped
++    size_t frontier_live_labels = 0; // distinct labels on those heads
+     std::optional<CapTrigger> cap_trigger;
+     // Every admissible walk of at most complete_to_bp bases from the seed boundary is in
+     // |segments|, and every path that ended before it ended for the reported reason.
+diff --git a/metagraph/tests/graph/traversal/test_walker.cpp b/metagraph/tests/graph/traversal/test_walker.cpp
+index dc81c70eeb..99aa1d0b0b 100644
+--- a/metagraph/tests/graph/traversal/test_walker.cpp
++++ b/metagraph/tests/graph/traversal/test_walker.cpp
+@@ -646,6 +646,16 @@ TYPED_TEST(WalkerTest, Caps) {
+             EXPECT_EQ(EndReason::MAX_STEPS, arm.cap_trigger->reason);
+             EXPECT_EQ(arm.cap_trigger->at_bp, arm.complete_to_bp);
+             EXPECT_EQ(1u, arm.frontier_live_paths);
++            EXPECT_EQ(1u, arm.frontier_live_labels);
++            // the stopped head's segment is a leaf
++            ASSERT_LT(arm.cap_trigger->segment, arm.segments.size());
++            EXPECT_TRUE(arm.segments[arm.cap_trigger->segment].children.empty());
++            // a bound ended the label: the node's successors were not looked at
++            for (const Segment &s : arm.segments) {
++                for (const LabelEnd &e : s.label_ends) {
++                    EXPECT_FALSE(e.successors.has_value());
++                }
++            }
+             ASSERT_EQ(1u, arm.paths.size());
+             EXPECT_EQ(EndReason::MAX_STEPS, *arm.paths[0].path_reason);
+             EXPECT_EQ(1u, count_ends(arm, EndReason::MAX_STEPS));
+@@ -766,6 +776,8 @@ TYPED_TEST(WalkerTest, SplitLimit) {
+             ASSERT_NE(nullptr, e);
+             EXPECT_EQ(0u, e->at_bp);
+             EXPECT_EQ(EndReason::MAX_SPLITS, e->reason);
++            // the fork has both successors
++            EXPECT_EQ(std::optional<size_t>(2), e->successors);
+         }
+         st.max_splits_per_path = 1;
+         auto one = run(*anno, X, { "A", "B" }, st);

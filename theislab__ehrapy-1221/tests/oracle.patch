@@ -1,0 +1,130 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 560451fe..c5371d4f 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -7,6 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ ### 🐛 Bug Fixes
+ 
+ - {func}`ep.pp.filter_observations <ehrapy.preprocessing.filter_observations>` applies criteria in `query` on `obs` columns also when `X`, or the given `layer`, is `None`, so that a cohort can be defined before any variables are set up; criteria on variables, `min_vars`, `max_vars` and `tem_names` need data and raise a `ValueError` without it, as does {func}`ep.pp.filter_features <ehrapy.preprocessing.filter_features>` ([#1216](https://github.com/theislab/ehrapy/pull/1216)) [@eroell](https://github.com/eroell)
++- {func}`ep.pp.pca <ehrapy.preprocessing.pca>` with `mask_var=None` uses all variables again with scanpy 1.13 ([#1221](https://github.com/theislab/ehrapy/pull/1221)) [@eroell](https://github.com/eroell)
+ 
+ ## v0.16.0
+ 
+diff --git a/docs/conf.py b/docs/conf.py
+index bc9194e3..de52f749 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -188,7 +188,7 @@
+ pygments_style = "sphinx"
+ pygments_dark_style = "native"
+ 
+-html_theme = "scanpydoc"
++html_theme = "scverse"
+ html_title = "ehrapy"
+ html_logo = "_static/ehrapy_logos/ehrapy_pure.png"
+ html_theme_options = {
+diff --git a/ehrapy/preprocessing/_scanpy_pp_api.py b/ehrapy/preprocessing/_scanpy_pp_api.py
+index 1793b6f8..a35c109b 100644
+--- a/ehrapy/preprocessing/_scanpy_pp_api.py
++++ b/ehrapy/preprocessing/_scanpy_pp_api.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from functools import singledispatch
++from importlib.metadata import version
+ from typing import TYPE_CHECKING, Literal
+ 
+ import numpy as np
+@@ -11,6 +12,7 @@
+ from ehrdata import EHRData
+ from fast_array_utils.types import DaskArray
+ from numpy.typing import NDArray
++from packaging.version import Version
+ 
+ from ehrapy._compat import _like_obs, _raise_if_3D, _raise_if_sparse, _unfold_time, function_2D_only
+ from ehrapy._types import _empty
+@@ -25,6 +27,21 @@
+ 
+     type Array = np.ndarray | DaskArray
+ 
++_SCANPY_HAS_MASK = Version(version("scanpy")) >= Version("1.13.0rc0")
++
++
++def _pca_mask_kwargs(mask_var) -> dict:
++    """Pass `mask_var` as scanpy's `mask` from scanpy 1.13 on, where `mask_var=None` no longer means all variables."""
++    if mask_var is _empty:
++        return {}
++    if not _SCANPY_HAS_MASK:
++        return {"mask_var": mask_var}
++    if isinstance(mask_var, str):
++        from anndata.acc import A
++
++        mask_var = A.var[mask_var]
++    return {"mask": mask_var}
++
+ 
+ def pca(
+     edata: EHRData | np.ndarray | spmatrix,
+@@ -136,7 +153,7 @@ def pca(
+     }
+     if not isinstance(edata, EHRData):
+         _raise_if_3D(edata, "pca", "the input")
+-    mask_kwargs = {} if mask_var is _empty else {"mask_var": mask_var}
++    mask_kwargs = _pca_mask_kwargs(mask_var)
+     if obsm is not None or getattr(X, "ndim", 2) != 3:
+         return sc.pp.pca(
+             data=edata,
+@@ -154,7 +171,7 @@ def pca(
+     var = edata.var.iloc[np.repeat(np.arange(n_vars), n_timepoints)].reset_index(drop=True)
+     var.index = var.index.astype(str)
+     if not (mask_var is _empty or mask_var is None or isinstance(mask_var, str)):
+-        mask_kwargs["mask_var"] = np.repeat(np.asarray(mask_var, dtype=bool), n_timepoints)
++        mask_kwargs = _pca_mask_kwargs(np.repeat(np.asarray(mask_var, dtype=bool), n_timepoints))
+     unfolded = EHRData(X=_unfold_time(X), obs=edata.obs[[]], var=var)
+     unfolded.uns = edata.uns
+     sc.pp.pca(unfolded, key_added=key_added, **params, **mask_kwargs)
+diff --git a/pyproject.toml b/pyproject.toml
+index cec71d90..f83b8ed7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -69,6 +69,7 @@ classifiers = [
+ 
+ dependencies = [
+     "ehrdata>=0.5.0",
++    "packaging",
+     "pooch",  # required by the ehrdata submodule, which is installed with --no-deps
+     "scanpy>=1.12",
+     "pynndescent<0.7",  # temporary pin: https://github.com/scverse/scanpy/issues/4444
+@@ -102,7 +103,7 @@ rapids13 = ["rapids-singlecell-cu13[rapids]>=0.18"]
+ doc = [
+     "docutils<0.22",  # https://github.com/vidartf/nbsphinx-link/issues/25
+     "sphinx",
+-    "scanpydoc",
++    "scverse-doc",
+     "sphinx-book-theme",
+     "myst-nb",
+     "myst-parser",
+diff --git a/tests/preprocessing/test_scanpy_pp_api.py b/tests/preprocessing/test_scanpy_pp_api.py
+index 8f5b966e..8d215893 100644
+--- a/tests/preprocessing/test_scanpy_pp_api.py
++++ b/tests/preprocessing/test_scanpy_pp_api.py
+@@ -43,6 +43,11 @@ def test_pca_mask_var_defaults_to_highly_variable(edata_blob_small):
+     ep.pp.pca(edata_blob_small, n_comps=2, mask_var=None)
+     assert (np.abs(edata_blob_small.varm["PCs"]).sum(axis=1) > 0).all()
+ 
++    edata_blob_small.var["first_three"] = np.arange(10) < 3
++    ep.pp.pca(edata_blob_small, n_comps=2, mask_var="first_three")
++    used_features = np.abs(edata_blob_small.varm["PCs"]).sum(axis=1) > 0
++    np.testing.assert_array_equal(used_features, edata_blob_small.var["first_three"])
++
+ 
+ def test_pca_key_added(edata_blob_small):
+     ep.pp.pca(edata_blob_small, n_comps=2, key_added="pca_custom")
+@@ -79,7 +84,6 @@ def test_pca_3D_mask_var(edata_blob_small):
+     np.testing.assert_array_equal(used, np.repeat(edata_blob_small.var[["highly_variable"]].to_numpy(), 10, axis=1))
+     assert edata_blob_small.obsm["pca_3D"].shape == (edata_blob_small.n_obs, 2)
+     assert edata_blob_small.uns["pca_3D"]["params"]["mask_var"] == "highly_variable"
+-    assert edata_blob_small.uns["pca_3D"]["params"]["use_highly_variable"] is True
+ 
+     ep.pp.pca(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME, n_comps=2, mask_var=np.arange(10) < 3)
+     used = np.abs(edata_blob_small.varm["PCs"]).sum(axis=2) > 0

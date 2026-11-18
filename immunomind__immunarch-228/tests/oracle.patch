@@ -1,0 +1,600 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 617871b3..52092e84 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -62,7 +62,8 @@ Imports:
+     ape,
+     doParallel,
+     rlist,
+-    utils
++    utils,
++    glue
+ Depends:
+     R (>= 4.0.0),
+     ggplot2 (>= 3.1.0),
+diff --git a/NAMESPACE b/NAMESPACE
+index db4d3397..6c47eafc 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -178,11 +178,11 @@ importFrom(magrittr,"%>%")
+ importFrom(magrittr,extract2)
+ importFrom(magrittr,set_attr)
+ importFrom(methods,as)
+-importFrom(parallel,detectCores)
+ importFrom(parallel,mclapply)
+ importFrom(patchwork,plot_annotation)
+ importFrom(patchwork,wrap_plots)
+ importFrom(pheatmap,pheatmap)
++importFrom(plyr,.)
+ importFrom(plyr,dlply)
+ importFrom(plyr,mapvalues)
+ importFrom(purrr,imap)
+@@ -190,6 +190,7 @@ importFrom(purrr,map)
+ importFrom(purrr,map2)
+ importFrom(purrr,map2_chr)
+ importFrom(purrr,map2_lgl)
++importFrom(purrr,map_chr)
+ importFrom(purrr,map_df)
+ importFrom(purrr,map_dfr)
+ importFrom(purrr,map_lgl)
+@@ -206,6 +207,7 @@ importFrom(readr,read_tsv)
+ importFrom(readr,write_lines)
+ importFrom(readxl,read_xlsx)
+ importFrom(reshape2,melt)
++importFrom(rlang,current_env)
+ importFrom(rlang,sym)
+ importFrom(rlist,list.remove)
+ importFrom(scales,percent)
+diff --git a/R/align_lineage.R b/R/align_lineage.R
+index 45863bb1..b24b6a76 100644
+--- a/R/align_lineage.R
++++ b/R/align_lineage.R
+@@ -10,19 +10,19 @@
+ #'
+ #' @importFrom magrittr %>% %<>% extract2
+ #' @importFrom stringr str_extract_all str_sub str_length boundary
+-#' @importFrom plyr dlply
++#' @importFrom plyr dlply .
+ #' @importFrom purrr map_dfr
+ #' @importFrom rlist list.remove
+ #' @importFrom utils str
+ #' @importFrom ape as.DNAbin muscle
+ #' @importFrom doParallel registerDoParallel
+-#' @importFrom parallel mclapply detectCores
++#' @importFrom parallel mclapply
+ 
+ #' @description Aligns all sequences incliding germline within each clonal lineage within each cluster
+ #'
+ #' @usage
+ #'
+-#' repAlignLineage(.data, .min.lineage.sequences, .prepare_threads, .align_threads)
++#' repAlignLineage(.data, .min.lineage.sequences, .prepare_threads, .align_threads, .verbose_output)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame}, \link{data.table}
+ #' or a list of these objects.
+@@ -30,7 +30,7 @@
+ #' @param .min.lineage.sequences If number of sequences in the same clonal lineage and the same
+ #' cluster (not including germline) is lower than this threshold, this group of sequences
+ #' will not be aligned and will not be used in next steps of BCR pipeline
+-#' (but still will be saved in the output table).
++#' (will be saved in output table only if .verbose_output parameter is set to TRUE).
+ #'
+ #' @param .prepare_threads Number of threads to prepare results table.
+ #' High number can cause heavy memory usage!
+@@ -41,6 +41,11 @@
+ #' must contain 'Cluster' column, which is added by seqCluster() function, and 'Sequence.germline'
+ #' column, which is added by repGermline() function.
+ #'
++#' @param .verbose_output If TRUE, all output dataframe columns will be included (see documentation about this
++#' function return), and unaligned clusters will be included in the output. Setting this to TRUE significantly
++#' increases memory usage. If FALSE, only aligned clusters and columns required for repClonalFamily() calculation
++#' will be included in the output.
++#'
+ #' @return
+ #'
+ #' Dataframe or list of dataframes (if input is a list with multiple samples).
+@@ -48,15 +53,14 @@
+ #' and unique germlines, and has these columns:
+ #' * Cluster: cluster name
+ #' * Germline: germline sequence
+-#' * Aligned: FALSE if this group of sequences was not aligned with lineage (.min.lineage.sequences
+-#'   is below the threshold); TRUE if it was aligned
+-#' * Alignment: DNAbin object with alignment (if Aligned=TRUE) or DNAbin object with unaligned
+-#'   sequences (if Aligned=FALSE)
+-#' * V.length: shortest length of V gene part outside of CDR3 in this group of sequences;
+-#'   longer V genes (including germline) are trimmed to this length before alignment
+-#' * J.length: shortest length of J gene part outside of CDR3 in this group of sequences;
+-#'   longer J genes (including germline) are trimmed to this length before alignment
+-#' * Sequences: nested dataframe containing all sequences for this combination
++#' * Aligned (included if .verbose_output=TRUE): FALSE if this group of sequences was not aligned with lineage
++#'   (.min.lineage.sequences is below the threshold); TRUE if it was aligned
++#' * Alignment: DNAbin object with alignment or DNAbin object with unaligned sequences (if Aligned=FALSE)
++#' * V.length (included if .verbose_output=TRUE): shortest length of V gene part outside of CDR3 region in this
++#'   group of sequences; longer V genes (including germline) are trimmed to this length before alignment
++#' * J.length (included if .verbose_output=TRUE): shortest length of J gene part outside of CDR3 region in this
++#'   group of sequences; longer J genes (including germline) are trimmed to this length before alignment
++#' * Sequences (included if .verbose_output=TRUE): nested dataframe containing all sequences for this combination
+ #'   of cluster and germline; it has columns
+ #'   Sequence, V.end, J.start, CDR3.start, CDR3.end; all values taken from the input dataframe
+ #'
+@@ -73,7 +77,8 @@
+ repAlignLineage <- function(.data,
+                             .min.lineage.sequences = 3,
+                             .prepare_threads = 2,
+-                            .align_threads = parallel::detectCores()) {
++                            .align_threads = 4,
++                            .verbose_output = FALSE) {
+   require_system_package("clustalw", error_message = paste0(
+     "repAlignLineage requires Clustal W app to be installed!\n",
+     "Please download it from here: http://www.clustal.org/download/current/\n",
+@@ -84,12 +89,13 @@ repAlignLineage <- function(.data,
+     apply_to_sample_or_list(
+       align_single_df,
+       .min.lineage.sequences = .min.lineage.sequences,
+-      .align_threads = .align_threads
++      .align_threads = .align_threads,
++      .verbose_output = .verbose_output
+     )
+   return(.data)
+ }
+ 
+-align_single_df <- function(data, .min.lineage.sequences, .align_threads) {
++align_single_df <- function(data, .min.lineage.sequences, .align_threads, .verbose_output) {
+   for (required_column in c("Cluster", "Germline.sequence")) {
+     if (!(required_column %in% colnames(data))) {
+       stop(
+@@ -106,35 +112,49 @@ align_single_df <- function(data, .min.lineage.sequences, .align_threads) {
+       .variables = .(Cluster, Germline.sequence),
+       .fun = prepare_results_row,
+       .min.lineage.sequences = .min.lineage.sequences,
++      .verbose_output = .verbose_output,
+       .parallel = TRUE
+     ) %>%
++    `[`(!is.na(.)) %>%
+     unname()
+ 
+   # only required columns are passed to alignment function to reduce consumed memory
+-  alignments <- results %>%
+-    lapply("[", c("Aligned", "Alignment")) %>%
+-    parallel::mclapply(
+-      align_sequences,
+-      mc.preschedule = TRUE,
+-      mc.cores = .align_threads
+-    )
++  if (.verbose_output) {
++    alignments <- lapply(results, "[", c("Aligned", "Alignment"))
++  } else {
++    alignments <- lapply(results, "[", "Alignment")
++  }
++  alignments %<>% parallel::mclapply(
++    align_sequences,
++    .verbose_output = .verbose_output,
++    mc.preschedule = TRUE,
++    mc.cores = .align_threads
++  )
+ 
+-  return(convert_nested_to_df(results, alignments))
++  return(convert_nested_to_df(results, alignments, .verbose_output))
+ }
+ 
+ # this function accepts dataframe subset containing rows only for current lineage
+ # and returns named list containing 1 row for results dataframe
+-prepare_results_row <- function(lineage_subset, .min.lineage.sequences) {
++prepare_results_row <- function(lineage_subset, .min.lineage.sequences, .verbose_output) {
+   cluster_name <- lineage_subset[[1, "Cluster"]]
+   germline_seq <- lineage_subset[[1, "Germline.sequence"]]
+   aligned <- nrow(lineage_subset) >= .min.lineage.sequences
++
++  if (!aligned & !.verbose_output) {
++    return(NA)
++  }
++
+   lineage_subset[["V.lengths"]] <- v_len_outside_cdr3(
+     lineage_subset[["V.end"]], lineage_subset[["CDR3.start"]]
+   )
+   lineage_subset[["J.lengths"]] <- j_len_outside_cdr3(
+     lineage_subset[["Sequence"]], lineage_subset[["J.start"]], lineage_subset[["CDR3.end"]]
+   )
+-  sequences <- lineage_subset[c("Sequence", "V.end", "J.start", "CDR3.start", "CDR3.end")]
++
++  if (.verbose_output) {
++    sequences <- lineage_subset[c("Sequence", "V.end", "J.start", "CDR3.start", "CDR3.end")]
++  }
+ 
+   germline_parts <- strsplit(germline_seq, "N")[[1]]
+   germline_v_len <- stringr::str_length(germline_parts[1])
+@@ -152,15 +172,23 @@ prepare_results_row <- function(lineage_subset, .min.lineage.sequences) {
+   )
+   alignment <- convert_to_dnabin(germline_trimmed, clonotypes_trimmed)
+ 
+-  return(list(
+-    Cluster = cluster_name,
+-    Germline = germline_seq,
+-    Aligned = aligned,
+-    Alignment = alignment,
+-    V.length = v_min_len,
+-    J.length = j_min_len,
+-    Sequences = sequences
+-  ))
++  if (.verbose_output) {
++    return(list(
++      Cluster = cluster_name,
++      Germline = germline_seq,
++      Aligned = aligned,
++      Alignment = alignment,
++      V.length = v_min_len,
++      J.length = j_min_len,
++      Sequences = sequences
++    ))
++  } else {
++    return(list(
++      Cluster = cluster_name,
++      Germline = germline_seq,
++      Alignment = alignment
++    ))
++  }
+ }
+ 
+ convert_to_dnabin <- function(germline_seq, clonotypes) {
+@@ -182,22 +210,30 @@ trim_seq <- function(seq, v_len, v_min, j_len, j_min) {
+   stringr::str_sub(seq, v_len - v_min + 1, -(j_len - j_min + 1))
+ }
+ 
+-convert_nested_to_df <- function(nested_results_list, nested_alignments_list) {
++convert_nested_to_df <- function(nested_results_list, nested_alignments_list, .verbose_output) {
+   alignments <- nested_alignments_list %>%
+     lapply(magrittr::extract2, "Alignment") %>%
+     tibble(Alignment = .)
+-  sequences <- nested_results_list %>%
+-    lapply(magrittr::extract2, "Sequences") %>%
+-    tibble(Sequences = .)
+   df <- nested_results_list %>%
+     lapply(rlist::list.remove, c("Alignment", "Sequences")) %>%
+     purrr::map_dfr(~.) %>%
+-    cbind(alignments, sequences)
++    cbind(alignments)
++  if (.verbose_output) {
++    sequences <- nested_results_list %>%
++      lapply(magrittr::extract2, "Sequences") %>%
++      tibble(Sequences = .)
++    df %<>% cbind(sequences)
++  }
+   return(df)
+ }
+ 
+-align_sequences <- function(df_row) {
+-  if (df_row[["Aligned"]]) {
++align_sequences <- function(df_row, .verbose_output) {
++  if (.verbose_output) {
++    aligned <- df_row[["Aligned"]]
++  } else {
++    aligned <- TRUE
++  }
++  if (aligned) {
+     df_row[["Alignment"]] %<>% ape::clustal()
+   }
+   return(df_row)
+diff --git a/R/germline.R b/R/germline.R
+index 1599f56d..3730f18d 100644
+--- a/R/germline.R
++++ b/R/germline.R
+@@ -9,6 +9,7 @@
+ #'
+ #' @aliases repGermline germline_single_df generate_germline_sequence merge_reference_sequences validate_genes_edges validate_chains_length
+ #'
++#' @importFrom rlang current_env
+ #' @importFrom stringr str_sub str_length str_replace fixed
+ #' @importFrom purrr imap
+ #' @importFrom magrittr %>% %<>% extract2
+@@ -19,7 +20,7 @@
+ #'
+ #' @usage
+ #'
+-#' repGermline(.data, species, min_nuc_outside_cdr3)
++#' repGermline(.data, species, min_nuc_outside_cdr3, ref_only_first)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame}, \link{data.table}
+ #' or a list of these objects.
+@@ -36,6 +37,10 @@
+ #' @param min_nuc_outside_cdr3 This parameter sets how many nucleotides should have V or J chain
+ #' outside of CDR3 to be considered good for further alignment.
+ #'
++#' @param ref_only_first This parameter, if TRUE, means to take only first sequence from reference
++#' for each allele name; if FALSE, all sequences will be taken, and output table will
++#' increase in size as a result.
++#'
+ #' @return
+ #'
+ #' Data with added columns V.first.allele, J.first.allele (with first alleles of V and J genes),
+@@ -50,18 +55,27 @@
+ #'   top(2000) %>% # reduce the dataset to save time on examples
+ #'   repGermline()
+ #' @export repGermline
+-repGermline <- function(.data, species = "HomoSapiens", min_nuc_outside_cdr3 = 5) {
++repGermline <- function(.data, species = "HomoSapiens", min_nuc_outside_cdr3 = 5, ref_only_first = TRUE) {
++  # prepare reference sequences for all alleles
++  data(genesegments, envir = rlang::current_env())
++  reference <- GENE_SEGMENTS %>% filter(species == species)
++  reference <- reference[c("sequence", "allele_id")]
++  if (ref_only_first) {
++    reference <- reference[!duplicated(reference$allele_id), ]
++  }
++
+   .data %<>%
+     apply_to_sample_or_list(
+       germline_single_df,
+       .with_names = TRUE,
++      reference = reference,
+       species = species,
+       min_nuc_outside_cdr3 = min_nuc_outside_cdr3
+     )
+   return(.data)
+ }
+ 
+-germline_single_df <- function(data, species, min_nuc_outside_cdr3, sample_name = NA) {
++germline_single_df <- function(data, reference, species, min_nuc_outside_cdr3, sample_name = NA) {
+   data %<>%
+     validate_genes_edges(sample_name) %>%
+     add_column_with_first_gene(
+@@ -69,24 +83,26 @@ germline_single_df <- function(data, species, min_nuc_outside_cdr3, sample_name
+       "V.first.allele",
+       .with_allele = TRUE
+     ) %>%
+-    merge_reference_sequences("V", species, sample_name) %>%
++    merge_reference_sequences(reference, "V", species, sample_name) %>%
+     add_column_with_first_gene(
+       "J.name",
+       "J.first.allele",
+       .with_allele = TRUE
+     ) %>%
+-    merge_reference_sequences("J", species, sample_name) %>%
++    merge_reference_sequences(reference, "J", species, sample_name) %>%
+     validate_chains_length(min_nuc_outside_cdr3, sample_name) %>%
+     rowwise() %>%
+     mutate(Germline.sequence = generate_germline_sequence(
+-      Sequence, V.sequence, J.sequence, V.end, CDR3.start, CDR3.end, J.start, sample_name
++      Sequence, V.sequence, J.sequence, V.end, CDR3.start, CDR3.end, J.start,
++      V3.Deletions, J3.Deletions, sample_name
+     )) %>%
+     drop_na(Germline.sequence)
+   return(data)
+ }
+ 
+-generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start, sample_name) {
+-  if (any(is.na(c(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start))) || (seq == "")) {
++generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start, v3_del, j3_del, sample_name) {
++  if (any(is.na(c(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start, v3_del, j3_del))) ||
++    (seq == "")) {
+     warning(
+       "Some of mandatory fields in a row ",
+       optional_sample("from sample ", sample_name, " "),
+@@ -105,12 +121,18 @@ generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr
+       cdr3_end,
+       ", J.start = ",
+       j_start,
++      ",\nV3.Deletions = ",
++      v3_del,
++      ", J3.Deletions = ",
++      j3_del,
+       ".\nThe row will be dropped!"
+     )
+     return(NA)
+   } else {
+     cdr3_start %<>% as.numeric()
+     cdr3_end %<>% as.numeric()
++    v3_del %<>% as.numeric()
++    j3_del %<>% as.numeric()
+ 
+     if (v_end <= cdr3_start) {
+       v_part <- v_ref
+@@ -118,7 +140,7 @@ generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr
+       # trim intersection of V and CDR3 from reference V gene
+       v_part <- stringr::str_sub(
+         v_ref, 1,
+-        max(0, stringr::str_length(v_ref) - (v_end - cdr3_start))
++        max(0, stringr::str_length(v_ref) - (v_end - cdr3_start + v3_del))
+       )
+     }
+ 
+@@ -128,7 +150,7 @@ generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr
+       j_part <- j_ref
+     } else {
+       # trim intersection of J and CDR3 from reference J gene
+-      j_part <- stringr::str_sub(j_ref, cdr3_end - j_start + 1)
++      j_part <- stringr::str_sub(j_ref, cdr3_end - j_start + j3_del + 1)
+     }
+ 
+     germline <- paste0(v_part, cdr3_part, j_part) %>%
+@@ -137,17 +159,14 @@ generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr
+   }
+ }
+ 
+-merge_reference_sequences <- function(data, chain_letter, species, sample_name) {
+-  data(genesegments)
+-  reference_df <- GENE_SEGMENTS %>% filter(species == species)
+-  reference_df <- reference_df[c("sequence", "allele_id")]
++merge_reference_sequences <- function(data, reference, chain_letter, species, sample_name) {
+   chain_seq_colname <- paste0(chain_letter, ".sequence")
+   chain_allele_colname <- paste0(chain_letter, ".first.allele")
+-  colnames(reference_df) <- c(chain_seq_colname, chain_allele_colname)
++  colnames(reference) <- c(chain_seq_colname, chain_allele_colname)
+ 
+   # check for alleles in data that don't exist in the reference
+   alleles_in_data <- unique(data[[chain_allele_colname]])
+-  alleles_in_ref <- unique(reference_df[[chain_allele_colname]])
++  alleles_in_ref <- unique(reference[[chain_allele_colname]])
+   missing_alleles <- alleles_in_data[!(alleles_in_data %in% alleles_in_ref)]
+   if (length(missing_alleles) > 0) {
+     warning(
+@@ -162,7 +181,7 @@ merge_reference_sequences <- function(data, chain_letter, species, sample_name)
+     )
+   }
+ 
+-  data %<>% merge(reference_df, by = chain_allele_colname)
++  data %<>% merge(reference, by = chain_allele_colname)
+   if (nrow(data) == 0) {
+     stop(
+       "After merging with reference, the data ",
+diff --git a/R/immunr_data_format.R b/R/immunr_data_format.R
+index a2d22c69..c8e0b4a6 100644
+--- a/R/immunr_data_format.R
++++ b/R/immunr_data_format.R
+@@ -96,19 +96,23 @@ IMMCOL_EXT$fr3nt <- "FR3.nt"
+ IMMCOL_EXT$fr3aa <- "FR3.aa"
+ IMMCOL_EXT$fr4nt <- "FR4.nt"
+ IMMCOL_EXT$fr4aa <- "FR4.aa"
++IMMCOL_EXT$v3del <- "V3.Deletions"
++IMMCOL_EXT$j3del <- "J3.Deletions"
+ IMMCOL_EXT$order <- c(
+   IMMCOL_EXT$bestv, IMMCOL_EXT$bestj, IMMCOL_EXT$cdr3s, IMMCOL_EXT$cdr3e,
+   IMMCOL_EXT$c, IMMCOL_EXT$cs, IMMCOL_EXT$ce,
+   IMMCOL_EXT$cdr1nt, IMMCOL_EXT$cdr1aa, IMMCOL_EXT$cdr2nt, IMMCOL_EXT$cdr2aa,
+   IMMCOL_EXT$fr1nt, IMMCOL_EXT$fr1aa, IMMCOL_EXT$fr2nt, IMMCOL_EXT$fr2aa,
+-  IMMCOL_EXT$fr3nt, IMMCOL_EXT$fr3aa, IMMCOL_EXT$fr4nt, IMMCOL_EXT$fr4aa
++  IMMCOL_EXT$fr3nt, IMMCOL_EXT$fr3aa, IMMCOL_EXT$fr4nt, IMMCOL_EXT$fr4aa,
++  IMMCOL_EXT$v3del, IMMCOL_EXT$j3del
+ )
+ IMMCOL_EXT$type <- c(
+   "character", "character", "integer", "integer",
+   "character", "integer", "integer",
+   "character", "character", "character", "character",
+   "character", "character", "character", "character",
+-  "character", "character", "character", "character"
++  "character", "character", "character", "character",
++  "integer", "integer"
+ )
+ 
+ # Additional information
+diff --git a/R/io-parsers.R b/R/io-parsers.R
+index 13facb3c..e801fa1f 100644
+--- a/R/io-parsers.R
++++ b/R/io-parsers.R
+@@ -415,7 +415,9 @@ parse_mixcr <- function(.filename, .mode) {
+   )
+   pos_extra_headers <- list(
+     cdr3start = NA,
+-    cdr3end = NA
++    cdr3end = NA,
++    v3del = NA,
++    j3del = NA
+   )
+   gene_headers <- list(
+     vgenes = NA,
+@@ -668,6 +670,10 @@ parse_mixcr <- function(.filename, .mode) {
+     # CDR3Begin position is 10, CDR3End is 19
+     df[[pos_extra_headers[["cdr3start"]]]] <- sapply(df[["refpoints"]], get_ref_point_position, 10)
+     df[[pos_extra_headers[["cdr3end"]]]] <- sapply(df[["refpoints"]], get_ref_point_position, 19)
++
++    # number of 3' V deletions is 11; number of 3' J deletions is 18
++    df[[pos_extra_headers[["v3del"]]]] <- sapply(df[["refpoints"]], get_ref_point_position, 11)
++    df[[pos_extra_headers[["j3del"]]]] <- sapply(df[["refpoints"]], get_ref_point_position, 18)
+   }
+ 
+   if (!(.count %in% table.colnames)) {
+@@ -700,7 +706,8 @@ parse_mixcr <- function(.filename, .mode) {
+     nuc_headers[[".nuc.seq.fr1"]], aa_headers[[".aa.seq.fr1"]],
+     nuc_headers[[".nuc.seq.fr2"]], aa_headers[[".aa.seq.fr2"]],
+     nuc_headers[[".nuc.seq.fr3"]], aa_headers[[".aa.seq.fr3"]],
+-    nuc_headers[[".nuc.seq.fr4"]], aa_headers[[".aa.seq.fr4"]]
++    nuc_headers[[".nuc.seq.fr4"]], aa_headers[[".aa.seq.fr4"]],
++    pos_extra_headers[["v3del"]], pos_extra_headers[["j3del"]]
+   )
+   df_ext_column_names <- IMMCOL_EXT$order
+ 
+diff --git a/R/seqCluster.R b/R/seqCluster.R
+index 47f1df8a..3269c2d9 100644
+--- a/R/seqCluster.R
++++ b/R/seqCluster.R
+@@ -1,6 +1,6 @@
+ #' Function for asignment clusters based on sequencies similarity
+ #'
+-#' @importFrom purrr map map_lgl map2 map2_chr map_df map2_lgl
++#' @importFrom purrr map map_lgl map_chr map2 map2_chr map_df map2_lgl
+ #' @importFrom magrittr %>% %<>%
+ #' @importFrom reshape2 melt
+ #' @importFrom dplyr group_by mutate ungroup select cur_group_id left_join
+diff --git a/data/bcrdata.rda b/data/bcrdata.rda
+index 95f48c67..619cbd2d 100644
+Binary files a/data/bcrdata.rda and b/data/bcrdata.rda differ
+diff --git a/man/repAlignLineage.Rd b/man/repAlignLineage.Rd
+index ab68539d..ea4dfddd 100644
+--- a/man/repAlignLineage.Rd
++++ b/man/repAlignLineage.Rd
+@@ -14,7 +14,7 @@ and maturity of each clonal lineage. This allows you to find high mature cells a
+ number of offspring. The phylogenetic analysis will find mutations that increase the affinity of BCR.
+ Making alignment of the sequence is the first step towards sequence analysis including BCR.}
+ \usage{
+-repAlignLineage(.data, .min.lineage.sequences, .prepare_threads, .align_threads)
++repAlignLineage(.data, .min.lineage.sequences, .prepare_threads, .align_threads, .verbose_output)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame}, \link{data.table}
+@@ -23,7 +23,7 @@ or a list of these objects.}
+ \item{.min.lineage.sequences}{If number of sequences in the same clonal lineage and the same
+ cluster (not including germline) is lower than this threshold, this group of sequences
+ will not be aligned and will not be used in next steps of BCR pipeline
+-(but still will be saved in the output table).}
++(will be saved in output table only if .verbose_output parameter is set to TRUE).}
+ 
+ \item{.prepare_threads}{Number of threads to prepare results table.
+ High number can cause heavy memory usage!}
+@@ -33,6 +33,11 @@ High number can cause heavy memory usage!}
+ It must have columns in the immunarch compatible format \link{immunarch_data_format}, and also
+ must contain 'Cluster' column, which is added by seqCluster() function, and 'Sequence.germline'
+ column, which is added by repGermline() function.}
++
++\item{.verbose_output}{If TRUE, all output dataframe columns will be included (see documentation about this
++function return), and unaligned clusters will be included in the output. Setting this to TRUE significantly
++increases memory usage. If FALSE, only aligned clusters and columns required for repClonalFamily() calculation
++will be included in the output.}
+ }
+ \value{
+ Dataframe or list of dataframes (if input is a list with multiple samples).
+@@ -40,15 +45,14 @@ The dataframe has number of rows equal to number of combinations of unique clust
+ and unique germlines, and has these columns:
+ * Cluster: cluster name
+ * Germline: germline sequence
+-* Aligned: FALSE if this group of sequences was not aligned with lineage (.min.lineage.sequences
+-  is below the threshold); TRUE if it was aligned
+-* Alignment: DNAbin object with alignment (if Aligned=TRUE) or DNAbin object with unaligned
+-  sequences (if Aligned=FALSE)
+-* V.length: shortest length of V gene part outside of CDR3 in this group of sequences;
+-  longer V genes (including germline) are trimmed to this length before alignment
+-* J.length: shortest length of J gene part outside of CDR3 in this group of sequences;
+-  longer J genes (including germline) are trimmed to this length before alignment
+-* Sequences: nested dataframe containing all sequences for this combination
++* Aligned (included if .verbose_output=TRUE): FALSE if this group of sequences was not aligned with lineage
++  (.min.lineage.sequences is below the threshold); TRUE if it was aligned
++* Alignment: DNAbin object with alignment or DNAbin object with unaligned sequences (if Aligned=FALSE)
++* V.length (included if .verbose_output=TRUE): shortest length of V gene part outside of CDR3 region in this
++  group of sequences; longer V genes (including germline) are trimmed to this length before alignment
++* J.length (included if .verbose_output=TRUE): shortest length of J gene part outside of CDR3 region in this
++  group of sequences; longer J genes (including germline) are trimmed to this length before alignment
++* Sequences (included if .verbose_output=TRUE): nested dataframe containing all sequences for this combination
+   of cluster and germline; it has columns
+   Sequence, V.end, J.start, CDR3.start, CDR3.end; all values taken from the input dataframe
+ }
+diff --git a/man/repGermline.Rd b/man/repGermline.Rd
+index cb9afdf0..7a7b4530 100644
+--- a/man/repGermline.Rd
++++ b/man/repGermline.Rd
+@@ -14,7 +14,7 @@ for each BCR in clonal lineage. In other words, germline sequence is a sequence
+ after VDJ recombination, before B-cell maturation and hypermutation process. Germline sequence is useful
+ for assessing the degree of mutation and maturity of the repertoire.}
+ \usage{
+-repGermline(.data, species, min_nuc_outside_cdr3)
++repGermline(.data, species, min_nuc_outside_cdr3, ref_only_first)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame}, \link{data.table}
+@@ -31,6 +31,10 @@ It must have columns in the immunarch compatible format \link{immunarch_data_for
+ 
+ \item{min_nuc_outside_cdr3}{This parameter sets how many nucleotides should have V or J chain
+ outside of CDR3 to be considered good for further alignment.}
++
++\item{ref_only_first}{This parameter, if TRUE, means to take only first sequence from reference
++for each allele name; if FALSE, all sequences will be taken, and output table will
++increase in size as a result.}
+ }
+ \value{
+ Data with added columns V.first.allele, J.first.allele (with first alleles of V and J genes),

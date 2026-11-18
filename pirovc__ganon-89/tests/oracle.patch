@@ -1,0 +1,288 @@
+diff --git a/README.md b/README.md
+index 3795307b..51b9de8b 100755
+--- a/README.md
++++ b/README.md
+@@ -318,7 +318,7 @@ ctest -VV .
+ ## Installing GCC7 in a separate environment with conda
+ 
+ ```shh
+-conda create -n gcc7 -c quantstack gcc-7 libgcc-7 cmake>=3.8.2
++conda create -n gcc7 -c gouarin gcc-7 libgcc-7 "cmake>=3.10"
+ source activate gcc7
+ ```
+ 
+diff --git a/src/ganon-build/GanonBuild.cpp b/src/ganon-build/GanonBuild.cpp
+index 277c9054..40e9f9f3 100644
+--- a/src/ganon-build/GanonBuild.cpp
++++ b/src/ganon-build/GanonBuild.cpp
+@@ -225,9 +225,21 @@ bool run( Config config )
+             while ( !seqan::atEnd( seqFileIn ) )
+             {
+ 
+-                seqan::StringSet< seqan::CharString >  ids;
+-                seqan::StringSet< seqan::IupacString > seqs;
+-                seqan::readRecords( ids, seqs, seqFileIn, config.n_refs );
++                seqan::StringSet< seqan::CharString > ids;
++                seqan::StringSet< seqan::CharString > seqs;
++
++                try
++                {
++                    seqan::readRecords( ids, seqs, seqFileIn, config.n_refs );
++                }
++                catch ( seqan::Exception const& e )
++                {
++                    mtx.lock();
++                    std::cerr << "ERROR: " << e.what() << std::endl;
++                    mtx.unlock();
++                }
++
++
+                 for ( uint64_t i = 0; i < seqan::length( ids ); ++i )
+                 {
+                     stats.totalSeqsFile += 1;
+@@ -276,7 +288,7 @@ bool run( Config config )
+                 {
+                     for ( uint64_t i = 0; i < seq_bin[val.seqid].size(); i++ )
+                     {
+-                        auto [fragstart, fragend, binid] = seq_bin[val.seqid][i];
++                        auto[fragstart, fragend, binid] = seq_bin[val.seqid][i];
+                         // For infixes, we have to provide both the including start and the excluding end position.
+                         // fragstart -1 to fix offset
+                         // fragend -1+1 to fix offset and not exclude last position
+diff --git a/src/ganon-classify/GanonClassify.cpp b/src/ganon-classify/GanonClassify.cpp
+index 551b8770..30c54519 100755
+--- a/src/ganon-classify/GanonClassify.cpp
++++ b/src/ganon-classify/GanonClassify.cpp
+@@ -354,8 +354,92 @@ void print_stats( Stats& stats, const StopClock& timeClass )
+               << " match/read)" << std::endl;
+ }
+ 
+-} // namespace detail
++uint32_t parse_reads_single( seqan::SeqFileIn&                 seqFileIn,
++                             uint32_t                          pos_start,
++                             uint32_t                          n_reads,
++                             SafeQueue< detail::ReadBatches >& queue1 )
++{
++
++    seqan::setPosition( seqFileIn, pos_start ); // rewind the file to the last valid position without errors
++    seqan::CharString id;
++    seqan::CharString seq;
++
++    seqan::StringSet< seqan::CharString > ids;
++    seqan::StringSet< seqan::CharString > seqs;
++    uint32_t                              read_cnt    = 0;
++    uint32_t                              total_reads = 0;
++    while ( !seqan::atEnd( seqFileIn ) )
++    {
++        try
++        {
++            seqan::readRecord( id, seq, seqFileIn );
++            read_cnt++;
++
++            seqan::appendValue( seqs, seq );
++            seqan::appendValue( ids, id );
++            if ( read_cnt == n_reads )
++            {
++                queue1.push( detail::ReadBatches{ ids, seqs } );
++                seqan::clear( ids );
++                seqan::clear( seqs );
++                total_reads += read_cnt;
++                read_cnt = 0;
++            }
++        }
++        catch ( seqan::Exception const& e )
++        {
++            std::cerr << "ERROR: " << e.what() << " [@" << id << "]" << std::endl;
++        }
++    }
++    // left overs
++    if ( seqan::length( ids ) > 0 )
++    {
++        queue1.push( detail::ReadBatches{ ids, seqs } );
++        total_reads += read_cnt;
++    }
++
++    return total_reads;
++}
++
++void parse_reads( SafeQueue< detail::ReadBatches >& queue1,
++                  StopClock&                        timeLoadReads,
++                  Stats&                            stats,
++                  Config const&                     config )
++{
++    for ( auto const& reads_file : config.reads )
++    {
++        seqan::SeqFileIn seqFileIn;
++        if ( !seqan::open( seqFileIn, seqan::toCString( reads_file ) ) )
++        {
++            std::cerr << "Unable to open " << reads_file << std::endl;
++            continue;
++        }
++        uint32_t pos = 0;
++        while ( !seqan::atEnd( seqFileIn ) )
++        {
++            pos = seqan::position( seqFileIn );
++            seqan::StringSet< seqan::CharString > ids;
++            seqan::StringSet< seqan::CharString > seqs;
++            try
++            {
++                // Parse reads in batches
++                seqan::readRecords( ids, seqs, seqFileIn, config.n_reads );
++                stats.totalReads += seqan::length( ids );
++                queue1.push( detail::ReadBatches{ ids, seqs } );
++            }
++            catch ( seqan::Exception const& e )
++            {
++                // Error occured, faulty fastq, continue to parse reads one by one from the last valid position
++                stats.totalReads += parse_reads_single( seqFileIn, pos, config.n_reads, queue1 );
++            }
++        }
++        seqan::close( seqFileIn );
++    }
++    queue1.notify_push_over();
++    timeLoadReads.stop();
++}
+ 
++} // namespace detail
+ 
+ bool run( Config config )
+ {
+@@ -413,28 +497,13 @@ bool run( Config config )
+ 
+     // Thread for reading input files
+     timeLoadReads.start();
+-    std::future< void > read_task( std::async( std::launch::async, [=, &queue1, &timeLoadReads, &stats] {
+-        for ( auto const& reads_file : config.reads )
+-        {
+-            seqan::SeqFileIn seqFileIn;
+-            if ( !seqan::open( seqFileIn, seqan::toCString( reads_file ) ) )
+-            {
+-                std::cerr << "Unable to open " << reads_file << std::endl;
+-                continue;
+-            }
+-            while ( !seqan::atEnd( seqFileIn ) )
+-            {
+-                seqan::StringSet< seqan::CharString > ids;
+-                seqan::StringSet< seqan::Dna5String > seqs;
+-                seqan::readRecords( ids, seqs, seqFileIn, config.n_reads );
+-                stats.totalReads += seqan::length( ids );
+-                queue1.push( detail::ReadBatches{ ids, seqs } );
+-            }
+-            seqan::close( seqFileIn );
+-        }
+-        queue1.notify_push_over();
+-        timeLoadReads.stop();
+-    } ) );
++    std::future< void > read_task = std::async( std::launch::async,
++                                                detail::parse_reads,
++                                                std::ref( queue1 ),
++                                                std::ref( timeLoadReads ),
++                                                std::ref( stats ),
++                                                std::ref( config ) );
++
+ 
+     // Thread for printing classified reads
+     timePrintClass.start();
+@@ -553,8 +622,10 @@ bool run( Config config )
+                                                 // next iterations)
+         }
+ 
+-        if ( config.split_output_file_hierarchy && !hierarchy.second.output_file.empty() ){
+-            out << '\n'; //write line break at the end, signal to ganon wrapper that file is over in case of multiple files
++        if ( config.split_output_file_hierarchy && !hierarchy.second.output_file.empty() )
++        {
++            out << '\n'; // write line break at the end, signal to ganon wrapper that file is over in case of multiple
++                         // files
+             out.close();
+         }
+ 
+@@ -571,8 +642,9 @@ bool run( Config config )
+ 
+     if ( config.output_unclassified )
+         out_unclassified.close();
+-    if ( !config.split_output_file_hierarchy && !config.output_file.empty() ){
+-        out << '\n'; //write line break at the end, signal to ganon wrapper that file is over in case of multiple files
++    if ( !config.split_output_file_hierarchy && !config.output_file.empty() )
++    {
++        out << '\n'; // write line break at the end, signal to ganon wrapper that file is over in case of multiple files
+         out.close();
+     }
+ 
+diff --git a/tests/aux/Aux.hpp b/tests/aux/Aux.hpp
+index a3b89e2e..3f2a4f66 100755
+--- a/tests/aux/Aux.hpp
++++ b/tests/aux/Aux.hpp
+@@ -9,6 +9,15 @@
+ namespace aux
+ {
+ 
++inline int fileLines( const std::string& file )
++{
++    int count = 0;
++    std::ifstream f(file);
++    std::string line;
++    while (getline(f, line))
++        count++;
++    return count;
++}
+ 
+ inline int fileSize( const std::string& file )
+ {
+diff --git a/tests/ganon-classify/GanonClassify.test.cpp b/tests/ganon-classify/GanonClassify.test.cpp
+index 78438883..9b24a910 100755
+--- a/tests/ganon-classify/GanonClassify.test.cpp
++++ b/tests/ganon-classify/GanonClassify.test.cpp
+@@ -232,6 +232,18 @@ SCENARIO( "Classify multi-hierarchy with multiple errors and multiple unique err
+ 
+ // Functionality
+ 
++SCENARIO( "Classify problematic fastq", "[ganon-classify]" )
++{
++    auto cfg               = config_classify::defaultConfig();
++    cfg.bloom_filter_files = { "filters/bacteria.filter" };
++    cfg.group_bin_files    = { "files/bacteria.map" };
++    cfg.reads              = { "reads/problematic.fq" };
++    cfg.max_error          = "3";
++
++    REQUIRE( GanonClassify::run( cfg ) );
++    REQUIRE( aux::fileLines( cfg.output_file )==5 );
++}
++
+ SCENARIO( "Classify without matches", "[ganon-classify]" )
+ {
+     auto cfg               = config_classify::defaultConfig();
+diff --git a/tests/ganon-classify/data/reads/problematic.fq b/tests/ganon-classify/data/reads/problematic.fq
+new file mode 100755
+index 00000000..e5be9cb4
+--- /dev/null
++++ b/tests/ganon-classify/data/reads/problematic.fq
+@@ -0,0 +1,28 @@
++@good1
++CGCCAGACCCCCTTGCCTAGGCGCTCCATCCGCACCCTCTCCAGACTCCAAGCCCGCTTGAAGGCACCCGGAATCTCGCGCAGCGAAAATTTATAGATAC
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@good2
++CGCCAGACCCCCTTGCCTAGGCGCTCCATCCGCACCCTCTCCAGACTCCAAGCCCGCTTGAAGGCACCCGGAATCTCGCGCAGCGAAAATTTATAGATAC
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@good3
++CGCCAGACCCCCTTGCCTAGGCGCTCCATCCGCACCCTCTCCAGACTCCAAGCCCGCTTGAAGGCACCCGGAATCTCGCGCAGCGAAAATTTATAGATAC
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@bad1
++CGCCAGACCCCCTTGCCTAGGCGCTCCATCCGCACCCTCTCCAGACTCCAAGCCCGCTTGAAGGCACCCGGAATCTCG
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@good4
++CGCCAGACCCCCTTGCCTAGGCGCTCCATCCGCACCCTCTCCAGACTCCAAGCCCGCTTGAAGGCACCCGGAATCTCGCGCAGCGAAAATTTATAGATAC
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@bad2
++
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
++@bad3
++ZZZZ
+++
++2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222
+\ No newline at end of file

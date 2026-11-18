@@ -1,0 +1,637 @@
+diff --git a/bin/mmseqs_add_descriptions.py b/bin/mmseqs_add_descriptions.py
+index 50f0bea6..a23cde00 100755
+--- a/bin/mmseqs_add_descriptions.py
++++ b/bin/mmseqs_add_descriptions.py
+@@ -1,8 +1,30 @@
+ #!/usr/bin/env python
+ import sys
++import re
+ import pandas as pd
+ 
+ 
++def extract_kegg_orthology(description):
++    if pd.isna(description):
++        return None
++    orthologies = dict.fromkeys(re.findall(r"\bK\d{5}\b", description))
++    return "/".join(orthologies) or None
++
++
++def extract_kegg_EC(description):
++    if pd.isna(description):
++        return None
++    ec_fields = re.findall(r"\[EC:([^\]]*)\]", description)
++    if not ec_fields:
++        return None
++    ec_numbers = dict.fromkeys(
++        number
++        for field in ec_fields
++        for number in re.findall(r"\b\d+\.\d+\.\d+\.\d+\b", field)
++    )
++    return "; ".join(f"EC:{number}" for number in ec_numbers)
++
++
+ def assign_rank(row, a_rank, b_rank, db_name_bit_score):
+     """Assign rank based on bit score and provided thresholds."""
+     if pd.isna(row[db_name_bit_score]):
+@@ -36,8 +58,22 @@ def main(
+     print("Gene locations loaded. Sample rows:")
+     print(df_gene_locs.head())
+ 
+-    df_mmseqs = pd.read_csv(raw_mmseqs_path, sep="\t", header=None, usecols=[0, 1, 11])
+-    df_mmseqs.columns = ["query_id", f"{db_name}_id", f"{db_name}_bitScore"]
++    df_mmseqs = pd.read_csv(
++        raw_mmseqs_path,
++        sep="\t",
++        usecols=lambda column: column in {"query", "target", "bits", "theader"},
++    )
++    if df_mmseqs.empty:
++        print("No MMseqs hits. Skipping further processing.")
++        return
++    df_mmseqs.rename(
++        columns={
++            "query": "query_id",
++            "target": f"{db_name}_id",
++            "bits": f"{db_name}_bitScore",
++        },
++        inplace=True,
++    )
+     print("MMseqs data loaded and columns renamed. Sample rows:")
+     print(df_mmseqs.head())
+ 
+@@ -45,7 +81,7 @@ def main(
+     print("Merged MMseqs output with gene locations. Sample rows:")
+     print(df_merged.head())
+ 
+-    if descriptions_path != "NULL":
++    if descriptions_path and descriptions_path != "NULL":
+         df_descriptions = pd.read_csv(descriptions_path, sep="\t")
+         first_column = df_descriptions.columns[0]
+         df_descriptions.rename(columns={first_column: f"{db_name}_id"}, inplace=True)
+@@ -87,24 +123,56 @@ def main(
+         # Drop A_rank and B_rank columns as they should not be output
+         df_merged.drop(columns=["A_rank", "B_rank"], inplace=True, errors="ignore")
+ 
++    if "theader" in df_merged.columns:
++        description_column = f"{db_name}_description"
++        if description_column in df_merged.columns:
++            df_merged[description_column] = df_merged[description_column].fillna(
++                df_merged["theader"]
++            )
++        else:
++            df_merged[description_column] = df_merged["theader"]
++        df_merged.drop(columns="theader", inplace=True)
++
++    description_column = f"{db_name}_description"
++    if description_column in df_merged.columns:
++        if db_name == "kegg":
++            df_merged["kegg_EC"] = df_merged[description_column].apply(extract_kegg_EC)
++            df_merged.rename(columns={"kegg_id": "kegg_gene_name"}, inplace=True)
++            df_merged["kegg_id"] = df_merged[description_column].apply(
++                extract_kegg_orthology
++            )
++        elif db_name == "merops":
++            df_merged["merops_family"] = (
++                df_merged[description_column]
++                .fillna("")
++                .str.findall(r"#(\w*.)#")
++                .apply(lambda families: ";".join(families))
++            )
++
+     df_merged.to_csv(output_path, index=False)
+     print("Merged DataFrame saved to", output_path)
+ 
+ 
+ if __name__ == "__main__":
+-    input_fasta = sys.argv[1]
+-    db_name = sys.argv[2]
+-    descriptions_path = sys.argv[3]
+-    bit_score_threshold = float(sys.argv[4])
+-    gene_locs_path = sys.argv[5]
++    args = sys.argv[1:]
++    try:
++        float(args[2])
++    except (IndexError, ValueError):
++        pass
++    else:
++        args.insert(2, "NULL")
++
++    input_fasta = args[0]
++    db_name = args[1]
++    descriptions_path = args[2]
++    bit_score_threshold = float(args[3])
++    gene_locs_path = args[4]
+     raw_mmseqs_path = (
+-        sys.argv[6]
+-        if len(sys.argv) > 6
+-        else f"mmseqs_out/{input_fasta}___mmseqs_{db_name}.tsv"
++        args[5] if len(args) > 5 else f"mmseqs_out/{input_fasta}___mmseqs_{db_name}.tsv"
+     )
+     output_path = (
+-        sys.argv[7]
+-        if len(sys.argv) > 7
++        args[6]
++        if len(args) > 6
+         else f"mmseqs_out/{input_fasta}___mmseqs_{db_name}_formatted.csv"
+     )
+ 
+diff --git a/bin/sql_add_descriptions.py b/bin/sql_add_descriptions.py
+deleted file mode 100755
+index 6c568fde..00000000
+--- a/bin/sql_add_descriptions.py
++++ /dev/null
+@@ -1,167 +0,0 @@
+-#!/usr/bin/env python
+-import pandas as pd
+-import sqlite3
+-import re
+-from concurrent.futures import ThreadPoolExecutor
+-import argparse
+-
+-
+-def fetch_descriptions(chunk, db_name, db_file):
+-    # Function to fetch descriptions based on IDs from the specified table
+-    table_name = f"{db_name}_description"
+-    ids_column = "id"
+-    descriptions_column = "description"
+-
+-    # Establish connection to SQLite database
+-    conn = sqlite3.connect(db_file)
+-
+-    # Adjust the column name to match the hits CSV file and process dbcan_id values if needed
+-    hits_ids_column = f"{db_name}_id"
+-    if db_name == "dbcan":
+-        chunk[hits_ids_column] = chunk[hits_ids_column].str.replace(".hmm", "")
+-    ids = chunk[hits_ids_column].unique()
+-
+-    # Construct the query based on the database name
+-    query = f"SELECT {ids_column}, {descriptions_column} FROM {table_name} WHERE {ids_column} IN ({','.join(['?'] * len(ids))})"
+-    if db_name == "dbcan":
+-        query = f"SELECT {ids_column}, {descriptions_column}, ec FROM {table_name} WHERE {ids_column} IN ({','.join(['?'] * len(ids))})"
+-
+-    cursor = conn.cursor()
+-    cursor.execute(query, ids)
+-    results = cursor.fetchall()
+-
+-    # Update chunk with descriptions and process according to the database type
+-    if db_name == "dbcan":
+-        # For dbcan, also fetch and format EC numbers
+-        descriptions_dict = {row[0]: (row[1], row[2]) for row in results}
+-        chunk[f"{db_name}_description"] = chunk[hits_ids_column].map(
+-            lambda x: descriptions_dict.get(x, ("", ""))[0]
+-        )
+-        chunk["dbcan_EC"] = chunk[hits_ids_column].map(
+-            lambda x: format_dbcan_EC(descriptions_dict.get(x, ("", ""))[1])
+-        )
+-    elif db_name == "kegg":
+-        # For other databases, just update with descriptions
+-        descriptions_dict = {row[0]: row[1] for row in results}
+-        chunk[f"{db_name}_description"] = chunk[hits_ids_column].map(
+-            lambda x: descriptions_dict.get(x, "")
+-        )
+-        chunk["kegg_orthology"] = chunk[f"{db_name}_description"].apply(
+-            extract_kegg_orthology
+-        )
+-        chunk["kegg_EC"] = chunk[f"{db_name}_description"].apply(extract_kegg_EC)
+-
+-        # Ensure the 'kegg_id' column exists if your logic does not create it earlier
+-        if "kegg_id" not in chunk.columns:
+-            chunk["kegg_id"] = (
+-                ""  # or any default logic you have for generating 'kegg_id'
+-            )
+-
+-        # Rename 'kegg_id' to 'kegg_gene_name'
+-        chunk.rename(columns={"kegg_id": "kegg_gene_name"}, inplace=True)
+-
+-        # After extracting for kegg, rename "kegg_orthology" to "kegg_id"
+-        chunk.rename(columns={"kegg_orthology": "kegg_id"}, inplace=True)
+-    elif db_name == "merops":
+-        descriptions_dict = {row[0]: row[1] for row in results}
+-        chunk[f"{db_name}_description"] = chunk[hits_ids_column].map(
+-            lambda x: descriptions_dict.get(x, "")
+-        )
+-        chunk[f"{db_name}_family"] = (
+-            chunk[f"{db_name}_description"]
+-            .str.findall(r"#(\w*.)#")
+-            .apply(lambda x: ";".join(x))
+-        )
+-    else:
+-        descriptions_dict = {row[0]: row[1] for row in results}
+-        chunk[f"{db_name}_description"] = chunk[hits_ids_column].map(
+-            lambda x: descriptions_dict.get(x, "")
+-        )
+-
+-    conn.close()
+-    return chunk
+-
+-
+-def extract_kegg_orthology(description):
+-    # Extract KO from the description
+-    if "(K" in description:
+-        ko_start = description.find("(K") + 1
+-        ko_end = description.find(")", ko_start)
+-        # return description[ko_start:ko_end].replace("/", "; ")
+-        return description[ko_start:ko_end]
+-    else:
+-        return None
+-
+-
+-def format_dbcan_EC(ec_string):
+-    # Format EC numbers from the dbcan ec column with "EC:" prefix and semicolon separation
+-    if ec_string:
+-        ec_numbers = ec_string.split(",")  # Split the EC numbers string
+-        formatted_ec_numbers = "; ".join(
+-            [f"EC:{ec}" for ec in ec_numbers if ec]
+-        )  # Add "EC:" prefix and join with semicolon
+-        return formatted_ec_numbers
+-    else:
+-        return ""
+-
+-
+-def extract_kegg_EC(description):
+-    # TODO this could be optimized into one regex with groups I am pretty sure
+-    # Extract and format EC numbers from the description with "EC:" prefix and semicolon separation
+-    ec_start = description.find("[EC:")
+-    if ec_start != -1:
+-        ec_end = description.find("]", ec_start)
+-        ec_text = description[ec_start + 4 : ec_end]  # Skip the "[EC:" part
+-        ec_numbers = re.findall(
+-            r"\b\d+\.\d+\.\d+\.\d+\b", ec_text
+-        )  # Extract EC numbers using regex
+-        formatted_ec_numbers = "; ".join(
+-            [f"EC:{ec}" for ec in ec_numbers]
+-        )  # Add "EC:" prefix and join with semicolon
+-        return formatted_ec_numbers
+-    else:
+-        return None
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(
+-        description="Add descriptions from SQL database to hits file"
+-    )
+-    parser.add_argument("--hits_csv", type=str, help="Path to the hits CSV file")
+-    parser.add_argument(
+-        "--db_name",
+-        type=str,
+-        help="Name of the database table to fetch descriptions from",
+-    )
+-    parser.add_argument(
+-        "--output", type=str, help="Path to the output formatted CSV file"
+-    )
+-    parser.add_argument("--db_file", type=str, help="Path to the SQLite database file")
+-    args = parser.parse_args()
+-
+-    # Get the number of lines in the hits CSV file
+-    num_lines = sum(1 for line in open(args.hits_csv))
+-
+-    # Determine chunk size dynamically based on number of lines
+-    chunksize = max(1, min(10000, num_lines // 10))  # Adjust as needed, minimum 1 chunk
+-
+-    # Read CSV file in chunks
+-    reader = pd.read_csv(args.hits_csv, delimiter=",", chunksize=chunksize)
+-
+-    # Process chunks
+-    with ThreadPoolExecutor() as executor:
+-        # Convert reader to list before passing to executor.map
+-        processed_chunks = executor.map(
+-            lambda chunk: fetch_descriptions(chunk, args.db_name, args.db_file),
+-            list(reader),
+-        )
+-
+-    # Concatenate processed chunks into a single DataFrame
+-    df = pd.concat(processed_chunks, ignore_index=True)
+-
+-    # Write updated DataFrame to new CSV file
+-    df.to_csv(args.output, index=False)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/conf/modules.config b/conf/modules.config
+index 9fb710ad..3b4896ae 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -145,13 +145,6 @@ process {
+         ]
+     }
+ 
+-    withName: ADD_SQL_DESCRIPTIONS {
+-        publishDir = [
+-            path: "${params.outdir}/ANNOTATE/MMSEQS2",
+-            mode: params.publish_dir_mode,
+-        ]
+-    }
+-
+     withName: HMM_SEARCH {
+         publishDir = [
+             path: "${params.outdir}/ANNOTATE/HMM_SEARCH",
+diff --git a/modules/local/annotate/add_sql_descriptions.nf b/modules/local/annotate/add_sql_descriptions.nf
+deleted file mode 100644
+index 686c296f..00000000
+--- a/modules/local/annotate/add_sql_descriptions.nf
++++ /dev/null
+@@ -1,21 +0,0 @@
+-process ADD_SQL_DESCRIPTIONS {
+-    label 'process_single'
+-
+-    conda "${moduleDir}/environment.yml"
+-    container "${ workflow.containerEngine in ['singularity', 'apptainer'] ?
+-        'oras://community.wave.seqera.io/library/python_pandas_polars_hmmer_pruned:1742d882bc99fed5' :
+-        'community.wave.seqera.io/library/python_pandas_polars_hmmer_pruned:6d5bc9dfeca29b70' }"
+-
+-    input:
+-    tuple val(input_fasta), path(hits_file)
+-    val(db_name)
+-    file(ch_sql_descriptions_db)
+-
+-    output:
+-    tuple val(input_fasta), path("${input_fasta}___sql_formatted_${db_name}_hits.csv"), emit: sql_formatted_hits
+-
+-    script:
+-    """
+-    sql_add_descriptions.py --hits_csv ${hits_file} --db_name ${db_name} --output "${input_fasta}___sql_formatted_${db_name}_hits.csv" --db_file ${ch_sql_descriptions_db}
+-    """
+-}
+diff --git a/modules/local/annotate/mmseqs_search.nf b/modules/local/annotate/mmseqs_search.nf
+index 34c98a45..0bbacea9 100644
+--- a/modules/local/annotate/mmseqs_search.nf
++++ b/modules/local/annotate/mmseqs_search.nf
+@@ -54,7 +54,7 @@ process MMSEQS_SEARCH {
+         mmseqs rmdb mmseqs_out/passing.mmsdb
+ 
+         # Convert results to BLAST outformat 6
+-        mmseqs convertalis query_database/${input_fasta}.mmsdb ${db_name}.mmsdb  mmseqs_out/best.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus}
++        mmseqs convertalis query_database/${input_fasta}.mmsdb ${db_name}.mmsdb  mmseqs_out/best.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus} --format-mode 4 --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,theader"
+ 
+         mmseqs rmdb mmseqs_out/best.mmsdb
+ 
+@@ -63,8 +63,8 @@ process MMSEQS_SEARCH {
+         # Do profile search:
+         mmseqs search query_database/${input_fasta}.mmsdb ${db_name}.mmspro mmseqs_out/${input_fasta}_${db_name}.mmsdb mmseqs_out/tmp -k 5 -s 7  --threads ${task.cpus}
+ 
+-        # Convert results to BLAST outformat 6
+-        mmseqs convertalis query_database/${input_fasta}.mmsdb ${db_name}.mmspro mmseqs_out/${input_fasta}_${db_name}.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus}
++        # Convert results to BLAST outformat 6 but include target headers for description parsing if possible
++        mmseqs convertalis query_database/${input_fasta}.mmsdb ${db_name}.mmspro mmseqs_out/${input_fasta}_${db_name}.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus} --format-mode 4 --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,theader"
+     fi
+ 
+     # Check if the mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv file is empty
+diff --git a/modules/local/annotate/mmseqs_search_gpu.nf b/modules/local/annotate/mmseqs_search_gpu.nf
+index 9fd6fa5c..fcc19525 100644
+--- a/modules/local/annotate/mmseqs_search_gpu.nf
++++ b/modules/local/annotate/mmseqs_search_gpu.nf
+@@ -41,7 +41,8 @@ process MMSEQS_SEARCH_GPU {
+     mmseqs rmdb mmseqs_out/${input_fasta}_${db_name}.mmsdb
+     mmseqs filterdb mmseqs_out/${input_fasta}_${db_name}_passing.mmsdb mmseqs_out/${input_fasta}_${db_name}_best.mmsdb --extract-lines 1
+     mmseqs rmdb mmseqs_out/${input_fasta}_${db_name}_passing.mmsdb
+-    mmseqs convertalis query_database/${input_fasta}.mmsdb "\${target_db}" mmseqs_out/${input_fasta}_${db_name}_best.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus}
++    # Convert results to BLAST outformat 6 but include target headers for description parsing if possible
++    mmseqs convertalis query_database/${input_fasta}.mmsdb "\${target_db}" mmseqs_out/${input_fasta}_${db_name}_best.mmsdb mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv --threads ${task.cpus} --format-mode 4 --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,theader"
+     mmseqs rmdb mmseqs_out/${input_fasta}_${db_name}_best.mmsdb
+ 
+     if [ -s "mmseqs_out/${input_fasta}___mmseqs_${db_name}.tsv" ]; then
+diff --git a/nextflow.config b/nextflow.config
+index 93302d4f..149f2d49 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -163,8 +163,6 @@ params {
+     // TCDB
+     tcdb_db = "${launchDir}/databases/tcdb"
+     tcdb_gpu_db = "${launchDir}/databases/tcdb_gpu/"
+-    // SQL annotation descriptions database
+-    sql_descriptions_db = "${launchDir}/databases/db_descriptions/description_db.sqlite"
+ 
+     /* Product options */
+     viz_rules_tsv = null
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 38c152af..f9d8b686 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -577,11 +577,6 @@
+                     "default": "${launchDir}/databases/methyl_gpu/",
+                     "hidden": true
+                 },
+-                "sql_descriptions_db": {
+-                    "type": "string",
+-                    "default": "${launchDir}/databases/db_descriptions/description_db.sqlite",
+-                    "hidden": true
+-                },
+                 "kegg_e_value": {
+                     "type": "string",
+                     "default": "1e-05",
+diff --git a/subworkflows/local/db_search.nf b/subworkflows/local/db_search.nf
+index 2c2fd1af..42f001b2 100644
+--- a/subworkflows/local/db_search.nf
++++ b/subworkflows/local/db_search.nf
+@@ -35,13 +35,6 @@ include { MMSEQS_SEARCH_GPU_WORKFLOW as MMSEQS_GPU_UNIREF } from './mmseqs_searc
+ include { MMSEQS_SEARCH_GPU_WORKFLOW as MMSEQS_GPU_CARD } from './mmseqs_search_workflow'
+ include { MMSEQS_SEARCH_GPU_WORKFLOW as MMSEQS_GPU_TCDB } from './mmseqs_search_workflow'
+ 
+-include { ADD_SQL_DESCRIPTIONS as SQL_UNIREF            } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-include { ADD_SQL_DESCRIPTIONS as SQL_VIRAL             } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-include { ADD_SQL_DESCRIPTIONS as SQL_MEROPS            } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-include { ADD_SQL_DESCRIPTIONS as SQL_KEGG              } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-include { ADD_SQL_DESCRIPTIONS as SQL_PFAM              } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-include { ADD_SQL_DESCRIPTIONS as SQL_DBCAN             } from "../../modules/local/annotate/add_sql_descriptions.nf"
+-
+ include { HMM_SEARCH_WORKFLOW as HMM_KOFAM } from './hmm_search_workflow'
+ include { HMM_SEARCH_WORKFLOW as HMM_DRAM_DB } from './hmm_search_workflow'
+ include { HMM_SEARCH_WORKFLOW as HMM_VOG } from './hmm_search_workflow'
+@@ -116,7 +109,6 @@ workflow DB_SEARCH {
+ 
+     )
+ 
+-    ch_sql_descriptions_db = file(params.sql_descriptions_db)
+     ch_kofam_list = file(params.kofam_list)
+     ch_vog_list = file(params.vog_list)
+     ch_camper_hmm_list = file(params.camper_hmm_list)
+@@ -177,14 +169,12 @@ workflow DB_SEARCH {
+     if (use_kegg) {
+         if (use_gpu_kegg) {
+             MMSEQS_GPU_KEGG(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_kegg_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, kegg_name)
+-            ch_mmseqs_unformatted = MMSEQS_GPU_KEGG.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_GPU_KEGG.out.mmseqs_search_formatted_out
+         } else {
+             MMSEQS_KEGG(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_kegg_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, kegg_name)
+-            ch_mmseqs_unformatted = MMSEQS_KEGG.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_KEGG.out.mmseqs_search_formatted_out
+         }
+ 
+-        SQL_KEGG(ch_mmseqs_unformatted, kegg_name, ch_sql_descriptions_db)
+-        ch_mmseqs_formatted = SQL_KEGG.out.sql_formatted_hits
+         formattedOutputChannels = formattedOutputChannels.mix(ch_mmseqs_formatted)
+     }
+     // KOFAM annotation
+@@ -196,10 +186,8 @@ workflow DB_SEARCH {
+     // PFAM annotation
+     if (use_pfam) {
+         MMSEQS_PFAM(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_pfam_mmseqs_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, pfam_name)
+-        ch_mmseqs_unformatted = MMSEQS_PFAM.out.mmseqs_search_formatted_out
++        ch_mmseqs_formatted = MMSEQS_PFAM.out.mmseqs_search_formatted_out
+ 
+-        SQL_PFAM(ch_mmseqs_unformatted, pfam_name, ch_sql_descriptions_db)
+-        ch_mmseqs_formatted = SQL_PFAM.out.sql_formatted_hits
+         formattedOutputChannels = formattedOutputChannels.mix(ch_mmseqs_formatted)
+     }
+ 
+@@ -302,28 +290,24 @@ workflow DB_SEARCH {
+     if (use_merops) {
+         if (use_gpu_merops) {
+             MMSEQS_GPU_MEROPS(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_merops_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, merops_name)
+-            ch_mmseqs_unformatted = MMSEQS_GPU_MEROPS.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_GPU_MEROPS.out.mmseqs_search_formatted_out
+         } else {
+             MMSEQS_MEROPS(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_merops_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, merops_name)
+-            ch_mmseqs_unformatted = MMSEQS_MEROPS.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_MEROPS.out.mmseqs_search_formatted_out
+         }
+ 
+-        SQL_MEROPS(ch_mmseqs_unformatted, merops_name, ch_sql_descriptions_db)
+-        ch_mmseqs_formatted = SQL_MEROPS.out.sql_formatted_hits
+         formattedOutputChannels = formattedOutputChannels.mix(ch_mmseqs_formatted)
+     }
+     // Uniref annotation
+     if (use_uniref) {
+         if (use_gpu_uniref) {
+             MMSEQS_GPU_UNIREF(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_uniref_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, uniref_name)
+-            ch_mmseqs_unformatted = MMSEQS_GPU_UNIREF.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_GPU_UNIREF.out.mmseqs_search_formatted_out
+         } else {
+             MMSEQS_UNIREF(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_uniref_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, uniref_name)
+-            ch_mmseqs_unformatted = MMSEQS_UNIREF.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_UNIREF.out.mmseqs_search_formatted_out
+         }
+ 
+-        SQL_UNIREF(ch_mmseqs_unformatted, uniref_name, ch_sql_descriptions_db)
+-        ch_mmseqs_formatted = SQL_UNIREF.out.sql_formatted_hits
+         formattedOutputChannels = formattedOutputChannels.mix(ch_mmseqs_formatted)
+     }
+     // Metals annotation
+@@ -400,14 +384,12 @@ workflow DB_SEARCH {
+     if (params.use_viral) {
+         if (use_gpu_viral) {
+             MMSEQS_GPU_VIRAL(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_viral_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, viral_name)
+-            ch_mmseqs_unformatted = MMSEQS_GPU_VIRAL.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_GPU_VIRAL.out.mmseqs_search_formatted_out
+         } else {
+             MMSEQS_VIRAL(ch_mmseqs_queries, DB_CHANNEL_SETUP.out.ch_viral_db, params.bit_score_threshold, params.rbh_bit_score_threshold, default_sheet, viral_name)
+-            ch_mmseqs_unformatted = MMSEQS_VIRAL.out.mmseqs_search_formatted_out
++            ch_mmseqs_formatted = MMSEQS_VIRAL.out.mmseqs_search_formatted_out
+         }
+ 
+-        SQL_VIRAL(ch_mmseqs_unformatted, viral_name, ch_sql_descriptions_db)
+-        ch_mmseqs_formatted = SQL_VIRAL.out.sql_formatted_hits
+         formattedOutputChannels = formattedOutputChannels.mix(ch_mmseqs_formatted)
+     }
+ 
+diff --git a/tests/nextflow.config b/tests/nextflow.config
+index 0a43dd02..dd4c8b06 100644
+--- a/tests/nextflow.config
++++ b/tests/nextflow.config
+@@ -43,7 +43,5 @@ params {
+     sulfur_db = "${projectDir}/databases/sulfur/"
+     // Methyl
+     methyl_db = "${projectDir}/databases/methyl/"
+-    // SQL annotation descriptions database
+-    sql_descriptions_db = "${projectDir}/databases/db_descriptions/description_db.sqlite"
+ 
+ }
+diff --git a/tests/test_mmseqs_descriptions.py b/tests/test_mmseqs_descriptions.py
+new file mode 100644
+index 00000000..961499be
+--- /dev/null
++++ b/tests/test_mmseqs_descriptions.py
+@@ -0,0 +1,93 @@
++import contextlib
++import importlib.util
++import io
++from pathlib import Path
++import tempfile
++import unittest
++
++import pandas as pd
++
++
++spec = importlib.util.spec_from_file_location(
++    "mmseqs_add_descriptions",
++    Path(__file__).resolve().parents[1] / "bin/mmseqs_add_descriptions.py",
++)
++descriptions = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(descriptions)
++
++
++class KeggDescriptionTests(unittest.TestCase):
++    def test_header_and_legacy_orthologies(self):
++        for header in (
++            "aaa:Acav_0001 protein DnaA; K02313; dnaA",
++            "aaa:Acav_0001 (K02313) dnaA; protein",
++        ):
++            with self.subTest(header=header):
++                self.assertEqual(descriptions.extract_kegg_orthology(header), "K02313")
++
++    def test_multiple_orthologies(self):
++        self.assertEqual(
++            descriptions.extract_kegg_orthology("gene (K00001/K00002); K00001"),
++            "K00001/K00002",
++        )
++
++    def test_missing_or_invalid_orthologies(self):
++        for header in (None, float("nan"), "", "protein K123456 AK00001 K00001x"):
++            with self.subTest(header=header):
++                self.assertIsNone(descriptions.extract_kegg_orthology(header))
++
++    def test_ec_fields(self):
++        self.assertEqual(
++            descriptions.extract_kegg_EC(
++                "enzyme [EC:1.18.1.7 2.3.4.5] [EC:1.18.1.7 3.4.21.-]"
++            ),
++            "EC:1.18.1.7; EC:2.3.4.5",
++        )
++        self.assertEqual(descriptions.extract_kegg_EC("protease [EC:3.4.21.-]"), "")
++        for header in (None, "protein", "protein 1.2.3.4"):
++            with self.subTest(header=header):
++                self.assertIsNone(descriptions.extract_kegg_EC(header))
++
++    def test_formatted_output_uses_metadata_then_header(self):
++        with tempfile.TemporaryDirectory() as folder:
++            root = Path(folder)
++            raw = root / "hits.tsv"
++            loci = root / "loci.tsv"
++            metadata = root / "metadata.tsv"
++            output = root / "output.csv"
++            raw.write_text(
++                "query\ttarget\tbits\ttheader\n"
++                "q1\tgene1\t120\tgene1 enzyme; K00001 [EC:1.2.3.4]\n"
++                "q2\tgene2\t80\tgene2 enzyme; K00002 [EC:2.3.4.5]\n"
++            )
++            loci.write_text(
++                "query_id\tstart_position\tstop_position\nq1\t1\t90\nq2\t91\t180\n"
++            )
++            metadata.write_text(
++                "id\tdescription\tA_rank\tB_rank\n"
++                "gene1\tcurated (K99999) enzyme [EC:9.8.7.6]\t100\t60\n"
++            )
++            for info, expected in (
++                ("NULL", ["K00001", "K00002"]),
++                (metadata, ["K99999", "K00002"]),
++            ):
++                with (
++                    self.subTest(metadata=info),
++                    contextlib.redirect_stdout(io.StringIO()),
++                ):
++                    descriptions.main("sample", "kegg", info, 60, loci, raw, output)
++                    result = pd.read_csv(output)
++                    self.assertEqual(result["kegg_id"].tolist(), expected)
++                    self.assertEqual(
++                        result["kegg_gene_name"].tolist(), ["gene1", "gene2"]
++                    )
++                    self.assertEqual(result["kegg_bitScore"].tolist(), [120, 80])
++                    self.assertEqual(result.loc[1, "kegg_EC"], "EC:2.3.4.5")
++                    self.assertNotIn("theader", result)
++                    if info != "NULL":
++                        self.assertEqual(result.loc[0, "kegg_EC"], "EC:9.8.7.6")
++                        self.assertEqual(result.loc[0, "kegg_rank"], "A")
++
++
++if __name__ == "__main__":
++    unittest.main()

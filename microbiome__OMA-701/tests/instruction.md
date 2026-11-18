@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Tip box on parallel dissimilarity calculation
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ae826a267619`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

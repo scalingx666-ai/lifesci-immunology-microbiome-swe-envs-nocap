@@ -1,0 +1,316 @@
+diff --git a/.github/workflows/qiita-ci.yml b/.github/workflows/qiita-ci.yml
+index d241c5889..3abf6984f 100644
+--- a/.github/workflows/qiita-ci.yml
++++ b/.github/workflows/qiita-ci.yml
+@@ -148,6 +148,7 @@ jobs:
+ 
+           echo "4. Setting up nginx"
+           mkdir -p /usr/share/miniconda/envs/qiita/var/run/nginx/
++          sed -i "s|alias /Users/username|alias /home/runner/work/qiita|" ${PWD}/qiita_pet/nginx_example.conf
+           nginx -c ${PWD}/qiita_pet/nginx_example.conf
+ 
+           echo "5. Setting up qiita"
+diff --git a/qiita_db/handlers/tests/oauthbase.py b/qiita_db/handlers/tests/oauthbase.py
+index 93b592600..4a36a4f4b 100644
+--- a/qiita_db/handlers/tests/oauthbase.py
++++ b/qiita_db/handlers/tests/oauthbase.py
+@@ -6,7 +6,10 @@
+ # The full license is in the file LICENSE, distributed with this software.
+ # -----------------------------------------------------------------------------
+ 
+-from qiita_core.qiita_settings import r_client
++import requests
++import os
++import sys
++from qiita_core.qiita_settings import r_client, qiita_config
+ 
+ from qiita_pet.test.tornado_test_base import TestHandlerBase
+ 
+@@ -19,3 +22,49 @@ def setUp(self):
+         r_client.hset(self.token, 'grant_type', 'client')
+         r_client.expire(self.token, 20)
+         super(OauthTestingBase, self).setUp()
++        self._session = requests.Session()
++        # should point to client certificat file:
++        # /qiita/qiita_core/support_files/ci_rootca.crt
++        self._verify = os.environ['QIITA_ROOTCA_CERT']
++        self._fetch_token()
++
++        self._files_to_remove = []
++
++    def tearDown(self):
++        for fp in self._files_to_remove:
++            if os.path.exists(fp):
++                os.remove(fp)
++
++    def _fetch_token(self):
++        data = {
++            'client_id': '4MOBzUBHBtUmwhaC258H7PS0rBBLyGQrVxGPgc9g305bvVhf6h',
++            'client_secret':
++            ('rFb7jwAb3UmSUN57Bjlsi4DTl2owLwRpwCc0SggRN'
++             'EVb2Ebae2p5Umnq20rNMhmqN'),
++            'grant_type': 'client'}
++        resp = self._session.post(
++            "%s/qiita_db/authenticate/" % qiita_config.base_url,
++            verify=self._verify, data=data, timeout=80)
++        if resp.status_code != 200:
++            raise ValueError("_fetchToken() POST request failed")
++        self._token = resp.json()['access_token']
++        print('obtained access_token = %s' % self._token, file=sys.stderr)
++
++    def post_authed(self, url, **kwargs):
++        if 'headers' not in kwargs:
++            kwargs['headers'] = {}
++        if 'Authorization' not in kwargs['headers']:
++            kwargs['headers']['Authorization'] = 'Bearer %s' % self._token
++
++        r = self._session.post(
++            qiita_config.base_url + url, verify=self._verify, **kwargs)
++        r.close()
++
++        return r
++
++    def get_authed(self, url):
++        r = self._session.get(qiita_config.base_url + url, verify=self._verify,
++                              headers={'Authorization': 'Bearer %s' %
++                                       self._token})
++        r.close()
++        return r
+diff --git a/qiita_pet/handlers/cloud_handlers/__init__.py b/qiita_pet/handlers/cloud_handlers/__init__.py
+new file mode 100644
+index 000000000..d10344a05
+--- /dev/null
++++ b/qiita_pet/handlers/cloud_handlers/__init__.py
+@@ -0,0 +1,9 @@
++from .file_transfer_handlers import (FetchFileFromCentralHandler,
++                                     PushFileToCentralHandler)
++
++__all__ = ['FetchFileFromCentralHandler']
++
++ENDPOINTS = [
++    (r"/cloud/fetch_file_from_central/(.*)", FetchFileFromCentralHandler),
++    (r"/cloud/push_file_to_central/", PushFileToCentralHandler)
++]
+diff --git a/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+new file mode 100644
+index 000000000..2287c5c31
+--- /dev/null
++++ b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+@@ -0,0 +1,94 @@
++import os
++
++from tornado.web import HTTPError, RequestHandler
++from tornado.gen import coroutine
++
++from qiita_core.util import execute_as_transaction
++from qiita_db.handlers.oauth2 import authenticate_oauth
++from qiita_core.qiita_settings import qiita_config
++
++
++class FetchFileFromCentralHandler(RequestHandler):
++    @authenticate_oauth
++    @coroutine
++    @execute_as_transaction
++    def get(self, requested_filepath):
++        # ensure we have an absolute path, i.e. starting at /
++        filepath = os.path.join(os.path.sep, requested_filepath)
++        # use a canonic version of the filepath
++        filepath = os.path.abspath(filepath)
++
++        # canonic version of base_data_dir
++        basedatadir = os.path.abspath(qiita_config.base_data_dir)
++
++        # TODO: can we somehow check, if the requesting client (which should be
++        #       one of the plugins) was started from a user that actually has
++        #       access to the requested file?
++
++        if not filepath.startswith(basedatadir):
++            # attempt to access files outside of the BASE_DATA_DIR
++            # intentionally NOT reporting the actual location to avoid exposing
++            # instance internal information
++            raise HTTPError(403, reason=(
++                "You cannot access files outside of "
++                "the BASE_DATA_DIR of Qiita!"))
++
++        if not os.path.exists(filepath):
++            raise HTTPError(403, reason=(
++                "The requested file is not present in Qiita's BASE_DATA_DIR!"))
++
++        # delivery of the file via nginx requires replacing the basedatadir
++        # with the prefix defined in the nginx configuration for the
++        # base_data_dir, '/protected/' by default
++        protected_filepath = filepath.replace(basedatadir, '/protected')
++
++        self.set_header('Content-Type', 'application/octet-stream')
++        self.set_header('Content-Transfer-Encoding', 'binary')
++        self.set_header('X-Accel-Redirect', protected_filepath)
++        self.set_header('Content-Description', 'File Transfer')
++        self.set_header('Expires',  '0')
++        self.set_header('Cache-Control',  'no-cache')
++        self.set_header('Content-Disposition',
++                        'attachment; filename=%s' % os.path.basename(
++                            protected_filepath))
++        self.finish()
++
++
++class PushFileToCentralHandler(RequestHandler):
++    @authenticate_oauth
++    @coroutine
++    @execute_as_transaction
++    def post(self):
++        if not self.request.files:
++            raise HTTPError(400, reason='No files to upload defined!')
++
++        # canonic version of base_data_dir
++        basedatadir = os.path.abspath(qiita_config.base_data_dir)
++        stored_files = []
++
++        for filespath, filelist in self.request.files.items():
++            if filespath.startswith(basedatadir):
++                filespath = filespath[len(basedatadir):]
++
++            for file in filelist:
++                filepath = os.path.join(filespath, file['filename'])
++                # remove leading /
++                if filepath.startswith(os.sep):
++                    filepath = filepath[len(os.sep):]
++                filepath = os.path.abspath(os.path.join(basedatadir, filepath))
++
++                if os.path.exists(filepath):
++                    raise HTTPError(403, reason=(
++                        "The requested file is already "
++                        "present in Qiita's BASE_DATA_DIR!"))
++
++                os.makedirs(os.path.dirname(filepath), exist_ok=True)
++                with open(filepath, "wb") as f:
++                    f.write(file['body'])
++                    stored_files.append(filepath)
++
++        self.write("Stored %i files into BASE_DATA_DIR of Qiita:\n%s\n" % (
++            len(stored_files),
++            '\n'.join(map(lambda x: ' - %s' % x, stored_files))))
++
++        self.finish()
+diff --git a/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+new file mode 100644
+index 000000000..12dfac9b9
+--- /dev/null
++++ b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+@@ -0,0 +1,93 @@
++from unittest import main
++from os.path import exists, basename
++from os import remove
++import filecmp
++
++from qiita_db.handlers.tests.oauthbase import OauthTestingBase
++import qiita_db as qdb
++
++
++class FetchFileFromCentralHandlerTests(OauthTestingBase):
++    def setUp(self):
++        super(FetchFileFromCentralHandlerTests, self).setUp()
++
++    def test_get(self):
++        endpoint = '/cloud/fetch_file_from_central/'
++        base_data_dir = qdb.util.get_db_files_base_dir()
++
++        obs = self.get_authed(endpoint + 'nonexistingfile')
++        self.assertEqual(obs.status_code, 403)
++        self.assertIn('outside of the BASE_DATA_DIR', obs.reason)
++
++        obs = self.get_authed(
++            endpoint + base_data_dir[1:] + '/nonexistingfile')
++        self.assertEqual(obs.status_code, 403)
++        self.assertIn('The requested file is not present', obs.reason)
++
++        obs = self.get_authed(
++            endpoint + base_data_dir[1:] +
++            '/raw_data/FASTA_QUAL_preprocessing.fna')
++        self.assertEqual(obs.status_code, 200)
++        self.assertIn('FLP3FBN01ELBSX length=250 xy=1766_01', str(obs.content))
++
++
++class PushFileToCentralHandlerTests(OauthTestingBase):
++    def setUp(self):
++        super(PushFileToCentralHandlerTests, self).setUp()
++
++    def test_post(self):
++        endpoint = '/cloud/push_file_to_central/'
++        base_data_dir = qdb.util.get_db_files_base_dir()
++
++        # create a test file "locally", i.e. in current working directory
++        fp_source = 'foo.bar'
++        with open(fp_source, 'w') as f:
++            f.write("this is a test\n")
++        self._files_to_remove.append(fp_source)
++
++        # if successful, expected location of the file in BASE_DATA_DIR
++        fp_target = base_data_dir + '/bar/' + basename(fp_source)
++        self._files_to_remove.append(fp_target)
++
++        # create a second test file
++        fp_source2 = 'foo_two.bar'
++        with open(fp_source2, 'w') as f:
++            f.write("this is another test\n")
++        self._files_to_remove.append(fp_source2)
++        fp_target2 = base_data_dir + '/barr/' + basename(fp_source2)
++        self._files_to_remove.append(fp_target2)
++
++        # test raise error if no file is given
++        obs = self.post_authed(endpoint)
++        self.assertEqual(obs.reason, "No files to upload defined!")
++
++        # test correct mechanism
++        with open(fp_source, 'rb') as fh:
++            obs = self.post_authed(endpoint, files={'bar/': fh})
++            self.assertIn('Stored 1 files into BASE_DATA_DIR of Qiita',
++                          str(obs.content))
++            self.assertTrue(filecmp.cmp(fp_source, fp_target, shallow=False))
++
++        # check if error is raised, if file already exists
++        with open(fp_source, 'rb') as fh:
++            obs = self.post_authed(endpoint, files={'bar/': fh})
++            self.assertIn("already present in Qiita's BASE_DATA_DIR!",
++                          obs.reason)
++
++        # test transfer of multiple files
++        if exists(fp_target):
++            remove(fp_target)
++        with open(fp_source, 'rb') as fh1:
++            with open(fp_source2, 'rb') as fh2:
++                obs = self.post_authed(
++                    endpoint, files={'bar/': fh1, 'barr/': fh2})
++                self.assertIn('Stored 2 files into BASE_DATA_DIR of Qiita',
++                              str(obs.content))
++                self.assertTrue(filecmp.cmp(fp_source, fp_target,
++                                            shallow=False))
++                self.assertTrue(filecmp.cmp(fp_source2, fp_target2,
++                                            shallow=False))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/qiita_pet/webserver.py b/qiita_pet/webserver.py
+index 17fbf7af8..412667213 100644
+--- a/qiita_pet/webserver.py
++++ b/qiita_pet/webserver.py
+@@ -85,6 +85,7 @@
+ from qiita_pet.handlers.rest import ENDPOINTS as REST_ENDPOINTS
+ from qiita_pet.handlers.qiita_redbiom import RedbiomPublicSearch
+ from qiita_pet.handlers.public import PublicHandler
++from qiita_pet.handlers.cloud_handlers import ENDPOINTS as CLOUD_ENDPOINTS
+ 
+ if qiita_config.portal == "QIITA":
+     from qiita_pet.handlers.portal import (
+@@ -244,6 +245,11 @@ def __init__(self):
+             (r"/qiita_db/studies/(.*)", APIStudiesListing)
+         ]
+ 
++        # expose endpoints necessary for https file communication between
++        # master and plugins IF no shared file system for base_data_dir is
++        # intended
++        handlers.extend(CLOUD_ENDPOINTS)
++
+         # rest endpoints
+         handlers.extend(REST_ENDPOINTS)
+ 

@@ -1,0 +1,293 @@
+diff --git a/binette/diamond.py b/binette/diamond.py
+index f3a97cf..91dbace 100644
+--- a/binette/diamond.py
++++ b/binette/diamond.py
+@@ -3,7 +3,6 @@
+ import re
+ import shutil
+ import subprocess
+-import sys
+ from collections import Counter
+ from pathlib import Path
+ 
+@@ -15,37 +14,44 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class DiamondError(Exception):
++    """
++    Error when locating the CheckM2 DIAMOND database, running DIAMOND or reading
++    its results. `exit_code` is the exit status Binette ends with.
++    """
++
++    def __init__(self, message: str, exit_code: int = 1):
++        super().__init__(message)
++        self.exit_code = exit_code
++
++
+ def get_checkm2_db() -> str:
+     """
+     Get the path to the CheckM2 database.
+ 
+     :return: The path to the CheckM2 database.
++    :raises DiamondError: If checkm2 is missing or does not return a database path.
+     """
+     if shutil.which("checkm2") is None:
+-        logger.error("Make sure checkm2 is on your system path")
+-        sys.exit(1)
++        raise DiamondError("Make sure checkm2 is on your system path")
+ 
+     checkm2_database_raw = subprocess.run(
+         ["checkm2", "database", "--current"], text=True, stderr=subprocess.PIPE
+     )
+ 
+     if checkm2_database_raw.returncode != 0:
+-        logger.error(
++        raise DiamondError(
+             f"Something went wrong with checkm2:\n=======\n{checkm2_database_raw.stderr}========"
+         )
+-        sys.exit(1)
+ 
+     reg_result = re.search("INFO: (/.*.dmnd)", checkm2_database_raw.stderr)
+ 
+     if reg_result is None:
+-        logger.error(
++        raise DiamondError(
+             f"Something went wrong when retrieving checkm2 db path:\n{checkm2_database_raw.stderr}"
+         )
+-        sys.exit(1)
+-    else:
+-        db_path = reg_result.group(1)
+ 
+-    return db_path
++    return reg_result.group(1)
+ 
+ 
+ def check_tool_exists(tool_name: str):
+@@ -54,12 +60,10 @@ def check_tool_exists(tool_name: str):
+ 
+     :param tool_name: The name of the tool to check for.
+     :type tool_name: str
+-    :raises FileNotFoundError: If the tool is not found on the system's PATH.
++    :raises DiamondError: If the tool is not found on the system's PATH.
+     """
+     if shutil.which(tool_name) is None:
+-        raise FileNotFoundError(
+-            f"The '{tool_name}' tool is not found on your system PATH."
+-        )
++        raise DiamondError(f"The '{tool_name}' tool is not found on your system PATH.")
+ 
+ 
+ def resolve_checkm2_db(checkm2_db: Path | None) -> Path:
+@@ -111,6 +115,7 @@ def run(
+     :param percent_id: Minimum percent identity (default is 30).
+     :param evalue: Maximum e-value threshold (default is 1e-05).
+     :param low_mem: Use low memory mode if True (default is False).
++    :raises DiamondError: If DIAMOND fails.
+     """
+     check_tool_exists("diamond")
+ 
+@@ -140,8 +145,9 @@ def run(
+     run = subprocess.run(cmd, shell=True)
+ 
+     if run.returncode != 0:
+-        logger.error(f"An error occurred while running DIAMOND. Check log file '{log}'")
+-        sys.exit(1)
++        raise DiamondError(
++            f"An error occurred while running DIAMOND. Check log file '{log}'"
++        )
+ 
+     atomic_replace(tmp_output, final_output)
+     logger.info("Finished running DIAMOND")
+@@ -153,17 +159,18 @@ def get_contig_to_kegg_id(diamond_result_file: str) -> dict:
+ 
+     :param diamond_result_file: Path to the Diamond result file.
+     :return: A dictionary mapping contig IDs to KEGG annotations.
++    :raises DiamondError: If the result file is empty (exit code 3).
+     """
+     diamond_results_df = pd.read_csv(
+         diamond_result_file, sep="\t", usecols=[0, 1], names=["ProteinID", "annotation"]
+     )
+ 
+     if diamond_results_df.empty:
+-        logger.error(
++        raise DiamondError(
+             f"DIAMOND result file '{diamond_result_file}' is empty. "
+-            "This can happen with low-quality assemblies where DIAMOND produces no hits."
++            "This can happen with low-quality assemblies where DIAMOND produces no hits.",
++            exit_code=3,
+         )
+-        sys.exit(3)
+ 
+     diamond_results_df[["Ref100_hit", "Kegg_annotation"]] = diamond_results_df[
+         "annotation"
+diff --git a/binette/main.py b/binette/main.py
+index ff5a054..05bafb3 100755
+--- a/binette/main.py
++++ b/binette/main.py
+@@ -18,7 +18,7 @@
+ from rich.logging import RichHandler
+ 
+ import binette as binette_init
+-from binette import checkpoint, pipeline
++from binette import checkpoint, diamond, pipeline
+ from binette.config import RunConfig
+ 
+ logger = logging.getLogger(__name__)
+@@ -403,6 +403,9 @@ def binette(
+     except checkpoint.OutputDirConflictError as exc:
+         logger.error(str(exc))
+         raise typer.Exit(code=1) from exc
++    except diamond.DiamondError as exc:
++        logger.error(str(exc))
++        raise typer.Exit(code=exc.exit_code) from exc
+ 
+ 
+ def main():
+diff --git a/tests/functional_tests/test_binette_command.py b/tests/functional_tests/test_binette_command.py
+index 0e1a774..d04b3e0 100644
+--- a/tests/functional_tests/test_binette_command.py
++++ b/tests/functional_tests/test_binette_command.py
+@@ -66,6 +66,29 @@ def test_wrong_input_both_input_types(tmp_path):
+     assert result.exit_code == 2
+ 
+ 
++def test_diamond_error_exit_code(tmp_path, monkeypatch, caplog):
++    """A DIAMOND error ends Binette with its exit code and a logged message, no traceback."""
++    from binette import diamond, pipeline
++
++    def failing_run(config):
++        raise diamond.DiamondError("DIAMOND result file is empty", exit_code=3)
++
++    monkeypatch.setattr(pipeline, "run", failing_run)
++    contigs = tmp_path / "contigs.fna"
++    contigs.write_text(">c1\nACGT\n")
++    bin_dirs = [tmp_path / "set1", tmp_path / "set2"]
++    for bin_dir in bin_dirs:
++        bin_dir.mkdir()
++
++    with caplog.at_level(logging.ERROR):
++        result = runner.invoke(
++            app, ["-c", str(contigs), "-d", str(bin_dirs[0]), "-d", str(bin_dirs[1])]
++        )
++
++    assert result.exit_code == 3
++    assert "DIAMOND result file is empty" in caplog.text
++
++
+ def test_quiet_and_verbose_flag(tmp_path):
+     input = tmp_path / "contig.fna"
+     input.write_text(">contig1\nATGC\n>contig2\nATGC")
+diff --git a/tests/unit_tests/diamonds_test.py b/tests/unit_tests/diamonds_test.py
+index a1fb35c..f45694d 100644
+--- a/tests/unit_tests/diamonds_test.py
++++ b/tests/unit_tests/diamonds_test.py
+@@ -29,11 +29,10 @@ def mock_shutil_which_none(*args, **kwargs):
+     monkeypatch.setattr(shutil, "which", mock_shutil_which_none)
+ 
+     # Call the function
+-    with pytest.raises(SystemExit) as pytest_wrapped_e:
++    with pytest.raises(diamond.DiamondError) as exc_info:
+         diamond.get_checkm2_db()
+ 
+-    assert pytest_wrapped_e.type is SystemExit
+-    assert pytest_wrapped_e.value.code == 1
++    assert exc_info.value.exit_code == 1
+ 
+ 
+ def test_get_checkm2_db_with_success(monkeypatch):
+@@ -70,11 +69,10 @@ def mock_subprocess_run(*args, **kwargs):
+     monkeypatch.setattr(shutil, "which", mock_shutil_which)
+ 
+     # Call the function
+-    with pytest.raises(SystemExit) as pytest_wrapped_e:
++    with pytest.raises(diamond.DiamondError) as exc_info:
+         diamond.get_checkm2_db()
+ 
+-    assert pytest_wrapped_e.type is SystemExit
+-    assert pytest_wrapped_e.value.code == 1
++    assert exc_info.value.exit_code == 1
+ 
+ 
+ def test_get_checkm2_db_wrong_path_format(monkeypatch):
+@@ -94,11 +92,10 @@ def mock_subprocess_run(*args, **kwargs):
+     monkeypatch.setattr(shutil, "which", mock_shutil_which)
+ 
+     # Call the function
+-    with pytest.raises(SystemExit) as pytest_wrapped_e:
++    with pytest.raises(diamond.DiamondError) as exc_info:
+         diamond.get_checkm2_db()
+ 
+-    assert pytest_wrapped_e.type is SystemExit
+-    assert pytest_wrapped_e.value.code == 1
++    assert exc_info.value.exit_code == 1
+ 
+ 
+ def test_check_tool_exists_tool_found(monkeypatch):
+@@ -109,10 +106,7 @@ def mock_shutil_which(*args, **kwargs):
+     monkeypatch.setattr(shutil, "which", mock_shutil_which)
+ 
+     # Call the function
+-    try:
+-        diamond.check_tool_exists("existing_tool")
+-    except FileNotFoundError:
+-        pytest.fail("check_tool_exists raised FileNotFoundError unexpectedly.")
++    diamond.check_tool_exists("existing_tool")
+ 
+ 
+ def test_check_tool_exists_tool_not_found(monkeypatch):
+@@ -122,10 +116,12 @@ def mock_shutil_which(*args, **kwargs):
+ 
+     monkeypatch.setattr(shutil, "which", mock_shutil_which)
+ 
+-    # Call the function and expect FileNotFoundError
+-    with pytest.raises(FileNotFoundError):
++    with pytest.raises(diamond.DiamondError) as exc_info:
+         diamond.check_tool_exists("non_existing_tool")
+ 
++    assert exc_info.value.exit_code == 1
++    assert "non_existing_tool" in str(exc_info.value)
++
+ 
+ def test_run_diamond_tool_found(monkeypatch, tmp_path):
+     log_path = tmp_path / "log.txt"
+@@ -184,7 +180,7 @@ class CompletedProcess:
+     monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+     monkeypatch.setattr(diamond, "check_tool_exists", lambda tool: None)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
++    with pytest.raises(diamond.DiamondError) as exc_info:
+         diamond.run(
+             "test.faa",
+             output_file.as_posix(),
+@@ -193,7 +189,7 @@ class CompletedProcess:
+             threads=1,
+         )
+ 
+-    assert exc_info.value.code == 1
++    assert exc_info.value.exit_code == 1
+     # A failed run never produces the final result file
+     assert not output_file.exists()
+ 
+@@ -247,18 +243,17 @@ def return_default_values_from_category(self, category):
+ 
+ 
+ def test_get_contig_to_kegg_id_empty_file():
+-    """Test that get_contig_to_kegg_id exits with code 3 when DIAMOND result file is empty."""
++    """Test that get_contig_to_kegg_id raises an error with exit code 3 when DIAMOND result file is empty."""
+     diamond_result_file = "empty_diamond_results.txt"
+ 
+     # Mock empty dataframe
+     empty_df = pd.DataFrame()
+ 
+     with patch("pandas.read_csv", return_value=empty_df):
+-        with pytest.raises(SystemExit) as pytest_wrapped_e:
++        with pytest.raises(diamond.DiamondError) as exc_info:
+             diamond.get_contig_to_kegg_id(diamond_result_file)
+ 
+-    assert pytest_wrapped_e.type is SystemExit
+-    assert pytest_wrapped_e.value.code == 3
++    assert exc_info.value.exit_code == 3
+ 
+ 
+ def test_resolve_checkm2_db(tmp_path):

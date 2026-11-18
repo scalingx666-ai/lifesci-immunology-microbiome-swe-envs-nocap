@@ -1,0 +1,180 @@
+diff --git a/src/core/agent/agent.cc b/src/core/agent/agent.cc
+index d158e4be3..40bfb4b7a 100644
+--- a/src/core/agent/agent.cc
++++ b/src/core/agent/agent.cc
+@@ -74,18 +74,29 @@ void Agent::Update(const NewAgentEvent& event) {
+   UpdateBehaviors(event);
+ }
+ 
+-void Agent::PropagateStaticness() {
++void Agent::PropagateStaticness(bool beginning) {
++  if (!propagate_staticness_neighborhood_) {
++    return;
++  }
++
+   if (!Simulation::GetActive()->GetParam()->detect_static_agents) {
+     is_static_next_ts_ = false;
+     return;
+   }
+ 
+-  if (!propagate_staticness_neighborhood_) {
++  auto* env = Simulation::GetActive()->GetEnvironment();
++  // TODO(all) generalize to axis-aligned bounding box
++  if (!beginning && GetDiameter() > env->GetLargestAgentSize()) {
++    // If the agent is bigger than all other agents,
++    // the uniform grid implementation is not able to inform
++    // all necessary neighbors.
++    // Therefore, we delay the propagation of the staticness info
++    // to the beginning of the next iteration.
+     return;
+   }
++
+   propagate_staticness_neighborhood_ = false;
+   is_static_next_ts_ = false;
+-  auto* env = Simulation::GetActive()->GetEnvironment();
+   auto set_staticness = L2F([this](Agent* neighbor, double squared_distance) {
+     // TODO(all) generalize to axis-aligned bounding box
+     double distance = this->GetDiameter() + neighbor->GetDiameter();
+diff --git a/src/core/agent/agent.h b/src/core/agent/agent.h
+index 0fe450047..840c55ab4 100644
+--- a/src/core/agent/agent.h
++++ b/src/core/agent/agent.h
+@@ -173,7 +173,19 @@ class Agent {
+     propagate_staticness_neighborhood_ = value;
+   }
+ 
+-  void PropagateStaticness();
++  /// If the agent is not static, a call to this method
++  /// sets all neighbors to 'not static'. \n
++  /// This method will be called twice:
++  /// 1) At the end of the iteration using an agent op (`beginning=false`).\n
++  /// 2) At the beginning of the iteration as pre_scheduled op
++  /// (`beginning=true`).\n
++  ///
++  /// 1 is faster because it can use cached neighbors, but it might miss some
++  ///   conditions. (Neighbors modifying an agent after PropagateStaticness
++  ///   has been called. Agent which is larger than the largest agent.)
++  /// 2 is slower but able to process all conditions.
++  /// Therefore, we use 1 whenever possible and 2 for the remaining conditions.
++  void PropagateStaticness(bool beginning = false);
+ 
+   void UpdateStaticness();
+ 
+@@ -254,7 +266,7 @@ class Agent {
+   bool is_static_ = false;  //!
+   /// If an agent becomes non-static (i.e. it moved or grew), we should set this
+   /// flag to true to also compute mechanical forces on the neighboring agents
+-  bool propagate_staticness_neighborhood_ = false;  //!
++  bool propagate_staticness_neighborhood_ = true;  //!
+   /// Flag to determine of an agent is static in the next timestep
+   mutable bool is_static_next_ts_ = false;  //!
+ 
+diff --git a/src/core/operation/default_ops.cc b/src/core/operation/default_ops.cc
+index 6bfcfffb5..7c50de7ad 100644
+--- a/src/core/operation/default_ops.cc
++++ b/src/core/operation/default_ops.cc
+@@ -53,6 +53,15 @@ struct UpdateStaticnessOp : public AgentOperationImpl {
+ 
+ BDM_REGISTER_OP(UpdateStaticnessOp, "update staticness", kCpu);
+ 
++struct PropagateStaticnessAgentOp : public AgentOperationImpl {
++  BDM_OP_HEADER(PropagateStaticnessAgentOp);
++
++  void operator()(Agent* agent) override { agent->PropagateStaticness(); }
++};
++
++BDM_REGISTER_OP(PropagateStaticnessAgentOp, "propagate staticness agentop",
++                kCpu);
++
+ struct BehaviorOp : public AgentOperationImpl {
+   BDM_OP_HEADER(BehaviorOp);
+ 
+@@ -124,9 +133,11 @@ struct PropagateStaticnessOp : public StandaloneOperationImpl {
+     if (!Simulation::GetActive()->GetParam()->detect_static_agents) {
+       return;
+     }
+-    auto function = L2F([](Agent* agent) { agent->PropagateStaticness(); });
++    auto function = L2F(
++        [](Agent* agent, AgentHandle) { agent->PropagateStaticness(true); });
+     auto* rm = Simulation::GetActive()->GetResourceManager();
+-    rm->ForEachAgentParallel(function);
++    auto* param = Simulation::GetActive()->GetParam();
++    rm->ForEachAgentParallel(param->scheduling_batch_size, function);
+   }
+ };
+ 
+diff --git a/src/core/scheduler.cc b/src/core/scheduler.cc
+index d750d9eaf..d5cd2f2a2 100644
+--- a/src/core/scheduler.cc
++++ b/src/core/scheduler.cc
+@@ -44,7 +44,8 @@ Scheduler::Scheduler() {
+   // operation implementation type, so that actual order may vary)
+   std::vector<std::string> default_op_names = {
+       "update staticness", "bound space",    "behavior",
+-      "mechanical forces", "discretization", "diffusion"};
++      "mechanical forces", "discretization", "propagate staticness agentop",
++      "diffusion"};
+ 
+   std::vector<std::string> pre_scheduled_ops_names = {
+       "set up iteration", "update environment", "propagate staticness"};
+@@ -70,6 +71,11 @@ Scheduler::Scheduler() {
+ 
+   auto disabled_op_names =
+       Simulation::GetActive()->GetParam()->unschedule_default_operations;
++  if (!param->detect_static_agents) {
++    disabled_op_names.push_back("propagate staticness");
++    disabled_op_names.push_back("propagate staticness agentop");
++  }
++
+   std::vector<std::vector<std::string>*> all_op_names;
+   all_op_names.push_back(&pre_scheduled_ops_names);
+   all_op_names.push_back(&default_op_names);
+diff --git a/test/unit/core/agent/agent_test.cc b/test/unit/core/agent/agent_test.cc
+index 4ce5d3e30..cf6074350 100644
+--- a/test/unit/core/agent/agent_test.cc
++++ b/test/unit/core/agent/agent_test.cc
+@@ -172,6 +172,8 @@ TEST(AgentTest, StaticnessOff) {
+   Simulation simulation(TEST_NAME, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* scheduler = simulation.GetScheduler();
++  // no interference from mechanical forces operation
++  scheduler->UnscheduleOp(scheduler->GetOps("mechanical forces")[0]);
+ 
+   std::unordered_map<AgentUid, bool> static_agents_map;
+ 
+@@ -224,6 +226,8 @@ TEST(AgentTest, StaticnessBasic) {
+   Simulation simulation(TEST_NAME, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* scheduler = simulation.GetScheduler();
++  // no interference from mechanical forces operation
++  scheduler->UnscheduleOp(scheduler->GetOps("mechanical forces")[0]);
+ 
+   std::unordered_map<AgentUid, bool> static_agents_map;
+ 
+@@ -284,6 +288,8 @@ TEST(AgentTest, StaticnessNeighbors) {
+   Simulation simulation(TEST_NAME, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* scheduler = simulation.GetScheduler();
++  // no interference from mechanical forces operation
++  scheduler->UnscheduleOp(scheduler->GetOps("mechanical forces")[0]);
+ 
+   std::unordered_map<AgentUid, bool> static_agents_map;
+ 
+@@ -329,6 +335,8 @@ TEST(AgentTest, StaticnessNewAgent) {
+   Simulation simulation(TEST_NAME, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* scheduler = simulation.GetScheduler();
++  // no interference from mechanical forces operation
++  scheduler->UnscheduleOp(scheduler->GetOps("mechanical forces")[0]);
+ 
+   std::unordered_map<AgentUid, bool> static_agents_map;
+ 
+@@ -407,6 +415,8 @@ TEST(AgentTest, StaticnessNewAgentLargetThanAllOthers) {
+   Simulation simulation(TEST_NAME, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* scheduler = simulation.GetScheduler();
++  // no interference from mechanical forces operation
++  scheduler->UnscheduleOp(scheduler->GetOps("mechanical forces")[0]);
+ 
+   std::unordered_map<AgentUid, bool> static_agents_map;
+ 

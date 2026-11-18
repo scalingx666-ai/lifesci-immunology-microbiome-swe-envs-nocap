@@ -1,0 +1,1901 @@
+diff --git a/metagraph/integration_tests/test_align.py b/metagraph/integration_tests/test_align.py
+index 4809a55e31..f25b5be3f7 100644
+--- a/metagraph/integration_tests/test_align.py
++++ b/metagraph/integration_tests/test_align.py
+@@ -6,7 +6,7 @@
+ import glob
+ import os
+ 
+-from base import PROTEIN_MODE, DNA_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, NUM_THREADS
++from base import PROTEIN_MODE, DNA_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, NUM_THREADS, MMAP_FLAG
+ 
+ 
+ """Test graph construction and alignment"""
+@@ -393,5 +393,406 @@ def setUp(self):
+     #     pass
+ 
+ 
++coord_anno_file_extension = {
++    'column_coord': '.column_coord.annodbg',
++    'row_diff_brwt_coord': '.row_diff_brwt_coord.annodbg',
++}
++
++COORD_ANNO_TYPES = list(coord_anno_file_extension.keys())
++
++
++@unittest.skipUnless(DNA_MODE, "These alignment tests are only for the DNA4 alphabet")
++class TestAlignCoordToHeader(TestingBase):
++    """Test that 'metagraph align' resolves coordinates via .seqs index.
++
++    Future work: the current `.seqs`-based mode produces one alignment row
++    per column/file (LabeledAligner treats the file as a single label), and
++    CoordToHeader splits the coord range into per-sequence headers at
++    display time. To make this mode truly equivalent to `--anno-header`
++    (per-sequence columns) even when sequences within a file have
++    divergent extension paths, the annotator could be sliced by
++    CoordToHeader into virtual per-sequence sub-columns before alignment
++    so LabeledAligner extends per-sequence and emits distinct CIGARs.
++    That is a larger change — design to be worked out separately.
++    """
++
++    def setUp(self):
++        self.tempdir = TemporaryDirectory()
++
++    def tearDown(self):
++        if getattr(self, 'tempdir', None) is not None:
++            self.tempdir.cleanup()
++
++    def _setup_graph(self, fa_files, anno_repr, k=5):
++        """Build graph + coord annotation + .seqs index. Return (graph, anno) paths."""
++        if isinstance(fa_files, str):
++            fa_files = [fa_files]
++        fa_input = ' '.join(fa_files)
++
++        graph_base = self.tempdir.name + '/graph'
++        graph = graph_base + '.dbg'
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + coord_anno_file_extension[anno_repr]
++
++        self._build_graph(fa_input, graph_base, k=k, repr='succinct', mode='basic')
++        self._annotate_graph(fa_input, graph, anno_base, anno_repr, anno_type='filename')
++
++        # The annotation column order may differ from the input file order
++        # (e.g. due to parallel construction).  Query the actual column order
++        # so the .seqs index matches.
++        res = subprocess.run([f"{METAGRAPH} stats {anno} --print-col-names"],
++                             shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        columns = [l.strip() for l in res.stdout.decode().split('\n')[2:] if l.strip()]
++        seqs_input = ' '.join(columns) if columns else fa_input
++
++        cmd = (f"{METAGRAPH} annotate --anno-filename --index-header-coords -v "
++               f"-i {graph} -o {anno_base} {seqs_input}" + MMAP_FLAG)
++        res = subprocess.run([cmd], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0,
++                         f"Indexing headers failed: {res.stderr.decode()}")
++        self.assertTrue(os.path.exists(anno_base + '.seqs'))
++        return graph, anno
++
++    def _run_align(self, graph, anno, query_fa, extra_flags='', only_forwards=True):
++        """Run align and return parsed output lines as lists of tab-separated fields."""
++        forwards = '--align-only-forwards ' if only_forwards else ''
++        align_cmd = (f'{METAGRAPH} align {forwards}{extra_flags} '
++                     f'-i {graph} -a {anno} {query_fa}' + MMAP_FLAG)
++        res = subprocess.run([align_cmd], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0, f"Align failed: {res.stderr.decode()}")
++        output = res.stdout.decode().rstrip()
++        if not output:
++            return []
++        return [line.split('\t') for line in output.split('\n')]
++
++    def _write_fa(self, name, sequences):
++        """Write a FASTA file. sequences is a list of (header, seq) tuples."""
++        path = os.path.join(self.tempdir.name, name)
++        with open(path, 'w') as f:
++            for header, seq in sequences:
++                f.write(f'>{header}\n{seq}\n')
++        return path
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_with_seqs_maps_coords_to_headers(self, anno_repr):
++        """Core test: .seqs resolves global coords to per-sequence header:start-end."""
++        #   seq1: GTATCGATCG       (10 bp)
++        #   seq2: GCTAGCTAGCTAGCTA (16 bp)
++        #   seq3: ATCGATCGAAAAACCCCCGGGGGTTTTT (28 bp)
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ])
++        query_fa = self._write_fa('query.fa', [
++            ('query1', 'TATCGATCG'),     # matches seq1
++            ('query2', 'GCTAGCTAGCTAG'), # matches seq2
++            ('query3', 'AAAAACCCCC'),    # matches seq3
++        ])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++        rows = self._run_align(graph, anno, query_fa)
++        self.assertEqual(len(rows), 3)
++
++        # query1 -> seq1:2-10
++        self.assertEqual(rows[0][0], 'query1')
++        self.assertEqual(rows[0][1], 'TATCGATCG')
++        self.assertEqual(rows[0][3], 'TATCGATCG')
++        self.assertEqual(rows[0][6], '9=')
++        self.assertEqual(rows[0][7], '0')
++        self.assertEqual(rows[0][8], 'seq1:2-10')
++
++        # query2 -> seq2:1-13
++        self.assertEqual(rows[1][0], 'query2')
++        self.assertEqual(rows[1][1], 'GCTAGCTAGCTAG')
++        self.assertEqual(rows[1][3], 'GCTAGCTAGCTAG')
++        self.assertEqual(rows[1][6], '13=')
++        self.assertEqual(rows[1][7], '0')
++        self.assertEqual(rows[1][8], 'seq2:1-13')
++
++        # query3 -> seq3:9-18
++        self.assertEqual(rows[2][0], 'query3')
++        self.assertEqual(rows[2][1], 'AAAAACCCCC')
++        self.assertEqual(rows[2][3], 'AAAAACCCCC')
++        self.assertEqual(rows[2][6], '10=')
++        self.assertEqual(rows[2][7], '0')
++        self.assertEqual(rows[2][8], 'seq3:9-18')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_no_coord_mapping_flag(self, anno_repr):
++        """--no-coord-mapping disables header resolution, keeps global file offsets."""
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ])
++        query_fa = self._write_fa('query.fa', [
++            ('query1', 'TATCGATCG'),
++            ('query2', 'GCTAGCTAGCTAG'),
++            ('query3', 'AAAAACCCCC'),
++        ])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++        rows = self._run_align(graph, anno, query_fa, extra_flags='--no-coord-mapping')
++        self.assertEqual(len(rows), 3)
++
++        # With --no-coord-mapping, labels use global file path:offset format
++        self.assertEqual(rows[0][0], 'query1')
++        self.assertEqual(rows[0][6], '9=')
++        self.assertEqual(rows[0][8], f'{test_fa}:2-10')
++
++        self.assertEqual(rows[1][0], 'query2')
++        self.assertEqual(rows[1][6], '13=')
++        self.assertEqual(rows[1][8], f'{test_fa}:7-19')
++
++        self.assertEqual(rows[2][0], 'query3')
++        self.assertEqual(rows[2][6], '10=')
++        self.assertEqual(rows[2][8], f'{test_fa}:27-36')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_shared_kmers_multiple_labels(self, anno_repr):
++        """Query matching k-mers shared between sequences produces semicolon-separated labels."""
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ])
++        # ATCGATCG appears in both seq1 (pos 3-10) and seq3 (pos 1-8)
++        query_fa = self._write_fa('query.fa', [('shared_query', 'ATCGATCG')])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++        rows = self._run_align(graph, anno, query_fa)
++        self.assertEqual(len(rows), 1)
++
++        self.assertEqual(rows[0][0], 'shared_query')
++        self.assertEqual(rows[0][1], 'ATCGATCG')
++        self.assertEqual(rows[0][3], 'ATCGATCG')
++        self.assertEqual(rows[0][6], '8=')
++        self.assertEqual(rows[0][7], '0')
++        # Both sequences reported, separated by ;
++        self.assertEqual(rows[0][8], 'seq1:3-10;seq3:1-8')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_multiple_input_files(self, anno_repr):
++        """Sequences from separate FASTA files get correct per-file header mapping."""
++        fa1 = self._write_fa('file1.fa', [
++            ('alpha', 'GTATCGATCGACGT'),
++            ('beta', 'GCTAGCTAGCTAGCTA'),
++        ])
++        fa2 = self._write_fa('file2.fa', [
++            ('gamma', 'ATCGATCGAAAAACCCCC'),
++        ])
++        query_fa = self._write_fa('query.fa', [
++            ('q_alpha', 'TATCGATCG'),
++            ('q_gamma', 'AAAAACCCCC'),
++        ])
++
++        graph, anno = self._setup_graph([fa1, fa2], anno_repr)
++        rows = self._run_align(graph, anno, query_fa)
++        self.assertEqual(len(rows), 2)
++
++        # q_alpha -> alpha:2-10 (in file1.fa)
++        self.assertEqual(rows[0][0], 'q_alpha')
++        self.assertEqual(rows[0][3], 'TATCGATCG')
++        self.assertEqual(rows[0][6], '9=')
++        self.assertEqual(rows[0][8], 'alpha:2-10')
++
++        # q_gamma -> gamma:9-18 (in file2.fa)
++        self.assertEqual(rows[1][0], 'q_gamma')
++        self.assertEqual(rows[1][3], 'AAAAACCCCC')
++        self.assertEqual(rows[1][6], '10=')
++        self.assertEqual(rows[1][8], 'gamma:9-18')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_with_mismatch(self, anno_repr):
++        """Non-trivial CIGAR (substitution) still gets correct coord mapping."""
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'GTATCGATCGACGTACGT'),
++        ])
++        # Position 12: G->A mismatch
++        query_fa = self._write_fa('query.fa', [
++            ('mismatch_q', 'GTATCGATCGACATACGT'),
++        ])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++        rows = self._run_align(graph, anno, query_fa, extra_flags='--align-min-exact-match 0.0')
++        self.assertEqual(len(rows), 1)
++
++        self.assertEqual(rows[0][0], 'mismatch_q')
++        self.assertEqual(rows[0][1], 'GTATCGATCGACATACGT')
++        self.assertEqual(rows[0][3], 'GTATCGATCGACGTACGT')
++        self.assertEqual(rows[0][6], '12=1X5=')
++        self.assertEqual(rows[0][8], 'seq1:1-18')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_sequence_boundaries(self, anno_repr):
++        """Matches at very start (coord 1) and very end of a sequence."""
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'ACGTACGTACGT'),
++            ('seq2', 'TTTTTAAAAATTTTT'),
++        ])
++        query_start = self._write_fa('q_start.fa', [('q_start', 'ACGTACGTA')])
++        query_end = self._write_fa('q_end.fa', [('q_end', 'GTACGTACGT')])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++
++        # Match at start of seq1 -> coord starts at 1
++        rows = self._run_align(graph, anno, query_start)
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0][0], 'q_start')
++        self.assertEqual(rows[0][6], '9=')
++        self.assertEqual(rows[0][8], 'seq1:1-9')
++
++        # Match at end of seq1 -> coord ends at len(seq1)=12
++        rows = self._run_align(graph, anno, query_end)
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0][0], 'q_end')
++        self.assertEqual(rows[0][6], '10=')
++        self.assertEqual(rows[0][8], 'seq1:3-12')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_cross_sequence_boundary(self, anno_repr):
++        """Alignment path crosses from one indexed sequence into the next.
++
++        When two sequences share the boundary k-1-mer, the graph connects
++        them and the aligner follows a path whose coordinate range extends
++        past the end of the first sequence.  The label is split across
++        consecutive headers, joined by ';'.
++        """
++        # seq1 ends with ...ACGT, seq2 starts with ACGT... — they share the
++        # k-1-mer 'ACGT' at the boundary, so the graph connects them.
++        #   seq1: AAAAACGTACGT  (12 bp, k-mer coords 0-7)
++        #   seq2: ACGTTTTTTTTT  (12 bp, k-mer coords 8-15)
++        test_fa = self._write_fa('seqs.fa', [
++            ('seq1', 'AAAAACGTACGT'),
++            ('seq2', 'ACGTTTTTTTTT'),
++        ])
++        # The aligner finds a 16bp path crossing the boundary (8bp soft
++        # clip at the start, since the first 8 query bp cannot extend into
++        # a longer run than the cross-boundary one).
++        query_fa = self._write_fa('query.fa', [
++            ('q_concat', 'AAAAACGTACGTACGTTTTTTTTT'),
++        ])
++
++        graph, anno = self._setup_graph(test_fa, anno_repr)
++        rows = self._run_align(graph, anno, query_fa)
++        self.assertEqual(len(rows), 1)
++
++        self.assertEqual(rows[0][0], 'q_concat')
++        self.assertEqual(rows[0][6], '8S16=')
++        # Range 8 nt in seq1 (local 5-12) + 8 nt in seq2 (local 1-8).
++        self.assertEqual(rows[0][8], 'seq1:5-12;seq2:1-8')
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_coord_to_header_matches_per_sequence_columns(self, anno_repr):
++        """CoordToHeader output matches per-sequence-column annotation output.
++
++        With CoordToHeader (one column + .seqs index) vs per-sequence columns
++        (each sequence its own label via --anno-header), the aligner should
++        produce the same labels with the same local coordinate ranges.
++        """
++        sequences = [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ]
++        test_fa = self._write_fa('seqs.fa', sequences)
++        query_fa = self._write_fa('query.fa', [
++            ('q1', 'TATCGATCG'),         # matches seq1 (and shared 'ATCGATCG' in seq3)
++            ('q2', 'GCTAGCTAGCTAG'),     # matches seq2
++            ('q3', 'AAAAACCCCC'),        # matches seq3
++            ('q2_rc', 'CTAGCTAGCTAGC'),  # rc of a seq2 substring — hits on rev strand
++        ])
++
++        # Mode A: CoordToHeader — one column (filename), headers via .seqs.
++        graph_a, anno_a = self._setup_graph(test_fa, anno_repr)
++        rows_a = self._run_align(graph_a, anno_a, query_fa, only_forwards=False)
++
++        # Mode B: per-sequence columns — each FASTA header is its own label.
++        graph_b_base = self.tempdir.name + '/graph_b'
++        graph_b = graph_b_base + '.dbg'
++        anno_b_base = self.tempdir.name + '/anno_b'
++        anno_b = anno_b_base + coord_anno_file_extension[anno_repr]
++        self._build_graph(test_fa, graph_b_base, k=5, repr='succinct', mode='basic')
++        self._annotate_graph(test_fa, graph_b, anno_b_base, anno_repr, anno_type='header')
++        rows_b = self._run_align(graph_b, anno_b, query_fa, only_forwards=False)
++
++        # The CIGAR (col 6) and label field (col 8) must match between modes.
++        self.assertEqual(len(rows_a), len(rows_b))
++        for row_a, row_b in zip(rows_a, rows_b):
++            self.assertEqual(row_a[0], row_b[0])  # query name
++            self.assertEqual(row_a[6], row_b[6],
++                             f"CIGAR mismatch for {row_a[0]}: "
++                             f"CoordToHeader={row_a[6]!r} vs per-sequence={row_b[6]!r}")
++            # Normalize semicolon-separated labels (order may vary across modes).
++            labels_a = sorted(row_a[8].split(';'))
++            labels_b = sorted(row_b[8].split(';'))
++            self.assertEqual(labels_a, labels_b,
++                             f"label mismatch for {row_a[0]}: "
++                             f"CoordToHeader={row_a[8]!r} vs per-sequence={row_b[8]!r}")
++
++    @parameterized.expand(COORD_ANNO_TYPES)
++    def test_align_coord_to_header_matches_per_sequence_columns_two_files(self, anno_repr):
++        """Same equivalence as above, but with sequences split across two files.
++
++        This produces two columns under --anno-filename (one per file), so a
++        query that hits sequences in both files gets an alignment row per file;
++        CoordToHeader then expands each file-label into its matched sequence.
++        Under --anno-header the same query gets a row per matching sequence.
++        Per-row CIGARs should match between the two modes on this fixture.
++
++        Scope: this equivalence assumes that sequences within the same file
++        do not produce divergent extension paths for the test queries. With
++        divergent paths, --anno-header would emit a row per sequence with
++        distinct CIGARs while --anno-filename + .seqs would emit one row
++        per file. See the "future work" note in the class docstring.
++        """
++        file1_fa = self._write_fa('file1.fa', [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++        ])
++        file2_fa = self._write_fa('file2.fa', [
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ])
++        query_fa = self._write_fa('query.fa', [
++            ('q_seq1', 'TATCGATCG'),          # only-seq1 match; shares kmers with seq3
++            ('q_seq2', 'GCTAGCTAGCTAG'),      # only-seq2 match
++            ('q_seq3', 'AAAAACCCCC'),         # only-seq3 match (in file2)
++            ('q_seq2_rc', 'CTAGCTAGCTAGC'),   # rc of a seq2 substring
++        ])
++
++        # Mode A: CoordToHeader — one column per file (two columns total).
++        graph_a, anno_a = self._setup_graph([file1_fa, file2_fa], anno_repr)
++        rows_a = self._run_align(graph_a, anno_a, query_fa, only_forwards=False)
++
++        # Mode B: per-sequence columns from the combined input.
++        combined_fa = self._write_fa('combined.fa', [
++            ('seq1', 'GTATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCCGGGGGTTTTT'),
++        ])
++        graph_b_base = self.tempdir.name + '/graph_b_two'
++        graph_b = graph_b_base + '.dbg'
++        anno_b_base = self.tempdir.name + '/anno_b_two'
++        anno_b = anno_b_base + coord_anno_file_extension[anno_repr]
++        self._build_graph(combined_fa, graph_b_base, k=5, repr='succinct', mode='basic')
++        self._annotate_graph(combined_fa, graph_b, anno_b_base, anno_repr, anno_type='header')
++        rows_b = self._run_align(graph_b, anno_b, query_fa, only_forwards=False)
++
++        # Per-row CIGAR + label equivalence, as in the single-file case.
++        self.assertEqual(len(rows_a), len(rows_b))
++        for row_a, row_b in zip(rows_a, rows_b):
++            self.assertEqual(row_a[0], row_b[0])
++            self.assertEqual(row_a[6], row_b[6],
++                             f"CIGAR mismatch for {row_a[0]}: "
++                             f"CoordToHeader={row_a[6]!r} vs per-sequence={row_b[6]!r}")
++            labels_a = sorted(row_a[8].split(';'))
++            labels_b = sorted(row_b[8].split(';'))
++            self.assertEqual(labels_a, labels_b,
++                             f"label mismatch for {row_a[0]}: "
++                             f"CoordToHeader={row_a[8]!r} vs per-sequence={row_b[8]!r}")
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/metagraph/src/annotation/coord_to_header.cpp b/metagraph/src/annotation/coord_to_header.cpp
+index 541de6a67b..c48aef722e 100644
+--- a/metagraph/src/annotation/coord_to_header.cpp
++++ b/metagraph/src/annotation/coord_to_header.cpp
+@@ -19,7 +19,7 @@ CoordToHeader::CoordToHeader(std::vector<std::vector<std::string>> &&headers,
+     assert(headers_.size() == num_kmers.size());
+     #pragma omp parallel for num_threads(get_num_threads()) schedule(dynamic)
+     for (size_t j = 0; j < num_kmers.size(); ++j) {
+-        assert(num_kmers[j].size() == num_headers(j));
++        assert(num_kmers[j].size() == num_sequences(j));
+         if (num_kmers[j].empty())
+             continue;
+         auto &offsets = num_kmers[j];
+@@ -38,27 +38,55 @@ void CoordToHeader::map_to_local_coords(std::vector<RowTuples> *rows) const {
+     assert(rows);
+     for (auto &row : *rows) {
+         for (auto &[col, coords] : row) {
+-            const auto &offsets = coord_offsets_.at(col);
++            const size_t n = num_sequences(col);
+             for (uint64_t &coord : coords) {
+-                if (coord >= offsets.size()) {
+-                    throw std::runtime_error("Querying coordinate " + std::to_string(coord) + " for"
+-                            + " column " + std::to_string(col) + " while CoordToHeader has only "
+-                            + std::to_string(offsets.size()) + " coordinates for that column");
++                auto [seq_id, local_coord] = map_single_coord(col, coord);
++                assert(n);
++                if (local_coord > std::numeric_limits<uint64_t>::max() / n) {
++                    throw std::runtime_error(fmt::format("Local coordinate {} is too large to "
++                            "pack with a seq_id into a single 64-bit integer "
++                            "({} sequences in column {})", local_coord, n, col));
+                 }
+-                size_t header = coord ? offsets.rank1(coord - 1) : 0;
+-                // Convert global coordinate to local (sequence-based) coordinate
+-                uint64_t local_coord = !header ? coord : coord - offsets.select1(header) - 1;
+-                if (local_coord > std::numeric_limits<uint64_t>::max() / num_headers(col)) {
+-                    throw std::runtime_error(fmt::format("Local coordinate {} is too large for the "
+-                            "given {} headers in column {} to encode both local_coord and header_id"
+-                            " in a single 64-bit integer", local_coord, num_headers(col), col));
+-                }
+-                coord = local_coord * num_headers(col) + header;
++                coord = local_coord * n + seq_id;
+             }
+         }
+     }
+ }
+ 
++std::pair<size_t, uint64_t>
++CoordToHeader::map_single_coord(Column col, uint64_t coord) const {
++    if (col >= num_columns()) {
++        throw std::out_of_range(fmt::format("Column {} out of range "
++                "(CoordToHeader has {} columns)", col, num_columns()));
++    }
++    const auto &offsets = coord_offsets_[col];
++    if (coord >= offsets.size()) {
++        throw std::out_of_range(fmt::format("Coordinate {} for column {} out of range "
++                "(CoordToHeader has {} coordinates for that column)", coord, col, offsets.size()));
++    }
++    size_t header = coord ? offsets.rank1(coord - 1) : 0;
++    uint64_t local_coord = !header ? coord : coord - offsets.select1(header) - 1;
++    return { header, local_coord };
++}
++
++uint64_t CoordToHeader::num_kmers_in_sequence(Column col, size_t seq_id) const {
++    if (col >= num_columns()) {
++        throw std::out_of_range(fmt::format("Column {} out of range "
++                "(CoordToHeader has {} columns)", col, num_columns()));
++    }
++    const auto &offsets = coord_offsets_[col];
++    if (seq_id >= num_sequences(col)) {
++        throw std::out_of_range(fmt::format("Sequence id {} out of range for column {} "
++                "({} sequences)", seq_id, col, num_sequences(col)));
++    }
++    // coord_offsets_ has a set bit at the partial-sum boundary of each
++    // sequence, so the k-mer count for sequence s is
++    //     select1(s+1) - (s == 0 ? -1 : select1(s)).
++    uint64_t end = offsets.select1(seq_id + 1);
++    uint64_t start = seq_id ? offsets.select1(seq_id) + 1 : 0;
++    return end - start + 1;
++}
++
+ bool CoordToHeader::load(const std::string &filename_base) {
+     const std::string path = utils::make_suffix(filename_base, kExtension);
+     std::unique_ptr<std::ifstream> in = utils::open_ifstream(path);
+diff --git a/metagraph/src/annotation/coord_to_header.hpp b/metagraph/src/annotation/coord_to_header.hpp
+index efdf31b909..bda217de28 100644
+--- a/metagraph/src/annotation/coord_to_header.hpp
++++ b/metagraph/src/annotation/coord_to_header.hpp
+@@ -13,10 +13,27 @@ namespace annot {
+ 
+ /**
+  * An index mapping k-mer coordinates in annotation columns to sequence headers.
+- * This mapping can be used to transform coordinates and labels in query results to show
+- * sequence-based (e.g., "<seq1>:0-0-3\t<seq3>:0-1-5") instead of file-based coordinates
+- * (e.g., "<file.fa>:0-0-3:0-23-27"). This allows showing results of querying coordinate
+- * annotations as if sequences were annotated by their headers instead of source files.
++ * A column is typically the output of `annotate --anno-filename` (all sequences
++ * in a FASTA file are collapsed into one label, with consecutive global
++ * coordinates). This index remembers, for each column, the FASTA header of
++ * each sequence and how many k-mers it contributed, so downstream tools can
++ * report per-sequence labels instead of whole-file offsets:
++ *
++ *   metagraph query (coords): transforms
++ *       "<file.fa>:0-0-3:0-23-27"   (pos-first[-last], tab-separated labels)
++ *     into
++ *       "<seq1>:0-0-3\t<seq3>:0-1-5"
++ *
++ *   metagraph align (coord-aware): transforms
++ *       "file.fa:4-30"              (label:1-based-inclusive nt range)
++ *     into
++ *       "seq1:4-10;seq3:1-5"        (';'-separated per-sequence ranges)
++ *
++ * Terminology: a "header" is the sequence's label (FASTA header line), and
++ * `seq_id` is the 0-based index of a sequence within its column.
++ *
++ * Built by `annotate --index-header-coords` and stored alongside the column
++ * annotation as a ".seqs" file.
+  */
+ class CoordToHeader {
+   public:
+@@ -32,29 +49,33 @@ class CoordToHeader {
+     bool load(const std::string &filename_base);
+     void serialize(const std::string &filename_base) const;
+ 
++    // global_coord -> (seq_id, local_coord)
++    std::pair<size_t, uint64_t> map_single_coord(Column col, uint64_t coord) const;
++
+     /**
+-     * Transforms global coordinates to local (sequence-based) coordinates in-place.
+-     *
+-     * For each coordinate in `rows_tuples`, this function:
+-     *   1. Determines which sequence (header) the coordinate belongs to within its column
+-     *   2. Converts the global coordinate to a local coordinate within that sequence
+-     *   3. Encodes both the local coordinate and header index into a single value
++     * Batch variant of `map_single_coord` that replaces each global coord
++     * in `rows_tuples` with a packed `(seq_id, local_coord)` pair
++     * encoded as a single `uint64_t`. Used by the query pipeline to reuse
++     * the existing `uint64_t`-valued row/tuple data structures instead of
++     * introducing a parallel structure for pairs.
+      *
+-     * Encoding scheme: For a coordinate in column `j`, the transformed value is:
+-     *   `encoded_coord = local_coord * num_headers[j] + header_id`
++     * Packing:   `packed = local_coord * num_sequences[col] + seq_id`
++     * Unpacking: `seq_id   = packed % num_sequences[col]`
++     *            `local_coord = packed / num_sequences[col]`
+      *
+-     * Decoding: To extract the header index and local coordinate from an encoded value:
+-     *   `header_id = encoded_coord % num_headers[j]`
+-     *   `local_coord = encoded_coord / num_headers[j]`
++     * For single-coord lookups prefer `map_single_coord`, which returns
++     * the pair directly without packing.
+      */
+     void map_to_local_coords(std::vector<RowTuples> *rows_tuples) const;
+ 
+     uint64_t num_columns() const { return coord_offsets_.size(); }
+-    uint64_t num_sequences(Column column) const { return headers_[column].size(); }
+-    // Get number of k-mers/coordinates in a specific column
++    size_t num_sequences(Column column) const { return headers_[column].size(); }
++    // Number of k-mers in a sequence.
++    uint64_t num_kmers_in_sequence(Column col, size_t seq_id) const;
++    // Total number of k-mers / coordinates in a column (across all sequences).
+     uint64_t num_kmers(Column column) const { return coord_offsets_[column].size(); }
++    // FASTA headers of the sequences in a column, indexed by seq_id.
+     const std::vector<std::string>& get_headers(Column column) const { return headers_[column]; }
+-    size_t num_headers(Column column) const { return headers_[column].size(); }
+ 
+     static constexpr auto kExtension = ".seqs";
+ 
+diff --git a/metagraph/src/cli/align.cpp b/metagraph/src/cli/align.cpp
+index a4d91a1bad..4fab00aaac 100644
+--- a/metagraph/src/cli/align.cpp
++++ b/metagraph/src/cli/align.cpp
+@@ -254,7 +254,9 @@ void gfa_map_files(const Config *config,
+ std::string format_alignment(const std::string &header,
+                              const AlignmentResults &paths,
+                              const DeBruijnGraph &graph,
+-                             const Config &config) {
++                             const Config &config,
++                             const annot::LabelEncoder<> *encoder,
++                             const annot::CoordToHeader *cth) {
+     std::string sout;
+     if (!config.output_json) {
+         sout += fmt::format("{}\t{}", header, paths.get_query());
+@@ -263,6 +265,21 @@ std::string format_alignment(const std::string &header,
+         } else {
+             for (const auto &path : paths) {
+                 sout += fmt::format("\t{}", path);
++                // labels/coordinates only ever come from a labeled aligner,
++                // which always supplies the encoder. cth is the optional refinement.
++                if (path.label_coordinates.size()) {
++                    assert(encoder);
++                    sout += "\t" + (cth ? path.format_coords(*cth, graph.get_k())
++                                        : path.format_coords(*encoder));
++                } else if (path.label_columns.size()) {
++                    assert(encoder);
++                    std::vector<std::string> labels;
++                    labels.reserve(path.label_columns.size());
++                    for (auto col : path.label_columns) {
++                        labels.emplace_back(encoder->decode(col));
++                    }
++                    sout += fmt::format("\t{}", fmt::join(labels, ";"));
++                }
+             }
+             sout += "\n";
+         }
+@@ -431,9 +448,16 @@ int align_to_graph(Config *config) {
+                     aligner = std::make_unique<DBGAligner<>>(*aln_graph, aligner_config);
+                 }
+ 
++                const annot::LabelEncoder<> *encoder = nullptr;
++                const annot::CoordToHeader *cth = nullptr;
++                if (anno_dbg) {
++                    encoder = &anno_dbg->get_annotator().get_label_encoder();
++                    cth = anno_dbg->get_coord_to_header();
++                }
++
+                 aligner->align_batch(batch,
+                     [&](const std::string &header, AlignmentResults&& paths) {
+-                        const auto &res = format_alignment(header, paths, *graph, *config);
++                        auto res = format_alignment(header, paths, *graph, *config, encoder, cth);
+                         std::lock_guard<std::mutex> lock(print_mutex);
+                         *out << res;
+                     }
+diff --git a/metagraph/src/graph/alignment/aligner_chainer.cpp b/metagraph/src/graph/alignment/aligner_chainer.cpp
+index 72f7beab4c..35dd62a026 100644
+--- a/metagraph/src/graph/alignment/aligner_chainer.cpp
++++ b/metagraph/src/graph/alignment/aligner_chainer.cpp
+@@ -267,6 +267,36 @@ call_seed_chains_both_strands(const IDBGAligner &aligner,
+                           chain_seeds.end());
+         assert(chain_seeds.size());
+ 
++        // Drop coord-redundant seeds: when two consecutive chain seeds share
++        // the same starting reference coord (different query positions), one
++        // is a strictly redundant alternative — keep the longer one. The
++        // chain DP can produce such pairs when two paths tie in score (more
++        // common on protein graphs with BLOSUM62 than on DNA's ±2 scoring);
++        // the merge loop above only merges when query- and coord-shifts
++        // agree, so coord-redundant seeds with a query-side insertion gap
++        // survive otherwise. A redundant seed contributes no new coordinate
++        // distance and would later trip the strictly-positive marginal-coord
++        // assertions, and downstream `coord_offset += chain[i].second` would
++        // assert non-positive.
++        for (size_t i = chain_seeds.size(); i-- > 1;) {
++            auto &prev_seed = chain_seeds[i - 1].first;
++            auto &cur_seed = chain_seeds[i].first;
++            if (prev_seed.empty() || cur_seed.empty())
++                continue;
++            if (chain_seeds[i - 1].second == chain_seeds[i].second) {
++                if (prev_seed.get_query_view().size()
++                        <= cur_seed.get_query_view().size()) {
++                    prev_seed = Seed();
++                } else {
++                    cur_seed = Seed();
++                }
++            }
++        }
++        chain_seeds.erase(std::remove_if(chain_seeds.begin(), chain_seeds.end(),
++                                         [](const auto &a) { return a.first.empty(); }),
++                          chain_seeds.end());
++        assert(chain_seeds.size());
++
+         for (size_t i = chain_seeds.size() - 1; i > 0; --i) {
+             assert(chain_seeds[i].first.get_clipping()
+                         > chain_seeds[i - 1].first.get_clipping());
+diff --git a/metagraph/src/graph/alignment/aligner_labeled.cpp b/metagraph/src/graph/alignment/aligner_labeled.cpp
+index bef5b3738d..c941eba93f 100644
+--- a/metagraph/src/graph/alignment/aligner_labeled.cpp
++++ b/metagraph/src/graph/alignment/aligner_labeled.cpp
+@@ -337,7 +337,6 @@ void LabeledExtender::call_alignments(score_t end_score,
+                                       const std::function<void(Alignment&&)> &callback) {
+     Alignment alignment = construct_alignment(ops, clipping, window, path, match,
+                                               end_score, offset, extra_score);
+-    alignment.label_encoder = &annotation_buffer_.get_annotator().get_label_encoder();
+ 
+     auto [base_labels, base_coords]
+         = annotation_buffer_.get_labels_and_coords(alignment.get_nodes().front());
+diff --git a/metagraph/src/graph/alignment/aligner_labeled.hpp b/metagraph/src/graph/alignment/aligner_labeled.hpp
+index df40219a2f..a35675fe7b 100644
+--- a/metagraph/src/graph/alignment/aligner_labeled.hpp
++++ b/metagraph/src/graph/alignment/aligner_labeled.hpp
+@@ -38,15 +38,9 @@ class LabeledExtender : public DefaultColumnExtender {
+         flush();
+ 
+         // run backtracking
+-        auto alignments = DefaultColumnExtender::backtrack(
++        return DefaultColumnExtender::backtrack(
+             min_path_score, window, right_end_bonus, tips, target_node
+         );
+-
+-        for (Alignment &alignment : alignments) {
+-            alignment.label_encoder = &annotation_buffer_.get_annotator().get_label_encoder();
+-        }
+-
+-        return alignments;
+     }
+ 
+     virtual bool set_seed(const Alignment &seed) override final;
+diff --git a/metagraph/src/graph/alignment/alignment.cpp b/metagraph/src/graph/alignment/alignment.cpp
+index 1f0a9a6fe7..ff49436432 100644
+--- a/metagraph/src/graph/alignment/alignment.cpp
++++ b/metagraph/src/graph/alignment/alignment.cpp
+@@ -3,7 +3,9 @@
+ #include "graph/representation/base/sequence_graph.hpp"
+ #include "graph/representation/succinct/dbg_succinct.hpp"
+ #include "graph/representation/canonical_dbg.hpp"
++#include "annotation/coord_to_header.hpp"
+ #include "common/algorithms.hpp"
++#include "common/vector_map.hpp"
+ #include "common/logger.hpp"
+ #include "common/seq_tools/reverse_complement.hpp"
+ #include "graph/representation/rc_dbg.hpp"
+@@ -15,7 +17,7 @@ namespace align {
+ 
+ using mtg::common::logger;
+ 
+-std::string Alignment::format_coords() const {
++std::string Alignment::format_coords(const annot::LabelEncoder<> &encoder) const {
+     if (!label_coordinates.size())
+         return "";
+ 
+@@ -24,16 +26,65 @@ std::string Alignment::format_coords() const {
+ 
+     std::vector<std::string> decoded_labels;
+     decoded_labels.reserve(label_columns.size());
+-
+     for (size_t i = 0; i < label_columns.size(); ++i) {
+-        decoded_labels.emplace_back(label_encoder
+-            ? label_encoder->decode(label_columns[i])
+-            : std::to_string(label_columns[i])
+-        );
++        decoded_labels.emplace_back(encoder.decode(label_columns[i]));
+         for (uint64_t coord : label_coordinates[i]) {
+             // alignment coordinates are 1-based inclusive ranges
+-            decoded_labels.back()
+-                += fmt::format(":{}-{}", coord + 1, coord + sequence_.size());
++            decoded_labels.back() += fmt::format(":{}-{}", coord + 1, coord + sequence_.size());
++        }
++    }
++    return fmt::format("{}", fmt::join(decoded_labels, ";"));
++}
++
++std::string Alignment::format_coords(const annot::CoordToHeader &cth, size_t k) const {
++    if (!label_coordinates.size())
++        return "";
++
++    assert(label_columns.size());
++    assert(label_coordinates.size() == label_columns.size());
++    assert(k > 0 && "k must be >0 when CoordToHeader is in use");
++
++    using Key = std::pair<Column, size_t>;  // (column, seq_id)
++    // Per-key list of local (start, end_inclusive) ranges, 0-based.
++    VectorMap<Key, std::vector<std::pair<uint64_t, uint64_t>>> seq_ranges;
++
++    const uint64_t L = sequence_.size();
++    for (size_t i = 0; i < label_columns.size(); ++i) {
++        Column col = label_columns[i];
++        const size_t n_seqs = cth.num_sequences(col);
++        for (uint64_t coord : label_coordinates[i]) {
++            auto [seq_id, local_coord] = cth.map_single_coord(col, coord);
++            uint64_t remaining = L;
++            uint64_t cur_local = local_coord;
++            size_t cur_seq_id = seq_id;
++            while (remaining) {
++                if (cur_seq_id >= n_seqs) {
++                    // Alignment overflows the indexed column (stale or
++                    // inconsistent .seqs index). Log at trace, truncate.
++                    logger->trace("Alignment coord {} in column {} extends past the last "
++                            "indexed sequence; truncating output", coord, col);
++                    break;
++                }
++                uint64_t nt_len = cth.num_kmers_in_sequence(col, cur_seq_id) + k - 1;
++                assert(nt_len > cur_local && "local_coord must be a valid k-mer index");
++                uint64_t span = std::min(remaining, nt_len - cur_local);
++                seq_ranges[{ col, cur_seq_id }]
++                    .emplace_back(cur_local, cur_local + span - 1);
++                remaining -= span;
++                ++cur_seq_id;
++                cur_local = 0;
++            }
++        }
++    }
++
++    std::vector<std::string> decoded_labels;
++    decoded_labels.reserve(seq_ranges.size());
++    for (const auto &[key, ranges] : seq_ranges) {
++        const auto &[col, seq_id] = key;
++        decoded_labels.emplace_back(cth.get_headers(col)[seq_id]);
++        for (auto [start, end] : ranges) {
++            // 1-based inclusive ranges
++            decoded_labels.back() += fmt::format(":{}-{}", start + 1, end + 1);
+         }
+     }
+ 
+diff --git a/metagraph/src/graph/alignment/alignment.hpp b/metagraph/src/graph/alignment/alignment.hpp
+index 8751b84a1e..34724227d4 100644
+--- a/metagraph/src/graph/alignment/alignment.hpp
++++ b/metagraph/src/graph/alignment/alignment.hpp
+@@ -21,6 +21,7 @@
+ 
+ 
+ namespace mtg {
++namespace annot { class CoordToHeader; }
+ namespace graph {
+ namespace align {
+ 
+@@ -151,7 +152,7 @@ class Alignment {
+             cigar_(Cigar::CLIPPED, clipping) { cigar_.append(std::move(cigar)); }
+ 
+     Alignment(const Seed &seed, const DBGAlignerConfig &config)
+-          : label_encoder(seed.label_encoder), label_columns(seed.label_columns),
++          : label_columns(seed.label_columns),
+             label_coordinates(seed.label_coordinates), query_view_(seed.get_query_view()),
+             nodes_(std::vector<node_index>(seed.get_nodes())),
+             orientation_(seed.get_orientation()), offset_(seed.get_offset()),
+@@ -281,8 +282,6 @@ class Alignment {
+ 
+     bool is_valid(const DeBruijnGraph &graph, const DBGAlignerConfig *config = nullptr) const;
+ 
+-    const annot::LabelEncoder<> *label_encoder = nullptr;
+-
+     Columns label_columns;
+ 
+     // for each column in |label_columns|, store a vector of coordinates for the
+@@ -294,7 +293,32 @@ class Alignment {
+ 
+     score_t extra_score = 0;
+ 
+-    std::string format_coords() const;
++    /**
++     * Emit the alignment's labels and their 1-based inclusive coordinate
++     * ranges as a single string:
++     *
++     *   "<label>:<start>-<end>[:<start>-<end>...][;<label>:...]"
++     *
++     * Separators: ';' separates labels; ':' separates the label from its
++     * first range and subsequent ranges within the same label. Multiple
++     * ranges for one label occur when the alignment matches that label
++     * at several positions (shared-k-mer case).
++     *
++     * Ordering: labels appear in the order of first occurrence when
++     * walking `label_coordinates` (by column, then by starting coord).
++     * Ranges within a single label appear in the order their starting
++     * coords were processed, which is the order of the source coords in
++     * the alignment's tuple.
++     *
++     * Two rendering modes (caller picks the overload that matches the
++     * available context — alignment itself is data-only):
++     *   - encoder: decode column indices to label names.
++     *   - cth + k: split ranges that cross a sequence boundary in the
++     *     CoordToHeader index across consecutive sequences (`k` must be > 0).
++     * Returns "" if the alignment has no coordinates.
++     */
++    std::string format_coords(const annot::LabelEncoder<> &encoder) const;
++    std::string format_coords(const annot::CoordToHeader &cth, size_t k) const;
+ 
+   private:
+     std::string_view query_view_;
+@@ -368,9 +392,12 @@ class AlignmentResults {
+     size_t size() const { return alignments_.size(); }
+     bool empty() const { return alignments_.empty(); }
+     const Alignment& operator[](size_t i) const { return alignments_[i]; }
++    Alignment& operator[](size_t i) { return alignments_[i]; }
+ 
+     auto begin() const { return alignments_.begin(); }
+     auto end() const { return alignments_.end(); }
++    auto begin() { return alignments_.begin(); }
++    auto end() { return alignments_.end(); }
+ 
+   private:
+     std::string query_;
+@@ -397,34 +424,13 @@ template <> struct formatter<mtg::graph::align::Alignment> {
+ 
+     template <typename FormatContext>
+     auto format(const mtg::graph::align::Alignment &a, FormatContext &ctx) const -> decltype(ctx.out()) {
+-        format_to(ctx.out(), "{}\t{}\t{}\t{}\t{}\t{}",
+-                  a.get_orientation() ? "-" : "+",
+-                  a.get_sequence(),
+-                  a.get_score(),
+-                  a.get_cigar().get_num_matches(),
+-                  a.get_cigar().to_string(),
+-                  a.get_offset());
+-
+-        const auto &label_columns = a.label_columns;
+-        const auto &label_coordinates = a.label_coordinates;
+-
+-        if (label_coordinates.size()) {
+-            format_to(ctx.out(), "\t{}", a.format_coords());
+-        } else if (label_columns.size()) {
+-            if (a.label_encoder) {
+-                std::vector<std::string> decoded_labels;
+-                decoded_labels.reserve(label_columns.size());
+-                for (size_t i = 0; i < label_columns.size(); ++i) {
+-                    decoded_labels.emplace_back(a.label_encoder->decode(label_columns[i]));
+-                }
+-
+-                format_to(ctx.out(), "\t{}", fmt::join(decoded_labels, ";"));
+-            } else {
+-                format_to(ctx.out(), "\t{}", fmt::join(label_columns, ";"));
+-            }
+-        }
+-
+-        return ctx.out();
++        return format_to(ctx.out(), "{}\t{}\t{}\t{}\t{}\t{}",
++                         a.get_orientation() ? "-" : "+",
++                         a.get_sequence(),
++                         a.get_score(),
++                         a.get_cigar().get_num_matches(),
++                         a.get_cigar().to_string(),
++                         a.get_offset());
+     }
+ };
+ } // namespace fmt
+diff --git a/metagraph/src/graph/annotated_dbg.cpp b/metagraph/src/graph/annotated_dbg.cpp
+index ab7a60aea9..85aff81d5d 100644
+--- a/metagraph/src/graph/annotated_dbg.cpp
++++ b/metagraph/src/graph/annotated_dbg.cpp
+@@ -628,10 +628,10 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+         }
+ 
+         coord_to_header_->map_to_local_coords(&rows_tuples);
+-        // Now each coord in `rows_tuples` is `coord = local_coord * num_headers[j] + header_id`
++        // Now each coord in `rows_tuples` is `coord = local_coord * num_sequences[j] + seq_id`
+ 
+-        // Before splitting coords across headers, filter them by the number of k-mer matches
+-        using Header = std::pair<Column, size_t>; // global header id
++        // Before splitting coords across sequences, filter them by the number of k-mer matches
++        using Header = std::pair<Column, size_t>; // (column, seq_id)
+         using Count = size_t;
+         std::vector<std::pair<Header, Count>> counts;
+         {
+@@ -641,7 +641,7 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+                 matches.clear();
+                 for (auto &[col, coords] : row) {
+                     for (uint64_t coord : coords) {
+-                        size_t header = coord % coord_to_header_->num_headers(col);
++                        size_t header = coord % coord_to_header_->num_sequences(col);
+                         matches.emplace(col, header);
+                     }
+                 }
+@@ -652,16 +652,16 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+             counts = to_vector(std::move(counts_map));
+         }
+ 
+-        // remove headers with insufficient number of k-mer matches
++        // remove sequences with insufficient number of k-mer matches
+         counts.erase(std::remove_if(counts.begin(), counts.end(),
+                                     [&](const auto &pair) { return pair.second < min_count; }),
+                      counts.end());
+ 
+-        // keep only top-n headers
++        // keep only top-n sequences
+         if (counts.size() > num_top_labels)
+             top_n_sorted(counts, num_top_labels);
+ 
+-        // split coordinates across headers
++        // split coordinates across sequences
+         tsl::hopscotch_map<Header, std::vector<Tuple>> coords_map;
+         coords_map.reserve(counts.size());
+         for (const auto &[h, count] : counts) {
+@@ -670,8 +670,8 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+         for (size_t i = 0; i < rows_tuples.size(); ++i) {
+             for (auto &[col, coords] : rows_tuples[i]) {
+                 for (uint64_t coord : coords) {
+-                    size_t header = coord % coord_to_header_->num_headers(col);
+-                    uint64_t local_coord = coord / coord_to_header_->num_headers(col);
++                    size_t header = coord % coord_to_header_->num_sequences(col);
++                    uint64_t local_coord = coord / coord_to_header_->num_sequences(col);
+                     auto it = coords_map.find({col, header});
+                     if (it != coords_map.end())
+                         it.value()[kmer_positions[i]].push_back(local_coord);
+diff --git a/metagraph/tests/annotation/test_aligner_labeled.cpp b/metagraph/tests/annotation/test_aligner_labeled.cpp
+index dc4658b046..0d0b17ab06 100644
+--- a/metagraph/tests/annotation/test_aligner_labeled.cpp
++++ b/metagraph/tests/annotation/test_aligner_labeled.cpp
+@@ -6,6 +6,7 @@
+ #include "../test_helpers.hpp"
+ #include "test_annotated_dbg_helpers.hpp"
+ 
++#include "annotation/coord_to_header.hpp"
+ #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
+ #include "annotation/annotation_converters.hpp"
+ #include "common/seq_tools/reverse_complement.hpp"
+@@ -280,6 +281,326 @@ TYPED_TEST(LabeledAlignerTest, SimpleTangleGraphCoordsMiddle) {
+     }
+ }
+ 
++// Fixture for the end-to-end CoordToHeader alignment tests. Builds a
++// DBGSuccinct + ColumnCompressed annotation where all sequences share a
++// single label (simulating --anno-filename), with distinct coordinate
++// offsets so the k-mer coord axis spans the full column.
++//
++// DNA-only: tests use the DNA scoring matrix and short ACGT sequences. The
++// functionality under test (CoordToHeader formatting) is alphabet-agnostic
++// and exercised separately by `LabeledAlignerProteinCoordTest` in protein
++// builds.
++#if ! _PROTEIN_GRAPH
++class LabeledAlignerCoordTest : public ::testing::Test {
++  protected:
++    static constexpr size_t k = 5;
++    std::unique_ptr<AnnotatedDBG> anno_graph;
++    DBGAlignerConfig config;
++
++    void SetUp() override {
++        config.max_seed_length = std::numeric_limits<size_t>::max();
++        config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -1, -1);
++    }
++
++    void build(const std::vector<std::string> &sequences,
++               const std::vector<uint64_t> &coord_starts) {
++        std::vector<std::string> labels(sequences.size(), "file");
++        anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
++            k, sequences, labels, DeBruijnGraph::BASIC, /*coordinates=*/true, coord_starts
++        );
++    }
++
++    AlignmentResults align(const std::string &query) {
++        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
++        return aligner.align(query);
++    }
++};
++
++TEST_F(LabeledAlignerCoordTest, CrossBoundary) {
++    // Two sequences sharing the boundary 4-mer 'ACGT'. Literal seq1+seq2
++    // duplicates the shared 'ACGT', but the graph path does not (spells
++    // seq1 + seq2[k-1:] = 20 nt). The aligner soft-clips the first 8
++    // query bases and takes the higher-scoring 16 nt cross-boundary run
++    // starting at seq1 k-mer 4 (8S16= vs the alternative 12=12S).
++    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
++
++    auto alignments = align("AAAAACGTACGTACGTTTTTTTTT");
++    //                       SSSSSSSS================
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("8S16=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-8", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerCoordTest, CrossBoundaryThreeSequences) {
++    // Three sequences chained by shared boundary 4-mers (ACGT, AGCT).
++    // Query spells the 24 nt cross-boundary path from seq1 k-mer 4
++    // through all of seq2 into the first 4 nt of seq3.
++    build({
++        "GCGCTTCGACGT",   // ends 'ACGT'
++        "ACGTATGCAGCT",   // starts 'ACGT', ends 'AGCT'
++        "AGCTGGGCGCAT",   // starts 'AGCT'
++    }, { 0, 8, 16 });
++
++    auto alignments = align("TTCGACGTATGCAGCTGGGCGCAT");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("24=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-12;seq3:1-4", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerCoordTest, CrossBoundaryThreeSequencesWithIndels) {
++    // Same graph as the ThreeSequences test. Query has 'AA' inserted and
++    // one 'G' deleted vs the 24-nt ref path; aligner deterministically
++    // picks CIGAR '13=2I3=1D7='. The ref-path spelling (and per-header
++    // split) is identical to the non-indel case.
++    build({
++        "GCGCTTCGACGT",
++        "ACGTATGCAGCT",
++        "AGCTGGGCGCAT",
++    }, { 0, 8, 16 });
++    config.min_exact_match = 0.0;
++
++    auto alignments = align("TTCGACGTATGCAAAGCT"/*G*/"GGCGCAT");
++    //                       =============II===   D   =======
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("13=2I3=1D7=", aln.get_cigar().to_string());
++    EXPECT_EQ("TTCGACGTATGCAGCTGGGCGCAT", aln.get_sequence());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-12;seq3:1-4", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerCoordTest, ThreeSequencesPartialCoverage) {
++    // Three sequences share the 7-mer 'CGTACGT' in their middles. A query
++    // matching just the shared 7-mer yields one alignment whose coord
++    // tuple holds three starts — one per sequence — so format_coords
++    // reports a partial range in the middle of each.
++    build({
++        "TTCGTACGTAAA",
++        "AACGTACGTCCC",
++        "GGCGTACGTGGG",
++    }, { 0, 8, 16 });
++
++    auto alignments = align("CGTACGT");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("7=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(3u, aln.label_coordinates[0].size());
++    EXPECT_EQ(2u,  aln.label_coordinates[0][0]);
++    EXPECT_EQ(10u, aln.label_coordinates[0][1]);
++    EXPECT_EQ(18u, aln.label_coordinates[0][2]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
++    EXPECT_EQ("seq1:3-9;seq2:3-9;seq3:3-9", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerCoordTest, CrossBoundaryReverseComplement) {
++    // rc of the CrossBoundary query. label_coordinates and sequence_
++    // stay in fwd-strand space, so format_coords emits the same ranges
++    // as the non-rc case.
++    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
++
++    auto alignments = align("AAAAAAAAACGTACGTACGTTTTT");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_TRUE(aln.get_orientation());
++    EXPECT_EQ("8S16=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-8", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerCoordTest, CrossBoundaryWithIndel) {
++    // Same graph as CrossBoundary. Query has extra bases inserted near
++    // the seq1/seq2 boundary; aligner deterministically picks CIGAR
++    // '12=4I8=1S' — ref-path spelling length = 20 nt.
++    build({ "AAAAACGTACGT", "ACGTTTTTTTTT" }, { 0, 8 });
++    config.min_exact_match = 0.0;
++
++    auto alignments = align("AAAAACGTACGTCACGTTTTTTTTT");
++    //                       ============IIII========S
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("12=4I8=1S", aln.get_cigar().to_string());
++    EXPECT_EQ(20u, aln.get_sequence().size());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(0u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:1-12;seq2:1-8", alignments[0].format_coords(cth, k));
++}
++#endif  // ! _PROTEIN_GRAPH
++
++// Protein-alphabet equivalents of the basic CoordToHeader cases. Use BLOSUM62
++// scoring and amino-acid sequences with letters not present in DNA so the
++// chainer's seed pattern differs from the DNA fixture's corner cases.
++#if _PROTEIN_GRAPH
++class LabeledAlignerProteinCoordTest : public ::testing::Test {
++  protected:
++    static constexpr size_t k = 5;
++    std::unique_ptr<AnnotatedDBG> anno_graph;
++    DBGAlignerConfig config;
++
++    void SetUp() override {
++        config.max_seed_length = std::numeric_limits<size_t>::max();
++        config.score_matrix = DBGAlignerConfig::score_matrix_blosum62;
++    }
++
++    void build(const std::vector<std::string> &sequences,
++               const std::vector<uint64_t> &coord_starts) {
++        std::vector<std::string> labels(sequences.size(), "file");
++        anno_graph = build_anno_graph<DBGSuccinct, annot::ColumnCompressed<>>(
++            k, sequences, labels, DeBruijnGraph::BASIC, /*coordinates=*/true, coord_starts
++        );
++    }
++
++    AlignmentResults align(const std::string &query) {
++        LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
++        return aligner.align(query);
++    }
++};
++
++TEST_F(LabeledAlignerProteinCoordTest, CrossBoundary) {
++    // Two amino-acid sequences sharing the boundary 4-mer 'MNPQ'. Exact-match
++    // query spans the seq1/seq2 boundary; format_coords splits it across
++    // both per-sequence ranges.
++    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
++
++    auto alignments = align("EEEEMNPQRRRR");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("12=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-4", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerProteinCoordTest, SharedKmerMultipleLabels) {
++    // Two amino-acid sequences sharing an internal 5-mer 'MNPQR'. Query of
++    // exactly that 5-mer matches both sequences; the resulting alignment's
++    // coord tuple has two entries (one per occurrence) and format_coords
++    // emits a partial range for each header.
++    build({ "EEEMNPQRSSSS", "WWWMNPQRTTTT" }, { 0, 8 });
++
++    auto alignments = align("MNPQR");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("5=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(2u, aln.label_coordinates[0].size());
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:4-8;seq2:4-8", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerProteinCoordTest, CrossBoundaryWithMismatch) {
++    // Same graph as CrossBoundary, with a single R→K substitution after the
++    // boundary. R/K is +2 in BLOSUM62 (conservative substitution) but the
++    // CIGAR still reports it as a mismatch. format_coords output is
++    // unchanged from the exact case — coords are reference-relative.
++    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
++    config.min_exact_match = 0.0;
++
++    auto alignments = align("EEEEMNPQKRRR");
++    //                       ========X===
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("8=1X3=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-4", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerProteinCoordTest, SoftClipPrefix) {
++    // Query has a 4-aa 'C' prefix that scores very poorly against the graph
++    // (BLOSUM62 C/E = -4), so the aligner soft-clips it instead of matching
++    // through. The remaining 12 aa span the seq1/seq2 boundary, exact match.
++    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
++
++    auto alignments = align("CCCCEEEEMNPQRRRR");
++    //                       SSSS============
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("4S12=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(4u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:5-12;seq2:1-4", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerProteinCoordTest, CrossBoundaryWithInsertion) {
++    // Same graph as CrossBoundary. Query inserts 5 'C' between the MNPQ
++    // boundary and the R-stretch. BLOSUM62 C/R = -3, so 5 mismatches
++    // (-15) score worse than gap-open + 4 ext (-5 + -8 = -13); the
++    // aligner picks the insertion. The reference path is unchanged
++    // (20 aa), so format_coords emits the full per-sequence ranges.
++    build({ "EEEEEEEEMNPQ", "MNPQRRRRRRRR" }, { 0, 8 });
++    config.min_exact_match = 0.0;
++
++    auto alignments = align("EEEEEEEEMNPQCCCCCRRRRRRRR");
++    //                       ============IIIII========
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("12=5I8=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(1u, aln.label_coordinates[0].size());
++    EXPECT_EQ(0u, aln.label_coordinates[0][0]);
++
++    annot::CoordToHeader cth({ { "seq1", "seq2" } }, { { 8, 8 } });
++    EXPECT_EQ("seq1:1-12;seq2:1-8", alignments[0].format_coords(cth, k));
++}
++
++TEST_F(LabeledAlignerProteinCoordTest, ThreeSequencesPartialCoverage) {
++    // Three sequences share the 5-mer 'MNPQR' at the same internal offset.
++    // A 5-aa query matches each of them; the alignment carries a 3-entry
++    // coord tuple that format_coords splits into one partial range per
++    // header (analog of the DNA `ThreeSequencesPartialCoverage`).
++    build({
++        "EEMNPQRSAYYY",
++        "VVMNPQRWLLLL",
++        "GGMNPQRDIIII",
++    }, { 0, 8, 16 });
++
++    auto alignments = align("MNPQR");
++    ASSERT_EQ(1u, alignments.size());
++    const auto &aln = alignments[0];
++    EXPECT_EQ("5=", aln.get_cigar().to_string());
++    ASSERT_EQ(1u, aln.label_coordinates.size());
++    ASSERT_EQ(3u, aln.label_coordinates[0].size());
++
++    annot::CoordToHeader cth({ { "seq1", "seq2", "seq3" } }, { { 8, 8, 8 } });
++    EXPECT_EQ("seq1:3-7;seq2:3-7;seq3:3-7", alignments[0].format_coords(cth, k));
++}
++#endif  // _PROTEIN_GRAPH
++
+ TYPED_TEST(LabeledAlignerTest, SimpleTangleGraphCoordsCycle) {
+     // TODO: for now, not implemented for other annotators
+     if constexpr(!std::is_same_v<typename TypeParam::second_type, annot::ColumnCompressed<>>
+diff --git a/metagraph/tests/annotation/test_annotated_dbg.cpp b/metagraph/tests/annotation/test_annotated_dbg.cpp
+index 6cc8175785..be68de29d0 100644
+--- a/metagraph/tests/annotation/test_annotated_dbg.cpp
++++ b/metagraph/tests/annotation/test_annotated_dbg.cpp
+@@ -2048,9 +2048,8 @@ TEST(AnnotatedDBG, score_kmer_presence_mask) {
+     }
+ }
+ 
+-// `RowDiff<RowDisk>` previously forced mmap; now it loads via either
+-// `sdsl::mmap_ifstream` or `utils::named_ifstream`. Verify both paths
+-// produce the same query results.
++// `RowDiff<RowDisk>` can load via either `sdsl::mmap_ifstream` or
++// `utils::named_ifstream`. Verify both paths produce the same query results.
+ TEST(RowDiffDiskAnnotatorTest, LoadConsistentAcrossMmapSettings) {
+     const std::vector<std::string> sequences {
+         std::string(80, 'A') + std::string(5, 'C'),
+@@ -2090,8 +2089,8 @@ TEST(RowDiffDiskAnnotatorTest, LoadConsistentAcrossMmapSettings) {
+     }
+ }
+ 
+-// `IntRowDisk::load` no longer forces mmap; verify both paths produce the
+-// same row reads from a freshly serialized matrix.
++// `IntRowDisk::load` supports both mmap and non-mmap paths; verify they
++// produce the same row reads from a freshly serialized matrix.
+ TEST(IntRowDiskTest, LoadConsistentAcrossMmapSettings) {
+     using mtg::annot::matrix::IntRowDisk;
+     using mtg::annot::matrix::IntMatrix;
+diff --git a/metagraph/tests/annotation/test_annotated_dbg_helpers.cpp b/metagraph/tests/annotation/test_annotated_dbg_helpers.cpp
+index 0787d69fb9..e6b91023c6 100644
+--- a/metagraph/tests/annotation/test_annotated_dbg_helpers.cpp
++++ b/metagraph/tests/annotation/test_annotated_dbg_helpers.cpp
+@@ -32,8 +32,10 @@ std::unique_ptr<AnnotatedDBG> build_anno_graph(uint64_t k,
+                                                const std::vector<std::string> &sequences,
+                                                const std::vector<std::string> &labels,
+                                                DeBruijnGraph::Mode mode,
+-                                               bool coordinates) {
++                                               bool coordinates,
++                                               const std::vector<uint64_t> &coord_starts) {
+     assert(sequences.size() == labels.size());
++    assert(coord_starts.empty() || coord_starts.size() == sequences.size());
+     auto graph = build_graph_batch<Graph>(k, sequences, mode);
+ 
+     // TODO: what if CanonicalDBG is not the highest level? find a better way to do this
+@@ -50,7 +52,8 @@ std::unique_ptr<AnnotatedDBG> build_anno_graph(uint64_t k,
+     if (coordinates) {
+         std::vector<std::tuple<std::string, std::vector<std::string>, uint64_t>> data;
+         for (size_t i = 0; i < sequences.size(); ++i) {
+-            data.emplace_back(sequences[i], std::vector<std::string>{ labels[i] }, 0);
++            uint64_t start = coord_starts.empty() ? 0 : coord_starts[i];
++            data.emplace_back(sequences[i], std::vector<std::string>{ labels[i] }, start);
+         }
+         anno_graph->annotate_kmer_coords(data);
+         if constexpr(std::is_same_v<Annotation, ColumnCompressed<>>) {
+@@ -224,23 +227,23 @@ std::unique_ptr<AnnotatedDBG> build_anno_graph(uint64_t k,
+     }
+ }
+ 
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGBitmap, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashOrdered, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashString, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSSHash, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGBitmap, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashOrdered, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashString, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowDiffColumnAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowDiffDiskAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowDiffColumnAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
+-template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowDiffDiskAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGBitmap, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashOrdered, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashString, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSSHash, ColumnCompressed<>>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGBitmap, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashOrdered, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashString, RowFlatAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowDiffColumnAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGHashFast, RowDiffDiskAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowDiffColumnAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
++template std::unique_ptr<AnnotatedDBG> build_anno_graph<DBGSuccinct, RowDiffDiskAnnotator>(uint64_t, const std::vector<std::string> &, const std::vector<std::string>&, DeBruijnGraph::Mode, bool, const std::vector<uint64_t>&);
+ 
+ } // namespace test
+ } // namespace mtg
+diff --git a/metagraph/tests/annotation/test_annotated_dbg_helpers.hpp b/metagraph/tests/annotation/test_annotated_dbg_helpers.hpp
+index 249b515709..f96856c6b1 100644
+--- a/metagraph/tests/annotation/test_annotated_dbg_helpers.hpp
++++ b/metagraph/tests/annotation/test_annotated_dbg_helpers.hpp
+@@ -23,7 +23,8 @@ build_anno_graph(uint64_t k,
+                  const std::vector<std::string> &sequences = {},
+                  const std::vector<std::string> &labels = {},
+                  graph::DeBruijnGraph::Mode mode = graph::DeBruijnGraph::BASIC,
+-                 bool coordinates = false);
++                 bool coordinates = false,
++                 const std::vector<uint64_t> &coord_starts = {});
+ 
+ } // namespace test
+ } // namespace mtg
+diff --git a/metagraph/tests/annotation/test_coord_to_header.cpp b/metagraph/tests/annotation/test_coord_to_header.cpp
+new file mode 100644
+index 0000000000..05cf54a4b4
+--- /dev/null
++++ b/metagraph/tests/annotation/test_coord_to_header.cpp
+@@ -0,0 +1,459 @@
++#include <gtest/gtest.h>
++
++#include "../test_helpers.hpp"
++#include "annotation/coord_to_header.hpp"
++#include "graph/alignment/alignment.hpp"
++#include "annotation/representation/base/annotation.hpp"
++
++
++namespace {
++
++using namespace mtg;
++using namespace mtg::annot;
++
++TEST(CoordToHeader, MapSingleCoordFirstSequence) {
++    // Column 0: two sequences, with 5 and 3 k-mers respectively
++    //   seq0: coords 0..4, seq1: coords 5..7
++    CoordToHeader cth(
++        { { "seq0", "seq1" } },
++        { { 5, 3 } }
++    );
++
++    EXPECT_EQ(cth.num_columns(), 1u);
++    EXPECT_EQ(cth.num_sequences(0), 2u);
++
++    // coord 0 -> seq0, local 0
++    auto [h0, lc0] = cth.map_single_coord(0, 0);
++    EXPECT_EQ(h0, 0u);
++    EXPECT_EQ(lc0, 0u);
++
++    // coord 4 -> seq0, local 4
++    auto [h4, lc4] = cth.map_single_coord(0, 4);
++    EXPECT_EQ(h4, 0u);
++    EXPECT_EQ(lc4, 4u);
++}
++
++TEST(CoordToHeader, MapSingleCoordSecondSequence) {
++    CoordToHeader cth(
++        { { "alpha", "beta" } },
++        { { 5, 3 } }
++    );
++
++    // coord 5 -> beta, local 0
++    auto [h5, lc5] = cth.map_single_coord(0, 5);
++    EXPECT_EQ(h5, 1u);
++    EXPECT_EQ(lc5, 0u);
++
++    // coord 7 -> beta, local 2
++    auto [h7, lc7] = cth.map_single_coord(0, 7);
++    EXPECT_EQ(h7, 1u);
++    EXPECT_EQ(lc7, 2u);
++}
++
++TEST(CoordToHeader, MapSingleCoordMultipleColumns) {
++    // Column 0: "A" (4 kmers), "B" (6 kmers)
++    // Column 1: "X" (3 kmers)
++    CoordToHeader cth(
++        { { "A", "B" }, { "X" } },
++        { { 4, 6 }, { 3 } }
++    );
++
++    EXPECT_EQ(cth.num_columns(), 2u);
++    EXPECT_EQ(cth.num_sequences(0), 2u);
++    EXPECT_EQ(cth.num_sequences(1), 1u);
++
++    // Column 0, coord 3 -> A, local 3
++    auto [h0, lc0] = cth.map_single_coord(0, 3);
++    EXPECT_EQ(h0, 0u);
++    EXPECT_EQ(lc0, 3u);
++
++    // Column 0, coord 4 -> B, local 0
++    auto [h1, lc1] = cth.map_single_coord(0, 4);
++    EXPECT_EQ(h1, 1u);
++    EXPECT_EQ(lc1, 0u);
++
++    // Column 1, coord 2 -> X, local 2
++    auto [h2, lc2] = cth.map_single_coord(1, 2);
++    EXPECT_EQ(h2, 0u);
++    EXPECT_EQ(lc2, 2u);
++}
++
++TEST(CoordToHeader, MapSingleCoordThreeSequences) {
++    // Column 0: "a" (2 kmers), "b" (3 kmers), "c" (4 kmers) -> coords 0-1, 2-4, 5-8
++    CoordToHeader cth(
++        { { "a", "b", "c" } },
++        { { 2, 3, 4 } }
++    );
++
++    EXPECT_EQ(cth.num_sequences(0), 3u);
++
++    // coord 0 -> a, local 0  (first seq, first coord)
++    auto [h0, lc0] = cth.map_single_coord(0, 0);
++    EXPECT_EQ(h0, 0u);
++    EXPECT_EQ(lc0, 0u);
++
++    // coord 1 -> a, local 1  (first seq, last coord)
++    auto [h1, lc1] = cth.map_single_coord(0, 1);
++    EXPECT_EQ(h1, 0u);
++    EXPECT_EQ(lc1, 1u);
++
++    // coord 2 -> b, local 0  (second seq boundary)
++    auto [h2, lc2] = cth.map_single_coord(0, 2);
++    EXPECT_EQ(h2, 1u);
++    EXPECT_EQ(lc2, 0u);
++
++    // coord 4 -> b, local 2  (second seq, last coord)
++    auto [h4, lc4] = cth.map_single_coord(0, 4);
++    EXPECT_EQ(h4, 1u);
++    EXPECT_EQ(lc4, 2u);
++
++    // coord 5 -> c, local 0  (third seq boundary)
++    auto [h5, lc5] = cth.map_single_coord(0, 5);
++    EXPECT_EQ(h5, 2u);
++    EXPECT_EQ(lc5, 0u);
++
++    // coord 8 -> c, local 3  (last valid coord in column)
++    auto [h8, lc8] = cth.map_single_coord(0, 8);
++    EXPECT_EQ(h8, 2u);
++    EXPECT_EQ(lc8, 3u);
++}
++
++TEST(CoordToHeader, MapSingleCoordOutOfRange) {
++    CoordToHeader cth(
++        { { "only" } },
++        { { 5 } }
++    );
++
++    // Out-of-range coord.
++    EXPECT_THROW(cth.map_single_coord(0, 5), std::out_of_range);
++    EXPECT_THROW(cth.map_single_coord(0, 100), std::out_of_range);
++    // Out-of-range column.
++    EXPECT_THROW(cth.map_single_coord(1, 0), std::out_of_range);
++    EXPECT_THROW(cth.map_single_coord(99, 0), std::out_of_range);
++}
++
++TEST(CoordToHeader, NumKmersInSequence) {
++    // Three columns with unequal sequence sizes, including singletons
++    // at the start, middle, and end of a column.
++    CoordToHeader cth(
++        { { "only" }, { "a", "b", "c" }, { "head", "mid", "tail" } },
++        { { 7 },      { 1, 4, 2 },       { 3, 1, 5 } }
++    );
++
++    // Column 0: single sequence, 7 k-mers.
++    EXPECT_EQ(7u, cth.num_kmers_in_sequence(0, 0));
++
++    // Column 1: singleton at start, then 4, then 2.
++    EXPECT_EQ(1u, cth.num_kmers_in_sequence(1, 0));
++    EXPECT_EQ(4u, cth.num_kmers_in_sequence(1, 1));
++    EXPECT_EQ(2u, cth.num_kmers_in_sequence(1, 2));
++
++    // Column 2: 3, singleton in the middle, then 5.
++    EXPECT_EQ(3u, cth.num_kmers_in_sequence(2, 0));
++    EXPECT_EQ(1u, cth.num_kmers_in_sequence(2, 1));
++    EXPECT_EQ(5u, cth.num_kmers_in_sequence(2, 2));
++
++    // Out-of-range inputs.
++    EXPECT_THROW(cth.num_kmers_in_sequence(0, 1), std::out_of_range);
++    EXPECT_THROW(cth.num_kmers_in_sequence(3, 0), std::out_of_range);
++}
++
++TEST(CoordToHeader, SerializeLoadRoundTrip) {
++    // Build a non-trivial index, serialize, load into a fresh instance,
++    // and verify every observable method returns the same value.
++    CoordToHeader src(
++        { { "only" },
++          { "a", "b", "c" },
++          { "head", "mid", "tail" } },
++        { { 7 },
++          { 1, 4, 2 },
++          { 3, 1, 5 } }
++    );
++
++    std::string path_base = test_dump_dir() + "/cth_roundtrip";
++    src.serialize(path_base);
++
++    CoordToHeader dst;
++    ASSERT_TRUE(dst.load(path_base));
++
++    ASSERT_EQ(src.num_columns(), dst.num_columns());
++    for (uint64_t col = 0; col < src.num_columns(); ++col) {
++        EXPECT_EQ(src.num_sequences(col), dst.num_sequences(col))  << "col " << col;
++        EXPECT_EQ(src.num_kmers(col),   dst.num_kmers(col))    << "col " << col;
++        EXPECT_EQ(src.get_headers(col), dst.get_headers(col))  << "col " << col;
++        for (size_t h = 0; h < src.num_sequences(col); ++h) {
++            EXPECT_EQ(src.num_kmers_in_sequence(col, h),
++                      dst.num_kmers_in_sequence(col, h))
++                << "col " << col << " seq_id " << h;
++        }
++        for (uint64_t coord = 0; coord < src.num_kmers(col); ++coord) {
++            EXPECT_EQ(src.map_single_coord(col, coord),
++                      dst.map_single_coord(col, coord))
++                << "col " << col << " coord " << coord;
++        }
++    }
++}
++
++TEST(CoordToHeader, MapSingleCoordConsistentWithBatch) {
++    // Verify map_single_coord gives same results as map_to_local_coords
++    CoordToHeader cth(
++        { { "h0", "h1", "h2" } },
++        { { 3, 4, 2 } }
++    );
++
++    // Batch mapping
++    using RowTuples = CoordToHeader::RowTuples;
++    std::vector<RowTuples> rows = {
++        { { 0, { 0, 2, 3, 6, 8 } } }
++    };
++    cth.map_to_local_coords(&rows);
++
++    // Single-coord mapping should produce same encoded values
++    for (auto &[col, coords] : rows[0]) {
++        size_t idx = 0;
++        for (uint64_t global_coord : { 0u, 2u, 3u, 6u, 8u }) {
++            auto [seq_id, local_coord] = cth.map_single_coord(col, global_coord);
++            uint64_t encoded = local_coord * cth.num_sequences(col) + seq_id;
++            EXPECT_EQ(encoded, coords[idx])
++                << "Mismatch at global coord " << global_coord;
++            ++idx;
++        }
++    }
++}
++
++// Test Alignment::format_coords(cth, k) renders per-header ranges
++TEST(AlignmentFormatCoords, WithCoordToHeader) {
++    using namespace mtg::graph::align;
++
++    // accession_A: 10 kmers (coords 0-9), accession_B: 20 kmers (coords 10-29)
++    CoordToHeader cth(
++        { { "accession_A", "accession_B" } },
++        { { 10, 20 } }
++    );
++
++    Alignment aln(
++        std::string_view{},
++        {},
++        std::string("ACGT"),  // 4-char sequence -> range width = 4
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0, 0 };
++    aln.label_coordinates = {
++        { 3 },   // column 0, coord 3 -> accession_A, local 3 -> "4-7"
++        { 12 },  // column 0, coord 12 -> accession_B, local 2 -> "3-6"
++    };
++
++    EXPECT_EQ(aln.format_coords(cth, 5), "accession_A:4-7;accession_B:3-6");
++}
++
++TEST(AlignmentFormatCoords, CoordToHeaderGroupsByHeader) {
++    using namespace mtg::graph::align;
++
++    // seqA: 5 kmers (coords 0-4), seqB: 5 kmers (coords 5-9)
++    CoordToHeader cth(
++        { { "seqA", "seqB" } },
++        { { 5, 5 } }
++    );
++
++    Alignment aln(
++        std::string_view{},
++        {},
++        std::string("ACG"),  // 3-char sequence -> range width = 3
++        0, {}, 0, false, 0
++    );
++    // One column entry with coords from different sequences
++    aln.label_columns = { 0 };
++    aln.label_coordinates = {
++        { 2, 7 },  // coord 2 -> seqA local 2, coord 7 -> seqB local 2
++    };
++
++    EXPECT_EQ(aln.format_coords(cth, 5), "seqA:3-5;seqB:3-5");
++}
++
++TEST(AlignmentFormatCoords, CoordToHeaderSameHeaderMultipleCoords) {
++    using namespace mtg::graph::align;
++
++    // Single sequence with 20 kmers
++    CoordToHeader cth(
++        { { "ref" } },
++        { { 20 } }
++    );
++
++    Alignment aln(
++        std::string_view{},
++        {},
++        std::string("AC"),  // 2-char sequence -> range width = 2
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = {
++        { 3, 10 },  // two coords in the same header
++    };
++
++    // Same header gets both ranges appended
++    EXPECT_EQ(aln.format_coords(cth, 5), "ref:4-5:11-12");
++}
++
++TEST(AlignmentFormatCoords, EmptyCoordinates) {
++    using namespace mtg::graph::align;
++
++    LabelEncoder<> encoder;
++    Alignment aln(
++        std::string_view{},
++        {},
++        std::string("ACGT"),
++        0, {}, 0, false, 0
++    );
++    // No coordinates -> empty string
++    EXPECT_EQ(aln.format_coords(encoder), "");
++}
++
++TEST(AlignmentFormatCoords, WithEncoder) {
++    using namespace mtg::graph::align;
++
++    LabelEncoder<> encoder;
++    encoder.insert_and_encode("/path/to/file.fa");
++
++    Alignment aln(
++        std::string_view{},
++        {},
++        std::string("ACGT"),  // 4-char sequence -> range width = 4
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 42 } };  // coord 42 -> "43-46"
++
++    EXPECT_EQ(aln.format_coords(encoder), "/path/to/file.fa:43-46");
++}
++
++// A range that extends past the starting sequence is split across
++// consecutive headers (joined by ';').
++TEST(AlignmentFormatCoords, CrossSequenceBoundaryWithK) {
++    using namespace mtg::graph::align;
++
++    // seqA/seqB: 10 kmers each -> 14 nt with k=5.
++    CoordToHeader cth(
++        { { "seqA", "seqB" } },
++        { { 10, 10 } }
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTACGT"),  // 8 nt
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 7 } };  // seqA local 7; 7 nt fit + 1 spills
++
++    EXPECT_EQ(aln.format_coords(cth, 5), "seqA:8-14;seqB:1-1");
++}
++
++TEST(AlignmentFormatCoords, CrossThreeSequences) {
++    using namespace mtg::graph::align;
++
++    // Three headers x 5 kmers = 7 nt each with k=3.
++    CoordToHeader cth(
++        { { "seqA", "seqB", "seqC" } },
++        { { 5, 5, 5 } }
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTACGTACGTACGT"),  // 16 nt, crosses both boundaries
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 3 } };
++
++    EXPECT_EQ(aln.format_coords(cth, 3), "seqA:4-7;seqB:1-7;seqC:1-5");
++}
++
++TEST(AlignmentFormatCoords, TwoCoordsBothCrossIntoSameNextSequence) {
++    // Two starting coords that both spill from seqA into seqB. Each coord
++    // produces a range in seqA and a range in seqB; the per-header ranges
++    // are aggregated into insertion-ordered lists.
++    using namespace mtg::graph::align;
++
++    // seqA/seqB: 8 k-mers each -> 12 nt each with k=5.
++    CoordToHeader cth(
++        { { "seqA", "seqB" } },
++        { { 8, 8 } }
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTACGT"),  // 8 nt
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    // Both coords are in seqA; both produce 8 nt ranges that cross into seqB.
++    //   coord 6 -> seqA local 6, avail=6, spills 2 nt into seqB
++    //   coord 7 -> seqA local 7, avail=5, spills 3 nt into seqB
++    aln.label_coordinates = { { 6, 7 } };
++
++    EXPECT_EQ(aln.format_coords(cth, 5), "seqA:7-12:8-12;seqB:1-2:1-3");
++}
++
++TEST(AlignmentFormatCoords, OverflowPastLastHeader) {
++    using namespace mtg::graph::align;
++
++    // Total column capacity = 14 nt; alignment of 20 nt overruns by 6 nt,
++    // exercising the warn+truncate branch.
++    CoordToHeader cth(
++        { { "seqA", "seqB" } },
++        { { 5, 5 } }
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTACGTACGTACGTACGT"),  // 20 nt
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 0 } };
++
++    EXPECT_EQ(aln.format_coords(cth, 3), "seqA:1-7;seqB:1-7");
++}
++
++TEST(AlignmentFormatCoords, ExactlyFillsStartingHeader) {
++    using namespace mtg::graph::align;
++
++    // L == available in the starting header: emit a single range and stop.
++    CoordToHeader cth(
++        { { "seqA", "seqB" } },
++        { { 5, 5 } }
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTA"),  // 5 nt; seqA has 7 nt, local 2..6 fills to end
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 2 } };
++
++    EXPECT_EQ(aln.format_coords(cth, 3), "seqA:3-7");
++}
++
++TEST(AlignmentFormatCoords, SpansEntireColumn) {
++    using namespace mtg::graph::align;
++
++    // L == total nt of the column; the walk must land on zero remaining
++    // after emitting every header exactly once.
++    CoordToHeader cth(
++        { { "seqA", "seqB", "seqC" } },
++        { { 3, 4, 2 } }  // 5 + 6 + 4 = 15 nt with k=3
++    );
++
++    Alignment aln(
++        std::string_view{}, {},
++        std::string("ACGTACGTACGTACG"),  // 15 nt
++        0, {}, 0, false, 0
++    );
++    aln.label_columns = { 0 };
++    aln.label_coordinates = { { 0 } };
++
++    EXPECT_EQ(aln.format_coords(cth, 3), "seqA:1-5;seqB:1-6;seqC:1-4");
++}
++
++} // namespace

@@ -1,0 +1,207 @@
+diff --git a/anvio/migrations/profile/v40_to_v41.py b/anvio/migrations/profile/v40_to_v41.py
+index bf83296269..d9a19b58dd 100644
+--- a/anvio/migrations/profile/v40_to_v41.py
++++ b/anvio/migrations/profile/v40_to_v41.py
+@@ -20,6 +20,8 @@
+ import sys
+ import argparse
+ 
++from collections import Counter
++
+ import anvio.dbinfo as dbinfo
+ import anvio.terminal as terminal
+ 
+@@ -81,7 +83,9 @@ def migrate(db_path):
+     # Strategy: for each _contigs table, we:
+     #   1. Read all rows into Python
+     #   2. Extract contig names from split names using regex (safe for any digit count)
+-    #   3. Validate that all splits of the same contig have identical values per layer
++    #   3. Collect all values per (contig, layer) and resolve conflicts. This only affects
++    #      extremely old anvio profiles and not really relevant for any profile-db files
++    #      generated after 2020.
+     #   4. Build the deduplicated rows
+     #   5. Queue DROP + CREATE + INSERT operations
+     #
+@@ -89,6 +93,7 @@ def migrate(db_path):
+     # BEGIN...COMMIT block at the end.
+ 
+     queued_operations = []  # list of (sql, params_list_or_None) tuples
++    conflicts_resolved = 0  # number of historical data inconsistencies that were auto-corrected
+ 
+     for field in essential_data_fields:
+         table_name = f'{field}_contigs'
+@@ -107,27 +112,39 @@ def migrate(db_path):
+             queued_operations.append((f'CREATE TABLE "{table_name}" (item text, layer text, value numeric)', None))
+             continue
+ 
+-        # Build contig_name -> layer -> value mapping, validating consistency along the way
+-        contig_layer_values = {}  # {contig_name: {layer: value}}
++        # First pass: collect all values seen for each (contig, layer) across all splits.
++        contig_layer_all_values = {}  # {contig_name: {layer: [value, ...]}}
+ 
+         for entry_id, split_name, layer, value in rows:
+             contig_name = get_contig_name(split_name)
+ 
+-            if contig_name not in contig_layer_values:
+-                contig_layer_values[contig_name] = {}
+-
+-            if layer in contig_layer_values[contig_name]:
+-                existing_value = contig_layer_values[contig_name][layer]
+-                if existing_value != value:
+-                    raise ConfigError(
+-                        f"Data integrity problem in table '{table_name}': the contig '{contig_name}' "
+-                        f"has different values across its splits for layer '{layer}' "
+-                        f"(found {existing_value} and {value}). This is unexpected — all splits of "
+-                        f"a contig should have identical values in the _contigs view tables. The "
+-                        f"migration cannot proceed. Please contact the anvi'o developers for help."
+-                    )
+-            else:
+-                contig_layer_values[contig_name][layer] = value
++            if contig_name not in contig_layer_all_values:
++                contig_layer_all_values[contig_name] = {}
++            if layer not in contig_layer_all_values[contig_name]:
++                contig_layer_all_values[contig_name][layer] = []
++
++            contig_layer_all_values[contig_name][layer].append(value)
++
++        # Second pass: detect conflicts and resolve them to the contig-level value.
++        # The true contig-level value is the one most splits agree on (mode). When
++        # a tie occurs, max() is used as a tiebreaker. This handles the historical
++        # bug where a minority of splits received a wrong value (often 0) while the
++        # majority correctly carried the parent contig's statistic.
++        contig_layer_values = {}  # {contig_name: {layer: value}}
++
++        for contig_name, layer_to_values in contig_layer_all_values.items():
++            contig_layer_values[contig_name] = {}
++            for layer, values in layer_to_values.items():
++                unique_values = set(values)
++                if len(unique_values) == 1:
++                    contig_layer_values[contig_name][layer] = values[0]
++                else:
++                    counter = Counter(values)
++                    max_count = max(counter.values())
++                    candidates = [v for v, c in counter.items() if c == max_count]
++                    resolved_value = max(candidates)
++                    contig_layer_values[contig_name][layer] = resolved_value
++                    conflicts_resolved += 1
+ 
+         # Build the deduplicated insert rows
+         new_rows = []
+@@ -150,6 +167,17 @@ def migrate(db_path):
+         queued_operations.append((f'CREATE TABLE "{table_name}" (item text, layer text, value numeric)', None))
+         queued_operations.append((f'INSERT INTO "{table_name}" (item, layer, value) VALUES (?, ?, ?)', new_rows))
+ 
++    if conflicts_resolved:
++        run.warning(f"This profile database had a historical data inconsistency: {conflicts_resolved} "
++                    f"(contig, layer) pair(s) had different values across their splits in the _contigs "
++                    f"view tables, which should never happen. This is a known bug from very early versions "
++                    f"of anvi'o that was fixed shortly after. Each conflict was resolved by keeping the "
++                    f"most common value across splits (the contig-level value), with the maximum used as "
++                    f"a tiebreaker. The migration will proceed normally, and you don't need to worry about "
++                    f"this since this inconsistency only affects a handful of profile-db files in the "
++                    f"entire world generated pre-2020. We are just being romantics and refuse to forget "
++                    f"that they exist, and keep them with us as we venture into a bold future.")
++
+     # Now execute everything in a single transaction
+     progress.update("Applying changes in a single transaction")
+ 
+diff --git a/anvio/migrations/profile/v41_to_v42.py b/anvio/migrations/profile/v41_to_v42.py
+index b86801e243..483c19b26f 100644
+--- a/anvio/migrations/profile/v41_to_v42.py
++++ b/anvio/migrations/profile/v41_to_v42.py
+@@ -110,8 +110,13 @@ def migrate(db_path):
+         progress.update(f"Validating {len(zero_pairs)} zero-coverage {target} across all fields")
+ 
+         # Step 2: Validate consistency across all other view tables.
+-        # For each zero-detection (item, layer) pair, every other field must also be 0.
+-        # We also verify that zero-detection pairs exist in every view table (no missing rows).
++        # For each zero-detection (item, layer) pair, every other field should also be 0.
++        # Extremely old databases may violate this invariant, but we keep them around for
++        # historical reasons (also see migration script from 40 to 41). So here we collect
++        # inconsistent pairs and exclude them from the zero_coverage movement rather than
++        # aborting. They stay in the view tables as-is.
++        inconsistent_pairs = set()
++
+         for field in essential_data_fields:
+             if field == 'detection':
+                 continue
+@@ -133,22 +138,25 @@ def migrate(db_path):
+                 if pair in zero_pairs:
+                     zero_pairs_found.add(pair)
+                     if value != 0 and value != 0.0:
+-                        raise ConfigError(
+-                            f"Data integrity problem: {target[:-1]} '{item}' in layer '{layer}' "
+-                            f"has detection=0 but {field}={value} (expected 0). "
+-                            f"The migration cannot proceed safely."
+-                        )
+-
+-            # Verify all zero-detection pairs exist in this table
+-            missing_pairs = zero_pairs - zero_pairs_found
++                        inconsistent_pairs.add(pair)
++
++            # Check that all zero-detection pairs have a row in this table.
++            # Missing rows mean the data is incomplete; exclude those pairs too.
++            truly_zero = zero_pairs - inconsistent_pairs
++            missing_pairs = truly_zero - zero_pairs_found
+             if missing_pairs:
+-                example = next(iter(missing_pairs))
+-                raise ConfigError(
+-                    f"Data integrity problem: {len(missing_pairs)} zero-detection pair(s) are missing "
+-                    f"from '{table_name}'. For example, {target[:-1]} '{example[0]}' in layer "
+-                    f"'{example[1]}' has detection=0 in '{detection_table}' but has no row in "
+-                    f"'{table_name}'. The migration cannot proceed safely."
+-                )
++                inconsistent_pairs.update(missing_pairs)
++
++        if inconsistent_pairs:
++            run.warning(f"This profile database had a historical data inconsistency: {len(inconsistent_pairs)} "
++                        f"zero-detection {target[:-1]} pair(s) had non-zero values in other fields, or were "
++                        f"missing rows in some view tables. This is a known bug from very early versions of "
++                        f"anvi'o. These pairs will be left in the view tables as-is and will NOT be moved "
++                        f"into the zero_coverage table. The migration will proceed normally.")
++            zero_pairs -= inconsistent_pairs
++
++        if not zero_pairs:
++            continue
+ 
+         # Step 3: Queue inserts into the zero_coverage table
+         zero_cov_rows = list(zero_pairs)
+diff --git a/anvio/tests/run_migration_tests_for_ancient_anvio_databases.sh b/anvio/tests/run_migration_tests_for_ancient_anvio_databases.sh
+index 324895d0c7..b29e4c51ad 100755
+--- a/anvio/tests/run_migration_tests_for_ancient_anvio_databases.sh
++++ b/anvio/tests/run_migration_tests_for_ancient_anvio_databases.sh
+@@ -10,10 +10,12 @@ pip install h5py==3.9.0
+ SETUP_WITH_OUTPUT_DIR $1 $2 $3
+ #####################################
+ 
+-cd $output_dir
+ 
++#########################################################################################
++# POUCHITIS DATA FROM 2015
+ #########################################################################################
+ 
++cd $output_dir
+ TEST="POUCHITIS_METAGENOMES_FROM_2015"
+ mkdir $TEST && cd $TEST
+ INFO "[$TEST] Downloading the data pack"
+@@ -37,10 +39,12 @@ anvi-run-scg-taxonomy -c CONTIGS.db $thread_controller
+ INFO "[$TEST] Estimating SCG taxonomy"
+ anvi-estimate-scg-taxonomy -p PROFILE.db -c CONTIGS.db -C FINAL
+ INFO "[$TEST] Done!"
+-cd ..
+ 
++#########################################################################################
++# TARA GENOMES POUCHITIS DATA FROM 2027
+ #########################################################################################
+ 
++cd $output_dir
+ TEST="A_TARA_MAG_FROM_2017"
+ mkdir $TEST && cd $TEST
+ INFO "[$TEST] Downloading the data pack"
+@@ -63,6 +67,3 @@ anvi-run-scg-taxonomy -c CONTIGS.db $thread_controller
+ INFO "[$TEST] Estimating SCG taxonomy"
+ anvi-estimate-scg-taxonomy -c CONTIGS.db
+ INFO "[$TEST] Done!"
+-cd ..
+-
+-#########################################################################################

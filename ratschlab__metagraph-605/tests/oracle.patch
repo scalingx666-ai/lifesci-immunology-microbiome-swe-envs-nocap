@@ -1,0 +1,1494 @@
+diff --git a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
+index 86d38c90f6..913422decc 100644
+--- a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
++++ b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
+@@ -16,6 +16,11 @@ namespace matrix {
+ 
+ const size_t kNumRowsInBlock = 250'000;
+ 
++static bool ONE_PASS_BRWT = false;
++
++void set_one_pass_brwt(bool value) { ONE_PASS_BRWT = value; }
++bool get_one_pass_brwt() { return ONE_PASS_BRWT; }
++
+ 
+ bool BRWT::get(Row row, Column column) const {
+     assert(row < num_rows());
+@@ -53,6 +58,66 @@ void call_sliced_rows(Slice &slice, Callback call_row) {
+     }
+ }
+ 
++// Maximum depth at which BRWT parallel traversal spawns new thread pool tasks.
++// Beyond this depth, subtrees are queried inline to limit task fan-out.
++const size_t kMaxParallelDepth = 20;
++
++// Minimum number of columns in a subtree to justify spawning a parallel task.
++// Subtrees narrower than this are queried inline.
++const size_t kMinColumnsForParallel = 10;
++
++// Maximum number of columns per chunk when deciding the cutoff for parallel subtree traversal.
++const size_t kMaxColumnsChunkSize = 1000;
++
++template <typename RowT>
++std::vector<RowT>
++BRWT::slice_rows_parallel(const std::vector<Row> &row_ids, size_t num_threads) const {
++    using T = typename RowT::value_type;
++    ThreadPool thread_pool(num_threads > 1 ? num_threads : 0);
++    std::mutex mu;
++    std::vector<RowT> rows(row_ids.size());
++    slice_rows<T>(row_ids, utils::arange<size_t>(0, row_ids.size()), this, {},
++        std::max(kMinColumnsForParallel,
++                 get_chunk_size(num_columns(), kMaxColumnsChunkSize, num_threads)),
++        thread_pool,
++        [&](std::vector<size_t> &&sliced_rows, Vector<T> &&slice) {
++            auto rows_it = sliced_rows.begin();
++            std::lock_guard<std::mutex> lock(mu);
++            call_sliced_rows(slice, [&](auto row_begin, auto row_end) {
++                rows[*rows_it].insert(rows[*rows_it].end(), row_begin, row_end);
++                ++rows_it;
++            });
++            assert(rows_it == sliced_rows.end());
++        }
++    );
++    thread_pool.join();
++    return rows;
++}
++
++#ifndef NDEBUG
++template <typename T>
++bool check_equal(const std::vector<T> &first, const std::vector<T> &second) {
++    auto same_rows = [](T a, T b) {
++        std::sort(a.begin(), a.end());
++        std::sort(b.begin(), b.end());
++        return a == b;
++    };
++    return std::equal(first.begin(), first.end(), second.begin(), second.end(), same_rows);
++}
++#endif // NDEBUG
++
++std::vector<BRWT::SetBitPositions>
++BRWT::get_rows(const std::vector<Row> &row_ids, size_t num_threads) const {
++    if (get_one_pass_brwt())
++        return slice_rows_parallel<SetBitPositions>(row_ids, num_threads);
++
++    auto result = BinaryMatrix::get_rows(row_ids, num_threads);
++    // When running the default BRWT query method, check the result against
++    // the one-pass BRWT to avoid writing separate tests for the one-pass BRWT.
++    assert(check_equal(result, slice_rows_parallel<SetBitPositions>(row_ids, num_threads)));
++    return result;
++}
++
+ std::vector<BRWT::SetBitPositions>
+ BRWT::get_rows(const std::vector<Row> &row_ids) const {
+     Vector<Column> slice;
+@@ -100,33 +165,72 @@ void BRWT::call_rows(const std::function<void(const SetBitPositions &)> &callbac
+     }
+ }
+ 
+-std::vector<Vector<std::pair<BRWT::Column, uint64_t>>>
+-BRWT::get_column_ranks(const std::vector<Row> &row_ids, size_t num_threads) const {
+-    return get_row_data_parallel<Vector<std::pair<Column, uint64_t>>>(row_ids, num_threads,
++using ColRanks = Vector<std::pair<BRWT::Column, uint64_t>>;
++std::vector<ColRanks> BRWT::get_column_ranks(const std::vector<Row>& row_ids,
++                                             size_t num_threads) const {
++    if (get_one_pass_brwt())
++        return slice_rows_parallel<ColRanks>(row_ids, num_threads);
++
++    auto result = get_row_data_parallel<ColRanks>(row_ids, num_threads,
+                 [this](const std::vector<Row> &row_ids) {
+-        Vector<std::pair<Column, uint64_t>> slice;
++        ColRanks slice;
+         // expect at least 3 relations per row
+         slice.reserve(row_ids.size() * 4);
+ 
+         slice_rows(row_ids, &slice);
+ 
+-        std::vector<Vector<std::pair<Column, uint64_t>>> rows;
+-        rows.reserve(rows.size());
++        std::vector<ColRanks> rows;
++        rows.reserve(row_ids.size());
+         call_sliced_rows(slice, [&](auto row_begin, auto row_end) {
+             rows.emplace_back(row_begin, row_end);
+         });
+         assert(rows.size() == row_ids.size());
+         return rows;
+     });
++
++    // When running the default BRWT query method, check the result against
++    // the one-pass BRWT to avoid writing separate tests for the one-pass BRWT.
++    assert(check_equal(result, slice_rows_parallel<ColRanks>(row_ids, num_threads)));
++
++    return result;
+ }
+ 
+-std::pair<std::vector<size_t>, std::vector<BRWT::Row>>
+-BRWT::get_nonzero_rows(const std::vector<Row> &row_ids) const {
++// Returns a pair (`nonzero_indices`, `child_row_ids`): indices into `row_ids` for
++// the rows with the set bit in `nonzero_rows_`, and their recalculated
++// (via rank) row indices for the respective rows in the children.
++using NonzeroAndChildRows = std::pair<std::vector<size_t>, std::vector<BRWT::Row>>;
++NonzeroAndChildRows BRWT::get_nonzero_rows(const std::vector<Row>& row_ids,
++                                           ThreadPool* thread_pool,
++                                           bool adaptive_chunk_size) const {
+     std::vector<size_t> nonzero_indices;
+     std::vector<Row> child_row_ids;
+     nonzero_indices.reserve(row_ids.size());
+     child_row_ids.reserve(row_ids.size());
+ 
++    constexpr size_t kMaxChunkSize = 10'000;
++    if (thread_pool && row_ids.size() > kMaxChunkSize) {
++        std::vector<std::pair<std::shared_future<NonzeroAndChildRows>, size_t>> futures;
++        // allow smaller chunks for the root node for better parallelism
++        const size_t chunk_size = adaptive_chunk_size
++                                    ? get_chunk_size(row_ids.size(), kMaxChunkSize, thread_pool->num_threads())
++                                    : kMaxChunkSize;
++        for (size_t offset = 0; offset < row_ids.size(); offset += chunk_size) {
++            futures.emplace_back(thread_pool->force_enqueue_front([&,offset]() {
++                // TODO: Use std::span when moving to C++20
++                return get_nonzero_rows({ row_ids.begin() + offset,
++                                          std::min(row_ids.begin() + offset + chunk_size, row_ids.end()) });
++            }), offset);
++        }
++        for (auto &[future, offset] : futures) {
++            const auto &[nz, ids] = thread_pool->help_while_waiting(future).get();
++            for (size_t idx : nz) {
++                nonzero_indices.push_back(offset + idx);
++            }
++            child_row_ids.insert(child_row_ids.end(), ids.begin(), ids.end());
++        }
++        return { std::move(nonzero_indices), std::move(child_row_ids) };
++    }
++
+     for (size_t i = 0; i < row_ids.size(); ++i) {
+         assert(row_ids[i] < num_rows());
+ 
+@@ -178,7 +282,8 @@ BRWT::get_nonzero_rows(const std::vector<Row> &row_ids) const {
+ //      return positions of set bits with their column ranks.
+ // Appends to `slice`
+ template <typename T>
+-void BRWT::slice_rows(const std::vector<Row> &row_ids, Vector<T> *slice) const {
++void BRWT::slice_rows(const std::vector<Row> &row_ids, Vector<T> *slice,
++                      ThreadPool *thread_pool) const {
+     const T delim = make_delim<T>();
+ 
+     // check if this is a leaf
+@@ -206,7 +311,7 @@ void BRWT::slice_rows(const std::vector<Row> &row_ids, Vector<T> *slice) const {
+     }
+ 
+     // construct indexing for children and the inverse mapping
+-    auto [nonzero_indices, child_row_ids] = get_nonzero_rows(row_ids);
++    auto [nonzero_indices, child_row_ids] = get_nonzero_rows(row_ids, thread_pool);
+     if (child_row_ids.empty()) {
+         for (size_t i = 0; i < row_ids.size(); ++i) {
+             slice->push_back(delim);
+@@ -227,7 +332,7 @@ void BRWT::slice_rows(const std::vector<Row> &row_ids, Vector<T> *slice) const {
+     for (size_t j = 0; j < child_nodes_.size(); ++j) {
+         const size_t offset = slice->size();
+ 
+-        child_nodes_[j]->slice_rows<T>(child_row_ids, slice);
++        child_nodes_[j]->slice_rows<T>(child_row_ids, slice, thread_pool);
+ 
+         if (slice->size() == offset + child_row_ids.size()) {
+             // no non-empty rows in this child
+@@ -262,11 +367,75 @@ void BRWT::slice_rows(const std::vector<Row> &row_ids, Vector<T> *slice) const {
+         }
+         last_nz = nz;
+     }
+-
+     slice->erase(slice->begin() + slice_start, slice->begin() + slice_offset);
+     slice->insert(slice->end(), row_ids.size() - last_nz, delim);
+ }
+ 
++template <typename T, class CallSlice>
++void BRWT::slice_rows(const std::vector<Row> &row_ids, std::vector<size_t> rows,
++                      const BRWT *root, std::vector<size_t> call_stack,
++                      size_t max_columns_cutoff, ThreadPool &thread_pool,
++                      CallSlice call_slice) const {
++    if (row_ids.empty())
++        return;
++
++    if (child_nodes_.size()
++            && call_stack.size() < kMaxParallelDepth
++            && num_columns() > max_columns_cutoff) {
++        // Only for root the chunk size is adaptive.
++        // For lower-level nodes, it's fixed to avoid creating too many tasks.
++        bool adaptive_chunk_size = call_stack.empty();
++        // construct indexing for children and the inverse mapping
++        auto [nonzero_indices, child_row_ids] = get_nonzero_rows(row_ids, &thread_pool,
++                                                                 adaptive_chunk_size);
++        if (nonzero_indices.empty())
++            return;
++        auto child_row_ids_ptr = std::make_shared<const std::vector<Row>>(std::move(child_row_ids));
++
++        // keep only the indices of non-empty rows
++        size_t i = 0;
++        for (size_t idx : nonzero_indices) {
++            rows[i++] = rows[idx];
++        }
++        rows.resize(i);
++
++        call_stack.push_back(0);
++
++        for (size_t j = 0; j < child_nodes_.size(); ++j) {
++            call_stack.back() = j;
++            // Each lambda captures `rows` and `call_stack` by value, giving each
++            // child its own copy to modify independently.
++            thread_pool.force_enqueue_front([=,&thread_pool]() {
++                this->child_nodes_[j]->slice_rows<T>(*child_row_ids_ptr, std::move(rows), root,
++                                                     std::move(call_stack), max_columns_cutoff,
++                                                     thread_pool, std::move(call_slice));
++            });
++        }
++    } else {
++        Vector<T> slice;
++        // expect at least 3 relations per row on average
++        slice.reserve(row_ids.size() * 4);
++        slice_rows(row_ids, &slice, &thread_pool);
++        // transform column indexes
++        std::vector<const BRWT*> call_stack_nodes(call_stack.size() + 1);
++        call_stack_nodes[0] = root;
++        for (size_t i = 0; i < call_stack.size(); ++i) {
++            call_stack_nodes[i + 1] = call_stack_nodes[i]->child_nodes_[call_stack[i]].get();
++        }
++        assert(call_stack_nodes.back() == this);
++        for (int64_t i = call_stack.size() - 1; i >= 0; --i) {
++            const auto &node = call_stack_nodes[i];
++            size_t child_idx = call_stack[i];
++            for (size_t s = 0; s < slice.size(); ++s) {
++                auto &col = utils::get_first(slice[s]);
++                if (col != std::numeric_limits<Column>::max())
++                    col = node->assignments_.get(child_idx, col);
++            }
++        }
++        call_slice(std::move(rows), std::move(slice));
++    }
++}
++
+ std::vector<BRWT::Row> BRWT::get_column(Column column) const {
+     assert(column < num_columns());
+ 
+diff --git a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
+index 7928fe876a..6d83fd1724 100644
+--- a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
++++ b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
+@@ -14,6 +14,9 @@ namespace mtg {
+ namespace annot {
+ namespace matrix {
+ 
++void set_one_pass_brwt(bool value);
++bool get_one_pass_brwt();
++
+ // The Multi-BRWT compressed binary matrix representation
+ class BRWT : public BinaryMatrix, public GetEntrySupport {
+     friend class BRWTBuilder;
+@@ -30,8 +33,8 @@ class BRWT : public BinaryMatrix, public GetEntrySupport {
+ 
+     bool get(Row row, Column column) const override;
+     std::vector<Row> get_column(Column column) const override;
+-    using BinaryMatrix::get_rows;
+     std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows) const override;
++    std::vector<SetBitPositions> get_rows(const std::vector<Row> &rows, size_t num_threads) const override;
+     // query row and get ranks of each set bit in its column
+     std::vector<Vector<std::pair<Column, uint64_t>>>
+     get_column_ranks(const std::vector<Row> &rows, size_t num_threads) const;
+@@ -58,13 +61,27 @@ class BRWT : public BinaryMatrix, public GetEntrySupport {
+     // helper function for querying rows in batches
+     // appends to `slice`
+     template <typename T>
+-    void slice_rows(const std::vector<Row> &rows, Vector<T> *slice) const;
++    void slice_rows(const std::vector<Row> &rows, Vector<T> *slice,
++                    ThreadPool *thread_pool = nullptr) const;
++
++    template <typename RowT>
++    std::vector<RowT> slice_rows_parallel(const std::vector<Row> &row_ids, size_t num_threads) const;
++
++    // `call_stack` tracks the child indexes at each level during parallel tree
++    // traversal, so that column indices can be remapped when merging results from subtrees.
++    template <typename T, class CallSlice>
++    void slice_rows(const std::vector<Row> &row_ids, std::vector<size_t> rows,
++                    const BRWT *root, std::vector<size_t> call_stack,
++                    size_t max_columns_cutoff, ThreadPool &thread_pool,
++                    CallSlice call_slice) const;
+ 
+     // Returns (`nonzero_indices`, `child_row_ids`): indices into `rows` for
+     // the rows with the set bit in `nonzero_rows_`, and their recalculated
+     // (via rank) row indices for the respective rows in the children.
+     std::pair<std::vector<size_t>, std::vector<BRWT::Row>>
+-    get_nonzero_rows(const std::vector<Row> &rows) const;
++    get_nonzero_rows(const std::vector<Row> &rows,
++                     ThreadPool *thread_pool = nullptr,
++                     bool adaptive_chunk_size = true) const;
+ 
+     // assigns columns to the child nodes
+     RangePartition assignments_;
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index 5e206a1a1e..29020ebfb3 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -6,6 +6,7 @@
+ #include <filesystem>
+ 
+ #include "common/threads/threading.hpp"
++#include "annotation/binary_matrix/multi_brwt/brwt.hpp"
+ #include "common/utils/string_utils.hpp"
+ #include "common/utils/file_utils.hpp"
+ #include "seq_io/formats.hpp"
+@@ -120,6 +121,8 @@ Config::Config(int argc, char *argv[]) {
+             utils::set_mmap(true);
+         } else if (!strcmp(argv[i], "--madv-random")) {
+             utils::set_madvise(true);
++        } else if (!strcmp(argv[i], "--one-pass-brwt")) {
++            annot::matrix::set_one_pass_brwt(true);
+         } else if (!strcmp(argv[i], "--print")) {
+             print_graph = true;
+         } else if (!strcmp(argv[i], "--advanced")) {
+@@ -1352,6 +1355,7 @@ if (advanced) {
+             fprintf(stderr, "\t   --threads-each [INT]\tnumber of parallel batches [1]\n");
+             fprintf(stderr, "\t   --RA-ivbuff-size [INT] \tsize (in bytes) of int_vector_buffer used in random access mode (e.g. by row disk annotator) [16384]\n");
+ }
++            fprintf(stderr, "\t   --one-pass-brwt \tuse one-pass parallel BRWT traversal for queries [off]\n");
+             fprintf(stderr, "\n");
+             fprintf(stderr, "Available options for --align:\n");
+ if (advanced) {
+@@ -1407,6 +1411,7 @@ if (advanced) {
+             // fprintf(stderr, "\t-d --distance [INT] \tmax allowed alignment distance [0]\n");
+             fprintf(stderr, "\t-p --parallel [INT] \tmaximum number of parallel connections [1]\n");
+             fprintf(stderr, "\t   --threads-each [INT] \tnumber of threads per graph [1]\n");
++            fprintf(stderr, "\t   --one-pass-brwt \tuse one-pass parallel BRWT traversal for queries [off]\n");
+             // fprintf(stderr, "\t   --cache-size [INT] \tnumber of uncompressed rows to store in the cache [0]\n");
+             fprintf(stderr, "\n\t   --num-top-labels [INT] \tmaximum number of top labels per query by default [10'000]\n");
+             fprintf(stderr, "\t   --no-coord-mapping \t\tquery without mapping coords to sequence headers even if the .seq index exists [off]\n");
+diff --git a/metagraph/src/cli/query.cpp b/metagraph/src/cli/query.cpp
+index 8d4a1033c8..d9c7f63e96 100644
+--- a/metagraph/src/cli/query.cpp
++++ b/metagraph/src/cli/query.cpp
+@@ -938,9 +938,7 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
+         static_cast<size_t>(max_hull_depth_per_seq_char * max_input_sequence_length)
+     );
+ 
+-    logger->trace("[Query graph construction] Batch graph contains {} k-mers"
+-                  " and constructed in {} sec",
+-                  graph_init->num_nodes(), timer.elapsed());
++    double construction_time = timer.elapsed();
+     timer.reset();
+ 
+     // pull contigs from query graph
+@@ -955,7 +953,9 @@ construct_query_graph(const AnnotatedDBG &anno_graph,
+                                full_dbg.get_mode() == DeBruijnGraph::CANONICAL,
+                                false);
+ 
+-    logger->trace("[Query graph construction] Contig extraction took {} sec", timer.elapsed());
++    logger->trace("[Query graph construction] Batch graph with {} k-mers constructed in {} "
++                  "sec, contig extraction took {} sec",
++                  graph_init->num_nodes(), construction_time, timer.elapsed());
+     timer.reset();
+ 
+     if (num_threads > 1) {
+diff --git a/metagraph/src/cli/server.cpp b/metagraph/src/cli/server.cpp
+index e81cc9fd57..0339f06d67 100644
+--- a/metagraph/src/cli/server.cpp
++++ b/metagraph/src/cli/server.cpp
+@@ -220,18 +220,6 @@ std::thread start_server(HttpServer &server_startup, Config &config, size_t num_
+     return std::thread([&server_startup]() { server_startup.start(); });
+ }
+ 
+-template<typename T>
+-bool check_data_ready(std::shared_future<T> &data, shared_ptr<HttpServer::Response> response) {
+-    if (data.wait_for(0s) != std::future_status::ready) {
+-        logger->info("[Server] Got a request during initialization. Asked to come back later");
+-        response->write(SimpleWeb::StatusCode::server_error_service_unavailable,
+-                        "Server is currently initializing, please come back later.");
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+ std::vector<std::string> filter_graphs_from_list(
+         const tsl::hopscotch_map<std::string, std::vector<std::pair<std::string, std::string>>> &indexes,
+         const Json::Value &content_json,
+@@ -374,9 +362,9 @@ int run_server(Config *config) {
+     server.resource["^/search"]["POST"] = [&](shared_ptr<HttpServer::Response> response,
+                                               shared_ptr<HttpServer::Request> request) {
+         size_t request_id = num_requests++;
+-        process_request(response, request, request_id, [&](const std::string &content) {
+-            if (!config->fnames.size() && !check_data_ready(anno_graph, response))
+-                throw CustomResponse();  // the index is not loaded yet, so we can't process the request
++        process_request(response, request, request_id, [&](const std::string& content) {
++            if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
++                throw CurrentlyInitializingError();  // the index is not loaded yet, so we can't process the request
+ 
+             Json::Value content_json = parse_json_string(content);
+             logger->info("[Server] Request {}: {}", request_id, content_json.toStyledString());
+@@ -498,8 +486,8 @@ int run_server(Config *config) {
+     server.resource["^/align"]["POST"] = [&](shared_ptr<HttpServer::Response> response,
+                                              shared_ptr<HttpServer::Request> request) {
+         process_request(response, request, num_requests++, [&](const std::string &content) {
+-            if (!config->fnames.size() && !check_data_ready(anno_graph, response))
+-                throw CustomResponse();  // the index is not loaded yet, so we can't process the request
++            if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
++                throw CurrentlyInitializingError(); // the index is not loaded yet, so we can't process the request
+ 
+             if (!config->fnames.size())
+                 return process_align_request(content, anno_graph.get()->get_graph(), *config);
+@@ -511,9 +499,9 @@ int run_server(Config *config) {
+ 
+     server.resource["^/column_labels"]["GET"] = [&](shared_ptr<HttpServer::Response> response,
+                                                     shared_ptr<HttpServer::Request> request) {
+-        process_request(response, request, num_requests++, [&](const std::string &) {
+-            if (!config->fnames.size() && !check_data_ready(anno_graph, response))
+-                throw CustomResponse();  // the index is not loaded yet, so we can't process the request
++        process_request(response, request, num_requests++, [&](const std::string&) {
++            if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
++                throw CurrentlyInitializingError(); // the index is not loaded yet, so we can't process the request
+ 
+             Json::Value root(Json::arrayValue);
+             if (!config->fnames.size()) {
+@@ -537,9 +525,9 @@ int run_server(Config *config) {
+ 
+     server.resource["^/stats"]["GET"] = [&](shared_ptr<HttpServer::Response> response,
+                                             shared_ptr<HttpServer::Request> request) {
+-        process_request(response, request, num_requests++, [&](const std::string &) {
+-            if (!config->fnames.size() && !check_data_ready(anno_graph, response))
+-                throw CustomResponse();  // the index is not loaded yet, so we can't process the request
++        process_request(response, request, num_requests++, [&](const std::string&) {
++            if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
++                throw CurrentlyInitializingError(); // the index is not loaded yet, so we can't process the request
+ 
+             auto get_num_labels = [](const AnnotatedDBG &anno_dbg) {
+                 uint64_t num_labels = 0;
+diff --git a/metagraph/src/cli/server_utils.cpp b/metagraph/src/cli/server_utils.cpp
+index c5b4dc1415..acedb591c2 100644
+--- a/metagraph/src/cli/server_utils.cpp
++++ b/metagraph/src/cli/server_utils.cpp
+@@ -62,23 +62,6 @@ bool is_compression_requested(const std::shared_ptr<HttpServer::Request> &reques
+             && encoding_header->second.find("deflate") != std::string::npos;
+ }
+ 
+-void write_response(SimpleWeb::StatusCode status,
+-                    const std::string &msg,
+-                    std::shared_ptr<HttpServer::Response> response,
+-                    bool compress) {
+-    auto header = SimpleWeb::CaseInsensitiveMultimap(
+-            { { "Content-Type", "application/json" } });
+-
+-    std::string msg_send = msg;
+-    if (compress) {
+-        msg_send = compress_string(msg);
+-        header.insert(std::make_pair("Content-Encoding", "deflate"));
+-        header.insert(std::make_pair("Content-Length", std::to_string(msg_send.size())));
+-    }
+-
+-    response->write(status, msg_send, header);
+-}
+-
+ Json::Value parse_json_string(const std::string &msg) {
+     Json::Value json;
+ 
+@@ -107,25 +90,38 @@ void process_request(std::shared_ptr<HttpServer::Response> &response,
+     Timer timer;
+     // Retrieve string:
+     std::string content = request->content.string();
++    SimpleWeb::CaseInsensitiveMultimap header({ { "Content-Type", "application/json" } });
++    SimpleWeb::StatusCode status;
++    std::string ret;
+ 
+     try {
+         // Return JSON string
+-        Json::StreamWriterBuilder builder;
+-        std::string ret = Json::writeString(builder, process(content));
+-        write_response(SimpleWeb::StatusCode::success_ok, ret, response,
+-                       is_compression_requested(request));
+-    } catch (const CustomResponse &) {
+-        // Do nothing — response already handled by the callback `process`
+-    } catch (const std::exception &e) {
++        status = SimpleWeb::StatusCode::success_ok;
++        ret = Json::writeString(Json::StreamWriterBuilder(), process(content));
++        if (is_compression_requested(request)) {
++            ret = compress_string(ret);
++            header.insert(std::make_pair("Content-Encoding", "deflate"));
++            header.insert(std::make_pair("Content-Length", std::to_string(ret.size())));
++        }
++    } catch (const CurrentlyInitializingError& e) {
++        logger->info("[Server] Got a request during initialization. Asked to come back later");
++        status = SimpleWeb::StatusCode::server_error_service_unavailable;
++        header.insert(std::make_pair("Retry-After", "60")); // ask to come back in 60 seconds
++        ret = json_str_with_error_msg("Server is currently initializing, please come back later.");
++    } catch (const std::exception& e) {
+         logger->warn("[Server] Error on request {}: {}", request_id, e.what());
+-        response->write(SimpleWeb::StatusCode::client_error_bad_request,
+-                        json_str_with_error_msg(e.what()));
++        status = SimpleWeb::StatusCode::client_error_bad_request;
++        ret = json_str_with_error_msg(e.what());
+     } catch (...) {
+         logger->warn("[Server] Error on request {}", request_id);
+-        response->write(SimpleWeb::StatusCode::server_error_internal_server_error,
+-                        json_str_with_error_msg("Internal server error"));
++        status = SimpleWeb::StatusCode::server_error_internal_server_error;
++        ret = json_str_with_error_msg("Internal server error");
+     }
+-    logger->info("[Server] Request {} finished in {} sec", request_id, timer.elapsed());
++    double processing_time = timer.elapsed();
++    response->write(status, ret, header);
++    logger->info("[Server] Request {} processing time: {:.3f} sec, response size: {:.1f} KB, "
++                 "finished in {:.3f} sec",
++                 request_id, processing_time, (double)ret.size() / 1000, timer.elapsed());
+ }
+ 
+ } // namespace cli
+diff --git a/metagraph/src/cli/server_utils.hpp b/metagraph/src/cli/server_utils.hpp
+index d4d593b959..5cfce14bf5 100644
+--- a/metagraph/src/cli/server_utils.hpp
++++ b/metagraph/src/cli/server_utils.hpp
+@@ -14,12 +14,10 @@ void process_request(std::shared_ptr<HttpServer::Response> &response,
+                      size_t request_id,
+                      const std::function<Json::Value(const std::string &)> &process);
+ 
+-// An exception that may be thrown inside the callback `process` to indicate that the response
+-// is already sent by the caller and no additional action in `process_request` is required.
+-class CustomResponse : public std::exception {
+-    const char* what() const noexcept override {
+-        return "Response already sent by callback";
+-    }
++class CurrentlyInitializingError : public std::runtime_error {
++  public:
++    CurrentlyInitializingError()
++        : std::runtime_error("Server is currently initializing") {}
+ };
+ 
+ Json::Value parse_json_string(const std::string &msg);
+diff --git a/metagraph/src/common/threads/threading.cpp b/metagraph/src/common/threads/threading.cpp
+index af32aa59d6..f7c576206b 100644
+--- a/metagraph/src/common/threads/threading.cpp
++++ b/metagraph/src/common/threads/threading.cpp
+@@ -30,11 +30,13 @@ void ThreadPool::join() {
+     if (!num_workers) {
+         return;
+     } else {
+-        std::lock_guard<std::mutex> lock(queue_mutex);
++        std::unique_lock<std::mutex> lock(this->queue_mutex);
+         assert(!joining_);
++        all_waiting.wait(lock, [this]() { return num_waiting_ == workers.size()
++                                                    && this->tasks.empty(); });
+         joining_ = true;
+     }
+-    empty_condition.notify_all();
++    has_work.notify_all();
+ 
+     for (std::thread &worker : workers) {
+         worker.join();
+@@ -47,8 +49,8 @@ void ThreadPool::join() {
+ 
+ void ThreadPool::remove_waiting_tasks() {
+     std::unique_lock<std::mutex> lock(this->queue_mutex);
+-    this->tasks = std::queue<std::function<void()>>();
+-    this->empty_condition.notify_all();
++    this->tasks = {};
++    this->not_full.notify_all();
+ }
+ 
+ void ThreadPool::initialize(size_t num_workers) {
+@@ -56,27 +58,37 @@ void ThreadPool::initialize(size_t num_workers) {
+     assert(workers.size() == 0);
+     joining_ = false;
+ 
++    num_threads_ = num_workers;
+     if (!num_workers)
+         return;
+ 
++    num_waiting_ = 0;
++
+     for (size_t i = 0; i < num_workers; ++i) {
+         workers.emplace_back([this]() {
+             while (true) {
+                 std::function<void()> task;
+                 {
+                     std::unique_lock<std::mutex> lock(this->queue_mutex);
+-                    this->empty_condition.wait(lock, [this]() {
++                    num_waiting_++;
++                    all_waiting.notify_one();
++                    this->has_work.wait(lock, [this]() {
+                         return this->joining_ || !this->tasks.empty();
+                     });
++                    num_waiting_--;
+                     if (this->tasks.empty())
+                         return;
+ 
+                     task = std::move(this->tasks.front());
+-                    this->tasks.pop();
++                    this->tasks.pop_front();
+                 }
+ 
+-                full_condition.notify_one();
++                not_full.notify_one();
+                 task();
++                // Performance only: wake every help_while_waiting caller so
++                // each can check whether its own future is now ready without
++                // waiting for the 100μs poll timeout.
++                helper_wakeup.notify_all();
+             }
+         });
+     }
+diff --git a/metagraph/src/common/threads/threading.hpp b/metagraph/src/common/threads/threading.hpp
+index a537f10671..848bce91ac 100644
+--- a/metagraph/src/common/threads/threading.hpp
++++ b/metagraph/src/common/threads/threading.hpp
+@@ -2,13 +2,15 @@
+ #define __THREADING_HPP__
+ 
+ #include <vector>
+-#include <queue>
++#include <deque>
+ #include <thread>
+ #include <mutex>
+ #include <condition_variable>
+ #include <future>
+ #include <functional>
+ #include <atomic>
++#include <cassert>
++#include <chrono>
+ 
+ 
+ void set_num_threads(unsigned int num_threads);
+@@ -44,12 +46,52 @@ class ThreadPool {
+ 
+     template <class F, typename... Args>
+     auto enqueue(F&& f, Args&&... args) {
+-        return emplace(false, std::forward<F>(f), std::forward<Args>(args)...);
++        return emplace(false /*front*/, false /*force*/, std::forward<F>(f), std::forward<Args>(args)...);
+     }
+ 
+     template <class F, typename... Args>
+     auto force_enqueue(F&& f, Args&&... args) {
+-        return emplace(true, std::forward<F>(f), std::forward<Args>(args)...);
++        return emplace(false /*front*/, true /*force*/, std::forward<F>(f), std::forward<Args>(args)...);
++    }
++
++    template <class F, typename... Args>
++    auto force_enqueue_front(F&& f, Args&&... args) {
++        return emplace(true /*front*/, true /*force*/, std::forward<F>(f), std::forward<Args>(args)...);
++    }
++
++    // Exception behavior differs between the two execution paths:
++    //   * Tasks run on a worker thread: if they throw, `future.get()` inside
++    //     `wrapped_task` rethrows on the worker, which escapes the worker
++    //     lambda and calls std::terminate (covered by MultiThreadException).
++    //   * Tasks stolen by `help_while_waiting` (below) run on the caller, so
++    //     an exception propagates out to the caller instead
++    //     (covered by HelpWhileWaitingStealedException).
++    template <class T>
++    std::shared_future<T>& help_while_waiting(std::shared_future<T> &future) {
++        auto ready = [&]() {
++            return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
++        };
++        while (workers.size() && !ready()) {
++            std::function<void()> task;
++            {
++                std::unique_lock<std::mutex> lock(queue_mutex);
++                helper_wakeup.wait_for(lock, std::chrono::microseconds(100), [this, &ready]() {
++                    return !tasks.empty() || ready();
++                });
++                if (ready())
++                    break;
++                if (tasks.empty())
++                    continue;
++
++                task = std::move(tasks.front());
++                tasks.pop_front();
++            }
++
++            not_full.notify_one();
++            task();
++        }
++
++        return future;
+     }
+ 
+     void join();
+@@ -58,22 +100,28 @@ class ThreadPool {
+ 
+     ~ThreadPool();
+ 
++    size_t num_threads() const { return num_threads_; }
++
+   private:
+     void initialize(size_t num_threads);
+ 
++    size_t num_threads_;
+     std::vector<std::thread> workers;
+-    std::queue<std::function<void()>> tasks;
++    size_t num_waiting_;
++    std::deque<std::function<void()>> tasks;
+     size_t max_num_tasks_;
+ 
+     std::mutex queue_mutex;
+-    std::condition_variable empty_condition;
+-    std::condition_variable full_condition;
++    std::condition_variable has_work; // task available or joining
++    std::condition_variable not_full; // queue has space
++    std::condition_variable all_waiting; // all workers are idle
++    std::condition_variable helper_wakeup; // task available for the helper or future is ready
+ 
+     bool joining_;
+     bool stop_;
+ 
+     template <class F, typename... Args>
+-    auto emplace(bool force, F&& f, Args&&... args) {
++    auto emplace(bool front, bool force, F&& f, Args&&... args) {
+         using return_type = decltype(f(args...));
+         auto task = std::make_shared<std::packaged_task<return_type()>>(
+             std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+@@ -91,13 +139,19 @@ class ThreadPool {
+             return future;
+         } else {
+             std::unique_lock<std::mutex> lock(queue_mutex);
+-            full_condition.wait(lock, [this,force]() {
++            assert(!joining_);
++            not_full.wait(lock, [this,force]() {
+                 return this->tasks.size() < this->max_num_tasks_ || force;
+             });
+-            tasks.emplace(std::move(wrapped_task));
++            if (front) {
++                tasks.emplace_front(std::move(wrapped_task));
++            } else {
++                tasks.emplace_back(std::move(wrapped_task));
++            }
+         }
+ 
+-        empty_condition.notify_one();
++        has_work.notify_one();
++        helper_wakeup.notify_one();
+ 
+         return future;
+     }
+diff --git a/metagraph/tests/test_utils.cpp b/metagraph/tests/test_utils.cpp
+index e44bfd8d3f..589b77dd0e 100644
+--- a/metagraph/tests/test_utils.cpp
++++ b/metagraph/tests/test_utils.cpp
+@@ -1,6 +1,8 @@
+ #include "test_helpers.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <future>
+ 
+ #include <gtest/gtest.h>
+ #include <gmock/gmock.h>
+@@ -429,34 +431,61 @@ TEST(ThreadPool, MultiThreadFuture) {
+ }
+ 
+ #ifndef _NO_DEATH_TEST
+-void throw_from_worker() {
+-    for (size_t i = 2; i < 20; ++i) {
+-        try {
+-            ThreadPool pool(i);
+-
+-            std::vector<std::shared_future<size_t>> result;
+-            for (size_t t = 0; t < 1000; ++t) {
+-                result.emplace_back(pool.enqueue([&](size_t i) {
+-                    // This exception will be thrown in a worker thread, which
+-                    // should kill the main thread and the whole process as well
+-                    throw std::runtime_error("test exception");
+-                    return i;
+-                }, 1));
++// Exceptions thrown in worker threads must kill the process (via std::terminate)
++// even if the caller never calls future.get().
++TEST(ThreadPool, MultiThreadException) {
++    for (size_t num_workers : { 1, 10 }) {
++        ASSERT_DEATH({
++            try {
++                ThreadPool pool(num_workers);
++                pool.enqueue([]() { throw std::runtime_error("test exception"); });
++                // A plain sleep (rather than a promise signal) is deliberate:
++                // ASSERT_DEATH runs this block in a forked subprocess that is
++                // expected to abort; we only need to stay alive long enough
++                // for the worker to pick up the task and terminate the process.
++                std::this_thread::sleep_for(std::chrono::seconds(1));
++            } catch (...) {
++                FAIL() << "all exceptions must be thrown in workers";
+             }
+-
+-        } catch (...) {
+-            FAIL() << "all exceptions must be thrown in workers";
+-        }
++        }, "");
+     }
+-    std::this_thread::sleep_for(std::chrono::seconds(1));
+ }
++#endif // ifndef _NO_DEATH_TEST
+ 
+-TEST(ThreadPool, MultiThreadException) {
+-    // check that a worker throws even if we don't
+-    // wait for the result in the returned 'future'
+-    ASSERT_DEATH(throw_from_worker(), "");
++// With 0 workers (synchronous), exceptions propagate back to the caller.
++TEST(ThreadPool, SynchronousException) {
++    ThreadPool pool(0);
++    EXPECT_THROW(
++        pool.enqueue([]() -> int { throw std::runtime_error("sync throw"); }),
++        std::runtime_error
++    );
++}
++
++// When help_while_waiting steals a throwing task, the exception propagates
++// to the caller rather than crashing a worker thread.
++TEST(ThreadPool, HelpWhileWaitingStealedException) {
++    ThreadPool pool(1);
++
++    // Block the only worker so it can't pick up subsequent tasks.
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    // Enqueue a task that throws — it stays in the queue since the worker is busy.
++    pool.force_enqueue([]() -> int { throw std::runtime_error("stolen throw"); });
++
++    // Enqueue the task we actually wait for — also stays in the queue.
++    auto future = pool.force_enqueue([]() { return 42; });
++
++    // help_while_waiting will steal the throwing task first, propagating the exception.
++    EXPECT_THROW(pool.help_while_waiting(future).get(), std::runtime_error);
++
++    unblock.set_value();
+ }
+-#endif // ifndef _NO_DEATH_TEST
+ 
+ TEST(ThreadPool, DummyEmptyJoin) {
+     ThreadPool pool(0);
+@@ -500,6 +529,632 @@ TEST(ThreadPool, DummyFuture) {
+ }
+ 
+ 
++// ---------------------------------------------------------------------------
++//  ThreadPool: force_enqueue_front ordering
++// ---------------------------------------------------------------------------
++
++// With 1 worker blocked, queued tasks accumulate. force_enqueue_front should
++// place tasks at the head, so the worker processes them first after unblocking.
++TEST(ThreadPool, ForceEnqueueFrontOrdering) {
++    ThreadPool pool(1);
++
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    std::vector<int> order;
++    std::mutex mu;
++    auto make_task = [&](int id) {
++        return [&mu, &order, id]() {
++            std::lock_guard<std::mutex> lock(mu);
++            order.push_back(id);
++        };
++    };
++
++    // Queue: push 1 back, push 2 back, push 3 front → [3, 1, 2]
++    pool.force_enqueue(make_task(1));
++    pool.force_enqueue(make_task(2));
++    pool.force_enqueue_front(make_task(3));
++
++    unblock.set_value();
++    pool.join();
++
++    ASSERT_EQ(3u, order.size());
++    EXPECT_EQ(3, order[0]);
++    EXPECT_EQ(1, order[1]);
++    EXPECT_EQ(2, order[2]);
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: force_enqueue bypasses queue limit
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, ForceEnqueueBypassesQueueLimit) {
++    // max_num_tasks = 2
++    ThreadPool pool(1, 2);
++
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    // Fill the queue to max_num_tasks
++    pool.force_enqueue([]() {});
++    pool.force_enqueue([]() {});
++
++    // Queue is full. force_enqueue should still succeed (no deadlock).
++    std::atomic<bool> task_ran{false};
++    pool.force_enqueue([&]() { task_ran = true; });
++
++    unblock.set_value();
++    pool.join();
++
++    EXPECT_TRUE(task_ran.load());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — basic correctness
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, HelpWhileWaitingBasic) {
++    for (size_t num_threads : {1, 2, 4, 8}) {
++        ThreadPool pool(num_threads);
++        auto future = pool.enqueue([]() { return 42; });
++        EXPECT_EQ(42, pool.help_while_waiting(future).get());
++    }
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — caller must steal work to avoid deadlock
++// ---------------------------------------------------------------------------
++
++// The only worker is blocked. The future's task sits in the queue.
++// Without work-stealing in help_while_waiting, this would deadlock.
++TEST(ThreadPool, HelpWhileWaitingCallerStealsWork) {
++    ThreadPool pool(1);
++
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    // Worker is blocked. These tasks can only run if the caller steals them.
++    std::atomic<std::thread::id> executor_thread_id{};
++    pool.force_enqueue([&]() {
++        executor_thread_id = std::this_thread::get_id();
++    });
++
++    auto future = pool.force_enqueue([]() { return 99; });
++
++    // Must not deadlock — caller processes queued tasks.
++    EXPECT_EQ(99, pool.help_while_waiting(future).get());
++
++    // The intermediate task was executed on the calling thread, not a worker.
++    EXPECT_EQ(std::this_thread::get_id(), executor_thread_id.load());
++
++    unblock.set_value();
++    pool.join();
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — no lost wakeup with many idle workers
++// ---------------------------------------------------------------------------
++
++// Tests that help_while_waiting wakes up promptly when the future completes.
++// Queue is empty, many workers are idle, one worker is executing the future's
++// task. When it completes, help_while_waiting must be woken via help_condition
++// (the dedicated CV), not delayed by idle workers competing for notifications.
++TEST(ThreadPool, HelpWhileWaitingNoLostWakeup) {
++    for (int iter = 0; iter < 100; ++iter) {
++        ThreadPool pool(8);
++
++        std::promise<void> task_started;
++        std::promise<void> release;
++
++        // One task occupies one worker; the other 7 are idle.
++        auto future = pool.enqueue([&]() {
++            task_started.set_value();
++            release.get_future().wait();
++            return iter;
++        });
++
++        // Ensure the task is running (not still in the queue).
++        task_started.get_future().wait();
++
++        // Queue is now empty, 7 workers are idle. Release the task so
++        // the future completes while help_while_waiting is waiting.
++        release.set_value();
++
++        // Must not deadlock.
++        EXPECT_EQ(iter, pool.help_while_waiting(future).get());
++    }
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — chunked work pattern
++// ---------------------------------------------------------------------------
++
++// Mimics the BRWT get_nonzero_rows pattern: enqueue many chunks, then
++// call help_while_waiting for each future sequentially.
++TEST(ThreadPool, HelpWhileWaitingChunkedWork) {
++    ThreadPool pool(4);
++
++    const int num_chunks = 40;
++    std::vector<std::shared_future<int>> futures;
++    for (int i = 0; i < num_chunks; ++i) {
++        futures.push_back(pool.force_enqueue_front([i]() {
++            int sum = 0;
++            for (int j = 0; j < 1000; ++j) sum += i + j;
++            return sum;
++        }));
++    }
++
++    int total = 0;
++    for (auto &f : futures) {
++        total += pool.help_while_waiting(f).get();
++    }
++
++    int expected = 0;
++    for (int i = 0; i < num_chunks; ++i) {
++        for (int j = 0; j < 1000; ++j) expected += i + j;
++    }
++    EXPECT_EQ(expected, total);
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — dummy pool (0 workers)
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, HelpWhileWaitingDummyPool) {
++    ThreadPool pool(0);
++
++    // 0 workers → task is executed inline in emplace(), future is already ready.
++    auto future = pool.enqueue([]() { return 42; });
++    EXPECT_EQ(std::future_status::ready,
++              future.wait_for(std::chrono::seconds(0)));
++
++    // help_while_waiting returns immediately (workers.size() == 0).
++    EXPECT_EQ(42, pool.help_while_waiting(future).get());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: tasks that spawn subtasks — join must wait for all
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, JoinWaitsForDynamicallySpawnedTasks) {
++    ThreadPool pool(4);
++    std::atomic<int> completed{0};
++
++    for (int i = 0; i < 50; ++i) {
++        pool.enqueue([&pool, &completed]() {
++            // Each parent spawns 10 children.
++            for (int j = 0; j < 10; ++j) {
++                pool.force_enqueue([&completed]() { completed++; });
++            }
++            completed++;
++        });
++    }
++
++    pool.join();
++    EXPECT_EQ(550, completed.load());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: join-reinitialize cycle
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, JoinReinitializeCycle) {
++    ThreadPool pool(4);
++
++    for (int cycle = 0; cycle < 5; ++cycle) {
++        std::atomic<int> counter{0};
++        for (int i = 0; i < 200; ++i) {
++            pool.enqueue([&counter]() { counter++; });
++        }
++        pool.join();
++        EXPECT_EQ(200, counter.load()) << "cycle " << cycle;
++    }
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: num_threads accessor
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, NumThreads) {
++    ThreadPool pool0(0);
++    EXPECT_EQ(0u, pool0.num_threads());
++
++    ThreadPool pool1(1);
++    EXPECT_EQ(1u, pool1.num_threads());
++
++    ThreadPool pool8(8);
++    EXPECT_EQ(8u, pool8.num_threads());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: remove_waiting_tasks cancels pending work
++// ---------------------------------------------------------------------------
++
++TEST(ThreadPool, RemoveWaitingTasksCancelsPendingWork) {
++    ThreadPool pool(1);
++
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    // Worker is blocked. Queue up 100 tasks.
++    std::atomic<int> counter{0};
++    for (int i = 0; i < 100; ++i) {
++        pool.force_enqueue([&counter]() { counter++; });
++    }
++
++    // Discard all pending tasks.
++    pool.remove_waiting_tasks();
++
++    unblock.set_value();
++    pool.join();
++
++    // The worker was busy, so none (or very few) of the 100 tasks ran.
++    EXPECT_LT(counter.load(), 100);
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting under contention — many futures, few workers
++// ---------------------------------------------------------------------------
++
++// All workers are occupied with slow tasks. The caller must steal and execute
++// fast tasks from the queue to complete quickly. Tests that the caller makes
++// forward progress rather than starving.
++TEST(ThreadPool, HelpWhileWaitingCallerMakesProgress) {
++    ThreadPool pool(2);
++
++    std::promise<void> workers_started;
++    std::atomic<int> started_count{0};
++    std::promise<void> unblock;
++    auto unblock_future = unblock.get_future().share();
++
++    // Occupy both workers with long tasks.
++    for (int w = 0; w < 2; ++w) {
++        pool.enqueue([&started_count, &workers_started, unblock_future]() {
++            if (++started_count == 2)
++                workers_started.set_value();
++            unblock_future.wait();
++        });
++    }
++    workers_started.get_future().wait();
++
++    // Both workers are blocked. Enqueue work that only the caller can process.
++    std::atomic<int> tasks_executed{0};
++    for (int i = 0; i < 20; ++i) {
++        pool.force_enqueue([&tasks_executed]() { tasks_executed++; });
++    }
++    auto future = pool.force_enqueue([]() { return true; });
++
++    EXPECT_TRUE(pool.help_while_waiting(future).get());
++
++    // The caller executed the future's task. It also processed tasks ahead of
++    // the future in the queue.
++    EXPECT_GT(tasks_executed.load(), 0);
++
++    unblock.set_value();
++    pool.join();
++
++    // All 20 tasks eventually complete (some by caller, rest by workers after unblock).
++    EXPECT_EQ(20, tasks_executed.load());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — timeout with empty queue must not crash
++// ---------------------------------------------------------------------------
++
++// When help_while_waiting's wait_for times out with an empty queue and the
++// future not yet ready, it must loop back — not access tasks.front() on an
++// empty deque (undefined behavior / crash).
++TEST(ThreadPool, HelpWhileWaitingTimeoutEmptyQueue) {
++    ThreadPool pool(1);
++
++    // The worker picks up this slow task immediately — queue becomes empty.
++    // The task takes much longer than the 100μs wait_for timeout.
++    auto future = pool.enqueue([]() {
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        return 42;
++    });
++
++    // Small delay so the worker dequeues the task before we call HWW.
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++
++    // Queue is empty, future not ready (worker still sleeping for 50ms).
++    // help_while_waiting enters wait_for(100μs), times out, predicate false.
++    // Without the tasks.empty() guard, this would access an empty deque.
++    EXPECT_EQ(42, pool.help_while_waiting(future).get());
++}
++
++// Same scenario but with multiple workers — the future's task is picked up
++// by one worker while others are idle. The queue is empty for extended time.
++TEST(ThreadPool, HelpWhileWaitingTimeoutEmptyQueueMultiWorker) {
++    ThreadPool pool(4);
++
++    auto future = pool.enqueue([]() {
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        return 99;
++    });
++
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++
++    // 4 workers, 3 idle, 1 executing the slow task. Queue empty.
++    // help_while_waiting will time out many times (~500x) before the future
++    // is ready. Each timeout must not access the empty deque.
++    EXPECT_EQ(99, pool.help_while_waiting(future).get());
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — cross-steal notification
++// ---------------------------------------------------------------------------
++
++// Multiple workers call help_while_waiting simultaneously (as happens in BRWT
++// when workers execute slice_rows tasks that call get_nonzero_rows).
++// Each enqueues a chunk task and waits for it. Cross-stealing occurs when
++// worker A executes worker B's chunk. Worker B discovers its future is ready
++// on the next wait_for timeout (100μs).
++//
++// The spin on all_done prevents workers from returning to the worker loop,
++// so only the timeout (not the worker loop's notify) resolves the cross-steal.
++TEST(ThreadPool, HelpWhileWaitingCrossStealNotification) {
++    for (int iter = 0; iter < 50; ++iter) {
++        const int N = 4;
++        ThreadPool pool(N);
++
++        std::atomic<int> chunks_enqueued{0};
++        std::atomic<int> finished_hww{0};
++        std::atomic<bool> all_done{false};
++
++        for (int i = 0; i < N; ++i) {
++            pool.force_enqueue([&]() {
++                // Each worker enqueues one chunk task.
++                auto f = pool.force_enqueue_front([]() { return 1; });
++
++                // Barrier: wait until all workers have enqueued their chunks
++                // before anyone starts stealing. This maximizes cross-steal
++                // probability — all N chunks sit in the queue when HWW begins.
++                chunks_enqueued.fetch_add(1, std::memory_order_release);
++                while (chunks_enqueued.load(std::memory_order_acquire) < N) {
++                    std::this_thread::yield();
++                }
++
++                pool.help_while_waiting(f).get();
++                finished_hww.fetch_add(1, std::memory_order_release);
++
++                // Spin here to prevent returning to the worker loop.
++                // Without this, the worker loop's help_condition.notify_one()
++                // would rescue stuck HWW callers, masking the bug.
++                while (!all_done.load(std::memory_order_acquire)) {
++                    std::this_thread::yield();
++                }
++            });
++        }
++
++        // Wait for all workers to finish help_while_waiting (with timeout).
++        auto deadline = std::chrono::steady_clock::now()
++                        + std::chrono::seconds(5);
++        while (finished_hww.load(std::memory_order_acquire) < N) {
++            ASSERT_LT(std::chrono::steady_clock::now(), deadline)
++                << "iter " << iter << ": only "
++                << finished_hww.load(std::memory_order_acquire) << "/" << N
++                << " workers completed help_while_waiting (deadlock from "
++                   "missing cross-steal notification)";
++            std::this_thread::yield();
++        }
++
++        all_done.store(true, std::memory_order_release);
++        pool.join();
++    }
++}
++
++// Multiple threads each enqueue a batch of work and call help_while_waiting.
++// All threads cooperatively execute each other's tasks. Verifies correctness
++// of concurrent HWW when many tasks are in-flight (similar to BRWT traversal).
++TEST(ThreadPool, HelpWhileWaitingMultipleHelpers) {
++    const int num_workers = 4;
++    const int chunks_per_worker = 20;
++    ThreadPool pool(num_workers);
++
++    std::atomic<int> total_executed{0};
++    std::atomic<int> helpers_done{0};
++
++    for (int w = 0; w < num_workers; ++w) {
++        pool.force_enqueue([&]() {
++            // Each worker enqueues a batch of chunk tasks and waits for the last one.
++            std::shared_future<int> last_future;
++            for (int c = 0; c < chunks_per_worker; ++c) {
++                last_future = pool.force_enqueue_front([&]() {
++                    total_executed.fetch_add(1, std::memory_order_relaxed);
++                    return 1;
++                });
++            }
++            // Help execute tasks (own and others') while waiting.
++            pool.help_while_waiting(last_future).get();
++            helpers_done.fetch_add(1, std::memory_order_release);
++        });
++    }
++
++    pool.join();
++    EXPECT_EQ(num_workers, helpers_done.load());
++    EXPECT_EQ(num_workers * chunks_per_worker, total_executed.load());
++}
++
++// Block all pool workers with promises, then spawn two external threads that
++// each call help_while_waiting. The external threads are the only ones that
++// can execute tasks, so HWW is deterministically called from exactly 2 threads.
++TEST(ThreadPool, HelpWhileWaitingTwoExternalHelpers) {
++    const int num_workers = 4;
++    const int tasks_per_helper = 50;
++    ThreadPool pool(num_workers);
++
++    // Block every worker with a promise so they can't pick up any more tasks.
++    std::promise<void> unblock;
++    auto gate = unblock.get_future().share();
++    std::atomic<int> workers_blocked{0};
++    for (int i = 0; i < num_workers; ++i) {
++        pool.force_enqueue([&]() {
++            workers_blocked.fetch_add(1, std::memory_order_release);
++            gate.wait();
++        });
++    }
++    // Wait until all workers are blocked.
++    while (workers_blocked.load(std::memory_order_acquire) < num_workers) {
++        std::this_thread::yield();
++    }
++
++    // Enqueue work that only external HWW callers can execute.
++    std::atomic<int> total_executed{0};
++    auto make_future = [&]() {
++        std::shared_future<int> last;
++        for (int i = 0; i < tasks_per_helper; ++i) {
++            last = pool.force_enqueue([&]() {
++                total_executed.fetch_add(1, std::memory_order_relaxed);
++                return 1;
++            });
++        }
++        return last;
++    };
++    auto future_a = make_future();
++    auto future_b = make_future();
++
++    // Two external threads call help_while_waiting concurrently.
++    std::thread helper_a([&]() { pool.help_while_waiting(future_a).get(); });
++    std::thread helper_b([&]() { pool.help_while_waiting(future_b).get(); });
++
++    helper_a.join();
++    helper_b.join();
++
++    EXPECT_EQ(2 * tasks_per_helper, total_executed.load());
++
++    // Release workers so the pool can shut down.
++    unblock.set_value();
++    pool.join();
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: remove_waiting_tasks unblocks enqueue
++// ---------------------------------------------------------------------------
++
++// If a thread is blocked in enqueue() because the queue is full,
++// remove_waiting_tasks() should unblock it by notifying full_condition.
++TEST(ThreadPool, RemoveWaitingTasksUnblocksEnqueue) {
++    ThreadPool pool(1, 2);  // 1 worker, max 2 tasks in queue
++
++    std::promise<void> worker_started;
++    std::promise<void> unblock;
++
++    pool.enqueue([&]() {
++        worker_started.set_value();
++        unblock.get_future().wait();
++    });
++    worker_started.get_future().wait();
++
++    // Fill the queue to max_num_tasks.
++    pool.force_enqueue([]() {});
++    pool.force_enqueue([]() {});
++
++    // A regular enqueue on another thread will block (queue full).
++    std::atomic<bool> enqueue_completed{false};
++    std::thread enqueuer([&]() {
++        pool.enqueue([]() {});
++        enqueue_completed.store(true, std::memory_order_release);
++    });
++
++    // Give the enqueuer time to block.
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    EXPECT_FALSE(enqueue_completed.load(std::memory_order_acquire));
++
++    // Clear the queue — should unblock the enqueuer via full_condition.
++    pool.remove_waiting_tasks();
++
++    auto deadline = std::chrono::steady_clock::now()
++                    + std::chrono::seconds(5);
++    while (!enqueue_completed.load(std::memory_order_acquire)) {
++        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
++            << "enqueue() still blocked after remove_waiting_tasks()";
++        std::this_thread::yield();
++    }
++
++    enqueuer.join();
++    unblock.set_value();
++    pool.join();
++}
++
++// ---------------------------------------------------------------------------
++//  ThreadPool: help_while_waiting — latency benchmark
++// ---------------------------------------------------------------------------
++
++// Measures the latency of help_while_waiting when the future is completed by
++// a worker (not stolen). The worker loop's help_condition.notify_one() wakes
++// HWW promptly; without it, HWW would rely on the 100μs poll timeout.
++TEST(ThreadPool, HelpWhileWaitingLatencyBenchmark) {
++    const int num_iters = 200;
++    ThreadPool pool(1);
++
++    // A releaser thread opens the gate after 200μs, ensuring HWW is already
++    // blocking when the worker completes. The "above 200μs gate" number in
++    // the output isolates wake-up overhead from the gate delay.
++    long long total_us = 0;
++    for (int i = 0; i < num_iters; ++i) {
++        std::promise<void> gate;
++        auto gate_future = gate.get_future().share();
++
++        auto future = pool.enqueue([gate_future]() {
++            gate_future.wait();  // block until released
++            return 1;
++        });
++
++        // Give the worker time to pick up the task and block on the gate.
++        std::this_thread::sleep_for(std::chrono::microseconds(100));
++
++        // Release the worker from a separate thread after 200μs.
++        // By then, HWW is definitely in wait_for.
++        std::thread releaser([&gate]() {
++            std::this_thread::sleep_for(std::chrono::microseconds(200));
++            gate.set_value();
++        });
++
++        auto t0 = std::chrono::steady_clock::now();
++        pool.help_while_waiting(future).get();
++        auto t1 = std::chrono::steady_clock::now();
++
++        total_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
++        releaser.join();
++    }
++
++    fprintf(stderr, "[BENCH] %d iterations: %lld μs total, %.1f μs/iter "
++                    "(%.1f μs above 200μs gate)\n",
++                    num_iters, total_us, (double)total_us / num_iters,
++                    (double)total_us / num_iters - 200.0);
++
++    // Loose upper bound: the 100μs HWW poll is the worst-case wake path when
++    // the worker notify is missed. Anything much above 200μs (gate) + 100μs
++    // (poll) + scheduling slack indicates the notify mechanism has regressed.
++    // Bound is generous for busy CI runners.
++    EXPECT_LT((double)total_us / num_iters, 5000.0);
++}
++
+ TEST(AsyncActivity, RunUniqueOnly) {
+     AsyncActivity async;
+ 

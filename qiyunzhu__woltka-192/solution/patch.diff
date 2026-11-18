@@ -1,0 +1,2126 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 460a75a..fb60a73 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -13,16 +13,16 @@ jobs:
+       max-parallel: 5
+       matrix:
+         os: ['ubuntu']
+-        python-version: ['3.8']
++        python-version: ['3.6', '3.8', '3.10', '3.12']
+ 
+     steps:
+-      - uses: actions/checkout@v2
+       - name: Set up Conda
+-        uses: s-weigand/setup-conda@v1
++      - uses: actions/checkout@v4
++        uses: conda-incubator/setup-miniconda@v3
+         with:
+-          update-conda: true
++          auto-update-conda: true
+           python-version: ${{ matrix.python-version }}
+-          conda-channels: anaconda, conda-forge
++          channels: conda-forge
+ 
+       - name: Install dependencies
+         run: conda install --file ci/conda_requirements.txt 
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3a2d00a..0e43105 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,9 +2,14 @@
+ 
+ ## Ongoing
+ 
++### Changed
++- Improved performance moderately ([#192](https://github.com/qiyunzhu/woltka/pull/192)).
++- Parameter `--chunk` is now the number of unique query sequences instead of the number of lines ([#192](https://github.com/qiyunzhu/woltka/pull/192)).
++
+ ### Added
++- Added parameter `-x|--exclude`, which will exclude query sequences that are mapped to given reference sequences (such as host genome, spike-in, vector, etc.) ([#192](https://github.com/qiyunzhu/woltka/pull/192)).
++- Added support for interleaved paired-end SAM files ([#191](https://github.com/qiyunzhu/woltka/pull/191)).
+ - Added native support for PAF file format ([#182](https://github.com/qiyunzhu/woltka/pull/182)).
+-- Improved support for interleaved paired-end SAM files ([#191](https://github.com/qiyunzhu/woltka/pull/191)).
+ 
+ ### Fixed
+ - Updated hyperlinks in documentation.
+diff --git a/doc/cli.md b/doc/cli.md
+index fef977c..06b1309 100644
+--- a/doc/cli.md
++++ b/doc/cli.md
+@@ -30,8 +30,9 @@ Option | Description
+ --- | ---
+ `--format`, `-f` | Format of read alignments. Options: <ul><li>`sam`: [SAM format](https://samtools.github.io/hts-specs/SAMv1.pdf).</li><li>`b6o`: [BLAST tabular format](https://www.ncbi.nlm.nih.gov/books/NBK279684/).</li><li>`paf`: [PAF format](https://github.com/lh3/miniasm/blob/master/PAF.md).</li><li>`map`: A simple map of query \<tab\> subject</li></ul>If not specified, program will automatically infer from file content.
+ `--filext`, `-e` | Input filename extension following sample ID.
+-`--samples`, `-s` | List of sample IDs to be included.
++`--samples`, `-s` | Sample IDs to include in the analysis. Can be a comma-separated string or path to a list file. Also defines the order of samples in the output.
+ `--demux/--no-demux` | Demultiplex alignment by first underscore in query identifier.
++`--exclude`, `-x` | Subject IDs to exclude while parsing alignments. Can be a comma-separated string or path to a list file. If an alignment is hit, the entire query (and its paired mate, if any) will be dropped.
+ `--trim-sub` | Trim subject IDs at the last given delimiter. Can accept the default value "_" or enter a custom value.
+ 
+ ### Hierarchies
+@@ -96,7 +97,7 @@ Option | Description
+ 
+ Option | Description
+ --- | ---
+-`--chunk` | Number of alignment lines to read and parse in each chunk. Default: 1,000 for plain mapping, or 1,000,000 for ordinal mapping.
++`--chunk` | Number of unique queries to read and parse in each chunk of an alignment file. Default: 1,000 for plain or range mapping, or 1,000,000 for ordinal mapping.
+ `--cache` | Number of recent classification results to cache for faster subsequent classifications. Default: 1024.
+ `--no-exe` | Disable calling external programs (`gzip`, `bzip2` and `xz`) for decompression. Otherwise, Woltka will use them if available for faster processing, or switch back to Python if not.
+ 
+diff --git a/doc/perform.md b/doc/perform.md
+index a3ffb3b..fbeab5c 100644
+--- a/doc/perform.md
++++ b/doc/perform.md
+@@ -62,7 +62,7 @@ Simple read-gene matching, with Numba [acceleration](install.md#acceleration) |
+ 
+ Two Woltka parameters visibly impacts Woltka's speed:
+ 
+-- `--chunk` | Number of alignment lines to read and parse in each chunk. Default: one thousand for plain mapping, or one million for ordinal mapping.
++- `--chunk` | Number of unique queries to read and parse in each chunk of an alignment file. Default: 1,000 for plain or range mapping, or 1,000,000 for ordinal mapping.
+ - `--cache` | Number of recent classification results to cache for faster subsequent classifications. Default: 1024.
+ 
+ Their default values were set based on our experience. However, alternative values could improve (or reduce) performance depending on the computer hardware, input file type, and database capacity. if you plan to routinely process bulks of biological big data using the same setting, we recommend that you do a few test runs on a small dataset and find out the values that work the best for you.
+diff --git a/woltka/align.py b/woltka/align.py
+index b9e44d3..de20c2b 100644
+--- a/woltka/align.py
++++ b/woltka/align.py
+@@ -13,22 +13,39 @@
+ 
+ Notes
+ -----
+-A parser function operates on a single line in the input file.
+-A parser function returns a tuple of:
+-    str : query Id
++A parser function operates on an entire alignment file and yields one unique
++query and its corresponding subject(s) at a time.
++
++This script supports four alignment file formats:
++    simple mapping file (map)
++    BLAST tabular file (b6o)
++    PAF file (paf)
++    SAM file (sam)
++
++For each format there are four variants of parser:
++    base : regular parser
++    base_ex : extended parser
++    base_ft : regular parser with filtering
++    base_ex_ft : extended parser with filtering
++* note: map format does not have ex mode
++
++A regular parser yields only subject Ids.
++A extended parser yields records with five fields:
+     str : subject Id
+-    float : alignment score, optional
+-    int : alignment length, optional
+-    start : alignment start (5') coordinate, optional
+-    start : alignment end (3') coordinate, optional
++    float : alignment score
++    int : alignment length
++    int : alignment start (5') coordinate
++    int : alignment end (3') coordinate
++
++In filter mode, if a subject is found in a given exclusion set, the entire
++unique query will be dropped.
+ """
+ 
+-from collections import deque
+ from itertools import chain
+ from functools import lru_cache
+ 
+ 
+-def plain_mapper(fh, fmt=None, n=1000):
++def plain_mapper(fh, fmt=None, excl=None, n=1000):
+     """Read an alignment file in chunks and yield query-to-subject(s) maps.
+ 
+     Parameters
+@@ -37,14 +54,16 @@ def plain_mapper(fh, fmt=None, n=1000):
+         Alignment file to parse.
+     fmt : str, optional
+         Alignment file format.
++    excl : set, optional
++        Subjects to exclude.
+     n : int, optional
+         Number of unique queries per chunk.
+ 
+     Yields
+     ------
+-    deque of str
++    list of str
+         Query queue.
+-    deque of set of str
++    list of set of str
+         Subject(s) queue.
+ 
+     Notes
+@@ -54,50 +73,45 @@ def plain_mapper(fh, fmt=None, n=1000):
+     processes current cache for every _n_ unique queries, yields and clears
+     cache, then proceeds.
+     """
+-    # determine alignment file format
+-    if not fmt:
+-        fmt, head = infer_align_format(fh)
+-        it = chain(iter(head), fh)
+-    else:
+-        it = fh
++    it = iter_align(fh, fmt, excl)
+ 
+-    # assign parser for given format
+-    parser = assign_parser(fmt)
++    # parse query-subject(s) pairs in chunks
++    while True:
+ 
+-    # query queue and subject(s) queue
+-    qryque, subque = deque(), deque()
++        # whether current chunk is completed
++        done = False
+ 
+-    # pre-load method references
+-    qryapd, subapd = qryque.append, subque.append
++        # pre-allocate queues
++        qryque, subque = [None] * n, [None] * n
+ 
+-    # target query count at end of current chunk
+-    target = n
++        # counter
++        i = 0
+ 
+-    # parse alignment file
+-    for i, (query, subjects) in enumerate(parser(it)):
++        # populate query queue and subject(s) queue of current chunk
++        for query, subjects in it:
++            qryque[i] = query
++            subque[i] = subjects
++            i += 1
+ 
+-        # line number has reached target
+-        if i == target:
+-
+-            # flush current queues of queries and subjects
+-            yield qryque, subque
++            # complete current chunk
++            if i == n:
++                done = True
++                break
+ 
+-            # reset queues and method references
+-            qryque, subque = deque(), deque()
+-            qryapd, subapd = qryque.append, subque.append
++        # chunk stopped early, i.e., the entire file has been parsed
++        if not done:
+ 
+-            # next target query count
+-            target += n
+-
+-        # append query and subjects
+-        qryapd(query)
+-        subapd(set(subjects))
++            # yield incomplete chunk
++            if i:
++                yield qryque[:i], subque[:i]
++            break
+ 
+-    # final flush
+-    yield qryque, subque
++        # yield complete chunk
++        else:
++            yield qryque, subque
+ 
+ 
+-def range_mapper(fh, fmt=None, n=1000):
++def range_mapper(fh, fmt=None, excl=None, n=1000):
+     """Read an alignment file and yield maps of query to subject(s) and their
+     ranges.
+ 
+@@ -107,14 +121,16 @@ def range_mapper(fh, fmt=None, n=1000):
+         Alignment file to parse.
+     fmt : str, optional
+         Alignment file format.
++    excl : set, optional
++        Subjects to exclude.
+     n : int, optional
+         Number of unique queries per chunk.
+ 
+     Yields
+     ------
+-    deque of str
++    list of str
+         Query queue.
+-    deque of dict of str to list of int
++    list of dict of list of int
+         Subject-to-ranges queue.
+ 
+     Notes
+@@ -129,39 +145,73 @@ def range_mapper(fh, fmt=None, n=1000):
+     plain_mapper
+     .coverage.merge_ranges
+     """
+-    if not fmt:
+-        fmt, head = infer_align_format(fh)
+-        it = chain(iter(head), fh)
+-    else:
+-        it = fh
+-    parser = assign_parser(fmt, ext=True)
+-    qryque, subque = deque(), deque()
+-    qryapd, subapd = qryque.append, subque.append
+-
+-    target = n
+-    for i, (query, records) in enumerate(parser(it)):
+-        if i == target:
++    it = iter_align(fh, fmt, excl, True)
++    while True:
++        i, done = 0, False
++        qryque, subque = [None] * n, [None] * n
++        for query, records in it:
++
++            # generate a mapping of subjects to interleaved starts and ends
++            ranges = {}
++            for subject, _, _, start, end in records:
++
++                # start and end must be positive integers
++                if start and end:
++
++                    # combine ranges on the same subject
++                    ranges.setdefault(subject, []).extend((start, end))
++
++            # append query and ranges
++            if ranges:
++                qryque[i] = query
++                subque[i] = ranges
++
++                i += 1
++                if i == n:
++                    done = True
++                    break
++
++        if not done:
++            if i:
++                yield qryque[:i], subque[:i]
++            break
++        else:
+             yield qryque, subque
+-            qryque, subque = deque(), deque()
+-            qryapd, subapd = qryque.append, subque.append
+-            target += n
+ 
+-        # generate a mapping of subjects to interleaved starts and ends
+-        ranges = {}
+-        for subject, _, _, start, end in records:
+ 
+-            # start and end must be positive integers
+-            if start and end:
++def iter_align(fh, fmt=None, excl=None, extr=None):
++    """Generate an iterator of alignment file content.
+ 
+-                # combine ranges on the same subject
+-                ranges.setdefault(subject, []).extend((start, end))
++    Parameters
++    ----------
++    fh : file handle
++        Alignment file to parse.
++    fmt : str, optional
++        Alignment file format.
++    excl : set, optional
++        Subjects to exclude.
++    extr : bool, optional
++        Whether to get extra information.
+ 
+-        # append query and ranges
+-        if ranges:
+-            qryapd(query)
+-            subapd(ranges)
++    Yields
++    ------
++    iterator
++        Alignment file content iterator.
++    """
++    # determine alignment file format
++    if not fmt:
++        fmt, head = infer_align_format(fh)
++        it = chain(iter(head), fh)
++    else:
++        it = fh
+ 
+-    yield qryque, subque
++    # assign parser for given format
++    if not excl:
++        parser = assign_parser(fmt, extr=extr)
++        return parser(it)
++    else:
++        parser = assign_parser(fmt, extr=extr, filt=True)
++        return parser(it, excl)
+ 
+ 
+ def infer_align_format(fh):
+@@ -237,15 +287,17 @@ def infer_align_format(fh):
+     raise ValueError('Cannot determine alignment file format.')
+ 
+ 
+-def assign_parser(fmt, ext=False):
++def assign_parser(fmt, extr=False, filt=False):
+     """Assign parser function based on format code.
+ 
+     Parameters
+     ----------
+     fmt : str
+         Alignment file format code.
+-    ext : bool, optional
++    extr : bool, optional
+         Whether to get extra information.
++    filt : bool, optional
++        Whether to filter subjects.
+ 
+     Returns
+     -------
+@@ -253,19 +305,22 @@ def assign_parser(fmt, ext=False):
+         Alignment parser function.
+     """
+     if fmt == 'map':  # simple map of query <tab> subject
+-        return parse_map_file
++        return parse_map_file_ft if filt else parse_map_file
+     if fmt == 'b6o':  # BLAST format
+-        return parse_b6o_file_ext if ext else parse_b6o_file
++        return ((parse_b6o_file_ex_ft if filt else parse_b6o_file_ex) if extr
++                else (parse_b6o_file_ft if filt else parse_b6o_file))
+     elif fmt == 'sam':  # SAM format
+-        return parse_sam_file_ext if ext else parse_sam_file
++        return ((parse_sam_file_ex_ft if filt else parse_sam_file_ex) if extr
++                else (parse_sam_file_ft if filt else parse_sam_file))
+     elif fmt == 'paf':  # PAF format
+-        return parse_paf_file_ext if ext else parse_paf_file
++        return ((parse_paf_file_ex_ft if filt else parse_paf_file_ex) if extr
++                else (parse_paf_file_ft if filt else parse_paf_file))
+     else:
+         raise ValueError(f'Invalid format code: "{fmt}".')
+ 
+ 
+ def parse_sam_file(fh):
+-    """Parse a SAM file (sam) to get basic information.
++    """Parse a SAM file to get basic information.
+ 
+     Parameters
+     ----------
+@@ -276,7 +331,7 @@ def parse_sam_file(fh):
+     ------
+     str
+         Query.
+-    list of str
++    set of str
+         Subjects.
+ 
+     Notes
+@@ -313,7 +368,7 @@ def parse_sam_file(fh):
+     this = None
+ 
+     # current subjects by mate: unpaired, forward, reverse
+-    pool = ([], [], [])
++    pool = (set(), set(), set())
+ 
+     # parse body
+     for line in it:
+@@ -328,7 +383,7 @@ def parse_sam_file(fh):
+         # extract mate from flag (forward: bit 6; reverse: bit 7)
+         mate = int(flag) >> 6 & 3
+ 
+-        # previous query completes
++        # previous query completes, new query starts
+         if qname != this:
+ 
+             # yield query and subjects
+@@ -340,10 +395,10 @@ def parse_sam_file(fh):
+                 yield this + '/2', pool[2]
+ 
+             # reset query and subjects
+-            this, pool = qname, ([], [], [])
++            this, pool = qname, (set(), set(), set())
+ 
+         # add subject to pool
+-        pool[mate].append(rname)
++        pool[mate].add(rname)
+ 
+     # final yield
+     if pool[0]:
+@@ -354,8 +409,8 @@ def parse_sam_file(fh):
+         yield this + '/2', pool[2]
+ 
+ 
+-def parse_sam_file_ext(fh):
+-    """Parse a SAM file (sam) to get extra information.
++def parse_sam_file_ex(fh):
++    """Parse a SAM file to get extra information.
+ 
+     Parameters
+     ----------
+@@ -374,7 +429,6 @@ def parse_sam_file_ext(fh):
+         if line[0] != '@':
+             last = line
+             break
+-
+     it = chain([last], fh) if last else fh
+ 
+     this, pool = None, ([], [], [])
+@@ -414,6 +468,147 @@ def parse_sam_file_ext(fh):
+         yield this + '/2', pool[2]
+ 
+ 
++def parse_sam_file_ft(fh, excl):
++    """Parse a SAM file to get basic information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        SAM file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    set of str
++        Subjects.
++
++    See Also
++    --------
++    parse_sam_file
++    parse_map_file_ft
++
++    Notes
++    -----
++    When a query is marked for exclusion, all corresponding unpaired, forward
++    and reverse records will be excluded.
++    """
++    last = None
++    for line in fh:
++        if line[0] != '@':
++            last = line
++            break
++    it = chain([last], fh) if last else fh
++
++    this, keep, pool = None, True, (set(), set(), set())
++    for line in it:
++        qname, flag, rname, _ = line.split('\t', 3)
++        if rname == '*':
++            continue
++
++        # 1st record of a query
++        if qname != this:
++            if keep:
++                if pool[0]:
++                    yield this, pool[0]
++                if pool[1]:
++                    yield this + '/1', pool[1]
++                if pool[2]:
++                    yield this + '/2', pool[2]
++            this = qname
++            keep = rname not in excl
++            if keep:
++                pool = (set(), set(), set())
++                pool[int(flag) >> 6 & 3].add(rname)
++
++        # 2nd to last records of a query
++        elif keep:
++            if rname in excl:
++                keep = False
++            else:
++                pool[int(flag) >> 6 & 3].add(rname)
++
++    # final yield
++    if keep:
++        if pool[0]:
++            yield this, pool[0]
++        if pool[1]:
++            yield this + '/1', pool[1]
++        if pool[2]:
++            yield this + '/2', pool[2]
++
++
++def parse_sam_file_ex_ft(fh, excl):
++    """Parse a SAM file to get extra information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        SAM file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    list of (str, None, int, int, int)
++        Records of (subject, None, length, start, end).
++
++    See Also
++    --------
++    parse_sam_file_ex
++    parse_map_file_ft
++    """
++    last = None
++    for line in fh:
++        if line[0] != '@':
++            last = line
++            break
++    it = chain([last], fh) if last else fh
++
++    this, keep, pool = None, True, ([], [], [])
++    for line in it:
++        qname, flag, rname, pos, _, cigar, _ = line.split('\t', 6)
++        if rname == '*':
++            continue
++
++        if qname != this:
++            if keep:
++                if pool[0]:
++                    yield this, pool[0]
++                if pool[1]:
++                    yield this + '/1', pool[1]
++                if pool[2]:
++                    yield this + '/2', pool[2]
++            this = qname
++            keep = rname not in excl
++            if keep:
++                pool = ([], [], [])
++                pos = int(pos)
++                length, offset = cigar_to_lens(cigar)
++                pool[int(flag) >> 6 & 3].append((
++                    rname, None, length, pos, pos + offset - 1))
++
++        elif keep:
++            if rname in excl:
++                keep = False
++            else:
++                pos = int(pos)
++                length, offset = cigar_to_lens(cigar)
++                pool[int(flag) >> 6 & 3].append((
++                    rname, None, length, pos, pos + offset - 1))
++
++    if pool[0]:
++        yield this, pool[0]
++    if pool[1]:
++        yield this + '/1', pool[1]
++    if pool[2]:
++        yield this + '/2', pool[2]
++
++
+ @lru_cache(maxsize=128)
+ def cigar_to_lens(cigar):
+     """Extract lengths from a CIGAR string.
+@@ -552,7 +747,7 @@ def parse_map_file(fh, *args):
+     ------
+     str
+         Query.
+-    list of str
++    set of str
+         Subjects.
+ 
+     Notes
+@@ -560,7 +755,7 @@ def parse_map_file(fh, *args):
+     Only the first two columns are considered.
+     """
+     # current query and subjects
+-    this, pool = None, []
++    this, pool = None, set()
+ 
+     # find first query (micro-optimization)
+     for line in fh:
+@@ -571,7 +766,7 @@ def parse_map_file(fh, *args):
+             subject, _, _ = rest.partition('\t')
+ 
+             # initialize query
+-            this, pool = query, [subject.rstrip()]
++            this, pool = query, {subject.rstrip()}
+             break
+ 
+     # iterate over the rest of file
+@@ -582,20 +777,96 @@ def parse_map_file(fh, *args):
+ 
+             # if query is the same, add subject to pool
+             if query == this:
+-                pool.append(subject.rstrip())
++                pool.add(subject.rstrip())
+ 
+             # if not, yield and reset query and subjects
+             else:
+                 yield this, pool
+-                this, pool = query, [subject.rstrip()]
++                this, pool = query, {subject.rstrip()}
+ 
+     # final yield
+     if this is not None:
+         yield this, pool
+ 
+ 
++def parse_map_file_ft(fh, excl):
++    """Parse a simple mapping file, while excluding given subjects.
++
++    Parameters
++    ----------
++    fh : file handle
++        Mapping file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    set of str
++        Subjects.
++
++    See Also
++    --------
++    parse_map_file
++    """
++    this, pool = None, set()
++
++    # whether current query should be kept
++    # i.e., subject(s) are not found in the exclusion set so far
++    keep = True
++
++    # head
++    for line in fh:
++        query, found, rest = line.partition('\t')
++        if found:
++            subject, _, _ = rest.partition('\t')
++            subject = subject.rstrip()
++            this = query
++
++            # if one subject is found in the exclusion set, the entire query
++            # (which may have multiple subjects) will not be kept
++            if subject in excl:
++                keep = False
++            else:
++                pool.add(subject)
++            break
++
++    # body
++    for line in fh:
++        query, found, rest = line.partition('\t')
++        if found:
++            subject, _, _ = rest.partition('\t')
++            subject = subject.rstrip()
++            if query != this:
++
++                # yield only if current query is kept (i.e., no subject is
++                # excluded)
++                if keep:
++                    yield this, pool
++
++                # reset status for the next unique query
++                # (no need to reset pool if subject is excluded)
++                this = query
++                keep = subject not in excl
++                if keep:
++                    pool = {subject}
++
++            # proceed with the rest of subjects only if current query is still
++            # kept, but will stop if current subject is excluded
++            elif keep:
++                if subject in excl:
++                    keep = False
++                else:
++                    pool.add(subject)
++
++    # foot
++    if this is not None and keep:
++        yield this, pool
++
++
+ def parse_b6o_file(fh):
+-    """Parse a BLAST tabular file (b6o) to get basic information.
++    """Parse a BLAST tabular file to get basic information.
+ 
+     Parameters
+     ----------
+@@ -606,7 +877,7 @@ def parse_b6o_file(fh):
+     ------
+     str
+         Query.
+-    list of str
++    set of str
+         Subjects.
+ 
+     Notes
+@@ -618,7 +889,7 @@ def parse_b6o_file(fh):
+     .. _BLAST manual:
+         https://www.ncbi.nlm.nih.gov/books/NBK279684/
+     """
+-    this, pool = None, []
++    this, pool = None, set()
+ 
+     # head
+     for line in fh:
+@@ -626,7 +897,7 @@ def parse_b6o_file(fh):
+             qseqid, sseqid, _ = line.split('\t', 2)
+         except ValueError:
+             continue
+-        this, pool = qseqid, [sseqid]
++        this, pool = qseqid, {sseqid}
+         break
+ 
+     # body
+@@ -636,17 +907,17 @@ def parse_b6o_file(fh):
+         except ValueError:
+             continue
+         if qseqid == this:
+-            pool.append(sseqid)
++            pool.add(sseqid)
+         else:
+             yield this, pool
+-            this, pool = qseqid, [sseqid]
++            this, pool = qseqid, {sseqid}
+ 
+     # foot
+     if this is not None:
+         yield this, pool
+ 
+ 
+-def parse_b6o_file_ext(fh):
++def parse_b6o_file_ex(fh):
+     """Parse a BLAST tabular file (b6o) to get extra information.
+ 
+     Parameters
+@@ -660,6 +931,10 @@ def parse_b6o_file_ext(fh):
+         Query.
+     list of (str, float, int, int, int)
+         Records of (subject, score, length, start, end).
++
++    See Also
++    --------
++    parse_b6o_file
+     """
+     this, pool = None, []
+ 
+@@ -693,8 +968,134 @@ def parse_b6o_file_ext(fh):
+         yield this, pool
+ 
+ 
++def parse_b6o_file_ft(fh, excl):
++    """Parse a BLAST tabular file to get basic information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        BLAST tabular file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    set of str
++        Subjects.
++
++    See Also
++    --------
++    parse_b6o_file
++    parse_map_file_ft
++    """
++    this, keep, pool = None, True, set()
++
++    # head
++    for line in fh:
++        try:
++            qseqid, sseqid, _ = line.split('\t', 2)
++        except ValueError:
++            continue
++        this = qseqid
++        if sseqid in excl:
++            keep = False
++        else:
++            pool.add(sseqid)
++        break
++
++    # body
++    for line in fh:
++        try:
++            qseqid, sseqid, _ = line.split('\t', 2)
++        except ValueError:
++            continue
++        if qseqid != this:
++            if keep:
++                yield this, pool
++            this = qseqid
++            keep = sseqid not in excl
++            if keep:
++                pool = {sseqid}
++        elif keep:
++            if sseqid in excl:
++                keep = False
++            else:
++                pool.add(sseqid)
++
++    # foot
++    if this is not None and keep:
++        yield this, pool
++
++
++def parse_b6o_file_ex_ft(fh, excl):
++    """Parse a BLAST tabular file to get extra information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        BLAST tabular file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    list of (str, float, int, int, int)
++        Records of (subject, score, length, start, end).
++
++    See Also
++    --------
++    parse_b6o_file_ex
++    parse_b6o_file_ft
++    """
++    this, keep, pool = None, True, []
++
++    # head
++    for line in fh:
++        x = line.split('\t')
++        try:
++            qseqid, sseqid, length, score = x[0], x[1], int(x[3]), float(x[11])
++        except IndexError:
++            continue
++        this = qseqid
++        if sseqid in excl:
++            keep = False
++        else:
++            sstart, send = sorted((int(x[8]), int(x[9])))
++            pool.append((sseqid, score, length, sstart, send))
++        break
++
++    # body
++    for line in fh:
++        x = line.split('\t')
++        try:
++            qseqid, sseqid, length, score = x[0], x[1], int(x[3]), float(x[11])
++        except IndexError:
++            continue
++        sstart, send = sorted((int(x[8]), int(x[9])))
++        if qseqid != this:
++            if keep:
++                yield this, pool
++            this = qseqid
++            keep = sseqid not in excl
++            if keep:
++                pool = [(sseqid, score, length, sstart, send)]
++        elif keep:
++            if sseqid in excl:
++                keep = False
++            else:
++                pool.append((sseqid, score, length, sstart, send))
++
++    # foot
++    if this is not None and keep:
++        yield this, pool
++
++
+ def parse_paf_file(fh):
+-    """Parse a PAF file (paf) to get basic information.
++    """Parse a PAF file to get basic information.
+ 
+     Parameters
+     ----------
+@@ -705,7 +1106,7 @@ def parse_paf_file(fh):
+     ------
+     str
+         Query.
+-    list of str
++    set of str
+         Subjects.
+ 
+     Notes
+@@ -727,7 +1128,7 @@ def parse_paf_file(fh):
+     .. _PAF format specification:
+         https://github.com/lh3/miniasm/blob/master/PAF.md
+     """
+-    this, pool = None, []
++    this, pool = None, set()
+ 
+     # head
+     for line in fh:
+@@ -735,7 +1136,7 @@ def parse_paf_file(fh):
+             qname, _, _, _, _, tname, _ = line.split('\t', 6)
+         except ValueError:
+             continue
+-        this, pool = qname, [tname]
++        this, pool = qname, {tname}
+         break
+ 
+     # body
+@@ -745,17 +1146,17 @@ def parse_paf_file(fh):
+         except ValueError:
+             continue
+         if qname == this:
+-            pool.append(tname)
++            pool.add(tname)
+         else:
+             yield this, pool
+-            this, pool = qname, [tname]
++            this, pool = qname, {tname}
+ 
+     # foot
+     if this is not None:
+         yield this, pool
+ 
+ 
+-def parse_paf_file_ext(fh):
++def parse_paf_file_ex(fh):
+     """Parse a PAF file (paf) to get extra information.
+ 
+     Parameters
+@@ -776,25 +1177,150 @@ def parse_paf_file_ext(fh):
+     for line in fh:
+         x = line.split('\t')
+         try:
+-            rec = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
++            record = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
+         except (IndexError, ValueError):
+             continue
+-        this, pool = x[0], [rec]
++        this, pool = x[0], [record]
+         break
+ 
+     # body
+     for line in fh:
+         x = line.split('\t')
+         try:
+-            rec = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
++            record = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
+         except (IndexError, ValueError):
+             continue
+         if x[0] == this:
+-            pool.append(rec)
++            pool.append(record)
+         else:
+             yield this, pool
+-            this, pool = x[0], [rec]
++            this, pool = x[0], [record]
+ 
+     # foot
+     if this is not None:
+         yield this, pool
++
++
++def parse_paf_file_ft(fh, excl):
++    """Parse a PAF file to get basic information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        PAF file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    set of str
++        Subjects.
++
++    See Also
++    --------
++    parse_paf_file
++    parse_map_file_ft
++    """
++    this, keep, pool = None, True, set()
++
++    # head
++    for line in fh:
++        try:
++            qname, _, _, _, _, tname, _ = line.split('\t', 6)
++        except ValueError:
++            continue
++        this = qname
++        if tname in excl:
++            keep = False
++        else:
++            pool.add(tname)
++        break
++
++    # body
++    for line in fh:
++        try:
++            qname, _, _, _, _, tname, _ = line.split('\t', 6)
++        except ValueError:
++            continue
++        if qname != this:
++            if keep:
++                yield this, pool
++            this = qname
++            keep = tname not in excl
++            if keep:
++                pool = {tname}
++        elif keep:
++            if tname in excl:
++                keep = False
++            else:
++                pool.add(tname)
++
++    # foot
++    if this is not None and keep:
++        yield this, pool
++
++
++def parse_paf_file_ex_ft(fh, excl):
++    """Parse a PAF file to get extra information, while filtering.
++
++    Parameters
++    ----------
++    fh : file handle
++        PAF file to parse.
++    excl : set
++        Subjects to exclude.
++
++    Yields
++    ------
++    str
++        Query.
++    list of (str, int, int, int, int)
++        Records of (subject, score, length, start, end).
++
++    See Also
++    --------
++    parse_paf_file_ex
++    parse_paf_file_ft
++    """
++    this, keep, pool = None, True, []
++
++    # head
++    for line in fh:
++        x = line.split('\t')
++        try:
++            record = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
++        except (IndexError, ValueError):
++            continue
++        this = x[0]
++        if x[5] in excl:
++            keep = False
++        else:
++            pool.append(record)
++        break
++
++    # body
++    for line in fh:
++        x = line.split('\t')
++        try:
++            record = (x[5], int(x[11]), int(x[10]), int(x[7]) + 1, int(x[8]))
++        except (IndexError, ValueError):
++            continue
++
++        if x[0] != this:
++            if keep:
++                yield this, pool
++            this = x[0]
++            keep = x[5] not in excl
++            if keep:
++                pool = [record]
++        elif keep:
++            if x[5] in excl:
++                keep = False
++            else:
++                pool.append(record)
++
++    # foot
++    if this is not None and keep:
++        yield this, pool
+diff --git a/woltka/cli.py b/woltka/cli.py
+index 94747f2..b436dcb 100644
+--- a/woltka/cli.py
++++ b/woltka/cli.py
+@@ -64,10 +64,17 @@ def cli():
+     help='Input filename extension following sample ID.')
+ @click.option(
+     '--samples', '-s', type=click.STRING,
+-    help='List of sample IDs to be included.')
++    help=('Sample IDs to include in the analysis. Can be a comma-separated '
++          'string or path to a list file. Also defines the order of samples '
++          'in the output.'))
+ @click.option(
+     '--demux/--no-demux', default=None,
+     help='Demultiplex alignment by first underscore in query identifier.')
++@click.option(
++    '--exclude', '-x', type=click.STRING,
++    help=('Subject IDs to exclude while parsing alignments. Can be a comma-'
++          'separated string or path to a list file. If an alignment is hit, '
++          'the entire query (and its paired mate, if any) will be dropped.'))
+ @click.option(
+     '--trim-sub', 'trimsub', is_flag=False, flag_value='_',
+     help=('Trim subject IDs at the last given delimiter. Default: "_", or '
+@@ -175,7 +182,7 @@ def cli():
+ # performance
+ @click.option(
+     '--chunk', type=click.INT, default=None,
+-    help='Number of alignment lines to read and parse in each chunk.')
++    help='Number of queries to read and parse in each chunk of alignment.')
+ @click.option(
+     '--cache', type=click.INT, default=1024,
+     help='Number of recent results to cache for faster classification.')
+diff --git a/woltka/ordinal.py b/woltka/ordinal.py
+index 46b0ca7..f3fa833 100644
+--- a/woltka/ordinal.py
++++ b/woltka/ordinal.py
+@@ -15,10 +15,10 @@
+ from itertools import chain
+ from bisect import bisect
+ 
+-from .align import infer_align_format, assign_parser
++from .align import iter_align
+ 
+ 
+-def ordinal_mapper(fh, coords, idmap, fmt=None, n=1000000, th=0.8,
++def ordinal_mapper(fh, coords, idmap, fmt=None, excl=None, n=1000000, th=0.8,
+                    prefix=False):
+     """Read an alignment file and match reads and genes in an ordinal system.
+ 
+@@ -32,6 +32,8 @@ def ordinal_mapper(fh, coords, idmap, fmt=None, n=1000000, th=0.8,
+         Gene identifiers.
+     fmt : str, optional
+         Alignment file format.
++    excl : set, optional
++        Subjects to exclude.
+     n : int, optional
+         Number of unique queries per chunk.
+     th : float
+@@ -51,15 +53,7 @@ def ordinal_mapper(fh, coords, idmap, fmt=None, n=1000000, th=0.8,
+     dict of set of str
+         Subject(s) queue.
+     """
+-    # determine alignment file format
+-    if not fmt:
+-        fmt, head = infer_align_format(fh)
+-        it = chain(iter(head), fh)
+-    else:
+-        it = fh
+-
+-    # assign parser for given format
+-    parser = assign_parser(fmt, ext=True)
++    it = iter_align(fh, fmt, excl, True)
+ 
+     # cached list of query Ids for reverse look-up
+     # gene Ids are unique, but read Ids can have duplicates (i.e., one read is
+@@ -127,7 +121,7 @@ def flush():
+     target = n
+ 
+     # parse alignment file
+-    for i, (query, records) in enumerate(parser(it)):
++    for i, (query, records) in enumerate(it):
+ 
+         # when chunk limit is reached
+         if i == target:
+diff --git a/woltka/tests/data/README.md b/woltka/tests/data/README.md
+index d71ec27..e27d377 100644
+--- a/woltka/tests/data/README.md
++++ b/woltka/tests/data/README.md
+@@ -42,7 +42,7 @@ In addition, `nucl/` contains the mappings from nucleotide sequence accessions (
+ 
+ Woltka output files generated from the provided alignments and classification systems. The commands for generating those files are:
+ 
+-`bowtie2.ogu.tsv`: Generate an [OGU table](../../../doc/ogu.md) (just assign, don't classify).
++`bowtie2.ogu.tsv`: Generate an [OGU table](../../../doc/ogu.md) (just assign, don't classify) from Bowtie2 alignment results.
+ 
+ ```bash
+ woltka classify -i align/bowtie2 -o bowtie2.ogu.tsv
+@@ -80,7 +80,7 @@ woltka classify \
+ 
+ `blastn.species.biom`: Same as above, replacing `.tsv` with `.biom`.
+ 
+-`burst.genus.tsv`:
++`burst.genus.tsv`: Taxonomic profiling of BURST alignment results (in the standard BLAST tabular format) using the NCBI taxonomy database.
+ 
+ ```bash
+ woltka classify \
+@@ -127,6 +127,12 @@ woltka classify \
+   --output bt2sho.order.cpm.tsv
+ ```
+ 
++`bt2sho.filt.ogu.tsv`: Filter out all reads that are mapped to reference sequence "G000215745" prior to classification. If a read is simultaneously mapped to multiple reference sequences, as long as one of them is "G000215745", all results will be discarded.
++
++```bash
++woltka classify -i align/bt2sho -x G000215745 -o bt2sho.filt.ogu.tsv
++```
++
+ `burst.process.tsv`: Functional profiling to GO biological processes.
+ 
+ ```bash
+diff --git a/woltka/tests/data/output/bt2sho.filt.ogu.tsv b/woltka/tests/data/output/bt2sho.filt.ogu.tsv
+new file mode 100644
+index 0000000..31cd015
+--- /dev/null
++++ b/woltka/tests/data/output/bt2sho.filt.ogu.tsv
+@@ -0,0 +1,50 @@
++#FeatureID	S01	S02	S03	S04	S05
++G000006845	0	0	8	0	0
++G000006925	0	2	92	0	2
++G000007145	0	0	0	0	69
++G000007265	0	0	0	17	0
++G000007325	0	19	0	0	176
++G000007465	0	8	0	0	0
++G000007525	0	0	0	1	0
++G000007785	7	0	0	0	0
++G000007845	0	0	5	0	0
++G000007985	0	0	0	0	91
++G000008165	0	0	5	0	0
++G000008505	0	0	2	1	0
++G000008625	0	0	46	0	0
++G000008865	0	1	90	0	0
++G000009065	0	0	7	0	1
++G000009345	0	0	495	0	4
++G000009925	0	219	0	0	0
++G000011545	61	0	18	0	0
++G000011705	84	0	22	0	0
++G000011985	0	0	17	0	0
++G000012005	0	1	62	0	0
++G000014205	0	5	0	0	0
++G000014525	0	0	0	0	15
++G000014805	0	0	0	0	785
++G000015005	140	0	0	0	0
++G000017045	0	52	0	0	0
++G000017145	0	61	0	0	0
++G000018865	10	0	0	0	0
++G000024905	0	0	0	0	45
++G000025565	0	2	1	0	0
++G000026325	0	2	70	0	2
++G000026345	0	2	70	0	1
++G000027165	0	0	126	0	0
++G000063585	0	61	0	0	0
++G000091545	1298	0	0	0	0
++G000092025	0	0	18	0	0
++G000146165	0	542	0	0	0
++G000174395	0	0	0	45	0
++G000183345	0	2	55	0	1
++G000185905	4	0	0	5	0
++G000191145	0	0	0	0	8
++G000195715	0	0	0	11	0
++G000195735	0	0	41	0	0
++G000195855	0	0	0	0	70
++G000195995	0	1	1	0	329
++G000240185	2	586	2	0	0
++G000299455	0	3	341	0	1
++G000317935	0	0	0	3	0
++G000318015	0	0	0	3	0
+diff --git a/woltka/tests/test_align.py b/woltka/tests/test_align.py
+index 4b2a506..5300838 100644
+--- a/woltka/tests/test_align.py
++++ b/woltka/tests/test_align.py
+@@ -16,10 +16,12 @@
+ 
+ from woltka.file import openzip
+ from woltka.align import (
+-    plain_mapper, range_mapper, infer_align_format, assign_parser,
+-    parse_sam_file, parse_sam_file_ext, cigar_to_lens, cigar_to_lens_ord,
+-    parse_sam_file_pd, parse_map_file, parse_b6o_file, parse_b6o_file_ext,
+-    parse_paf_file, parse_paf_file_ext)
++    plain_mapper, range_mapper, iter_align, infer_align_format, assign_parser,
++    parse_sam_file, parse_sam_file_ex, parse_sam_file_ft, parse_sam_file_ex_ft,
++    cigar_to_lens, cigar_to_lens_ord, parse_sam_file_pd,
++    parse_map_file, parse_map_file_ft,
++    parse_b6o_file, parse_b6o_file_ex, parse_b6o_file_ft, parse_b6o_file_ex_ft,
++    parse_paf_file, parse_paf_file_ex, parse_paf_file_ft, parse_paf_file_ex_ft)
+ 
+ 
+ class AlignTests(TestCase):
+@@ -86,6 +88,12 @@ def _res2lst(res):
+         obs = plain_mapper(aln, fmt='map', n=5)
+         self.assertTupleEqual(_res2lst(obs), exp)
+ 
++        # exclude a subject
++        aln.seek(0)
++        obs = plain_mapper(aln, excl={'G1'})
++        exp = ((['R4', 'R5'], [{'G4'}, {'G5'}]),)
++        self.assertTupleEqual(_res2lst(obs), exp)
++
+         # empty alignment
+         with self.assertRaises(ValueError) as ctx:
+             list(plain_mapper(StringIO()))
+@@ -122,11 +130,29 @@ def _res2lst(res):
+         self.assertListEqual(list(obs[0]), [x[0] for x in exp])
+         self.assertListEqual(list(obs[1]), [x[1] for x in exp])
+ 
++        # specify format
+         aln.seek(0)
+         obs = _res2lst(range_mapper(aln, fmt='b6o'))[0]
+         self.assertListEqual(list(obs[0]), [x[0] for x in exp])
+         self.assertListEqual(list(obs[1]), [x[1] for x in exp])
+ 
++        # exclude a subject
++        aln.seek(0)
++        obs = _res2lst(range_mapper(aln, excl={'G1'}))[0]
++        self.assertListEqual(list(obs[0]), [x[0] for x in exp[2:]])
++        self.assertListEqual(list(obs[1]), [x[1] for x in exp[2:]])
++
++    def test_iter_align(self):
++        line = 'S1/1	NC_123456'
++        obs = list(iter_align(StringIO(line)))
++        self.assertTupleEqual(obs[0], ('S1/1', {'NC_123456'}))
++        obs = list(iter_align(StringIO(line), fmt='map'))
++        self.assertTupleEqual(obs[0], ('S1/1', {'NC_123456'}))
++        obs = list(iter_align(StringIO(line), excl={'abc'}))
++        self.assertTupleEqual(obs[0], ('S1/1', {'NC_123456'}))
++        obs = list(iter_align(StringIO(line), extr=True))
++        self.assertTupleEqual(obs[0], ('S1/1', {'NC_123456'}))
++
+     def test_infer_align_format(self):
+         # simple cases
+         # map
+@@ -186,17 +212,29 @@ def test_assign_parser(self):
+         self.assertEqual(assign_parser('sam'), parse_sam_file)
+         self.assertEqual(assign_parser('paf'), parse_paf_file)
+         self.assertEqual(assign_parser('b6o'), parse_b6o_file)
+-        self.assertEqual(assign_parser('map', True), parse_map_file)
+-        self.assertEqual(assign_parser('sam', True), parse_sam_file_ext)
+-        self.assertEqual(assign_parser('paf', True), parse_paf_file_ext)
+-        self.assertEqual(assign_parser('b6o', True), parse_b6o_file_ext)
++        self.assertEqual(assign_parser('map', extr=True), parse_map_file)
++        self.assertEqual(assign_parser('sam', extr=True), parse_sam_file_ex)
++        self.assertEqual(assign_parser('paf', extr=True), parse_paf_file_ex)
++        self.assertEqual(assign_parser('b6o', extr=True), parse_b6o_file_ex)
++        self.assertEqual(assign_parser('map', filt=True), parse_map_file_ft)
++        self.assertEqual(assign_parser('sam', filt=True), parse_sam_file_ft)
++        self.assertEqual(assign_parser('paf', filt=True), parse_paf_file_ft)
++        self.assertEqual(assign_parser('b6o', filt=True), parse_b6o_file_ft)
++        self.assertEqual(assign_parser('map', extr=True, filt=True),
++                         parse_map_file_ft)
++        self.assertEqual(assign_parser('sam', extr=True, filt=True),
++                         parse_sam_file_ex_ft)
++        self.assertEqual(assign_parser('paf', extr=True, filt=True),
++                         parse_paf_file_ex_ft)
++        self.assertEqual(assign_parser('b6o', extr=True, filt=True),
++                         parse_b6o_file_ex_ft)
+         with self.assertRaises(ValueError) as ctx:
+             assign_parser('xyz')
+         self.assertEqual(str(ctx.exception), (
+             'Invalid format code: "xyz".'))
+ 
+     def test_parse_sam_file(self):
+-        sam = iter((
++        sam = (
+             # 1st line: header
+             '@HD	VN:1.0	SO:unsorted',
+             # 2nd line: normal, fully-aligned, forward strand
+@@ -211,31 +249,33 @@ def test_parse_sam_file(self):
+             'S3	83	NC_123456	452	0	100M	*	0	0	*	*',
+             'S3	163	NC_123456	378	0	80M5D15M	*	0	0	*	*',
+             'S3	355	NC_345678	133	0	100M	*	0	0	*	*',
+-            'S3	403	NC_345678	261	0	10M5I85M	*	0	0	*	*'))
+-        obs = list(parse_sam_file(sam))
+-        self.assertEqual(len(obs), 5)
+-        exp = [('S1/1', ['NC_123456']),
+-               ('S1/2', ['NC_123456']),
+-               ('S2',   ['NC_789012']),
+-               ('S3/1', ['NC_123456', 'NC_345678']),
+-               ('S3/2', ['NC_123456', 'NC_345678'])]
+-        for i in range(5):
+-            self.assertTupleEqual(obs[i], exp[i])
++            'S3	403	NC_345678	261	0	10M5I85M	*	0	0	*	*'
++        )
++        obs = list(parse_sam_file(iter(sam)))
++        exp = [
++            ('S1/1', {'NC_123456'}),
++            ('S1/2', {'NC_123456'}),
++            ('S2',   {'NC_789012'}),
++            ('S3/1', {'NC_123456', 'NC_345678'}),
++            ('S3/2', {'NC_123456', 'NC_345678'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
+ 
+         # header only
+-        sam = iter((
++        sam = (
+             '@HD	VN:1.0	SO:unsorted',
+             '@SQ	SN:G000005825	LN:4249288',
+-            '@SQ	SN:G000006175	LN:1936387'))
+-        obs = list(parse_sam_file(sam))
+-        self.assertEqual(len(obs), 0)
++            '@SQ	SN:G000006175	LN:1936387'
++        )
++        self.assertFalse(list(parse_sam_file(iter(sam))))
+ 
+-        # file is empty
+-        obs = list(parse_sam_file(iter(())))
+-        self.assertEqual(len(obs), 0)
++        # empty file
++        self.assertFalse(list(parse_sam_file(iter(()))))
+ 
+-    def test_parse_sam_file_ext(self):
+-        sam = iter((
++    def test_parse_sam_file_ex(self):
++        sam = (
+             '@HD	VN:1.0	SO:unsorted',
+             'S1	77	NC_123456	26	0	100M	*	0	0	*	*',
+             'S1	141	NC_123456	151	0	80M	*	0	0	*	*',
+@@ -244,21 +284,95 @@ def test_parse_sam_file_ext(self):
+             'S3	83	NC_123456	452	0	100M	*	0	0	*	*',
+             'S3	163	NC_123456	378	0	80M5D15M	*	0	0	*	*',
+             'S3	355	NC_345678	133	0	100M	*	0	0	*	*',
+-            'S3	403	NC_345678	261	0	10M5I85M	*	0	0	*	*'))
+-        obs = list(parse_sam_file_ext(sam))
+-        self.assertEqual(len(obs), 5)
+-        exp = [('S1/1', [('NC_123456', None, 100, 26,  125)]),
+-               ('S1/2', [('NC_123456', None,  80, 151, 230)]),
+-               ('S2',   [('NC_789012', None,  90, 186, 280)]),
+-               ('S3/1', [('NC_123456', None, 100, 452, 551),
+-                         ('NC_345678', None, 100, 133, 232)]),
+-               ('S3/2', [('NC_123456', None,  95, 378, 477),
+-                         ('NC_345678', None,  95, 261, 355)])]
+-        for i in range(5):
+-            self.assertTupleEqual(obs[i], exp[i])
+-
+-        obs = list(parse_sam_file_ext(iter(())))
+-        self.assertEqual(len(obs), 0)
++            'S3	403	NC_345678	261	0	10M5I85M	*	0	0	*	*'
++        )
++        obs = list(parse_sam_file_ex(iter(sam)))
++        exp = [
++            ('S1/1', [('NC_123456', None, 100, 26,  125)]),
++            ('S1/2', [('NC_123456', None,  80, 151, 230)]),
++            ('S2',   [('NC_789012', None,  90, 186, 280)]),
++            ('S3/1', [('NC_123456', None, 100, 452, 551),
++                      ('NC_345678', None, 100, 133, 232)]),
++            ('S3/2', [('NC_123456', None,  95, 378, 477),
++                      ('NC_345678', None,  95, 261, 355)])
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        self.assertFalse(list(parse_sam_file_ex(iter(()))))
++
++    def test_parse_sam_file_ft(self):
++        sam = (
++            '@HD	VN:1.0	SO:unsorted',
++            'S1	77	G1	80	0	50M	*	0	0	*	*',
++            'S1	141	G2	80	0	50M	*	0	0	*	*',
++            'S2	0	G2	80	0	50M	*	0	0	*	*',
++            'S2	16	G3	80	0	50M	*	0	0	*	*',
++            'S2	147	G4	80	0	50M	*	0	0	*	*',
++            'S2	99	G3	80	0	50M	*	0	0	*	*',
++            'S2	0	*	0	0	*	*	0	0	*	*',
++            'S3	83	G3	80	0	50M	*	0	0	*	*',
++            'S3	163	G1	80	0	50M	*	0	0	*	*',
++            'S3	355	G4	80	0	50M	*	0	0	*	*',
++            'S3	403	G5	80	0	50M	*	0	0	*	*',
++            'S4	99	G6	80	0	50M	*	0	0	*	*',
++            'S4	147	G6	80	0	50M	*	0	0	*	*',
++            'S4	256	G6	80	0	50M	*	0	0	*	*'
++        )
++        obs = list(parse_sam_file_ft(iter(sam), {'G1'}))
++        exp = [
++            ('S2',   {'G2', 'G3'}),
++            ('S2/1', {'G3'}),
++            ('S2/2', {'G4'}),
++            ('S4',   {'G6'}),
++            ('S4/1', {'G6'}),
++            ('S4/2', {'G6'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++
++        # single record
++        sam = ('S1	77	G1	80	0	50M	*	0	0	*	*',)
++        self.assertFalse(list(parse_sam_file_ft(iter(sam), {'G1'})))
++
++        # empty file
++        self.assertFalse(list(parse_sam_file_ft(iter(()), {'G1'})))
++
++    def test_parse_sam_file_ex_ft(self):
++        sam = (
++            '@HD	VN:1.0	SO:unsorted',
++            'S1	77	G1	80	0	50M	*	0	0	*	*',
++            'S1	141	G2	80	0	50M	*	0	0	*	*',
++            'S2	0	G2	80	0	50M	*	0	0	*	*',
++            'S2	16	G3	80	0	50M	*	0	0	*	*',
++            'S2	147	G4	80	0	50M	*	0	0	*	*',
++            'S2	99	G3	80	0	50M	*	0	0	*	*',
++            'S2	0	*	0	0	*	*	0	0	*	*',
++            'S3	83	G3	80	0	50M	*	0	0	*	*',
++            'S3	163	G1	80	0	50M	*	0	0	*	*',
++            'S3	355	G4	80	0	50M	*	0	0	*	*',
++            'S3	403	G5	80	0	50M	*	0	0	*	*',
++            'S4	99	G6	80	0	50M	*	0	0	*	*',
++            'S4	147	G6	80	0	50M	*	0	0	*	*',
++            'S4	256	G6	80	0	50M	*	0	0	*	*'
++        )
++        obs = list(parse_sam_file_ex_ft(iter(sam), {'G1'}))
++        exp = [
++            ('S2',   [('G2', None, 50, 80, 129),
++                      ('G3', None, 50, 80, 129)]),
++            ('S2/1', [('G3', None, 50, 80, 129)]),
++            ('S2/2', [('G4', None, 50, 80, 129)]),
++            ('S4',   [('G6', None, 50, 80, 129)]),
++            ('S4/1', [('G6', None, 50, 80, 129)]),
++            ('S4/2', [('G6', None, 50, 80, 129)])
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        sam = ('S1	77	G1	80	0	50M	*	0	0	*	*',)
++        self.assertFalse(list(parse_sam_file_ex_ft(iter(sam), {'G1'})))
++        self.assertFalse(list(parse_sam_file_ex_ft(iter(()), {'G1'})))
+ 
+     def test_cigar_to_lens(self):
+         self.assertTupleEqual(cigar_to_lens('150M'), (150, 150))
+@@ -272,58 +386,157 @@ def test_parse_sam_file_pd(self):
+         self.assertIsNone(parse_sam_file_pd([]))
+ 
+     def test_parse_map_file(self):
+-        aln = iter((
+-            'R1	G1',           # 1st line (normal)
+-            'R1	G2',           # 2nd line (normal, same query)
+-            'R2	G3	# note',   # 3rd line (with additional column)
+-            '',                # 4th line (empty)
+-            'R2	G4',           # 5th line (same query)
+-            '# end of file'))  # 6th line (not tab-delimited)
+-        obs = list(parse_map_file(aln))
+-        self.assertEqual(len(obs), 2)
+-        self.assertTupleEqual(obs[0], ('R1', ['G1', 'G2']))
+-        self.assertTupleEqual(obs[1], ('R2', ['G3', 'G4']))
+-
+-        obs = list(parse_map_file(iter(('Hi there!'))))
+-        self.assertEqual(len(obs), 0)
++        aln = (
++            'R1	G1',          # 1st line (normal)
++            'R1	G2',          # 2nd line (normal, same query)
++            'R2	G3	# note',  # 3rd line (with additional column)
++            '',               # 4th line (empty)
++            'R2	G4',          # 5th line (same query)
++            '# end'           # 6th line (not tab-delimited)
++        )
++        obs = list(parse_map_file(iter(aln)))
++        exp = [
++            ('R1', {'G1', 'G2'}),
++            ('R2', {'G3', 'G4'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        self.assertFalse(list(parse_map_file(iter(('hello')))))
++        self.assertFalse(list(parse_map_file(iter(()))))
++
++    def test_parse_map_file_ft(self):
++        aln = (
++            'R1	G1',
++            'R1	G2',
++            'R2	G3	# note',
++            '',
++            'R2	G4',
++            '# end'
++        )
++
++        # exclude nothing
++        obs = list(parse_map_file_ft(iter(aln), set()))
++        exp = [
++            ('R1', {'G1', 'G2'}),
++            ('R2', {'G3', 'G4'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++
++        # exclude 1st subject of 1st query, and 2nd (i.e., non-1st) subject of
++        # 2nd (i.e., non-1st) query
++        obs = list(parse_map_file_ft(iter(aln), {'G1', 'G4'}))
++        self.assertFalse(obs)
++
++        # exclude 2nd subject of 1st query, and 1st subject of 2nd query
++        obs = list(parse_map_file_ft(iter(aln), {'G2', 'G3'}))
++        self.assertFalse(obs)
++
++        # no valid mapping
++        obs = list(parse_map_file_ft(iter(('hello')), {'X'}))
++        self.assertFalse(obs)
+ 
+     def test_parse_b6o_file(self):
+-        b6o = iter((
++        b6o = (
+             '# BLAST result:',
+             'S1/1	NC_123456	100	100	0	0	1	100	225	324	1.2e-30	345',
+             'S1/2	NC_123456	95	98	2	1	2	99	708	608	3.4e-20	270',
+             'S1/2	NC_789012	80	95	5	2	3	97	337	425	5.6e-15	206',
+-            '- the end -'))
+-        obs = list(parse_b6o_file(b6o))
+-        self.assertEqual(len(obs), 2)
+-        exp = [('S1/1', ['NC_123456']),
+-               ('S1/2', ['NC_123456', 'NC_789012'])]
+-        self.assertTupleEqual(obs[0], exp[0])
+-        self.assertTupleEqual(obs[1], exp[1])
+-
+-        obs = list(parse_b6o_file(iter(('Hi there!'))))
+-        self.assertEqual(len(obs), 0)
+-
+-    def test_parse_b6o_file_ext(self):
+-        b6o = iter((
++            '# end'
++        )
++        obs = list(parse_b6o_file(iter(b6o)))
++        exp = [
++            ('S1/1', {'NC_123456'}),
++            ('S1/2', {'NC_123456', 'NC_789012'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        self.assertFalse(list(parse_b6o_file(iter(('hello')))))
++        self.assertFalse(list(parse_b6o_file(iter(()))))
++
++    def test_parse_b6o_file_ex(self):
++        b6o = (
+             '# BLAST result:',
+             'S1/1	NC_123456	100	100	0	0	1	100	225	324	1.2e-30	345',
+             'S1/2	NC_123456	95	98	2	1	2	99	708	608	3.4e-20	270',
+             'S1/2	NC_789012	80	95	5	2	3	97	337	425	5.6e-15	206',
+-            '- the end -'))
+-        obs = list(parse_b6o_file_ext(b6o))
++            '# end'
++        )
++        obs = list(parse_b6o_file_ex(iter(b6o)))
+         self.assertEqual(len(obs), 2)
+-        exp = [('S1/1', [('NC_123456', 345, 100, 225, 324)]),
+-               ('S1/2', [('NC_123456', 270, 98, 608, 708),
+-                         ('NC_789012', 206, 95, 337, 425)])]
++        exp = [
++            ('S1/1', [('NC_123456', 345, 100, 225, 324)]),
++            ('S1/2', [('NC_123456', 270, 98, 608, 708),
++                      ('NC_789012', 206, 95, 337, 425)])
++        ]
+         self.assertTupleEqual(obs[0], exp[0])
+         self.assertTupleEqual(obs[1], exp[1])
+ 
+-        obs = list(parse_b6o_file_ext(iter(('Hi there!'))))
++        obs = list(parse_b6o_file_ex(iter(('Hi there!'))))
+         self.assertEqual(len(obs), 0)
+ 
++    def test_parse_b6o_file_ft(self):
++        b6o = (
++            'S1	G1	100	100	0	0	1	100	1	100	1.1e-9	900',
++            'S2	G1	90	90	1	1	5	95	101	200	2.2e-8	800',
++            'S2	G2	80	80	2	2	10	90	201	300	3.3e-7	700',
++            'S3	G3	70	70	3	3	15	85	301	400	4.4e-6	600',
++            'S3	G1	60	60	4	4	20	80	401	500	5.5e-5	500',
++            'S4	G2	50	50	5	5	25	75	501	600	6.6e-4	400',
++            'S4	G3	40	40	6	6	30	70	601	700	7.7e-5	300',
++            '# end'
++        )
++        obs = list(parse_b6o_file_ft(iter(b6o), set()))
++        exp = [
++            ('S1', {'G1'}),
++            ('S2', {'G1', 'G2'}),
++            ('S3', {'G3', 'G1'}),
++            ('S4', {'G2', 'G3'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        obs = list(parse_b6o_file_ft(iter(b6o), {'G1'}))
++        self.assertEqual(len(obs), 1)
++        self.assertTupleEqual(obs[0], ('S4', {'G2', 'G3'}))
++        self.assertFalse(list(parse_b6o_file_ft(iter(('hello')), {'G1'})))
++        self.assertFalse(list(parse_b6o_file_ft(iter(()), {'G1'})))
++
++    def test_parse_b6o_file_ex_ft(self):
++        b6o = (
++            'S1	G1	100	100	0	0	1	100	1	100	1.1e-9	900',
++            'S2	G1	90	90	1	1	5	95	101	200	2.2e-8	800',
++            'S2	G2	80	80	2	2	10	90	201	300	3.3e-7	700',
++            'S3	G3	70	70	3	3	15	85	301	400	4.4e-6	600',
++            'S3	G1	60	60	4	4	20	80	401	500	5.5e-5	500',
++            'S4	G2	50	50	5	5	25	75	501	600	6.6e-4	400',
++            'S4	G3	40	40	6	6	30	70	601	700	7.7e-5	300',
++            '# end'
++        )
++        obs = list(parse_b6o_file_ex_ft(iter(b6o), set()))
++        exp = [
++            ('S1', [('G1', 900, 100,   1, 100)]),
++            ('S2', [('G1', 800,  90, 101, 200),
++                    ('G2', 700,  80, 201, 300)]),
++            ('S3', [('G3', 600,  70, 301, 400),
++                    ('G1', 500,  60, 401, 500)]),
++            ('S4', [('G2', 400,  50, 501, 600),
++                    ('G3', 300,  40, 601, 700)])
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        obs = list(parse_b6o_file_ex_ft(iter(b6o), {'G1'}))
++        self.assertEqual(len(obs), 1)
++        self.assertTupleEqual(obs[0], exp[3])
++        self.assertFalse(list(parse_b6o_file_ex_ft(iter(('hello')), {'G1'})))
++        self.assertFalse(list(parse_b6o_file_ex_ft(iter(()), {'G1'})))
++
+     def test_parse_paf_file(self):
+-        paf = iter((
++        paf = (
+             '# Minimap2 result:',
+             'S1/1	150	25	100	+	NC_123456	1000000	1025	1100	70	75	20'
+             '	tp:A:P	cm:i:10	s1:i:100	s2:i:0	rl:i:0',
+@@ -335,21 +548,23 @@ def test_parse_paf_file(self):
+             '	tp:A:P	cm:i:7	s1:i:55	s2:i:0	rl:i:0',
+             'S2/2	250	0	250	+	NC_789012	500000	99900	100150	245	250	0'
+             '	tp:A:P	cm:i:24	s1:i:282	s2:i:267	rl:i:0',
+-            '- the end -'))
+-        obs = list(parse_paf_file(paf))
+-        self.assertEqual(len(obs), 4)
+-        exp = [('S1/1', ['NC_123456']),
+-               ('S1/2', ['NC_123456']),
+-               ('S2/1', ['NC_789012', 'NC_345678']),
+-               ('S2/2', ['NC_789012'])]
+-        for obs_, exp_ in zip(obs, exp):
+-            self.assertTupleEqual(obs_, exp_)
+-
+-        obs = list(parse_paf_file(iter(('Hi there!'))))
+-        self.assertEqual(len(obs), 0)
+-
+-    def test_parse_paf_file_ext(self):
+-        paf = iter((
++            '- the end -'
++        )
++        obs = list(parse_paf_file(iter(paf)))
++        exp = [
++            ('S1/1', {'NC_123456'}),
++            ('S1/2', {'NC_123456'}),
++            ('S2/1', {'NC_789012', 'NC_345678'}),
++            ('S2/2', {'NC_789012'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        self.assertFalse(list(parse_paf_file(iter(('hello')))))
++        self.assertFalse(list(parse_paf_file(iter(()))))
++
++    def test_parse_paf_file_ex(self):
++        paf = (
+             '# Minimap2 result:',
+             'S1/1	150	25	100	+	NC_123456	1000000	1025	1100	70	75	20'
+             '	tp:A:P	cm:i:10	s1:i:100	s2:i:0	rl:i:0',
+@@ -361,19 +576,78 @@ def test_parse_paf_file_ext(self):
+             '	tp:A:P	cm:i:7	s1:i:55	s2:i:0	rl:i:0',
+             'S2/2	250	0	250	+	NC_789012	500000	99900	100150	245	250	0'
+             '	tp:A:P	cm:i:24	s1:i:282	s2:i:267	rl:i:0',
+-            '- the end -'))
+-        obs = list(parse_paf_file_ext(paf))
+-        self.assertEqual(len(obs), 4)
+-        exp = [('S1/1', [('NC_123456', 20, 75, 1026, 1100)]),
+-               ('S1/2', [('NC_123456', 6, 100, 1201, 1300)]),
+-               ('S2/1', [('NC_789012', 65, 150, 100001, 100150),
+-                         ('NC_345678', 50, 100, 125001, 125100)]),
+-               ('S2/2', [('NC_789012', 0, 250, 99901, 100150)])]
+-        for obs_, exp_ in zip(obs, exp):
+-            self.assertTupleEqual(obs_, exp_)
+-
+-        obs = list(parse_paf_file_ext(iter(('Hi there!'))))
+-        self.assertEqual(len(obs), 0)
++            '- the end -'
++        )
++        obs = list(parse_paf_file_ex(iter(paf)))
++        exp = [
++            ('S1/1', [('NC_123456', 20, 75, 1026, 1100)]),
++            ('S1/2', [('NC_123456', 6, 100, 1201, 1300)]),
++            ('S2/1', [('NC_789012', 65, 150, 100001, 100150),
++                      ('NC_345678', 50, 100, 125001, 125100)]),
++            ('S2/2', [('NC_789012', 0, 250, 99901, 100150)])
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        self.assertFalse(list(parse_paf_file_ex(iter(('hello')))))
++        self.assertFalse(list(parse_paf_file_ex(iter(()))))
++
++    def test_parse_paf_file_ft(self):
++        paf = (
++            'S1	100	0	100	+	G1	1000	0	100	100	100	200',
++            'S2	100	5	95	-	G1	1000	100	200	90	100	175',
++            'S2	100	10	90	+	G2	2000	200	300	80	100	150',
++            'S3	100	15	85	-	G3	3000	300	400	70	100	125',
++            'S3	100	20	80	+	G1	1000	400	500	60	100	100',
++            'S4	100	25	75	-	G2	2000	500	600	50	100	75',
++            'S4	100	30	70	+	G3	3000	600	700	40	100	50',
++            '# end'
++        )
++        obs = list(parse_paf_file_ft(iter(paf), set()))
++        exp = [
++            ('S1', {'G1'}),
++            ('S2', {'G1', 'G2'}),
++            ('S3', {'G3', 'G1'}),
++            ('S4', {'G2', 'G3'})
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        obs = list(parse_paf_file_ft(iter(paf), {'G1'}))
++        self.assertEqual(len(obs), 1)
++        self.assertTupleEqual(obs[0], ('S4', {'G2', 'G3'}))
++        self.assertFalse(list(parse_paf_file_ft(iter(('hello')), {'G1'})))
++        self.assertFalse(list(parse_paf_file_ft(iter(()), {'G1'})))
++
++    def test_parse_paf_file_ex_ft(self):
++        paf = (
++            'S1	100	0	100	+	G1	1000	0	100	100	100	200',
++            'S2	100	5	95	-	G1	1000	100	200	90	95	175',
++            'S2	100	10	90	+	G2	2000	200	300	80	90	150',
++            'S3	100	15	85	-	G3	3000	300	400	70	85	125',
++            'S3	100	20	80	+	G1	1000	400	500	60	80	100',
++            'S4	100	25	75	-	G2	2000	500	600	50	75	75',
++            'S4	100	30	70	+	G3	3000	600	700	40	70	50',
++            '# end'
++        )
++        obs = list(parse_paf_file_ex_ft(iter(paf), set()))
++        exp = [
++            ('S1', [('G1', 200, 100,   1, 100)]),
++            ('S2', [('G1', 175,  95, 101, 200),
++                    ('G2', 150,  90, 201, 300)]),
++            ('S3', [('G3', 125,  85, 301, 400),
++                    ('G1', 100,  80, 401, 500)]),
++            ('S4', [('G2',  75,  75, 501, 600),
++                    ('G3',  50,  70, 601, 700)])
++        ]
++        self.assertEqual(len(obs), len(exp))
++        for o, e in zip(obs, exp):
++            self.assertTupleEqual(o, e)
++        obs = list(parse_paf_file_ex_ft(iter(paf), {'G1'}))
++        self.assertEqual(len(obs), 1)
++        self.assertTupleEqual(obs[0], exp[3])
++        self.assertFalse(list(parse_paf_file_ex_ft(iter(('hello')), {'G1'})))
++        self.assertFalse(list(parse_paf_file_ex_ft(iter(()), {'G1'})))
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/woltka/tests/test_ordinal.py b/woltka/tests/test_ordinal.py
+index 23c4918..10704f8 100644
+--- a/woltka/tests/test_ordinal.py
++++ b/woltka/tests/test_ordinal.py
+@@ -20,7 +20,7 @@
+ from functools import partial
+ 
+ from woltka.file import openzip
+-from woltka.align import parse_b6o_file_ext, parse_sam_file_ext
++from woltka.align import parse_b6o_file_ex, parse_sam_file_ex
+ from woltka.ordinal import (
+     match_read_gene_dummy, match_read_gene, match_read_gene_naive,
+     match_read_gene_quart, ordinal_parser_dummy, ordinal_mapper,
+@@ -240,7 +240,7 @@ def test_ordinal_parser_dummy(self):
+         b6o = iter((
+             'S1/1	NC_123456	100	100	0	0	1	100	225	324	1.2e-30	345',
+             'S1/2	NC_123456	95	98	2	1	2	99	708	608	3.4e-20	270'))
+-        obs = ordinal_parser_dummy(b6o, parse_b6o_file_ext)
++        obs = ordinal_parser_dummy(b6o, parse_b6o_file_ex)
+         self.assertListEqual(obs[0], ['S1/1', 'S1/2'])
+         self.assertDictEqual(obs[1], {'NC_123456': {0: 100, 1: 98}})
+         self.assertDictEqual(obs[2], {'NC_123456': [
+@@ -259,7 +259,7 @@ def test_ordinal_parser_dummy(self):
+             'S2	0	NC_789012	186	0	50M5I20M5D20M	*	0	0	*	*',
+             # unaligned
+             'S2	16	*	0	0	*	*	0	0	*	*'))
+-        obs = ordinal_parser_dummy(sam, parse_sam_file_ext)
++        obs = ordinal_parser_dummy(sam, parse_sam_file_ex)
+         self.assertListEqual(obs[0], ['S1/1', 'S1/2', 'S2'])
+         self.assertDictEqual(obs[1], {
+             'NC_123456': {0: 100, 1: 80},
+diff --git a/woltka/tests/test_workflow.py b/woltka/tests/test_workflow.py
+index ef5e293..b54c9ab 100644
+--- a/woltka/tests/test_workflow.py
++++ b/woltka/tests/test_workflow.py
+@@ -21,9 +21,10 @@
+ from pandas.testing import assert_frame_equal
+ 
+ from woltka.workflow import (
+-    workflow, classify, parse_samples, parse_strata, build_mapper, parse_sizes,
+-    prepare_ranks, build_hierarchy, assign_readmap, strip_suffix, demultiplex,
+-    read_strata, frac_profiles, scale_profiles, round_profiles, write_profiles)
++    workflow, classify, parse_samples, parse_exclude, parse_strata,
++    build_mapper, parse_sizes, prepare_ranks, build_hierarchy, assign_readmap,
++    strip_suffix, demultiplex, read_strata, frac_profiles, scale_profiles,
++    round_profiles, write_profiles)
+ 
+ 
+ class WorkflowTests(TestCase):
+@@ -254,6 +255,22 @@ def test_parse_samples(self):
+         self.assertEqual(str(ctx.exception), (
+             '"im/not/path" is not a valid file or directory.'))
+ 
++    def test_parse_exclude(self):
++        self.assertIsNone(parse_exclude())
++
++        # comma-separated subjects
++        obs = parse_exclude('G1,G2,G3')
++        self.assertSetEqual(obs, {'G1', 'G2', 'G3'})
++
++        # subject list file
++        fp = join(self.tmpdir, 'exclude.list')
++        with open(fp, 'w') as f:
++            for x in ('G1', 'G2', 'G3'):
++                print(x, file=f)
++        obs = parse_exclude(fp)
++        self.assertSetEqual(obs, {'G1', 'G2', 'G3'})
++        remove(fp)
++
+     def test_parse_strata(self):
+         # default
+         for i in range(1, 4):
+diff --git a/woltka/util.py b/woltka/util.py
+index 03be77a..a919956 100644
+--- a/woltka/util.py
++++ b/woltka/util.py
+@@ -89,8 +89,9 @@ def sum_dict(dic, other):
+     --------
+     update_dict
+     """
++    dic_get = dic.get
+     for key, value in other.items():
+-        dic[key] = dic.get(key, 0) + value
++        dic[key] = dic_get(key, 0) + value
+ 
+ 
+ def scale_factor(s):
+diff --git a/woltka/workflow.py b/woltka/workflow.py
+index 802330d..3060e53 100644
+--- a/woltka/workflow.py
++++ b/woltka/workflow.py
+@@ -18,7 +18,7 @@
+ 
+ from os import makedirs
+ from os.path import join, basename, isfile, isdir
+-from collections import deque, defaultdict
++from collections import defaultdict
+ from functools import partial, lru_cache
+ from typing import Tuple
+ import click
+@@ -48,6 +48,7 @@ def workflow(input_fp:     str,
+              input_ext:    str = None,
+              samples:      str = None,
+              demux:       bool = None,
++             exclude:      set = None,
+              trimsub:      str = None,
+              # hierarchies
+              nodes_fps:   list = [],
+@@ -111,6 +112,9 @@ def workflow(input_fp:     str,
+     samples, files, demux = parse_samples(
+         input_fp, input_ext, samples, demux)
+ 
++    # parse subjects to exclude
++    exclude = parse_exclude(exclude)
++
+     # parse stratification files
+     stratmap = parse_strata(strata_dir, samples)
+ 
+@@ -133,8 +137,8 @@ def workflow(input_fp:     str,
+     data = classify(
+         mapper, files, samples, input_fmt, demux, trimsub, tree, rankdic,
+         namedic if name_as_id else None, root, ranks, rank2dir, outmap_zip,
+-        uniq, major, above, subok, sizes, unassigned, stratmap, chunk, cache,
+-        zippers, outcov_dir)
++        uniq, major, above, subok, sizes, unassigned, stratmap, exclude, chunk,
++        cache, zippers, outcov_dir)
+ 
+     # convert counts to fractions
+     frac_profiles(data, frac)
+@@ -174,6 +178,7 @@ def classify(mapper:  object,
+              sizes:     dict = None,
+              unasgd:    bool = False,
+              stratmap:  dict = None,
++             exclude:    set = None,
+              chunk:      int = None,
+              cache:      int = 1024,
+              zippers:   dict = None,
+@@ -234,8 +239,10 @@ def classify(mapper:  object,
+         Report unassigned sequences.
+     stratmap : dict, optional
+         Map of sample ID to stratification file.
++    exclude : set, optional
++        Subjects to exclude while reading an alignment file.
+     chunk : int, optional
+-        Number of lines per chunk to read from alignment file.
++        Number of queries per chunk to read from an alignment file.
+     cache : int, optional
+         LRU cache size for classification results at each rank.
+     zippers : dict, optional
+@@ -290,7 +297,7 @@ def classify(mapper:  object,
+             nqry, nstep = 0, -1
+ 
+             # parse alignment file by chunk
+-            for qryque, subque in mapper(fh, fmt=fmt, n=chunk):
++            for qryque, subque in mapper(fh, fmt=fmt, excl=exclude, n=chunk):
+                 nqry += len(qryque)
+ 
+                 # (optional) demultiplex and generate per-sample maps
+@@ -305,8 +312,11 @@ def classify(mapper:  object,
+                 for sample, (qryque, subque) in rmaps.items():
+ 
+                     # (optional) strip suffixes from subject Ids
+-                    subque = deque(map(tuple, map(sorted, strip_suffix(
+-                        subque, trimsub) if trimsub else subque)))
++                    if trimsub:
++                        subque = strip_suffix(subque, trimsub)
++
++                    subque = list(map(tuple, subque))
++                    # subque = list(map(tuple, map(sorted, subque)))
+ 
+                     # (optional) read strata of current sample into cache
+                     if stratmap and sample != csample:
+@@ -465,6 +475,29 @@ def parse_samples(fp:        str,
+     return samples, files, demux
+ 
+ 
++def parse_exclude(exclude: str = None) -> set:
++    """Get a set of subject IDs to exclude while parsing alignments.
++
++    Parameters
++    ----------
++    exclude : str, optional
++        Comma-separated list of subject IDs, or path to subject ID list file.
++
++    Returns
++    -------
++    set
++        Subject IDs to exclude.
++    """
++    if exclude:
++        if isfile(exclude):
++            with openzip(exclude) as fh:
++                exclude = read_ids(fh)
++        else:
++            exclude = exclude.split(',')
++        click.echo(f'Number of subjects to exclude: {len(exclude)}.')
++        return set(exclude)
++
++
+ def parse_strata(fp:       str = None,
+                  samples: list = None) -> dict:
+     """Get a map of sample Ids to mapping files for stratification.
+@@ -511,7 +544,7 @@ def build_mapper(coords_fp:  str = None,
+     overlap : int, optional
+         Read/gene overlapping percentage threshold.
+     chunk : int, optional
+-        Number of lines per chunk to read from alignment file.
++        Number of queries per chunk to read from an alignment file.
+     zippers : dict, optional
+         External compression programs.
+ 
+@@ -822,7 +855,7 @@ def demultiplex(qryque:  list,
+ 
+     Returns
+     -------
+-    dict of (deque, deque)
++    dict of (list, list)
+         Per-sample read-to-subject(s) maps.
+ 
+     Notes
+@@ -837,7 +870,7 @@ def demultiplex(qryque:  list,
+         samset = set(samples)
+ 
+     # per-sample read and subject(s) queues
+-    qryques, subques = defaultdict(deque), defaultdict(deque)
++    qryques, subques = defaultdict(list), defaultdict(list)
+ 
+     # current sample Id (it can be None so start with False)
+     csample = False

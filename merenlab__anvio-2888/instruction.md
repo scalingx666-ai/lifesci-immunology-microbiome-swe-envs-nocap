@@ -1,0 +1,35 @@
+# Issue
+
+**Title:** Fix codon usage, plotting, and saved trees in `anvi-compute-trnaseq-functional-affinity`
+
+## Description
+
+This PR fixes problems in `anvi-compute-trnaseq-functional-affinity`. These include that codon statistics were computed incorrectly for bins, and the "plot-only" mode, which uses affinity and codon data that was already generated, had various errors.
+
+**Codon usage**
+- Compute codon usage separately for each bin. With `-C` or `-B`, codon usage was computed once over every bin of the collection — including bins not listed in the bin IDs file provided by `-B` — and assigned to the first bin. The first bin's affinities therefore came from the genes of all bins, and the other bins got no affinities. Running with a single bin ID given by `-b` was not affected. Genes selected with `--gene-caller-ids` now get their affinities in the bin that contains them, rather than all in the first bin. A bin with none of the selected genes gets no affinities, and a selected gene outside the analyzed bins raises an error.
+- Save codon frequencies and codon trees only for genes with affinities. With `--gene-affinity` and several genomes (a collection without `-b`, `--internal-genomes`, or `--external-genomes`), `--save-codon-frequencies` and `--save-codon-trees` also included genes without affinities, such as genes removed by `--gene-min-total-codons` or not selected with `--gene-caller-ids`. For a single genome, the program passes the IDs of the genes with affinities to `SingleGenomeCodonUsage`, which returns codon frequencies for only those genes. `MultiGenomeCodonUsage`, used for several genomes, takes no gene IDs and returned every gene of the genome, so the program now subsequently removes the genes without affinities from the returned values. Function affinities were not affected, as both classes select functions by accession.
+- Fix the codon outputs of `--compare-all-function-sources`, which reports multiple functional annotation sources side-by-side. A loop over the table's functions reused the variable holding the 'all_functions' key. A single genome then requested codon usage of only the last function source in its table, failing with a false error that sources were missing. Codon tables were also stored under that source instead of 'all_functions', which made codon trees and `--plot` dendrograms fail.
+
+**Plot-only mode**
+- Load affinity tables. The check of the table's column names always raised an error, so every table failed to load. Behind that check, gene tables failed because the loader looked for function sources in them; a table with several genomes had all its genomes merged under the first genome's name; the code referred to some options by wrong names.
+- Load codon tables (`--plot-codon-file`). Genome names were looked up among the table's columns instead of its `genome_name` values, so every genome was reported missing.
+- Draw loaded codon and sample trees as they are. `clustering.get_linkage_from_tree` called a method that ete3 trees lack, so it always failed. Even if it had run, it re-clustered the tree's leaf-to-leaf distances with the linkage method of the options, which can give a different tree. The function now converts the tree directly into a scipy linkage that keeps the tree's topology and leaf order. A node with more than two children merges them one by one at its height. Table rows are now ordered like the linkage's leaves, as seaborn expects; the old code reversed them. Gene trees, whose leaves are gene caller IDs, now pass the Newick check and match the table's IDs.
+- Fix plotting with a loaded codon tree (`--plot-codon-tree-file`). The run tried to compute codon frequencies, which requires a contigs database that plot-only runs don't have, and failed. The dendrogram comes from the tree, so codon frequencies are no longer computed.
+- Refuse saves that need computed data. Plot-only runs have no isoacceptor abundance ratios or codon weights, and they have codon frequencies only from `--plot-codon-file`, so options saving data a run lacks are now refused at the start.
+- Require `--seeds-specific-txt` only to compute affinities. Plot-only runs never read it but had to pass it.
+- Name the samples of `--select-samples-txt` that are missing from the loaded table, which the error left out.
+- Correct the `--plot` help. It said that a normalization method in a loaded table's file name, as in `AFFINITY-min-max.txt`, would be added to the plot's path and set its color scale, but the program never read the method from the file name. The help now says that a loaded table is plotted on the color scale of raw affinities, and that passing a normalized table's method to `--normalize-affinity` adds a plot on that method's scale.
+
+**Plots and trees**
+- Fix plots and codon trees of genes. Code that labels rows was reading the function source of every table, which gene tables lack, so `--gene-affinity` with `--plot` or `--save-codon-trees` failed in every mode. One such read, in a KEGG BRITE block, tested the index of the source column instead of its values, so it never ran for functions. The code block was removed.
+- Keep codon tree labels out of saved tables, which sometimes had an extra 'label' column. With `--separate-genomes --separate-function-sources`, the labels were removed too early, so some plots and codon trees failed.
+- Fix `--no-codon-dendrogram`, which never worked. Plots without the dendrogram had no row labels, so they failed. Plot-only mode refused the flag.
+- Fix plots of runs that save trees without drawing them. Linkages made only to save trees have no plot linkage, but plotting looked one up, so `--plot --save-sample-trees` without `--plot-sample-dendrogram` failed, as did `--plot --no-codon-dendrogram --save-codon-trees`.
+- Skip the codon dendrogram and tree of a single function or gene, with a warning. A single row cannot be clustered, so a genome or function source with one function or gene to plot or save made the run fail.
+- Add the function source to plot paths when several sources are plotted. A plot is made for each source, but the source was added to the path only with `--separate-function-sources`, so otherwise each source's plot overwrote the previous one.
+- Name trees `-CODONS.nwk` and `-SAMPLES.nwk`, as the help says. Both kinds of trees were saved to `<root>-<genome>-<source>.nwk`, so the sample tree of raw affinities overwrote the codon tree when both were saved. As the help also says, the source is left out with `--gene-affinity` or `--compare-all-function-sources`, where paths had used the internal keys 'genes' and 'all_functions'.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `d78becfef3e1`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

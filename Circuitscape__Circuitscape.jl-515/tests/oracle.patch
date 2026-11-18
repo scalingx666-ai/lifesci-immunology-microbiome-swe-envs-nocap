@@ -1,0 +1,435 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index 4602fcb6..b726191d 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -87,7 +87,7 @@ All Circuitscape configuration is done through an `.ini` file. Below is a comple
+ |----------|------|---------|-------------|
+ | `solver` | String | `cg+amg` | Linear solver to use. Values: `cg+amg` (iterative, recommended for large grids), `cholmod` (direct, uses more memory), `accelerate` (direct, macOS only, requires [AppleAccelerate.jl](https://github.com/JuliaLinearAlgebra/AppleAccelerate.jl)), `pardiso` (direct, requires [Pardiso.jl](https://github.com/JuliaSparse/Pardiso.jl)). Also accepted: `amg+cg`, `cholesky`, `cholfact`, `mklpardiso`, `apple_accelerate`. Any other value is an error. |
+ | `precision` | String | `double` | Floating-point precision. Values: `double`, `single` (either case). Single precision is supported and tested for `cg+amg`, `cholmod` and `accelerate`; `pardiso` is double-only and switches to double with a warning. See the accuracy note under *Convergence Checks* in [On Solvers and Computation Time](compute.md). |
+-| `use_64bit_indexing` | Boolean | `True` | If `True`, use 64-bit integer indexing. Required for very large grids. |
++| `use_64bit_indexing` | Boolean | `False` | If `True`, always use 64-bit integer indices for node numbers and the sparse matrices. If `False`, 32-bit indices are used whenever the input fits (fewer than 100 million cells or network nodes with `cg+amg`, fewer than 8 million with the direct solvers whose Cholesky factor must fit 32-bit indices too, and a network's twice-edge count below 2^31), and 64-bit indices otherwise. 32-bit indices halve the memory of the graph's index arrays, the connected components, the AMG hierarchy and the index arrays of the CHOLMOD factor; the results are identical. |
+ | `cholmod_batch_size` | Integer | `32` | Number of right-hand sides the direct solvers (`cholmod`, `pardiso`, `accelerate`) solve at once in pairwise mode. Postprocessing of each batch runs across threads. Ignored by `cg+amg`. |
+ | `residual_tolerance` | Float | `auto` | Every linear solve is accepted only if its true relative residual `‖Gv − b‖ / ‖b‖` is below this. `auto` means `1e-4` in double precision and `1e-3` in single. With `cg+amg`, a solve that stops short is retried with tighter Krylov tolerances before the run is aborted. |
+ | `parallelize` | Boolean | `False` | If `True`, run pair solves (or per-focal-node solves) in parallel using Julia threads. Start Julia with `julia -t N` for N threads; see *Parallelism* below. |
+diff --git a/ext/CircuitscapeAppleAccelerateExt.jl b/ext/CircuitscapeAppleAccelerateExt.jl
+index 818b705e..cbe37a1d 100644
+--- a/ext/CircuitscapeAppleAccelerateExt.jl
++++ b/ext/CircuitscapeAppleAccelerateExt.jl
+@@ -3,14 +3,15 @@ module CircuitscapeAppleAccelerateExt
+ using AppleAccelerate
+ using SparseArrays
+ using LinearAlgebra
+-import Circuitscape: AccelerateSolver, construct_cholesky_factor, solve_linear_system, refine_columns!
++import Circuitscape: AccelerateSolver, construct_cholesky_factor, solve_linear_system,
++                     refine_columns!, regularize
+ 
+-function construct_cholesky_factor(matrix, ::AccelerateSolver)
+-    T = eltype(matrix)
+-    regularized = matrix + sparse(T(10) * eps(T) * I, size(matrix)...)
+-    factor = AppleAccelerate.AAFactorization(regularized)
+-    factor
+-end
++# AppleAccelerate.jl only accepts `Int64`-indexed matrices, though it copies
++# the indices into Accelerate's own 32-bit row index / 64-bit column start
++# arrays either way, so a 32-bit matrix is converted on the way in; the copy
++# is transient.
++construct_cholesky_factor(matrix::SparseMatrixCSC{T}, ::AccelerateSolver) where T =
++    AppleAccelerate.AAFactorization(convert(SparseMatrixCSC{T,Int64}, regularize(matrix)))
+ 
+ function solve_linear_system(factor::AppleAccelerate.AAFactorization, matrix, rhs; tol = 1e-4)
+     refine_columns!(factor \ rhs, factor, matrix, rhs, tol, "Apple Accelerate")
+diff --git a/ext/CircuitscapePardisoExt.jl b/ext/CircuitscapePardisoExt.jl
+index ad3768c3..c24224b6 100644
+--- a/ext/CircuitscapePardisoExt.jl
++++ b/ext/CircuitscapePardisoExt.jl
+@@ -3,7 +3,8 @@ module CircuitscapePardisoExt
+ using Pardiso
+ using SparseArrays
+ using LinearAlgebra
+-import Circuitscape: PardisoSolver, construct_cholesky_factor, solve_linear_system, solve_linear_system!, refine_columns!
++import Circuitscape: PardisoSolver, construct_cholesky_factor, solve_linear_system, solve_linear_system!,
++                     refine_columns!, regularize
+ 
+ mutable struct PardisoFactorize
+     const ps::Pardiso.MKLPardisoSolver
+@@ -44,7 +45,7 @@ end
+ 
+ function solve_linear_system!(lhs, factor::PardisoFactorize, matrix, rhs;
+                               tol = 1e-4, resid = similar(lhs))
+-    mat = sparse(10eps(eltype(matrix)) * I, size(matrix)...) + matrix
++    mat = regularize(matrix)
+     op = PardisoOp(factor, mat)
+     for i = 1:size(lhs, 2)
+         lhs[:, i] .= op \ rhs[:, i]
+diff --git a/src/advanced.jl b/src/advanced.jl
+index 8d1716fc..5a17f789 100644
+--- a/src/advanced.jl
++++ b/src/advanced.jl
+@@ -216,7 +216,11 @@ function multiple_solver(cfg, solver, a::SparseMatrixCSC{T,V}, sources, grounds,
+     # No copy of `a` here: `asolve[r, r]` below copies, and `a` is left as is.
+     asolve = a
+     if finitegrounds[1] != -9999
+-        asolve = a + spdiagm(0 => finitegrounds)
++        # Diagonal built with the index type of `a`: `spdiagm` is always
++        # `Int` indexed and would promote a 32-bit matrix to 64-bit indices.
++        n = size(a, 1)
++        r = V(1):V(n)
++        asolve = a + sparse(r, r, finitegrounds, n, n)
+     end
+ 
+     infgrounds = findall(x -> x == Inf, grounds)
+diff --git a/src/config.jl b/src/config.jl
+index 7e90b7fd..c140072e 100644
+--- a/src/config.jl
++++ b/src/config.jl
+@@ -41,7 +41,7 @@ Base.@kwdef struct CSConfig
+     solver::SolverType = st_cg_amg
+     parallelize::Bool = false
+     precision::Precision = pr_double
+-    use_64bit_indexing::Bool = true
++    use_64bit_indexing::Bool = false   # false = 32-bit indices when the problem fits
+     cholmod_batch_size::Int = 32
+     residual_tolerance::Float64 = 0.0   # 0 = automatic: 1e-4 double, 1e-3 single
+     low_memory_mode::Bool = false
+@@ -157,7 +157,7 @@ function CSConfig(dict::Dict{String,String})
+         solver = _parse_solver(get(dict, "solver", "cg+amg")),
+         parallelize = _parse_bool(dict, "parallelize"),
+         precision = _parse_precision(get(dict, "precision", "Double")),
+-        use_64bit_indexing = _parse_bool(dict, "use_64bit_indexing", "true"),
++        use_64bit_indexing = _parse_bool(dict, "use_64bit_indexing", "false"),
+         cholmod_batch_size = parse(Int, get(dict, "cholmod_batch_size", "32")),
+         residual_tolerance = _parse_tolerance(get(dict, "residual_tolerance", "auto")),
+         low_memory_mode = _parse_bool(dict, "low_memory_mode"),
+@@ -458,7 +458,7 @@ function init_config()
+     a["log_level"] = "INFO"
+     a["cholmod_batch_size"] = "32"
+     a["residual_tolerance"] = "auto"
+-    a["use_64bit_indexing"] = "true"
++    a["use_64bit_indexing"] = "false"
+     a["write_as_tif"] = "false"
+     a["suppress_messages"] = "false"
+     a
+diff --git a/src/core.jl b/src/core.jl
+index 3ed3525b..520ab450 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -521,6 +521,21 @@ function solve_pairs!(handle_pair, factor, solver::DirectSolver, matrix::SparseM
+     nothing
+ end
+ 
++"""
++    regularize(matrix)
++
++`matrix + 10ε I`: the diagonal shift that makes a component's singular
++Laplacian positive definite for the direct solvers. The identity is built
++with the index type of `matrix`; `sparse(c * I, n, n)` is always `Int`
++indexed, and adding it silently promoted a 32-bit matrix, and the factor
++built from it, back to 64-bit indices.
++"""
++function regularize(matrix::SparseMatrixCSC{T,V}) where {T,V}
++    n = size(matrix, 1)
++    r = V(1):V(n)
++    matrix + sparse(r, r, T(10) * eps(T), n, n)
++end
++
+ # TODO: In the pardiso case, we're not really constructing the factor
+ # So can we make this consistent?
+ function construct_cholesky_factor(matrix, ::CholmodSolver)
+@@ -529,7 +544,20 @@ function construct_cholesky_factor(matrix, ::CholmodSolver)
+     # `matrix + shift*I`) instead of materializing that sum as a second sparse
+     # matrix; the factor is bit-identical. `refine_columns!` keeps measuring
+     # the residual against the unshifted `matrix`, as before.
+-    cholesky(matrix; shift = T(10) * eps(T))
++    try
++        cholesky(matrix; shift = T(10) * eps(T))
++    catch e
++        # CHOLMOD's 32-bit variant refuses a factor whose index arrays
++        # exceed 2^31 entries ("problem too large"). The index type was
++        # chosen from the node count before the fill was known, so say
++        # what to do rather than surface CHOLMOD's message.
++        if e isa SparseArrays.CHOLMOD.CHOLMODException && eltype(rowvals(matrix)) === Int32
++            error("CHOLMOD could not factorize a component of $(size(matrix, 1)) nodes " *
++                  "with 32-bit indices ($(e.msg)): the Cholesky factor is too large for " *
++                  "them. Set use_64bit_indexing = true, or use the cg+amg solver.")
++        end
++        rethrow()
++    end
+ end
+ 
+ 
+diff --git a/src/io.jl b/src/io.jl
+index 1a73d0d7..754f9ca7 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -421,18 +421,73 @@ function read_included_pairs(V, filename; starts_from_zero = false)
+ 
+ end
+ 
+-function get_network_data(T, V, cfg)::NetworkData{T,V}
++"""
++    index_type(cfg, nnodes, nnz) -> Int32 or Int64
++
++Integer type for node numbers and sparse matrix indices of a problem with
++node numbers up to `nnodes` and at most `nnz` stored matrix entries: `Int32`
++when `nnodes` is below `int32_max_nodes(cfg.solver)` and `nnz`
++fits, which halves the index memory of the graph, its connected components,
++the AMG hierarchy and the CHOLMOD factor's index arrays, and `Int64`
++otherwise or when `cfg.use_64bit_indexing` is set. Every downstream step is
++generic in the type.
++"""
++index_type(cfg, nnodes, nnz) =
++    (!cfg.use_64bit_indexing && nnodes < int32_max_nodes(cfg.solver) &&
++     nnz < typemax(Int32)) ? Int32 : Int64
++
++"""
++    int32_max_nodes(solver) -> Int
++
++Largest node count solved with 32-bit indices for a solver:
++`INT32_MAX_NODES_ITERATIVE` (100 million) for `cg+amg`, whose memory is a
++small multiple of the Laplacian, and `INT32_MAX_NODES_DIRECT` (8 million) for
++the direct solvers, whose factor must fit 32-bit indices too. The fill of a
++Cholesky factor of a grid Laplacian grows faster than linearly and crosses
++2^31 entries around 15 to 20 million cells with the default ordering, so
++the direct limit keeps a margin of two. Above the limit the run uses 64-bit
++indices; `use_64bit_indexing = true` forces them at any size.
++"""
++int32_max_nodes(solver::SolverType) =
++    solver == st_cg_amg ? INT32_MAX_NODES_ITERATIVE : INT32_MAX_NODES_DIRECT
++
++const INT32_MAX_NODES_ITERATIVE = 100_000_000
++const INT32_MAX_NODES_DIRECT = 8_000_000
++
++# Stored entries of a raster Laplacian: at most 4 undirected edges per cell
++# (8 neighbours), both orientations stored, plus the diagonal.
++raster_nnz_bound(ncells) = 9 * ncells + 1
++
++"""
++    get_network_data(T, cfg) -> NetworkData
++    get_network_data(T, V, cfg)
++
++Read a network's edge list, focal nodes, sources and grounds. The node number
++type `V` is chosen by [`index_type`](@ref) from the largest node number and
++the edge count unless given.
++"""
++function get_network_data(T, cfg)
++    i, j, v, starts_from_zero = load_graph(Int64, cfg.habitat_file, T)
++    m = max(maximum(i), maximum(j))
++    V = index_type(cfg, m, 2 * length(i) + m)
++    @info("Node indices: $V")
++    _get_network_data(T, V, cfg, (Vector{V}(i), Vector{V}(j), v), starts_from_zero)
++end
++
++function get_network_data(T, V, cfg)
++    i, j, v, starts_from_zero = load_graph(V, cfg.habitat_file, T)
++    _get_network_data(T, V, cfg, (i, j, v), starts_from_zero)
++end
++
++function _get_network_data(T, V, cfg, (i, j, v), starts_from_zero)::NetworkData{T,V}
+ 
+     hab_is_res = cfg.habitat_map_is_resistances
+-    hab_file = cfg.habitat_file
+     fp_file = cfg.point_file
+     source_file = cfg.source_file
+     ground_file = cfg.ground_file
+ 
+     is_pairwise = cfg.scenario == sc_pairwise
+ 
+-    i,j,v,starts_from_zero = load_graph(V, hab_file, T)
+-
+     if hab_is_res
+         v = 1 ./ v
+     end
+@@ -461,11 +516,40 @@ function get_network_data(T, V, cfg)::NetworkData{T,V}
+     NetworkData((i,j,v), fp, source_list, ground_list, included_pairs)
+ end
+ 
+-function load_raster_data(T, V, cfg)::RasterData{T,V}
++"""
++    load_raster_data(T, cfg) -> RasterData
++    load_raster_data(T, V, cfg)
+ 
+-    # Habitat file
+-    hab_file = cfg.habitat_file
+-    hab_is_res = cfg.habitat_map_is_resistances
++Read the habitat raster and everything `cfg` names alongside it. The node
++number type `V` is chosen by [`index_type`](@ref) from the number of cells
++unless given.
++"""
++function load_raster_data(T, cfg)
++    cellmap, hbmeta = read_habitat(T, cfg)
++    ncells = length(cellmap)
++    V = index_type(cfg, ncells, raster_nnz_bound(ncells))
++    @info("Node indices: $V")
++    _load_raster_data(T, V, cfg, cellmap, hbmeta)
++end
++
++load_raster_data(T, V, cfg) = _load_raster_data(T, V, cfg, read_habitat(T, cfg)...)
++
++# The habitat raster, reclassified if asked to, with its metadata.
++function read_habitat(T, cfg)
++    @info("Reading maps")
++    reclass_table = cfg.use_reclass_table ? read_reclass_table(T, cfg.reclass_file) : nothing
++    cellmap, hbmeta = read_cellmap(cfg.habitat_file, cfg.habitat_map_is_resistances, T;
++                                   reclass_table)
++    c = count(x -> x > 0, cellmap)
++    ncells = length(cellmap)
++    if ncells > 5_000_000 && cfg.solver == st_cholmod
++        @warn("The landscape has $(ncells) cells and the CHOLMOD solver is selected. CHOLMOD is a sparse direct solver that consumes a lot of memory on large grids. Consider using solver = cg+amg instead.")
++    end
++    @info("Resistance/Conductance map has $c nodes")
++    cellmap, hbmeta
++end
++
++function _load_raster_data(T, V, cfg, cellmap, hbmeta)::RasterData{T,V}
+ 
+     # Polygons
+     use_polygons = cfg.use_polygons
+@@ -493,18 +577,6 @@ function load_raster_data(T, V, cfg)::RasterData{T,V}
+     ground_file = cfg.ground_file
+     ground_is_res = cfg.ground_file_is_resistances
+ 
+-    @info("Reading maps")
+-
+-    # Read cell map, reclassifying its values first if asked to
+-    reclass_table = cfg.use_reclass_table ? read_reclass_table(T, cfg.reclass_file) : nothing
+-    cellmap, hbmeta = read_cellmap(hab_file, hab_is_res, T; reclass_table)
+-    c = count(x -> x > 0, cellmap)
+-    ncells = length(cellmap)
+-    if ncells > 5_000_000 && cfg.solver == st_cholmod
+-        @warn("The landscape has $(ncells) cells and the CHOLMOD solver is selected. CHOLMOD is a sparse direct solver that consumes a lot of memory on large grids. Consider using solver = cg+amg instead.")
+-    end
+-    @info("Resistance/Conductance map has $c nodes")
+-
+     # Read polymap
+     if use_polygons
+         polymap = read_polymap(V, polygon_file, hbmeta)
+diff --git a/src/problem.jl b/src/problem.jl
+index 8f54343a..4532a36d 100644
+--- a/src/problem.jl
++++ b/src/problem.jl
+@@ -1,24 +1,28 @@
+ """
++    load_data(T, cfg)
+     load_data(T, V, cfg)
+ 
+-Read the inputs named in `cfg`: a `RasterData` or a `NetworkData`. This and
+-the geometry construction in `build_graph` are the only steps that know
+-which of the two it is; everything downstream works on one representation.
++Read the inputs named in `cfg`: a `RasterData` or a `NetworkData` with
++values of type `T` and node numbers of type `V`. `V` is chosen by
++[`index_type`](@ref) from the size of the input unless given. This and the
++geometry construction in `build_graph` are the only steps that know which of
++the two it is; everything downstream works on one representation.
+ """
++load_data(T, cfg) = is_raster(cfg) ? load_raster_data(T, cfg) : get_network_data(T, cfg)
+ load_data(T, V, cfg) = is_raster(cfg) ? load_raster_data(T, V, cfg) :
+                                         get_network_data(T, V, cfg)
+ 
+ """
+     build_problem(data, cfg)
+-    build_problem(T, V, cfg)
++    build_problem(T, cfg)
+ 
+-The problem `cfg` describes over the loaded (or, given `T, V`, freshly read)
++The problem `cfg` describes over the loaded (or, given `T`, freshly read)
+ data: a `GraphProblem` in pairwise mode, an `AdvancedProblem` in advanced
+ mode. Both are built the same way for rasters and networks; `build_graph`,
+ `focal_nodes` and `initialize_cum` dispatch on the data type to construct the
+ graph and its output geometry.
+ """
+-build_problem(T, V, cfg) = build_problem(load_data(T, V, cfg), cfg)
++build_problem(T, cfg) = build_problem(load_data(T, cfg), cfg)
+ build_problem(data::Data, cfg) = is_advanced(cfg) ? advanced_problem(data, cfg) :
+                                                     graph_problem(data, cfg)
+ 
+diff --git a/src/run.jl b/src/run.jl
+index 24cc713e..ab18904f 100644
+--- a/src/run.jl
++++ b/src/run.jl
+@@ -37,13 +37,12 @@ function _run(cfg)
+         @warn("Pardiso solver works only in double precision. Switching precision to double.")
+         T = Float64
+     end
+-    V = cfg.use_64bit_indexing ? Int64 : Int32
+     @info("Precision used: $(_precision_str(cfg.precision))")
+     if cfg.parallelize
+         @info("Starting up Circuitscape to use $(Threads.nthreads()) threads in parallel")
+     end
+     with(CSTIMER => TimerOutput()) do
+-        r = @timeit CSTIMER[] "complete job" _compute(T, V, cfg)
++        r = @timeit CSTIMER[] "complete job" _compute(T, cfg)
+         if cfg.log_level == Logging.Debug
+             timings = CSTIMER[]
+             @info("\n", timings)
+@@ -52,8 +51,8 @@ function _run(cfg)
+     end
+ end
+ 
+-function _compute(T, V, cfg)
+-    data = @timeit CSTIMER[] "load data" load_data(T, V, cfg)
++function _compute(T, cfg)
++    data = @timeit CSTIMER[] "load data" load_data(T, cfg)
+     if is_pairwise(cfg)
+         run_pairwise(data, cfg)
+     elseif is_advanced(cfg) || is_network(cfg)
+diff --git a/test/internal.jl b/test/internal.jl
+index 7a4aa66b..ed96e4dc 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -857,3 +857,56 @@ end
+     @test rn[2, 3] ≈ 3.0
+     @test !any(f -> startswith(f, "net") && occursin("currents", f), readdir(dir))
+ end
++
++# 32-bit indices: chosen automatically when the problem fits, forced to
++# 64-bit by use_64bit_indexing, and kept through the whole pipeline. The
++# regularization used to promote a 32-bit matrix (and so the CHOLMOD factor)
++# back to 64-bit indices via `sparse(c * I, n, n)`.
++@testset "index type" begin
++    SparseMatrixCSC, sparse, nnz = SparseArrays.SparseMatrixCSC, SparseArrays.sparse, SparseArrays.nnz
++    I = LinearAlgebra.I
++    cfg =Circuitscape.parse_config("input/raster/one_to_all/11/oneToAllVerify11.ini")
++    cfg64 = Circuitscape.CSConfig(cfg; use_64bit_indexing = true)
++    @test Circuitscape.index_type(cfg, 10, 10) == Int32
++    @test Circuitscape.index_type(cfg, Circuitscape.INT32_MAX_NODES_ITERATIVE - 1, typemax(Int32) - 1) == Int32
++    @test Circuitscape.index_type(cfg, Circuitscape.INT32_MAX_NODES_ITERATIVE, 10) == Int64
++    cfgch = Circuitscape.CSConfig(cfg; solver = Circuitscape.st_cholmod)
++    @test Circuitscape.index_type(cfgch, Circuitscape.INT32_MAX_NODES_DIRECT - 1, 10) == Int32
++    @test Circuitscape.index_type(cfgch, Circuitscape.INT32_MAX_NODES_DIRECT, 10) == Int64
++    @test Circuitscape.index_type(cfgch, Circuitscape.INT32_MAX_NODES_ITERATIVE - 1, 10) == Int64
++    @test Circuitscape.index_type(cfg, 10, typemax(Int32)) == Int64
++    @test Circuitscape.index_type(cfg64, 10, 10) == Int64
++    @test Circuitscape.raster_nnz_bound(1_000_000) > nnz(model_problem(1000)) 
++
++    @test Circuitscape.load_raster_data(Float64, cfg) isa Circuitscape.RasterData{Float64,Int32}
++    @test Circuitscape.load_raster_data(Float64, cfg64) isa Circuitscape.RasterData{Float64,Int64}
++    @test Circuitscape.load_raster_data(Float32, Int64, cfg) isa Circuitscape.RasterData{Float32,Int64}
++    net = Circuitscape.parse_config("input/network/sgNetworkVerify1.ini")
++    @test Circuitscape.get_network_data(Float64, net) isa Circuitscape.NetworkData{Float64,Int32}
++    @test Circuitscape.get_network_data(Float64, Int64, net) isa Circuitscape.NetworkData{Float64,Int64}
++    @test Circuitscape.get_network_data(Float64, net).coords ==
++          Circuitscape.get_network_data(Float64, Int64, net).coords
++
++    for V in (Int32, Int64)
++        prob = Circuitscape.build_problem(Circuitscape.load_data(Float64, V, cfg), cfg)
++        @test prob.G isa SparseMatrixCSC{Float64,V}
++        @test prob.cc isa Vector{Vector{V}}
++        n = size(prob.G, 1)
++        R = Circuitscape.regularize(prob.G)
++        @test R isa SparseMatrixCSC{Float64,V}
++        @test R == prob.G + sparse(10eps() * I, n, n)
++        F = Circuitscape.construct_cholesky_factor(prob.G, Circuitscape.CholmodSolver(10))
++        @test F isa SparseArrays.CHOLMOD.Factor{Float64,V}
++        # Advanced mode's finite grounds go on the diagonal with the same index type
++        a = deepcopy(prob.G)
++        sources = zeros(n); sources[1] = 1
++        grounds = zeros(n); grounds[end] = 2.0
++        finitegrounds = copy(grounds)
++        v32 = Circuitscape.multiple_solver(cfg, Circuitscape.CholmodSolver(10), a, sources, grounds, finitegrounds)
++        @test length(v32) == n
++    end
++    # Same answers whichever index type is used
++    r32 = Circuitscape.run_onetoall(Circuitscape.load_data(Float64, Int32, cfg), cfg)
++    r64 = Circuitscape.run_onetoall(Circuitscape.load_data(Float64, Int64, cfg), cfg)
++    @test r32 == r64
++end

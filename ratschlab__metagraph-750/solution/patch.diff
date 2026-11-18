@@ -1,0 +1,164 @@
+diff --git a/metagraph/docs/source/traverse.rst b/metagraph/docs/source/traverse.rst
+index 6ca612f14c..12f13ccf76 100644
+--- a/metagraph/docs/source/traverse.rst
++++ b/metagraph/docs/source/traverse.rst
+@@ -184,6 +184,9 @@ Interval
+    * - ``branching.max_label_branches``
+      - How many times a column label can go on along more than one successor. An integer up to 1,000,000, or ``"unlimited"``.
+      - 0
++   * - ``branching.max_splits_per_path``
++     - How many times one path can split. An integer up to 1,000,000, or ``"unlimited"``. Raise it for a seed with many labels, where the labels part often.
++     - 64
+    * - ``bounds.max_extension_bp``
+      - How far each arm extends.
+      - 5000
+@@ -245,12 +248,13 @@ forbid, the column labels of the path end and its header labels go on.
+ Column labels have been walked on test data only. Every traversal run on the staging server so
+ far named records.
+ 
+-**Bounds.** Fixed limits bound the work for one seed, besides the extension length and the time
+-budget:
++**Bounds.** These limits bound the work for one seed, besides the extension length and the time
++budget. The first two lines are fixed:
+ 
+ - 1,000,000 steps. Reaching this limit, or the time budget, stops the whole seed.
+ - 1000 live paths and 10,000 paths per arm. Reaching one of these limits stops that arm.
+-- 64 splits per path. Reaching this limit ends that path only.
++- ``max_splits_per_path`` splits per path, 64 unless the request sets it. Reaching this limit ends
++  that path only.
+ 
+ Any of these limits marks the arm ``truncated``. ``complete_to_bp`` is then the extension up to
+ which every walk is present.
+diff --git a/metagraph/integration_tests/test_traverse.py b/metagraph/integration_tests/test_traverse.py
+index 86f02c1725..3efff49978 100644
+--- a/metagraph/integration_tests/test_traverse.py
++++ b/metagraph/integration_tests/test_traverse.py
+@@ -127,6 +127,22 @@ def test_fork(self):
+         self.assertEqual(1, len(left['paths']))
+         self.assertEqual(0, left['paths'][0]['length_bp'])
+ 
++    def test_split_limit(self):
++        seeds = [{'sequence': self.X, 'labels': ['A', 'B']}]
++        out = self._traverse({'seeds': seeds})
++        self.assertEqual(64, out['strategy']['branching']['max_splits_per_path'])
++        # no split allowed: the path ends at the fork
++        out = self._traverse({'seeds': seeds, 'strategy': {'branching': {'max_splits_per_path': 0}}})
++        right = out['results'][0]['arms']['right']
++        self.assertEqual('truncated', right['status'])
++        self.assertEqual(['max_splits_per_path'], [path['path_reason'] for path in right['paths']])
++        out = self._traverse({'seeds': seeds,
++                              'strategy': {'branching': {'max_splits_per_path': 'unlimited'}}})
++        self.assertEqual('unlimited', out['strategy']['branching']['max_splits_per_path'])
++        right = out['results'][0]['arms']['right']
++        self.assertEqual('complete', right['status'])
++        self.assertEqual(2, len(right['paths']))
++
+     def test_derived_labels_direction_and_bounds(self):
+         out = self._traverse({
+             'seeds': [{'sequence': self.X}],
+@@ -171,6 +187,7 @@ def test_invalid_requests(self):
+             {'seeds': [{'sequence': self.X, 'label': ['A']}]},
+             {'seeds': [{'sequence': self.X, 'labels': ['C']}]},
+             {'seeds': [{'sequence': self.X}], 'strategy': {'branching': {'max_label_branches': -1}}},
++            {'seeds': [{'sequence': self.X}], 'strategy': {'branching': {'max_splits_per_path': 'none'}}},
+             {'seeds': [{'sequence': self.X}] * 11},
+             {'seeds': [{'sequence': self.X}], 'graph': 'x'},
+             {'seeds': [{'sequence': self.X}], 'graphs': ['x']},  # no list of graphs here
+diff --git a/metagraph/src/cli/traverse.cpp b/metagraph/src/cli/traverse.cpp
+index 5344017a49..a3c08040c1 100644
+--- a/metagraph/src/cli/traverse.cpp
++++ b/metagraph/src/cli/traverse.cpp
+@@ -236,15 +236,20 @@ TraverseRequest parse_traverse_request(const Json::Value &json, const TraverseLi
+         }
+         if (t.has("branching")) {
+             Strict b(t.raw("branching"), "request.strategy.branching");
+-            if (b.has("max_label_branches")) {
+-                const Json::Value &v = b.raw("max_label_branches");
++            // a number in range, or "unlimited"
++            auto limit = [&](const char *key, size_t &value) {
++                if (!b.has(key))
++                    return;
++                const Json::Value &v = b.raw(key);
+                 if (v.isString() && v.asString() == "unlimited") {
+-                    st.max_label_branches = Strategy::kUnlimited;
++                    value = Strategy::kUnlimited;
+                 } else {
+                     // anything else, null included, must be a number in range
+-                    st.max_label_branches = b.uint("max_label_branches", 0, 0, 1'000'000);
++                    value = b.uint(key, 0, 0, 1'000'000);
+                 }
+-            }
++            };
++            limit("max_label_branches", st.max_label_branches);
++            limit("max_splits_per_path", st.max_splits_per_path);
+             b.done();
+         }
+         if (t.has("bounds")) {
+@@ -268,8 +273,11 @@ Json::Value strategy_to_json(const Strategy &st) {
+                    : st.direction == Strategy::LEFT ? "left" : "right";
+     j["labels"]["max_seed_labels"] = uint_json(st.max_seed_labels);
+     j["labels"]["seed_label_kind"] = st.seed_label_kind ? to_string(*st.seed_label_kind) : "auto";
+-    j["branching"]["max_label_branches"] = st.max_label_branches == Strategy::kUnlimited
+-        ? Json::Value("unlimited") : uint_json(st.max_label_branches);
++    auto limit_json = [](size_t value) {
++        return value == Strategy::kUnlimited ? Json::Value("unlimited") : uint_json(value);
++    };
++    j["branching"]["max_label_branches"] = limit_json(st.max_label_branches);
++    j["branching"]["max_splits_per_path"] = limit_json(st.max_splits_per_path);
+     j["bounds"]["max_extension_bp"] = uint_json(st.max_extension_bp);
+     j["bounds"]["time_budget_ms"] = st.time_budget_ms;
+     return j;
+diff --git a/metagraph/src/graph/traversal/walker.hpp b/metagraph/src/graph/traversal/walker.hpp
+index 903e4bb017..6104a48fe7 100644
+--- a/metagraph/src/graph/traversal/walker.hpp
++++ b/metagraph/src/graph/traversal/walker.hpp
+@@ -82,7 +82,7 @@ const char* to_string(EndReason reason);
+ struct Strategy {
+     enum Direction { BOTH, LEFT, RIGHT };
+ 
+-    // "no limit" for max_label_branches
++    // "no limit" for max_label_branches and max_splits_per_path
+     static constexpr size_t kUnlimited = std::numeric_limits<size_t>::max();
+ 
+     Direction direction = BOTH;
+@@ -101,8 +101,10 @@ struct Strategy {
+     uint64_t max_extension_bp = 5000;
+     double time_budget_ms = 30'000;
+ 
+-    // Safety caps. Not request fields: they keep a request within bounded memory.
++    // How many times a path may split (kUnlimited: the caps below bound the walk)
+     size_t max_splits_per_path = 64;
++
++    // Safety caps. Not request fields: they keep a request within bounded memory.
+     uint64_t max_steps = 1'000'000;
+     size_t max_live_paths = 1000;
+     size_t max_paths = 10'000;
+diff --git a/metagraph/tests/graph/traversal/test_walker.cpp b/metagraph/tests/graph/traversal/test_walker.cpp
+index dc81c70eeb..20bf42f700 100644
+--- a/metagraph/tests/graph/traversal/test_walker.cpp
++++ b/metagraph/tests/graph/traversal/test_walker.cpp
+@@ -771,6 +771,24 @@ TYPED_TEST(WalkerTest, SplitLimit) {
+         auto one = run(*anno, X, { "A", "B" }, st);
+         EXPECT_EQ(2u, one.arms[kRight].paths.size());
+         EXPECT_EQ(ArmResult::COMPLETE, one.arms[kRight].status);
++
++        // two forks in a row: the path of A and B splits from C after X and again after Y
++        auto c = fork_blocks(7);
++        const std::string &Y = c[0], &R = c[1], &T = c[2];
++        auto two = build_anno_graph<Graph, Annotation>(
++                kK, { X + P + Y + R, X + P + Y + T, X + Q }, { "A", "B", "C" }, mode);
++        st.max_splits_per_path = 1;
++        auto cut = run(*two, X, { "A", "B", "C" }, st);
++        check_invariants(cut.arms[kRight]);
++        EXPECT_EQ(ArmResult::TRUNCATED, cut.arms[kRight].status);
++        EXPECT_EQ(P.size() + Y.size(), cut.arms[kRight].complete_to_bp);
++        for (size_t limit : { size_t(2), Strategy::kUnlimited }) {
++            st.max_splits_per_path = limit;
++            auto all = run(*two, X, { "A", "B", "C" }, st);
++            check_invariants(all.arms[kRight]);
++            EXPECT_EQ(ArmResult::COMPLETE, all.arms[kRight].status) << mode;
++            EXPECT_EQ(3u, all.arms[kRight].paths.size()) << mode;
++        }
+     }
+ }
+ 

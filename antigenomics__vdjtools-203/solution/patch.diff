@@ -1,0 +1,150 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 37800f1e..4b2e2270 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "vdjtools"  # if the PyPI name is taken, fall back to a distinct dist name (cf. arda -> arda-mapper)
+-version = "5.2.0"
++version = "5.2.1"
+ description = "TCR/BCR repertoire analysis — Pgen/generation/inference, diversity, overlap, biomarkers (Python + C++)"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/python/vdjtools/io/convert.py b/python/vdjtools/io/convert.py
+index afb8151e..5e56e34c 100644
+--- a/python/vdjtools/io/convert.py
++++ b/python/vdjtools/io/convert.py
+@@ -298,7 +298,7 @@ def translate_junctions(nt, *, threads: int = 0) -> pl.Series:
+     return aa.zip_with(s.is_not_null() & (s.str.len_bytes() > 0), blank)
+ 
+ 
+-def _finalize(df: pl.DataFrame) -> pl.DataFrame:
++def _finalize(df: pl.DataFrame, *, collapse: bool = True) -> pl.DataFrame:
+     """Filter bad rows, collapse to unique clonotypes (summed counts), coerce to canonical.
+ 
+     Takes the frame the reader built with expressions. It used to take a list of one dict per
+@@ -309,6 +309,8 @@ def _finalize(df: pl.DataFrame) -> pl.DataFrame:
+         return schema.add_locus(schema.normalize(pl.DataFrame(schema={c: pl.Utf8 for c in
+                                 (V_CALL, D_CALL, J_CALL, JUNCTION_AA, JUNCTION_NT)})))
+     df = df.with_columns(pl.col(COUNT).cast(pl.Int64, strict=False))
++    if not collapse:
++        return schema.add_locus(schema.normalize(df, recompute_freq=True))
+     keep = (
+         pl.col(JUNCTION_NT).is_not_null() & (pl.col(JUNCTION_NT).str.len_bytes() > 0)
+         & pl.col(JUNCTION_AA).is_not_null() & (pl.col(JUNCTION_AA).str.len_bytes() > 0)
+@@ -390,18 +392,20 @@ def read_migec(path: str | os.PathLike, n_rows: int | None = None) -> pl.DataFra
+     ))
+ 
+ 
+-def read_mitcr(path: str | os.PathLike, n_rows: int | None = None) -> pl.DataFrame:
++def read_mitcr(path: str | os.PathLike, n_rows: int | None = None, *, collapse: bool = True) -> pl.DataFrame:
+     """Read a MiTCR / tcR (R package) clonotype table — the dot-separated dialect.
+ 
+     Header is ``Read.count Read.proportion CDR3.nucleotide.sequence CDR3.amino.acid.sequence
+     V.gene J.gene D.gene V.end J.start D5.end D3.end VD.insertions DJ.insertions
+-    Total.insertions``. Distinct from MiGEC's ``CDR3 nucleotide sequence`` / ``V segments``
++    Total.insertions``; tcR exports may instead use ``bestVGene`` / ``bestJGene``. Distinct from MiGEC's ``CDR3 nucleotide sequence`` / ``V segments``
+     (spaces, not dots), so it needs its own picks. ``D.gene`` may carry an ambiguous call
+     (``"TRBD1, TRBD2"``); :func:`extract_vdj` keeps the first.
+ 
+     Args:
+         path: Path to a MiTCR/tcR table.
+         n_rows: Read only the first ``n_rows`` rows.
++        collapse: Keep the historical bulk collapse/filter by default. False preserves
++            source row order, counts, ambiguous gene calls and missing calls for identity-aware callers.
+ 
+     Returns:
+         Canonical clonotype frame.
+@@ -414,18 +418,26 @@ def read_mitcr(path: str | os.PathLike, n_rows: int | None = None) -> pl.DataFra
+     count_c = _pick(lo, "read.count")
+     nt_c = _pick(lo, "cdr3.nucleotide.sequence")
+     aa_c = _pick(lo, "cdr3.amino.acid.sequence")
+-    v_c = _pick(lo, "v.gene")
+-    j_c = _pick(lo, "j.gene")
++    v_c = _pick(lo, "v.gene", "bestvgene")
++    j_c = _pick(lo, "j.gene", "bestjgene")
+     d_c = _pick(lo, "d.gene")
+     if not (count_c and nt_c and aa_c and v_c and j_c):
+         raise ValueError(f"not a MiTCR/tcR table; have {raw.columns}")
++    count = pl.col(count_c).cast(pl.Float64, strict=False).cast(pl.Int64)
++    if not collapse:
++        value = pl.col(count_c).str.strip_chars()
++        count = pl.when(value.str.contains(r"^[+]?[0-9]+(?:\.0+)?$")).then(
++            value.str.replace(r"\.0+$", "").cast(pl.Int64, strict=False)).otherwise(None)
++        if raw.select(count.is_null().any()).item():
++            raise ValueError('source rows require nonnegative int64 integer counts without missing values')
++    gene_expr = _vdj_expr if collapse else lambda col: _upper_expr(col) if col else pl.lit(None, pl.Utf8)
+     return _finalize(raw.select(
+-        _vdj_expr(v_c).alias(V_CALL), _vdj_expr(d_c).alias(D_CALL),
+-        _vdj_expr(j_c).alias(J_CALL),
++        gene_expr(v_c).alias(V_CALL), gene_expr(d_c).alias(D_CALL),
++        gene_expr(j_c).alias(J_CALL),
+         _upper_expr(nt_c).alias(JUNCTION_NT),
+         _unified_expr(aa_c).alias(JUNCTION_AA),
+-        pl.col(count_c).cast(pl.Float64, strict=False).cast(pl.Int64).alias(COUNT),
+-    ))
++        count.alias(COUNT),
++    ), collapse=collapse)
+ 
+ 
+ def read_rtcr(path: str | os.PathLike, n_rows: int | None = None) -> pl.DataFrame:
+diff --git a/python/vdjtools/io/schema.py b/python/vdjtools/io/schema.py
+index 7b5aaa93..f310b409 100644
+--- a/python/vdjtools/io/schema.py
++++ b/python/vdjtools/io/schema.py
+@@ -154,7 +154,7 @@ def normalize(df: pl.DataFrame, *, recompute_freq: bool = False,
+     for col, dtype in SCHEMA.items():
+         if col not in df.columns:
+             exprs.append(pl.lit(None, dtype=dtype).alias(col))
+-        elif col == COUNT:
++        elif col == COUNT and not df.schema[col].is_integer():
+             # Route the count through Float64: read via the all-Utf8 TSV path, a count of "5000.0"
+             # (pandas float-formats any integer column that once held a NaN) fails a direct
+             # Utf8->Int64 cast, becomes null, and recompute_frequency then reports frequency 0.0
+diff --git a/tests/python/test_convert.py b/tests/python/test_convert.py
+index 1c199e2e..c483614b 100644
+--- a/tests/python/test_convert.py
++++ b/tests/python/test_convert.py
+@@ -278,3 +278,41 @@ def test_read_immunoseq_uses_the_validated_gene_map(tmp_path):
+                  "TCRBV09-01\tTCRBD01-01\tTCRBJ02-04\t50\t50\n")
+     r = convert.read_immunoseq(p).row(0, named=True)
+     assert (r["v_call"], r["d_call"], r["j_call"]) == ("TRBV9", "TRBD1", "TRBJ2-4")
++
++
++def test_tcr_best_gene_column_aliases(tmp_path):
++    from vdjtools import io
++    p = tmp_path / "tcr.tsv"
++    p.write_text("Rank\tRead.count\tRead.proportion\tCDR3.nucleotide.sequence\tCDR3.amino.acid.sequence\tbestVGene\tbestJGene\n"
++                 "1\t7\t1.0\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2*01\tTRBJ1-1*01\n")
++    for frame in (convert.read_mitcr(p), io.read(p)):
++        assert frame.height == 1
++        assert frame["junction_aa"].item() == "CASSF"
++        assert frame["v_call"].item() == "TRBV2"
++        assert frame["j_call"].item() == "TRBJ1-1"
++        assert frame["duplicate_count"].item() == 7
++
++
++def test_mitcr_preserve_source_rows_when_not_collapsing(tmp_path):
++    p = tmp_path / "raw.tsv"
++    p.write_text("Read.count\tCDR3.nucleotide.sequence\tCDR3.amino.acid.sequence\tbestVGene\tbestJGene\n"
++                 "7\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2\tTRBJ1-1\n"
++                 "8\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2\tTRBJ1-1\n"
++                 "9\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2,TRBV3\t\n")
++    frame = convert.read_mitcr(p, collapse=False)
++    assert frame.height == 3 and frame["duplicate_count"].to_list() == [7,8,9]
++    assert frame["j_call"].null_count() == 1
++    assert frame["v_call"].to_list() == ["TRBV2", "TRBV2", "TRBV2,TRBV3"]
++    assert convert.read_mitcr(p)["duplicate_count"].to_list() == [15]
++
++
++def test_mitcr_source_counts_do_not_round_through_float(tmp_path):
++    p=tmp_path/'exact.tsv'
++    header='Read.count\tCDR3.nucleotide.sequence\tCDR3.amino.acid.sequence\tbestVGene\tbestJGene\n'
++    for value in ('9007199254740993','9007199254740993.0'):
++        p.write_text(header+value+'\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2\tTRBJ1-1\n')
++        assert convert.read_mitcr(p,collapse=False)['duplicate_count'].item()==9007199254740993
++    for value in ('-1','1.5','9223372036854775808',''):
++        p.write_text(header+value+'\tTGTGCCAGCAGCTTT\tCASSF\tTRBV2\tTRBJ1-1\n')
++        with pytest.raises(ValueError,match='integer counts'):
++            convert.read_mitcr(p,collapse=False)

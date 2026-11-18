@@ -1,0 +1,239 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bbfc94df..020da8d1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,27 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.18.1
++
++### `correct`'s coverage assignment, bounded in C++ — byte-identical
++
++`_assign_coverage` is 80 % of the stage (2.20 s of 2.74 s on a 100 k TRA amplicon). Its inner scan
++compared an integer mismatch count against a FLOAT budget one base at a time in Python, over a
++measured 3.55 M candidate diagonals per 20,000 reads.
++
++⛔ Unlike the assembler's overlap test in 2.18.0, this caller needs the **count**, not a verdict: a
++read joins the root with the longest overlap and, on a tie, the fewer mismatches — the tie-break
++~47 % of the reads the Jurkat phantom clonotype stole were decided by. `_markup.count_mismatches`
++returns the true count whenever the row is accepted and collapses to `max_mm + 1` only when the row
++is rejected anyway, so both the accept test and the tie-break see exactly what they saw before.
++
++| | before | after |
++|---|---|---|
++| `correct`, TRA amplicon 100 k | 3.23 s | **2.84 s** (1.14×) |
++| `correct`, bulk RNA-seq 660 k pairs | 1.10 s | **0.95 s** (1.16×) |
++
++`clones.tsv` byte-identical on both regimes. A patch release: no output, flag or default moves.
++
+ ## 2.18.0
+ 
+ ### `assemble` is 4.49× faster, byte-identical
+diff --git a/pyproject.toml b/pyproject.toml
+index 9d0260cf..0469360d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.18.0"
++version = "2.18.1"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/src/_markup/markup.cpp b/src/_markup/markup.cpp
+index a378274e..3a3a67b0 100644
+--- a/src/_markup/markup.cpp
++++ b/src/_markup/markup.cpp
+@@ -525,6 +525,33 @@ static bool within_mismatches(const std::string &a, const std::string &b, size_t
+     return true;
+ }
+ 
++// Mismatches between `a[a_off, a_off+n)` and `b[b_off, b_off+n)`, stopping once the count exceeds
++// `max_mm` (which it then returns as `max_mm + 1`).
++//
++// `correct._assign_coverage`'s inner loop, and the same shape as `within_mismatches` -- except
++// that this caller NEEDS the count, not a verdict: a read joins the root with the longest overlap
++// and, on a tie, the FEWER MISMATCHES. That tie-break is load-bearing. When a phantom clonotype
++// competed with the true Jurkat clone, ~47 % of the 5,758 reads it stole were exact 48-vs-48
++// overlap ties on which the losing TRUE root matched with 0 mismatches against the phantom's 1.
++//
++// Equivalence with the Python it replaces, which compared an integer count against a FLOAT budget
++// (`max_mm * ov`): for integer `mm`, `mm > budget` is exactly `mm > floor(budget)`, so the caller
++// passes `int(budget)` and the accept test `mm <= budget` is unchanged. When the scan completes,
++// the value returned IS the true count, so the tie-break sees exactly what it saw before; when it
++// exceeds, the row is rejected on the same comparison either way.
++static int count_mismatches(const std::string &a, size_t a_off,
++                            const std::string &b, size_t b_off,
++                            size_t n, int max_mm) {
++    if (a_off > a.size() || b_off > b.size()) return max_mm + 1;
++    n = std::min(n, std::min(a.size() - a_off, b.size() - b_off));
++    int mm = 0;
++    const char *pa = a.data() + a_off, *pb = b.data() + b_off;
++    for (size_t i = 0; i < n; ++i) {
++        if (pa[i] != pb[i] && ++mm > max_mm) return max_mm + 1;
++    }
++    return mm;
++}
++
+ // ---------------------------------------------------------------------------
+ // AIRR TSV row formatting.
+ //
+@@ -611,6 +638,12 @@ PYBIND11_MODULE(_markup, m) {
+           "Do a and b agree over their common length with at most max_mm mismatches? Stops at "
+           "max_mm + 1, which is the point: the assembler's overlap test decides nearly every "
+           "candidate in the first few bases and used to count all of them.");
++    m.def("count_mismatches", &count_mismatches,
++          py::arg("a"), py::arg("a_off"), py::arg("b"), py::arg("b_off"),
++          py::arg("n"), py::arg("max_mm"),
++          "Mismatches between a[a_off, a_off+n) and b[b_off, b_off+n), stopping at max_mm + 1. "
++          "Returns the TRUE count when it does not exceed max_mm -- the coverage assignment "
++          "breaks equal-overlap ties on it.");
+     m.def("project_region", &project_region,
+           py::arg("qaln"), py::arg("taln"), py::arg("ref_aln_offset"),
+           py::arg("qry_aln_offset"), py::arg("ref_start"), py::arg("ref_end"),
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index 53b19d59..e9c69af0 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.18.0"
++__version__ = "2.18.1"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/rnaseq/correct.py b/src/arda/rnaseq/correct.py
+index 485033cc..4489d0a8 100644
+--- a/src/arda/rnaseq/correct.py
++++ b/src/arda/rnaseq/correct.py
+@@ -26,6 +26,7 @@
+ 
+ import polars as pl
+ 
++from .. import _markup
+ from ..annotate.airr_out import read_airr as _read_airr
+ 
+ from ._res import Stage
+@@ -751,13 +752,14 @@ def col(name):
+                 # Overlap first, then FEWER MISMATCHES. Both were already computed.
+                 if ov < best_ov or ov < min_ov:
+                     continue
++                # ⛔ Bounded in C++, and EXACTLY equivalent -- see `_markup.count_mismatches`.
++                # The old inline scan compared an integer count against a FLOAT budget, and for an
++                # integer `mm`, `mm > budget` is `mm > floor(budget)`; the true count is still
++                # returned whenever the row is accepted, so the fewer-mismatches tie-break below
++                # sees what it always saw. This is the hot path of the whole stage: measured 3.55 M
++                # candidate diagonals over 20,000 reads, 7.2 base comparisons each.
+                 budget = max_mm * ov
+-                mm = 0
+-                for kk in range(lo, hi):
+-                    if s[kk] != jr[kk + d]:
+-                        mm += 1
+-                        if mm > budget:
+-                            break
++                mm = _markup.count_mismatches(s, lo, jr, lo + d, hi - lo, int(budget))
+                 if mm <= budget and (best_ri is None or ov > best_ov or mm < best_mm):
+                     best_ov, best_mm, best_ri = ov, mm, ri
+         if best_ri is not None:
+diff --git a/tests/unit/test_count_mismatches.py b/tests/unit/test_count_mismatches.py
+new file mode 100644
+index 00000000..357a0154
+--- /dev/null
++++ b/tests/unit/test_count_mismatches.py
+@@ -0,0 +1,91 @@
++"""The coverage assignment's inner loop, bounded — and why bounding it cannot move a read.
++
++`correct._assign_coverage` decides which clonotype every partial read belongs to. Its inner scan
++compared an integer mismatch count against a FLOAT budget (`max_mm * ov`) one base at a time in
++Python, over a measured 3.55 M candidate diagonals per 20,000 reads.
++
++⛔ Unlike the assembler's overlap test, this caller NEEDS the count and not a verdict: a read joins
++the root with the longest overlap and, **on a tie, the fewer mismatches**. That tie-break is
++load-bearing — when a phantom clonotype competed with the true Jurkat clone, ~47 % of the 5,758
++reads it stole were exact 48-vs-48 overlap ties on which the losing TRUE root matched with 0
++mismatches against the phantom's 1. So the bounded version must return the *true* count whenever
++the row is accepted, and only collapse to "too many" when the row is rejected anyway.
++"""
++from __future__ import annotations
++
++import pytest
++
++from arda import _markup
++
++
++def _reference(a: str, a_off: int, b: str, b_off: int, n: int, budget: float) -> tuple[int, bool]:
++    """The Python this replaced: count one base at a time, break once past the float budget."""
++    mm = 0
++    for k in range(n):
++        if a[a_off + k] != b[b_off + k]:
++            mm += 1
++            if mm > budget:
++                break
++    return mm, mm <= budget
++
++
++@pytest.mark.parametrize("a,b,n", [
++    ("ACGTACGTACGT", "ACGTACGTACGT", 12),
++    ("ACGTACGTACGT", "ACGTACGTACGA", 12),
++    ("ACGTACGTACGT", "TGCATGCATGCA", 12),
++    ("ACGTACGTACGT", "ACGTACGTACGT", 0),
++    ("A" * 48, "A" * 48, 48),
++    ("A" * 48, "A" * 24 + "C" * 24, 48),
++])
++@pytest.mark.parametrize("max_mm_frac", [0.0, 0.02, 0.12, 0.5, 1.0])
++def test_it_accepts_exactly_what_the_python_scan_accepted(a, b, n, max_mm_frac):
++    """Same accept/reject, and the same COUNT on every accepted row."""
++    budget = max_mm_frac * n
++    want_mm, want_ok = _reference(a, 0, b, 0, n, budget)
++    got = _markup.count_mismatches(a, 0, b, 0, n, int(budget))
++
++    assert (got <= budget) is want_ok, f"accept/reject moved: got {got} vs budget {budget}"
++    if want_ok:
++        assert got == want_mm, "an ACCEPTED row reported the wrong count — the tie-break reads this"
++
++
++def test_the_float_budget_collapses_to_floor():
++    """⛔ The equivalence the speedup rests on. `max_mm * ov` is a float; the count is an integer,
++    so `mm > budget` is exactly `mm > floor(budget)`. This is the real operating point:
++    `max_mm=0.12` over a 48 nt junction is 5.76, i.e. 5 mismatches pass and 6 do not."""
++    ov, budget = 48, 0.12 * 48                      # 5.76
++    assert int(budget) == 5
++
++    for count in range(0, 9):
++        a = "C" * count + "A" * (ov - count)
++        got = _markup.count_mismatches(a, 0, "A" * ov, 0, ov, int(budget))
++        assert (got <= budget) is (count <= budget), f"{count} mismatches vs budget {budget}"
++        if count <= budget:
++            assert got == count
++
++
++def test_offsets_address_the_diagonal():
++    """The caller compares `s[lo:hi]` against `jr[lo+d:hi+d]` — a read laid on a diagonal against a
++    junction — so both offsets are independent and neither string starts at 0."""
++    read = "TTTT" + "ACGTACGT"
++    junc = "GG" + "ACGTACGT" + "CCCC"
++    assert _markup.count_mismatches(read, 4, junc, 2, 8, 0) == 0
++    assert _markup.count_mismatches(read, 0, junc, 2, 8, 0) == 1   # exceeds -> max_mm+1
++
++
++def test_it_never_reads_past_either_string():
++    """`n` is clamped to what both strings actually have. A junction shorter than the projected
++    overlap must not read out of bounds — in Python that raised IndexError, which would have
++    surfaced; in C++ it would silently read adjacent memory."""
++    assert _markup.count_mismatches("ACGT", 0, "ACGT", 0, 999, 0) == 0
++    assert _markup.count_mismatches("ACGT", 0, "AC", 0, 4, 0) == 0
++    assert _markup.count_mismatches("ACGT", 9, "ACGT", 0, 4, 0) == 1     # offset past the end
++    assert _markup.count_mismatches("", 0, "", 0, 0, 0) == 0
++
++
++def test_a_rejected_row_reports_more_than_the_budget():
++    """The contract the caller relies on: when the scan gives up it must return something the
++    `mm <= budget` test rejects, never a truncated count that could sneak past."""
++    for max_mm in (0, 1, 5, 20):
++        got = _markup.count_mismatches("A" * 100, 0, "C" * 100, 0, 100, max_mm)
++        assert got == max_mm + 1

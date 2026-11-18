@@ -1,0 +1,429 @@
+diff --git a/metagraph/integration_tests/test_transform_anno.py b/metagraph/integration_tests/test_transform_anno.py
+index 73df5fe764..9a843896ad 100644
+--- a/metagraph/integration_tests/test_transform_anno.py
++++ b/metagraph/integration_tests/test_transform_anno.py
+@@ -397,5 +397,154 @@ def test_aggregate_counts_combinations(self, count_width, min_value, max_value,
+                 f"K-mer {kmer}: test={test_name}, expected {expected}, got {actual}")
+ 
+ 
++class TestRowDiffAnnoConverters(TestingBase):
++    """Source-preserving reformats that don't need -i <GRAPH> because the
++    anchor and fork_succ bitmaps are embedded in the input annotation:
++
++      row_diff_brwt -> row_diff_disk
++      row_diff_flat -> row_diff_disk
++      row_diff_brwt -> row_diff_flat
++
++    Each conversion is verified to produce an annotation whose stats match
++    the source and whose query output is byte-identical to the source's.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        cls.tempdir = TemporaryDirectory()
++        cls._build_graph(TEST_DATA_DIR + '/transcripts_100.fa',
++                         cls.tempdir.name + '/graph',
++                         20, 'succinct', 'basic', '--mask-dummy')
++        cls.graph_path = cls.tempdir.name + '/graph' + graph_file_extension['succinct']
++
++        # Build the two starting points via the full column -> row_diff -> {brwt,flat}
++        # pipeline. These are what the new reformat paths consume.
++        cls._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
++                            cls.graph_path,
++                            cls.tempdir.name + '/from_brwt',
++                            'row_diff_brwt')
++        cls.brwt_path = cls.tempdir.name + '/from_brwt.row_diff_brwt.annodbg'
++
++        cls._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
++                            cls.graph_path,
++                            cls.tempdir.name + '/from_flat',
++                            'row_diff_flat')
++        cls.flat_path = cls.tempdir.name + '/from_flat.row_diff_flat.annodbg'
++
++        # Query against the same fasta used to build the graph — guarantees
++        # non-empty matches, so query-identity tests actually exercise rows.
++        cls.query_fa = TEST_DATA_DIR + '/transcripts_100.fa'
++
++    def _reformat(self, source_path, target_anno, out_base):
++        """Run `transform_anno --anno-type <target>` without -i (embedded anchors)."""
++        command = (f'{METAGRAPH} transform_anno --anno-type {target_anno} '
++                   f'-o {out_base} -p {NUM_THREADS} {source_path}')
++        res = subprocess.run(command.split(), stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0,
++            msg=f"transform_anno failed: {res.stderr.decode()}")
++        out_path = f'{out_base}.{target_anno}.annodbg'
++        self.assertTrue(os.path.exists(out_path), f"missing {out_path}")
++        return out_path
++
++    def _assert_stats_match(self, src_path, dst_path):
++        src = self._get_stats(f'-a {src_path}')
++        dst = self._get_stats(f'-a {dst_path}')
++        self.assertEqual(src['returncode'], 0, msg=f"src stats rc={src['returncode']}")
++        self.assertEqual(dst['returncode'], 0, msg=f"dst stats rc={dst['returncode']}")
++        self.assertEqual(src['labels'], dst['labels'])
++        self.assertEqual(src['objects'], dst['objects'])
++
++    def _assert_query_identical(self, src_path, dst_path):
++        """Query the same FASTA against both annotations and compare stdout."""
++        def query(anno_path):
++            cmd = (f'{METAGRAPH} query -i {self.graph_path} -a {anno_path} '
++                   f'--min-kmers-fraction-label 0 {self.query_fa}')
++            res = subprocess.run(cmd.split(), stdout=PIPE, stderr=PIPE)
++            self.assertEqual(res.returncode, 0, msg=res.stderr.decode())
++            return res.stdout
++        self.assertEqual(query(src_path), query(dst_path))
++
++    def test_row_diff_brwt_to_row_diff_disk(self):
++        out = self._reformat(self.brwt_path, 'row_diff_disk',
++                             self.tempdir.name + '/brwt_to_disk')
++        self._assert_stats_match(self.brwt_path, out)
++        self._assert_query_identical(self.brwt_path, out)
++
++    def test_row_diff_brwt_to_row_diff_flat(self):
++        out = self._reformat(self.brwt_path, 'row_diff_flat',
++                             self.tempdir.name + '/brwt_to_flat')
++        self._assert_stats_match(self.brwt_path, out)
++        self._assert_query_identical(self.brwt_path, out)
++
++    def test_row_diff_flat_to_row_diff_disk(self):
++        out = self._reformat(self.flat_path, 'row_diff_disk',
++                             self.tempdir.name + '/flat_to_disk')
++        self._assert_stats_match(self.flat_path, out)
++        self._assert_query_identical(self.flat_path, out)
++
++    def test_embedded_anchor_input_ignores_graph_flag(self):
++        """Passing -i <GRAPH> emits a warning but still succeeds, since the
++        anchors are embedded in the annotation."""
++        for i, source in enumerate([self.brwt_path, self.flat_path]):
++            out_base = f'{self.tempdir.name}/with_graph_{i}'
++            command = (f'{METAGRAPH} transform_anno --anno-type row_diff_disk '
++                       f'-i {self.graph_path} -o {out_base} '
++                       f'-p {NUM_THREADS} {source}')
++            res = subprocess.run(command.split(), stdout=PIPE, stderr=PIPE)
++            self.assertEqual(res.returncode, 0,
++                msg=f"unexpected failure for {source}: {res.stderr.decode()}")
++            self.assertTrue(os.path.exists(f'{out_base}.row_diff_disk.annodbg'))
++
++    def test_all_zero_rows_preserved(self):
++        """Sparse rows (k-mers not covered by any annotation column) round-trip
++        through the new converters. The graph contains k-mers from
++        `transcripts_100.fa` that don't appear in the smaller annotation source,
++        so the resulting matrix has rows with zero set bits — which RowDisk's
++        delta encoding must handle without dropping or duplicating bytes."""
++        # Annotate using the first ~10 lines of transcripts_100.fa so the graph
++        # has many k-mers with no annotation row set.
++        small_fa = os.path.join(self.tempdir.name, 'small_subset.fa')
++        with open(TEST_DATA_DIR + '/transcripts_100.fa') as src, open(small_fa, 'w') as dst:
++            for i, line in enumerate(src):
++                if i >= 10:
++                    break
++                dst.write(line)
++
++        sparse_brwt_base = os.path.join(self.tempdir.name, 'sparse_brwt')
++        self._annotate_graph(small_fa, self.graph_path, sparse_brwt_base, 'row_diff_brwt')
++        sparse_brwt = sparse_brwt_base + '.row_diff_brwt.annodbg'
++
++        for target in ('row_diff_disk', 'row_diff_flat'):
++            out = self._reformat(sparse_brwt, target,
++                                 os.path.join(self.tempdir.name, f'sparse_{target}'))
++            self._assert_stats_match(sparse_brwt, out)
++            self._assert_query_identical(sparse_brwt, out)
++
++    def test_round_trip_column_to_brwt_to_flat_to_disk(self):
++        """Full pipeline: starting column annotation should query identically
++        after column -> row_diff_brwt -> row_diff_flat -> row_diff_disk."""
++        column_base = os.path.join(self.tempdir.name, 'rt_column')
++        self._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
++                             self.graph_path, column_base, 'column')
++        column_path = column_base + '.column.annodbg'
++
++        # Need the row_diff_column intermediate (with anchors) to feed into the
++        # reformat paths. _annotate_graph for 'row_diff_brwt' produces this end
++        # state directly; we then reformat brwt -> flat -> disk.
++        rt_brwt_base = os.path.join(self.tempdir.name, 'rt_brwt')
++        self._annotate_graph(TEST_DATA_DIR + '/transcripts_100.fa',
++                             self.graph_path, rt_brwt_base, 'row_diff_brwt')
++        rt_brwt = rt_brwt_base + '.row_diff_brwt.annodbg'
++
++        rt_flat = self._reformat(rt_brwt, 'row_diff_flat',
++                                 os.path.join(self.tempdir.name, 'rt_flat'))
++        rt_disk = self._reformat(rt_flat, 'row_diff_disk',
++                                 os.path.join(self.tempdir.name, 'rt_disk'))
++
++        # column and the reformatted variants must answer queries identically.
++        for converted in (rt_brwt, rt_flat, rt_disk):
++            self._assert_query_identical(column_path, converted)
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/metagraph/src/annotation/annotation_converters.cpp b/metagraph/src/annotation/annotation_converters.cpp
+index 0d6a3b1b32..d8c1b0ce1a 100644
+--- a/metagraph/src/annotation/annotation_converters.cpp
++++ b/metagraph/src/annotation/annotation_converters.cpp
+@@ -138,7 +138,7 @@ void convert<RowFlatAnnotator, std::string>(ColumnCompressed<std::string>&& anno
+     annotator.get_label_encoder().serialize(out);
+     out.close();
+ 
+-    RowFlat<>::serialize(call_rows, num_columns, num_rows, num_set_bits, fname, true);
++    RowFlat<>::serialize(fname, call_rows, num_columns, num_rows, num_set_bits);
+ }
+ 
+ template <>
+@@ -376,36 +376,62 @@ void convert_to_row_diff<RowDiffRowFlatAnnotator>(
+     uint64_t num_rows = columns.at(0)->size();
+     uint64_t num_columns = columns.size();
+ 
+-    RowFlat<>::serialize([&](auto callback) { utils::call_rows(columns, callback); },
+-                         num_columns, num_rows, num_set_bits, fname, true);
++    RowFlat<>::serialize(fname, [&](auto callback) { utils::call_rows(columns, callback); },
++                         num_columns, num_rows, num_set_bits);
+     logger->trace("Annotation converted");
+ }
+ 
+ 
+-template <>
+-void convert_to_row_diff<RowDiffRowFlatAnnotator>(const RowDiffBRWTAnnotator &anno,
+-                                                  const std::string &outfbase) {
+-    const auto &fname = utils::make_suffix(outfbase, RowDiffRowFlatAnnotator::kExtension);
++// Writes the standard RowDiff serialization header to |fname|:
++// label_encoder + "v2.0" + anchor + fork_succ. The file is created (or
++// truncated if it already exists), written, and closed so subsequent
++// target-specific writers can reopen and append the body.
++template <class Anno>
++static void write_row_diff_header(const std::string &fname, const Anno &anno) {
+     std::ofstream out = utils::open_new_ofstream(fname);
+     if (!out.good())
+         throw std::ofstream::failure("Can't write to " + fname);
+-
+     anno.get_label_encoder().serialize(out);
+-
+-    // serialize RowDiff<RowFlat<>>
+     out.write("v2.0", 4);
+     anno.get_matrix().anchor().serialize(out);
+     anno.get_matrix().fork_succ().serialize(out);
+-    out.close();
++}
+ 
+-    RowFlat<>::serialize([&](auto callback) { anno.get_matrix().diffs().call_rows(callback); },
+-                         anno.get_matrix().diffs().num_columns(),
+-                         anno.get_matrix().diffs().num_rows(),
+-                         anno.get_matrix().diffs().num_relations(),
+-                         fname, true);
++// Reformat an already-built `RowDiff<...>` annotator into another `RowDiff<...>`
++// representation. The on-disk header (label encoder + version + anchor +
++// fork_succ) is identical across `Target` types, so the body — produced by
++// `Source::base_matrix_type::call_rows` and consumed by
++// `Target::base_matrix_type::serialize` — is the only piece that varies.
++template <class Target, class Source>
++static void convert_row_diff_repr(const Source &anno, const std::string &outfbase) {
++    const auto &fname = utils::make_suffix(outfbase, Target::kExtension);
++    write_row_diff_header(fname, anno);
++
++    const auto &diffs = anno.get_matrix().diffs();
++    Target::binary_matrix_type::base_matrix_type::serialize(fname,
++        [&](auto callback) { diffs.call_rows(callback); },
++        diffs.num_columns(), diffs.num_rows(), diffs.num_relations());
+     logger->trace("Annotation converted");
+ }
+ 
++template <>
++void convert_to_row_diff<RowDiffRowFlatAnnotator>(const RowDiffBRWTAnnotator &anno,
++                                                  const std::string &outfbase) {
++    convert_row_diff_repr<RowDiffRowFlatAnnotator>(anno, outfbase);
++}
++
++template <>
++void convert_to_row_diff<RowDiffDiskAnnotator>(const RowDiffBRWTAnnotator &anno,
++                                               const std::string &outfbase) {
++    convert_row_diff_repr<RowDiffDiskAnnotator>(anno, outfbase);
++}
++
++template <>
++void convert_to_row_diff<RowDiffDiskAnnotator>(const RowDiffRowFlatAnnotator &anno,
++                                               const std::string &outfbase) {
++    convert_row_diff_repr<RowDiffDiskAnnotator>(anno, outfbase);
++}
++
+ template <>
+ void convert_to_row_diff<RowDiffRowSparseAnnotator>(
+             const std::vector<std::string> &files,
+diff --git a/metagraph/src/annotation/annotation_converters.hpp b/metagraph/src/annotation/annotation_converters.hpp
+index 7fe38d37f3..ac6a3bc561 100644
+--- a/metagraph/src/annotation/annotation_converters.hpp
++++ b/metagraph/src/annotation/annotation_converters.hpp
+@@ -84,6 +84,10 @@ template <class RowDiffAnnotator>
+ void convert_to_row_diff(const RowDiffBRWTAnnotator &anno,
+                          const std::string &outfbase);
+ 
++template <class RowDiffAnnotator>
++void convert_to_row_diff(const RowDiffRowFlatAnnotator &anno,
++                         const std::string &outfbase);
++
+ void merge_row_compressed(const std::vector<std::string> &filenames,
+                           const std::string &outfile);
+ 
+diff --git a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+index e8119b6f19..cd24b19d09 100644
+--- a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
++++ b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+@@ -95,6 +95,8 @@ class IRowDiff {
+ template <class BaseMatrix>
+ class RowDiff : public IRowDiff, public BinaryMatrix {
+   public:
++    using base_matrix_type = BaseMatrix;
++
+     template <typename... Args>
+     RowDiff(const graph::DeBruijnGraph *graph = nullptr, Args&&... args)
+         : diffs_(std::forward<Args>(args)...) { graph_ = graph; }
+diff --git a/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.cpp b/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.cpp
+index 6b5206717b..227df1d4ff 100644
+--- a/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.cpp
++++ b/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.cpp
+@@ -51,6 +51,14 @@ RowFlat<BitVector>::get_row(Row row) const {
+     return columns;
+ }
+ 
++template <typename BitVector>
++void RowFlat<BitVector>::call_rows(
++        const std::function<void(const SetBitPositions &)> &callback) const {
++    for (uint64_t r = 0; r < num_rows_; ++r) {
++        callback(get_row(r));
++    }
++}
++
+ template <typename BitVector>
+ std::vector<typename RowFlat<BitVector>::Row>
+ RowFlat<BitVector>::get_column(Column column) const {
+@@ -96,12 +104,12 @@ void RowFlat<BitVector>::serialize(std::ostream &out) const {
+ }
+ 
+ template <typename BitVector>
+-void RowFlat<BitVector>::serialize(const std::function<void(const RowCallback&)> &call_rows,
++void RowFlat<BitVector>::serialize(const std::string &filename,
++                                   const std::function<void(const RowCallback&)> &call_rows,
+                                    uint64_t num_columns,
+                                    uint64_t num_rows,
+-                                   uint64_t num_set_bits,
+-                                   const std::string &filename, bool append_file) {
+-    std::ofstream out(filename, std::ios::binary | (append_file ? std::ios::app : std::ios::openmode(0)));
++                                   uint64_t num_set_bits) {
++    std::ofstream out(filename, std::ios::binary | std::ios::app);
+     serialize_number(out, num_columns);
+     out.close();
+     auto call_bits = [&](auto callback) {
+diff --git a/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.hpp b/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.hpp
+index 62e3cff15b..1a662f387a 100644
+--- a/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.hpp
++++ b/metagraph/src/annotation/binary_matrix/row_flat/flat_matrix.hpp
+@@ -31,14 +31,22 @@ class RowFlat : public RowMajor, public GetEntrySupport {
+     SetBitPositions get_row(Row row) const;
+     std::vector<Row> get_column(Column column) const;
+ 
++    // Iterate the rows in order, invoking `callback` once per row with its
++    // `SetBitPositions`. Mirrors `BRWT::call_rows` so RowDiff converters can
++    // walk both representations through the same interface.
++    void call_rows(const std::function<void(const SetBitPositions &)> &callback) const;
++
+     bool load(std::istream &in);
+     void serialize(std::ostream &out) const;
+ 
+-    static void serialize(const std::function<void(const RowCallback&)> &call_rows,
++    // Append a freshly-serialized RowFlat body to `filename`. The file must
++    // already exist; callers write any preceding header (label encoder,
++    // version magic, RowDiff anchors, …) before calling this.
++    static void serialize(const std::string &filename,
++                          const std::function<void(const RowCallback&)> &call_rows,
+                           uint64_t num_columns,
+                           uint64_t num_rows,
+-                          uint64_t num_set_bits,
+-                          const std::string &filename, bool append_file);
++                          uint64_t num_set_bits);
+ 
+     const BitVector& data() const { return *compressed_rows_; }
+ 
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index 29020ebfb3..c92da2ba0b 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "common/threads/threading.hpp"
+ #include "annotation/binary_matrix/multi_brwt/brwt.hpp"
++#include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
++#include "common/logger.hpp"
+ #include "common/utils/string_utils.hpp"
+ #include "common/utils/file_utils.hpp"
+ #include "seq_io/formats.hpp"
+@@ -629,12 +631,30 @@ Config::Config(int argc, char *argv[]) {
+                                     || anno_type == RowDiffDiskCoord
+                                     || anno_type == RowDiffBRWTCoord
+                                     || anno_type == RowDiffCoord;
+-        if (to_row_diff && !infbase.size()) {
++        // For row_diff_brwt and row_diff_flat inputs, the anchor and fork-succ
++        // bitmaps are embedded in the .annodbg, so no graph is needed when
++        // re-formatting to another row_diff representation.
++        const bool input_has_embedded_anchor = fnames.size()
++                && (utils::ends_with(fnames.front(), annot::RowDiffBRWTAnnotator::kExtension)
++                        || utils::ends_with(fnames.front(), annot::RowDiffRowFlatAnnotator::kExtension));
++        if (input_has_embedded_anchor && fnames.size() != 1) {
++            std::cerr << "Can only convert " << fnames.front()
++                      << " annotations one at a time" << std::endl;
++            print_usage_and_exit = true;
++        }
++        if (to_row_diff && !infbase.size() && !input_has_embedded_anchor) {
+             std::cerr << "Path to graph must be passed with '-i <GRAPH>'" << std::endl;
+             print_usage_and_exit = true;
+         } else if (!to_row_diff && infbase.size()) {
+-            std::cerr << "Graph is only required for transform to row_diff types" << std::endl;
++            std::cerr << "Graph is only required for transform to row_diff types"
++                      << std::endl;
+             print_usage_and_exit = true;
++        } else if (input_has_embedded_anchor && infbase.size()) {
++            common::logger->warn(
++                    "Graph is not needed when the input annotation has embedded "
++                    "anchors (row_diff_brwt, row_diff_flat); ignoring '-i {}'",
++                    infbase);
++            infbase.clear();
+         }
+     }
+ 
+diff --git a/metagraph/src/cli/transform_annotation.cpp b/metagraph/src/cli/transform_annotation.cpp
+index 254b00f0ac..343d7f618c 100644
+--- a/metagraph/src/cli/transform_annotation.cpp
++++ b/metagraph/src/cli/transform_annotation.cpp
+@@ -915,15 +915,26 @@ int transform_annotation(Config *config) {
+                 logger->trace("Serialized to {}", config->outfbase);
+             }
+         }
+-    } else if (input_anno_type == Config::RowDiffBRWT && config->anno_type == Config::RowDiffRowFlat) {
+-        if (files.size() != 1) {
+-            logger->error("Can only convert row_diff_brwt annotations one at a time");
+-            exit(1);
++    } else if ((input_anno_type == Config::RowDiffBRWT
++                    && (config->anno_type == Config::RowDiffRowFlat
++                            || config->anno_type == Config::RowDiffDisk))
++                || (input_anno_type == Config::RowDiffRowFlat
++                    && config->anno_type == Config::RowDiffDisk)) {
++        // `files.size() == 1` is enforced earlier in Config::Config().
++        assert(files.size() == 1);
++        if (input_anno_type == Config::RowDiffBRWT) {
++            RowDiffBRWTAnnotator annotator;
++            annotator.load(files[0]);
++            if (config->anno_type == Config::RowDiffRowFlat) {
++                convert_to_row_diff<RowDiffRowFlatAnnotator>(annotator, config->outfbase);
++            } else {
++                convert_to_row_diff<RowDiffDiskAnnotator>(annotator, config->outfbase);
++            }
++        } else {  // Config::RowDiffRowFlat -> Config::RowDiffDisk
++            RowDiffRowFlatAnnotator annotator;
++            annotator.load(files[0]);
++            convert_to_row_diff<RowDiffDiskAnnotator>(annotator, config->outfbase);
+         }
+-        RowDiffBRWTAnnotator annotator;
+-        annotator.load(files[0]);
+-
+-        convert_to_row_diff<RowDiffRowFlatAnnotator>(annotator, config->outfbase);
+         logger->trace("Serialized to {}", config->outfbase);
+ 
+     } else {

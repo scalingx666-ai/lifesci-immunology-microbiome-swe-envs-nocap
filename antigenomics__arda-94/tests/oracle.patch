@@ -1,0 +1,1076 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 73479e8f..396f8ccb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,144 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.10.0
++
++### Fixed — a target-inverted alignment row silently produced a phantom clonotype
++
++arda detects a reverse-strand nt hit only from the **query** side (`rev = qstart > qend`,
++`annotate/mapper.py`). When MMseqs2 expresses the minus strand on the **target** side instead —
++`tstart > tend`, with `taln` reverse-complemented — the row reads as forward. `transfer_regions`
++then walks the target strictly forward from `tstart` (`_markup/markup.cpp:185-201`), which slides
++the whole scaffold markup by `(tlen + 1 - tstart) - tstart` nt and takes the junction window off
++Cys104 onto whatever codon lands there.
++
++Nothing downstream catches it. The only gate on a re-annotated contig is `assemble._CANON`'s
++`^C…[FW]$` — a conserved-motif test, not an anchor — so a window that happens to open on a
++spurious `TGT` and close on `TGG` passes, in frame, with no stop codon.
++
++Measured on a delivered **Jurkat** run (`ERR3003543`, arda 2.5.6 — Jurkat is a monoclonal T-cell
++line and must yield essentially one TRB and one TRA):
++
++| | junction_aa | reads |
++|---|---|---|
++| true clone | `CASSFSTCSANYGYTF` | 15,380 |
++| **phantom** | `CVLLCQQFLDLFGSLW` | **7,408** |
++
++`tlen` 349, true `tstart` 170, reported `tstart` 180 → the window slid **exactly 10 nt** into V
++framework 3. Ablating the two phantom contig rows and re-running `correct` moves the true clone
++**15,380 → 21,138**: the phantom had taken 5,758 reads from it. The same shape appears in the mouse
++sample (`CNVFLCSMVQHPF`, 1,239 reads, shifted +13 nt from `CALWYSTHYVF`) — two organisms, one bug.
++
++**These rows are not recoverable minus-strand hits to be reflected into forward coordinates.** They
++are internally inconsistent: on that read `germline_alignment` is the reverse complement of the
++scaffold while the query matches the plus strand at 91.4 % identity — the row's own reported
++`pident` — and `identity(qaln, taln)` is 0.232, which is why `v_identity` came out 0.216 against
++~0.98 for every normal record. They are now dropped in `_best_hits`, the one place that already
++knows a row is unusable, so the read routes to the full-reference rescue or stays unmapped. That is
++the only outcome that cannot ship a well-formed junction that is wrong.
++
++⚠ Emission is **MMseqs2-build dependent**: 120 such rows across the six delivered samples, **0** on
++the build in the local env at the same arda version. So this is a robustness gate rather than a
++regression fix, and comparing two arda versions on one machine cannot catch it. Blast radius when
++they do occur: 13 of 108,069 Jurkat reads (0.012 %), 3 of which emitted a junction.
++
++Regression tests: `tests/unit/test_best_hits.py::test_a_target_inverted_row_is_not_a_usable_hit`
++and `::test_an_inverted_row_never_beats_a_forward_one`. No reference DB, no MMseqs2 — the row is
++expressible directly as a TSV line, so the test cannot be skipped away.
++
++### Changed — `--max-subs` default 2 → 3
++
++`max_subs` is a seqtree **search radius**, not a threshold: the accept/reject decision is the
++length-scaled probability model (`count[parent] * (error_rate * L)**n >= count[child]`). A radius of
++2 truncated the search below what the model would already accept on a deep clone, leaving a
++sequencing-error trail uncollapsed in exactly the samples where the right answer is known.
++
++Measured on four delivered libraries, clonotypes out:
++
++| sample | kind | `max_subs=2` | `max_subs=3` | `max_subs=4` |
++|---|---|---|---|---|
++| Jurkat | monoclonal T line | 74 | **57** | 57 |
++| Raji | monoclonal B line | 91 | **58** | 58 |
++| GM12878 | oligoclonal B-LCL | 13 | **13** | 13 |
++| MouseSpleen_WT | polyclonal spleen | 7,942 | **7,942** | 7,942 |
++
++The polyclonal and oligoclonal repertoires are **unchanged** at 2, 3 and 4 — the model refuses those
++collapses on abundance regardless of radius — so this is not a diversity-destroying change. It
++saturates at 3.
++
++### Added — `annotate.project`: the junction placed by arithmetic, not by alignment
++
++AIRR `junction` runs from the Cys104 codon to the [FW]118 that opens FR4. Today arda learns those
++two positions by aligning the read against a `V + pad + J` scaffold, and the **15,414-scaffold
++reference exists for that and essentially nothing else** — the V and J *gene* calls already come out
++of the 924-target segment pass at .9997 / .9998 agreement.
++
++But the segment pass already returns `(target, tstart, qstart)` per read per side, and
++`cdr3_anchors.tsv` already records `anchor_nt`. `refbuild.segments` writes each segment target so
++its germline starts at offset 0, so target coordinates *are* germline coordinates:
++
++```
++offset = (anchor_nt + 1) - tstart
++pos    = qstart + offset                    # forward hit
++pos    = (qlen - qstart + 1) + offset       # reverse-complement hit
++```
++
++Two integer adds. Measured against IgBLAST truths at `v_score >= 70` on **254,867 scored reads**:
++
++| sample | locus | n | accuracy |
++|---|---|---|---|
++| IGH_naive | IGH | 78,394 | **.99977** |
++| IGH_repertoire (91.77 % median V identity) | IGH | 90,663 | **.99634** |
++| SRR5233635 | TRA | 41,881 | **.99947** |
++| SRR5233641 | TRB | 43,520 | **.99949** |
++| IGH_repertoire | IGK | 143 | **1.00000** |
++| IGH_repertoire | IGL | 17 | **1.00000** |
++
++Accuracy is >= .993 in **every** V-identity stratum, including `<90 %` at n = 38,007.
++
++**Not wired into the output path.** It yields `junction` and its coordinates; it does *not* yield
++`v_identity`, `sequence_alignment`, `germline_alignment`, the per-segment CIGARs or the `mmseqs2_*`
++block, all of which `annotate.transfer` derives from the alignment's `qaln`/`taln`, and
++`_align_implied` also decides the allele. Whether removing junction placement from the critical path
++recovers wall time is a separate measurement.
++
++**It refuses rather than degrades**, on the eight conditions in `project.REFUSALS`: missing or
++non-`ok` anchor (`no_anchor`), an unvalidated locus (`unvalidated_locus`), an indel gate that was
++never run (`indel_unchecked`), `segmap`'s two-diagonal indel signature (`indel_split`), V and J on
++opposite strands (`strand_mismatch`), an order violation (`order`), a projection landing off the
++read (`off_read`), and a junction length that is not a multiple of 3 (`bad_codon`). A well-formed
++junction that is wrong is the worst output this codebase can produce — the reference-geometry bug
++shipped junctions that started `C`, ended `[FW]`, passed `--complete-only` and were short by exactly
++the allele's truncation.
++
++⛔ **TRD is declined, because it has ZERO coverage.** The per-locus bar was ">= .99 at n >= 2,000, or
++the locus goes on the refusal list". Across two TR amplicons the segment pass never handed a single
++TRD read both anchors, so all 767 TRD junctions in the truths fell through to the aligner and TRD
++never appears at all. *Absent* is not *validated*, and the only TRD number that exists is 43/51 =
++0.843. `UNVALIDATED_LOCI` declines it, keyed off the **J** anchor — TRAV/DV alleles rearrange to
++either TRAJ or TRDJ and the J decides the locus.
++
++⚠ Scope is set by yield, not accuracy: **87.0 % of hit TRA-amplicon reads and 77.3 % of TRB carry
++both anchors, against 7.2 % of bulk reads** (bulk is 53.0 % `V_only`, 31.4 % `C_only`). Bulk reads
++mostly do not span a junction at all, so this is an amplicon lever.
++
++### Added — two off-by-default measurement hooks
++
++`ARDA_MMSEQS_SEARCH_OPTS` appends flags to every `mmseqs.search` argv, and `ARDA_PROJECT_DUMP` /
++`ARDA_VONLY_DUMP` write per-read diagnostic tables. None is a supported interface; they exist
++because every recorded flag measurement in the benchmark was taken against a reference that has
++since been rebuilt twice, so re-measuring had to become cheaper than editing source. The first
++immediately earned its keep: `--exact-kmer-matching 1` turns out to flip allele-level calls on
++IGH_naive at an *identical* clonotype count, which no count-based metric can see.
++
++### Changed — `project_junction`'s `split_checked` is required, with no default
++
++An inert indel gate must be loud. `split_checked` tells `project_junction` whether the caller has
++already run `segmap`'s two-diagonal split check; a default would let a caller skip the check and
++still get a projection, which is the failure mode the `indel_split` refusal exists to prevent.
++Making it a keyword with no default turns that into a `TypeError` at the call site instead. The new
++`indel_unchecked` refusal covers the case where the caller passes `False`.
++
+ ## 2.9.0
+ 
+ ### Added — `--indel-rescue`: an ungapped extension cannot score a read that has an indel
+diff --git a/docs/conf.py b/docs/conf.py
+index c4164f9a..1efa47c1 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -8,7 +8,7 @@
+ project = "arda"
+ author = "Mikhail Shugay"
+ copyright = "2026, Mikhail Shugay"
+-release = "2.7.2"
++release = "2.10.0"
+ 
+ extensions = [
+     "sphinx.ext.autodoc",
+diff --git a/pyproject.toml b/pyproject.toml
+index b682630f..7d8fbd6d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.9.0"
++version = "2.10.0"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/skills/arda/SKILL.md b/skills/arda/SKILL.md
+index 7093d2f2..eb8daf36 100644
+--- a/skills/arda/SKILL.md
++++ b/skills/arda/SKILL.md
+@@ -547,6 +547,56 @@ and 45 are locus TRD (with a TRDJ). There is deliberately no "α/δ is ambiguous
+ `combinations.tsv` is the arbiter, a pair it contains is real biology and one it does not is a
+ genuine chimera.
+ 
++### `annotate.project`: the junction from coordinates, no alignment
++
++```python
++from arda.annotate.project import project_junction, UNVALIDATED_LOCI
++
++proj, refusal = project_junction(strand_seq, qlen, v_row=v_row, j_row=j_row,
++                                 v_call=..., j_call=..., anchors=ref.anchors,
++                                 split_checked=...)   # REQUIRED keyword, deliberately no default
++if proj:
++    proj.junction   # AIRR: Cys104 .. [FW]118 INCLUSIVE
++    proj.cdr3       # IMGT: anchors excluded, two residues shorter
++```
++
++AIRR `junction` runs Cys104 -> [FW]118. The segment pass already returns `(target, tstart, qstart)`
++per read per side and `cdr3_anchors.tsv` already records `anchor_nt`, so the position is arithmetic:
++
++```
++offset = (anchor_nt + 1) - tstart
++pos    = qstart + offset                    # forward
++pos    = (qlen - qstart + 1) + offset       # reverse complement
++```
++
++⛔ **Three coordinate systems disagree about their origin here.** `tstart` is **1-based** on the
++forward target (`segmap.cpp`), `anchor_nt` is **0-based** in the germline (`cdr3fix.Anchor`), and a
++minus-strand `qstart` is in **forward** coordinates while the sequence it indexes is the reverse
++complement. Each is an off-by-one that still yields a plausible-looking junction — right length,
++starts with a codon, ends with a codon. `strand_seq` must be the strand the hits were MEASURED on;
++pass `revcomp(read)` for a minus-strand hit rather than reflecting coordinates afterwards.
++
++Measured vs IgBLAST at `v_score >= 70` on 254,867 reads: IGH .99977 (naive) / .99634 (91.77 % median
++V identity), TRA .99947, TRB .99949, IGK and IGL exact. >= .993 in every V-identity stratum.
++
++**It refuses rather than degrades** — `no_anchor`, `unvalidated_locus`, `indel_split`,
++`strand_mismatch`, `order`, `off_read`, `bad_codon`. A well-formed junction that is wrong is worse
++than no junction: the reference-geometry bug shipped junctions that started `C`, ended `[FW]`,
++passed `--complete-only`, and were short by exactly the allele's truncation.
++
++⛔ **`UNVALIDATED_LOCI = {"TRD"}`.** Not because TRD is known bad — because it has **zero** coverage.
++Across two TR amplicons the segment pass never handed a TRD read both anchors, so all 767 TRD
++truth junctions went to the aligner and TRD never appeared. Absent reads like fine in every
++aggregate. The locus is taken from the **J** anchor, never the V: TRAV/DV rearranges to either TRAJ
++or TRDJ and the J decides.
++
++⛔ **A `[FW]GXG` motif check is NOT equivalent to reading `anchor_nt`.** `TRAJ35*01`'s anchor codon
++decodes **Cys (TGC)** — it is `status = ok` and a functional IMGT `F` gene, with a real Cys six
++codons past the FGXG. A motif check deletes the gene silently (33/33 amplicon reads lost).
++
++⚠ Yield, not accuracy, sets the scope: 87.0 % / 77.3 % of hit amplicon reads carry both anchors
++against **7.2 % of bulk** reads, which mostly do not span a junction at all.
++
+ ## Sequence primitives
+ 
+ `arda.refbuild.translate` exposes fast C++-backed helpers, mirpy-API-compatible:
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index 6e2dd79b..02a371e7 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.9.0"
++__version__ = "2.10.0"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/annotate/mapper.py b/src/arda/annotate/mapper.py
+index fd74b79c..6bc1d451 100644
+--- a/src/arda/annotate/mapper.py
++++ b/src/arda/annotate/mapper.py
+@@ -406,13 +406,40 @@ def _best_hits(tsv: Path) -> dict[str, dict]:
+     # at parse time -- and a null then reaches `float(row["bits"])` in the J+C contest and dies
+     # there instead. Both symptoms are the same malformed row, so both are filtered here, at the
+     # one place that knows the row is unusable.
++    #
++    # A TARGET-INVERTED row (`tstart > tend`) is the third shape of unusable, and the most
++    # dangerous, because it does not raise -- it silently produces a well-formed WRONG junction.
++    # arda detects a reverse-strand nt hit only from the QUERY side (`rev = qs > qe`, ~:1280), so
++    # when mmseqs expresses the minus strand on the TARGET instead, the row looks forward.
++    # `_markup.transfer_regions` then walks the target strictly forward from `tstart`
++    # (`_markup/markup.cpp:185-201`), sliding the whole scaffold markup by
++    # `(tlen + 1 - tstart) - tstart` nt and moving the junction window off Cys104 onto whatever
++    # codon lands there. Measured on a delivered Jurkat run (arda 2.5.6, ERR3003543): tlen 349,
++    # true tstart 170, reported tstart 180 -> the window slid exactly 10 nt into V framework 3,
++    # started on a spurious TGT, ended on TGG, passed `assemble._CANON`'s `^C...[FW]$` and became
++    # a 7,408-read phantom clonotype in a MONOCLONAL cell line -- 48 % of the true clone, from
++    # which it had stolen 5,758 reads (ablation: 15,380 -> 21,138).
++    #
++    # These are not recoverable minus-strand hits to be reflected into forward coordinates. They
++    # are internally inconsistent: on that read `germline_alignment` is the reverse complement of
++    # the scaffold while the query matches the PLUS strand at 91.4 % identity (the row's own
++    # reported `pident`), and `identity(qaln, taln)` is 0.232 -- which is why `v_identity` came out
++    # 0.216 against ~0.98 for every normal record. Reflecting the coordinates would keep a garbage
++    # alignment; dropping routes the read to the full-reference rescue, or leaves it unmapped, and
++    # that is the only option that cannot ship a well-formed junction that is wrong.
++    #
++    # Emission is mmseqs-BUILD dependent -- 120 such rows across six delivered samples, 0 on the
++    # build in the local env at the same arda version -- so this is a robustness gate, not a
++    # regression fix, and comparing two arda versions on one machine cannot catch it.
+     n_before = df.height
+     df = df.filter(pl.col("query").is_not_null() & (pl.col("query") != "")
+-                   & pl.col("bits").is_not_null())
++                   & pl.col("bits").is_not_null()
++                   & (pl.col("tstart") <= pl.col("tend")))
+     if df.height != n_before:
+-        logger.warning("%d alignment rows were unusable (no query id or no score) and were routed "
+-                       "to the full-reference rescue; a large count means the hand-built sub-DB "
+-                       "is missing lookup entries", n_before - df.height)
++        logger.warning("%d alignment rows were unusable (no query id, no score, or an inverted "
++                       "target span) and were routed to the full-reference rescue; a large count "
++                       "means the hand-built sub-DB is missing lookup entries",
++                       n_before - df.height)
+     if df.height == 0:
+         return {}
+     df = (df.sort(["bits", "target"], descending=[True, False], maintain_order=True)
+@@ -746,6 +773,119 @@ def _full_rescue(query_db: Path, full_db: Path, ids: list[str], tmp: Path, *,
+     return _best_hits(out_tsv)
+ 
+ 
++#: Header of the ``ARDA_VONLY_DUMP`` calibration table. Order is the contract the offline fit reads.
++_VONLY_COLS = ("read_id", "v_allele", "seg_bits", "seg_qstart", "seg_qend", "seg_tstart",
++               "read_len", "scaffold", "scaffold_bits")
++
++#: Header of the ``ARDA_PROJECT_DUMP`` validation table.
++_PROJECT_COLS = ("read_id", "locus", "v_call", "j_call", "refusal",
++                 "proj_junction", "proj_start", "proj_end", "rev_comp")
++
++
++def _dump_projection(best_v: dict[str, str], best_j: dict[str, str],
++                     seg_rows: dict[tuple[str, str], dict], seqs: dict[str, str],
++                     ref: Reference, *, split_checked: bool) -> None:
++    """Append the ARITHMETIC junction for every read carrying both anchors, or why it was refused.
++
++    Validation only, and deliberately **out of the output path**: the projection is not yet what
++    arda reports, so this writes it beside the scaffold-derived answer and lets an offline script
++    join the two on ``sequence_id``. Wiring it in first and comparing second would make a
++    disagreement look like a regression instead of a measurement.
++
++    The refusal counts are as interesting as the junctions. Fast-path yield is 87.0 % of hit
++    TRA-amplicon reads against 7.2 % of bulk reads, because bulk reads mostly do not span a junction
++    at all -- and a fast path that silently covered 7 % of a library while looking like a speedup is
++    exactly the "correct output, zero speedup" failure this project has shipped twice.
++
++    No-op unless ``ARDA_PROJECT_DUMP`` names a path. Appends, because ``map`` runs per chunk.
++    """
++    path = os.environ.get("ARDA_PROJECT_DUMP")
++    if not path:
++        return
++    from ..refbuild.translate import reverse_complement
++    from .project import _anchor, project_junction
++
++    p = Path(path)
++    rows = []
++    for q in sorted(set(best_v) & set(best_j)):
++        v_row, j_row = seg_rows.get((q, "V")), seg_rows.get((q, "J"))
++        seq = seqs.get(q)
++        if not v_row or not j_row or not seq:
++            continue
++        # `project_junction` works in the frame the hits were measured in, so a minus-strand read is
++        # handed its reverse complement. Reflecting coordinates afterwards instead is how sign
++        # errors get in -- see the module docstring.
++        rc = v_row["qstart"] > v_row["qend"]
++        strand_seq = reverse_complement(seq) if rc else seq
++        proj, why = project_junction(strand_seq, len(seq), v_row=v_row, j_row=j_row,
++                                     v_call=best_v[q], j_call=best_j[q], anchors=ref.anchors,
++                                     split_checked=split_checked)
++        # Locus from the J anchor, not the V: TRAV/DV alleles pair with either TRAJ or TRDJ and
++        # **the J decides the locus**. Taking it from the V would mislabel every TRD read.
++        ja = _anchor(ref.anchors, "J", best_j[q])
++        rows.append("\t".join(str(x) for x in (
++            q, ja.locus if ja else "", best_v[q], best_j[q],
++            why, proj.junction if proj else "", proj.start if proj else "",
++            proj.end if proj else "", int(rc))))
++    if not rows:
++        return
++    new = not p.exists()
++    with p.open("a") as fh:
++        if new:
++            fh.write("\t".join(_PROJECT_COLS) + "\n")
++        fh.write("\n".join(rows) + "\n")
++
++
++def _dump_vonly(rescue: list[str], best_v: dict[str, str], best_j: dict[str, str],
++                seg_rows: dict[tuple[str, str], dict], best: dict[str, dict],
++                seqs: dict[str, str]) -> None:
++    """Append one row per ``v_only`` read: its SEGMENT score beside its SCAFFOLD score.
++
++    A ``v_only`` read hit a V and never reached a J, because on a 5'RACE amplicon **there is no J
++    in the read**. It is 43 % of amplicon mates and 93.4 % of the rescue set, and the only reason
++    it goes to the full 15,414-scaffold reference at all is to obtain a score on the scale
++    ``--min-score`` is defined in. Skipping that search is worth ~2.5x (measured, round 14 step 1),
++    but only if a segment-scale threshold can reproduce the same kept set.
++
++    This writes the raw pair of scores and nothing else. It deliberately does **not** fit or apply
++    a threshold: the fit belongs offline, where it can be cross-validated per locus against the
++    round-12/13 truth, and where getting it wrong cannot silently change a shipped call. Round 6
++    measured ``--min-score 60`` taking precision 94.3 % -> 65.5 %, which is the cost of guessing.
++
++    ⚠ The two scores are **not** on one scale and are not meant to be: ``seg_bits`` is an ungapped
++    ``MATCH 2 / MISMATCH -3`` score (``src/_segmap/segmap.cpp``) that grows with aligned length,
++    while ``scaffold_bits`` is an MMseqs2 bit score. Finding the map between them is the experiment.
++    ``seg_qstart``/``seg_qend``/``read_len`` are emitted so the fit can normalise by aligned length
++    rather than assuming a single global cut -- V genes differ in length across loci, so a raw
++    ungapped score is not comparable between them.
++
++    No-op unless ``ARDA_VONLY_DUMP`` names a path. Appends, because ``map`` runs per chunk.
++    """
++    path = os.environ.get("ARDA_VONLY_DUMP")
++    if not path:
++        return
++    p = Path(path)
++    rows = []
++    for q in rescue:
++        # The `v_only` predicate, restated from `shortlist()`: a V but no J. `Shortlist.reasons`
++        # only carries counts, so recomputing here is what keeps this out of the shipped partition.
++        if not best_v.get(q) or best_j.get(q):
++            continue
++        seg = seg_rows.get((q, "V")) or {}
++        hit = best.get(q) or {}
++        rows.append("\t".join(str(x) for x in (
++            q, best_v[q], seg.get("bits", ""), seg.get("qstart", ""), seg.get("qend", ""),
++            seg.get("tstart", ""), len(seqs.get(q, "")),
++            hit.get("target", ""), hit.get("bits", ""))))
++    if not rows:
++        return
++    new = not p.exists()
++    with p.open("a") as fh:
++        if new:
++            fh.write("\t".join(_VONLY_COLS) + "\n")
++        fh.write("\n".join(rows) + "\n")
++
++
+ def _segment_best_hits(
+     query_db: Path, seg_db: Path, full_db: Path, tmp: Path, ref: Reference, *,
+     threads: int, sensitivity: float, mm_strand: int | None, max_seqs: int, kmer: int | None,
+@@ -866,6 +1006,13 @@ def _segment_best_hits(
+             if sid:
+                 jc_scaffold.setdefault(q, sid)
+ 
++    # Before the shortlist, so the dump sees every read carrying both anchors -- including those the
++    # shortlist will send to rescue for a reason unrelated to the junction (an unknown V*J pair, an
++    # indel). Dumping after would silently under-report fast-path yield.
++    # `indel_rescue` is exactly the flag that makes `segment_rows` compute `split`, so it IS the
++    # answer to "did the indel check run" -- passed explicitly rather than re-derived.
++    _dump_projection(best_v, best_j, seg_rows, seqs, ref, split_checked=indel_rescue)
++
+     if combos is None:
+         combos = load_combinations(ref.target_fasta.parent / "combinations.tsv")
+     sl = shortlist(best_v, best_j, combos)
+@@ -980,6 +1127,7 @@ def _cands(q: str, sid: str) -> list[str]:
+         best.update(_full_rescue(query_db, full_db, rescue, tmp, threads=threads,
+                                  sensitivity=sensitivity, mm_strand=mm_strand,
+                                  max_seqs=max_seqs, kmer=kmer, search_type=search_type))
++        _dump_vonly(rescue, best_v, best_j, seg_rows, best, seqs)
+ 
+     seen = set(best_v) | set(best_j) | set(best_c)
+     # ⛔ Assert what actually matters: every read the segment pass SAW either came back with a hit
+diff --git a/src/arda/annotate/project.py b/src/arda/annotate/project.py
+new file mode 100644
+index 00000000..dc02bd18
+--- /dev/null
++++ b/src/arda/annotate/project.py
+@@ -0,0 +1,176 @@
++"""Place the junction by arithmetic instead of by alignment.
++
++AIRR ``junction`` runs from the Cys104 codon to the [FW]118 codon that opens FR4, both **included**
++(IMGT ``cdr3`` excludes them and is two residues shorter). Today arda learns those two positions by
++aligning the read against a ``V + pad + J`` scaffold, and the 15,414-scaffold reference exists for
++that and essentially nothing else -- the V and J *gene* calls already come out of the 924-target
++segment pass at .9997 / .9998 agreement.
++
++But the segment pass already returns, per read per side, ``(target, tstart, qstart)``; and
++``cdr3_anchors.tsv`` already records ``anchor_nt``, the 0-based offset of the anchor codon inside
++that segment's germline. The segment targets are built so target coordinates *are* germline
++coordinates -- ``refbuild.segments`` writes the V target as ``scaffold[:v_sequence_end]`` and the J
++target as ``scaffold[j_sequence_start - 1 : vj_end]``, so each germline starts at offset 0. So the
++anchor's position in the read is two integer adds:
++
++.. code-block:: text
++
++    offset = (anchor_nt + 1) - tstart          # germline distance from the hit start to the anchor
++    pos    = qstart + offset                   # forward hit
++    pos    = (qlen - qstart + 1) + offset      # reverse-complement hit, in revcomp coordinates
++
++Measured against IgBLAST on a TRA amplicon, a TRB amplicon and a bulk library:
++**54,740 / 54,756 = .99971 byte-exact junctions**, at no cost beyond the segment pass that already
++runs. See ``arda-benchmark/results/round14/README.md`` §2.
++
++⛔ **This is a fast path, not a replacement.** It yields ``junction`` and its coordinates. It does
++*not* yield ``v_identity``, ``sequence_alignment``, ``germline_alignment``, the per-segment CIGARs
++or the ``mmseqs2_*`` block, all of which ``annotate.transfer`` derives from the alignment's
++``qaln``/``taln``. Anything needing those still needs the scaffold alignment.
++
++⛔ **And it refuses rather than degrades.** A junction that is well-formed but wrong is the worst
++output this codebase can produce -- the reference-geometry bug shipped junctions that started ``C``,
++ended ``[FW]``, passed ``--complete-only`` and were short by exactly the allele's truncation. Every
++condition this projection cannot verify sends the read back to the aligner instead of guessing. Same
++rule as :func:`arda.igblast.auxiliary_data`, which raises rather than returning ``None``.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++__all__ = ["Projection", "project_junction", "REFUSALS"]
++
++#: Every reason a read is handed back to the scaffold aligner. Counted in the run report so the
++#: fast-path yield is auditable rather than inferred -- 87.0 % of hit TRA-amplicon reads carry both
++#: anchors against 7.2 % of bulk reads, and a silent fast path would hide that difference entirely.
++REFUSALS = ("no_anchor", "unvalidated_locus", "indel_unchecked", "indel_split",
++            "strand_mismatch", "order", "off_read", "bad_codon")
++
++#: Loci the projection declines regardless of how well the arithmetic works on them.
++#:
++#: ⛔ TRD is here because it is UNVALIDATED, not because it is known bad. The pre-registered bar for
++#: shipping a locus was "byte-exact >= 0.99 at n >= 2,000, or the locus goes on the refusal list",
++#: and TRD came back at **n = 0**: across two TR amplicons the segment pass never handed a single
++#: TRD read both anchors, so all 767 TRD junctions in the IgBLAST truth fell through to the aligner
++#: untouched. Zero coverage is not a pass. The one measurement that does exist is the design pass's
++#: 43/51 = 0.843, against .999 pooled -- far too small to be a rate and far too poor to ignore.
++#:
++#: TRD is also the locus most likely to break a projection: TRAV/DV alleles rearrange to either TRAJ
++#: or TRDJ and **the J decides the locus**, so a V-derived coordinate can be read in the wrong
++#: frame of reference. Declining costs nothing today (the path never fires) and stops a future
++#: reference change from silently routing TRD reads through untested arithmetic.
++UNVALIDATED_LOCI = frozenset({"TRD"})
++
++
++@dataclass(frozen=True)
++class Projection:
++    """A junction placed from segment coordinates alone."""
++
++    junction: str
++    #: 1-based, inclusive, on ``strand_seq`` -- i.e. on the reverse complement when ``rev_comp``.
++    start: int
++    end: int
++    rev_comp: bool
++
++    @property
++    def cdr3(self) -> str:
++        """IMGT ``cdr3``: the junction with both anchor codons removed."""
++        return self.junction[3:-3]
++
++
++def _anchor(anchors: dict, side: str, call: str):
++    """Resolve a possibly comma-joined segment call to a single usable anchor.
++
++    A segment target may name several alleles arda cannot separate (23 of 775 human ``V|`` targets
++    do, ``IGHV3-23*01,IGHV3-23D*01`` among them). They are duplicate SEQUENCES, so their anchors
++    agree by construction -- verified zero disagreement across every multi-allele header -- and
++    taking the first resolvable one is exact, not a heuristic.
++    """
++    for allele in call.split(","):
++        a = anchors.get((side, allele.strip()))
++        if a is not None and a.status == "ok" and a.anchor_nt >= 0:
++            return a
++    return None
++
++
++def project_junction(strand_seq: str, qlen: int, *, v_row: dict, j_row: dict,
++                     v_call: str, j_call: str, anchors: dict,
++                     split_checked: bool) -> tuple[Projection | None, str]:
++    """Project the junction from two segment hits. Returns ``(projection, refusal_reason)``.
++
++    Args:
++        strand_seq: the read on the strand the hits are measured in. For a reverse-complement hit
++            the caller passes ``revcomp(read)``, because that is the frame the arithmetic below is
++            expressed in and translating coordinates twice is how sign errors get in.
++        qlen: length of the ORIGINAL read, which is what ``segmap`` used to build a minus-strand
++            ``qstart``. Equal to ``len(strand_seq)``; passed explicitly so a caller that trims cannot
++            silently disagree with the mapper.
++        v_row, j_row: segment rows -- ``qstart``, ``qend``, ``tstart``, ``split``.
++        split_checked: did indel detection actually run? ``segment_rows`` only populates ``split``
++            when ``max_indel > 0``, so a ``False`` here means every ``split`` is 0 for want of
++            checking, not for want of indels. **No default** -- the caller must state it.
++
++    Exactly one of the return slots is set: a ``Projection`` and ``""``, or ``None`` and a member of
++    :data:`REFUSALS`.
++    """
++    va, ja = _anchor(anchors, "V", v_call), _anchor(anchors, "J", j_call)
++    if va is None or ja is None:
++        return None, "no_anchor"
++
++    # Locus from the J, never the V -- TRAV/DV alleles pair with either TRAJ or TRDJ and the J
++    # decides which, so a V-derived locus would mislabel exactly the reads this check protects.
++    if ja.locus in UNVALIDATED_LOCI:
++        return None, "unvalidated_locus"
++
++    # An indel between the read and the germline shifts every downstream base, so a projection that
++    # assumes a constant offset is wrong by exactly the indel length. `segmap`'s two-diagonal
++    # signature is what detects that, and it is the load-bearing refusal here.
++    #
++    # ⛔ `split` IS ONLY POPULATED WHEN INDEL DETECTION RAN. `segment_rows` passes `max_indel = 0`
++    # unless `--indel-rescue` is on, and then every `split` is 0 -- indistinguishable from "checked
++    # and clean". A caller that forgets would get the projection with its indel protection SILENTLY
++    # INERT, which is this codebase's most repeated failure shape (mmseqs `createdb` on its first
++    # byte, `fetch_database` across a filesystem boundary, a reference swap into the wrong cache).
++    # So the caller must SAY whether the check ran; there is no default.
++    #
++    # It matters, measured: on IGH_repertoire (91.77 % median V identity) the gate costs 3.97 % of
++    # fast-path yield and takes byte-exact accuracy from **.99634 to .99915** -- 332 wrong junctions
++    # down to 74. On IGH_naive (99.41 %) it costs 2.92 % and buys +0.00002. Like `--indel-rescue`
++    # itself, its value tracks SHM load, so the right default is per-library, not global.
++    if not split_checked:
++        return None, "indel_unchecked"
++    if v_row.get("split") or j_row.get("split"):
++        return None, "indel_split"
++
++    # `segmap` signals a minus-strand hit with qstart > qend, the convention `_align_implied` also
++    # relies on. A read whose V and J hits disagree on strand is not a rearrangement this can place.
++    v_rc, j_rc = v_row["qstart"] > v_row["qend"], j_row["qstart"] > j_row["qend"]
++    if v_rc != j_rc:
++        return None, "strand_mismatch"
++
++    def pos(row: dict, anchor_nt: int) -> int:
++        # `tstart` is 1-BASED on the forward target (segmap.cpp:376); `anchor_nt` is 0-BASED
++        # (cdr3fix.Anchor). Hence the +1. Getting this wrong shifts every junction by one base and
++        # still produces something that starts with a plausible codon.
++        offset = (anchor_nt + 1) - row["tstart"]
++        q = row["qstart"]
++        # For a minus-strand hit `qstart` is already in FORWARD coordinates (segmap.cpp:383), so it
++        # must be reflected back into the revcomp frame `strand_seq` is in before the offset applies.
++        return (qlen - q + 1 if v_rc else q) + offset
++
++    start, fw = pos(v_row, va.anchor_nt), pos(j_row, ja.anchor_nt)
++    end = fw + 2                                   # the [FW]118 codon is the junction's last 3 nt
++
++    if end <= start:
++        return None, "order"
++    if start < 1 or end > len(strand_seq):
++        return None, "off_read"
++
++    junction = strand_seq[start - 1:end]
++    # A junction whose length is not a multiple of 3 cannot be the thing AIRR says it is, whatever
++    # the arithmetic produced. Cheap, and it catches a coordinate error that survives every check
++    # above -- which is exactly the class of bug that shipped junctions "short by the truncation".
++    if len(junction) % 3:
++        return None, "bad_codon"
++    return Projection(junction=junction, start=start, end=end, rev_comp=v_rc), ""
+diff --git a/src/arda/cli.py b/src/arda/cli.py
+index 9070cb32..796758ae 100644
+--- a/src/arda/cli.py
++++ b/src/arda/cli.py
+@@ -390,7 +390,9 @@ def rnaseq_map(
+ def rnaseq_correct(
+     input: Path = typer.Option(..., "--input", "-i", help="Mapped-reads AIRR TSV (from `map`)."),
+     output: Path = typer.Option(..., "--output", "-o", help="Corrected clonotype table TSV."),
+-    max_subs: int = typer.Option(2, help="Max substitutions between an error child and its parent."),
++    max_subs: int = typer.Option(
++        3, help="Max substitutions between an error child and its parent. A search RADIUS, not a "
++                "threshold -- the length-scaled probability model still decides. Saturates at 3."),
+     max_indel: int = typer.Option(
+         0, help="Max indel bases searched (default 0). 1-2 bp indel errors are frameshifts already "
+                 "dropped by --complete-only, so this only helps with --all-junctions; multi-bp SHM "
+diff --git a/src/arda/mmseqs.py b/src/arda/mmseqs.py
+index 18c304c2..fa3545f9 100644
+--- a/src/arda/mmseqs.py
++++ b/src/arda/mmseqs.py
+@@ -304,6 +304,13 @@ def search(
+         args += ["-k", str(kmer)]
+     if extra:
+         args += extra
++    # Escape hatch for A/B-ing aligner options against a LIVE reference, without a rebuild per leg.
++    # Not a supported interface -- MMseqs2 flags are not part of arda's contract, and several of
++    # them (`--min-seq-id`, `-e`) silently change which reads are reported. It exists because every
++    # recorded flag measurement in this project was taken against a reference that has since been
++    # rebuilt twice, so re-measuring has to be cheaper than editing the source.
++    if opts := os.environ.get("ARDA_MMSEQS_SEARCH_OPTS", "").split():
++        args += opts
+     run(args)
+     return Path(result_db)
+ 
+diff --git a/src/arda/rnaseq/correct.py b/src/arda/rnaseq/correct.py
+index 6e5a7b0c..00f88bb3 100644
+--- a/src/arda/rnaseq/correct.py
++++ b/src/arda/rnaseq/correct.py
+@@ -432,7 +432,7 @@ def correct_airr(
+     *,
+     organism: str = "human",
+     map_d: bool = True,
+-    max_subs: int = 2,
++    max_subs: int = 3,
+     max_indel: int = 0,
+     error_rate: float = 0.001,
+     indel_rate: float = 0.001,
+@@ -461,6 +461,14 @@ def correct_airr(
+             clonotype's dominant isotype CLASS (from ``c_class``: IGHG, IGHA, ...), preferring a
+             resolved class over the ambiguous ``IGHC``; empty when no read carried a constant call.
+         max_subs: max substitutions between an error child and its parent (seqtree neighbour search).
++            This is a SEARCH RADIUS, not a threshold -- the accept/reject decision is the
++            length-scaled probability model above, so widening it only lets the model SEE parents
++            it would already have accepted. The default was 2 through 2.9.0, which truncated the
++            search below what the model would take on a deep clone: on the two monoclonal cell
++            lines in the arda-benchmark set 2 -> 3 collapses Jurkat 74 -> 57 clonotypes and Raji
++            91 -> 58, while a polyclonal mouse spleen (7,942) and an oligoclonal B-LCL (13) are
++            UNCHANGED at 2, 3 and 4 -- the model refuses those collapses on abundance regardless
++            of radius. It saturates at 3 (4 gives the same four numbers), so 3 is the default.
+         max_indel: max inserted/deleted bases searched for indel error children (default 0). A 1-2 bp
+             instrument indel is a frameshift and is already dropped by ``complete_only``, so on
+             complete junctions the indel search only costs time (~160x slower) and collapses nothing;
+diff --git a/tests/unit/test_best_hits.py b/tests/unit/test_best_hits.py
+index a201f7b0..8619872d 100644
+--- a/tests/unit/test_best_hits.py
++++ b/tests/unit/test_best_hits.py
+@@ -19,10 +19,12 @@
+ _COLS = mmseqs.DEFAULT_FORMAT_OUTPUT.split(",")
+ 
+ 
+-def _row(query: str, target: str, bits: float) -> str:
++def _row(query: str, target: str, bits: float,
++         tstart: int = 1, tend: int = 60) -> str:
+     """One mmseqs hit line; only query/target/bits matter to the tie-break."""
+     vals = {
+-        "query": query, "target": target, "qstart": 1, "qend": 60, "tstart": 1, "tend": 60,
++        "query": query, "target": target, "qstart": 1, "qend": 60,
++        "tstart": tstart, "tend": tend,
+         "qlen": 60, "tlen": 400, "alnlen": 60, "mismatch": 0, "gapopen": 0, "cigar": "60M",
+         "qaln": "A" * 60, "taln": "A" * 60, "evalue": 1e-20, "bits": bits, "pident": 100.0,
+     }
+@@ -73,3 +75,40 @@ def test_ties_are_broken_independently_per_query(tmp_path):
+     rev = _best_hits(_write(tmp_path / "many_rev.tsv", rows_rev))
+ 
+     assert {q: h["target"] for q, h in fwd.items()} == {q: h["target"] for q, h in rev.items()}
++
++
++def test_a_target_inverted_row_is_not_a_usable_hit(tmp_path):
++    """`tstart > tend` must be dropped, not projected.
++
++    mmseqs can express a minus-strand nt hit on the TARGET side. arda tests only the query
++    side (`rev = qstart > qend`), so such a row reads as forward, and `transfer_regions` walks
++    the target forward from an inverted `tstart` -- sliding the scaffold's cdr3/fwr4 markup by
++    `(tlen + 1 - tstart) - tstart` nt and taking the junction window off Cys104.
++
++    Measured consequence, arda 2.5.6 on Jurkat (ERR3003543, a MONOCLONAL T-cell line): the
++    window slid 10 nt into V framework 3, opened on a spurious TGT, closed on TGG, satisfied
++    `assemble._CANON` (`^C...[FW]$`) and shipped as a 7,408-read clonotype -- 48 % the size of
++    the true clone, from which it had taken 5,758 reads.
++
++    The row is not a recoverable reflection: on that read `identity(qaln, taln)` is 0.232
++    against the row's own reported `pident` of 91.3, so it is a garbage alignment. Refusing it
++    is the only outcome that cannot produce a well-formed junction that is wrong.
++    """
++    inverted = _row("read1", "TRBV12-3*01_TRBJ1-2*01", 243.0, tstart=180, tend=1)
++
++    assert _best_hits(_write(tmp_path / "inv.tsv", [inverted])) == {}, (
++        "a target-inverted alignment row was returned as a usable hit; projecting it slides "
++        "the junction window off Cys104 and emits a phantom clonotype"
++    )
++
++
++def test_an_inverted_row_never_beats_a_forward_one(tmp_path):
++    """Refusal must survive the tie-break -- an inverted row outscoring a real hit is exactly
++    the case where keeping it does damage."""
++    good = _row("read1", "TRBV12-3*01_TRBJ1-2*01", 200.0)
++    inverted = _row("read1", "TRBV6-6*01_TRBJ1-2*01", 243.0, tstart=180, tend=1)
++
++    for name, rows in (("inv_first", [inverted, good]), ("good_first", [good, inverted])):
++        got = _best_hits(_write(tmp_path / f"{name}.tsv", rows))["read1"]
++        assert got["target"] == "TRBV12-3*01_TRBJ1-2*01", name
++        assert got["tstart"] <= got["tend"], name
+diff --git a/tests/unit/test_project.py b/tests/unit/test_project.py
+new file mode 100644
+index 00000000..6c449937
+--- /dev/null
++++ b/tests/unit/test_project.py
+@@ -0,0 +1,216 @@
++"""The junction placed by arithmetic: the coordinate contract, and the refusals.
++
++`project_junction` composes three coordinate systems that disagree about their origin -- `tstart` is
++1-based on the forward target, `anchor_nt` is 0-based in the germline, and a minus-strand `qstart`
++is in forward coordinates while the sequence it indexes is the reverse complement. Every one of
++those is an off-by-one waiting to happen, and an off-by-one here still produces a junction that
++looks plausible: right length, starts with a codon, ends with a codon. So the tests pin the
++arithmetic against a hand-built case where the answer is known by construction, and then against the
++SHIPPED reference, where the anchor codon must actually decode to Cys / Phe / Trp.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from arda.annotate.project import project_junction
++from arda.cdr3fix import Anchor
++
++from ..conftest import requires_human_db
++
++COMP = str.maketrans("ACGT", "TGCA")
++
++
++def rc(s: str) -> str:
++    return s.translate(COMP)[::-1]
++
++
++def anchor(nt: int, status: str = "ok") -> Anchor:
++    return Anchor(locus="TRB", segment="V", templated_aa="C", functionality="F", status=status,
++                  source="test", anchor_nt=nt, partial_nt=0, germline_nt="TGT")
++
++
++# A read built so the answer is known: 30 nt of V, then TGT (Cys104), then a 12 nt NDN, then TTT
++# (Phe118), then 15 nt of FR4. The junction is therefore TGT + NDN + TTT = 18 nt.
++V_LEAD, NDN, FR4 = "A" * 30, "GGGCCCAAATTT", "C" * 15
++READ = V_LEAD + "TGT" + NDN + "TTT" + FR4
++JUNCTION = "TGT" + NDN + "TTT"
++
++
++@pytest.fixture
++def scene():
++    """V hit starting at read base 1 against germline base 1; J hit starting at the [FW] codon."""
++    v_row = {"qstart": 1, "qend": 33, "tstart": 1, "split": False}
++    j_row = {"qstart": 46, "qend": 61, "tstart": 1, "split": False}
++    # V germline: the Cys codon begins at read offset 30 (0-based), and the hit is germline-aligned
++    # from base 1, so anchor_nt is 30. J germline: the hit starts AT the [FW] codon, so anchor_nt 0.
++    anchors = {("V", "TRBV1*01"): anchor(30), ("J", "TRBJ1*01"): anchor(0)}
++    return dict(v_row=v_row, j_row=j_row, v_call="TRBV1*01", j_call="TRBJ1*01", anchors=anchors)
++
++
++def test_the_projected_junction_is_the_one_that_is_actually_there(scene):
++    p, why = project_junction(READ, len(READ), split_checked=True, **scene)
++    assert why == ""
++    assert p.junction == JUNCTION
++    assert READ[p.start - 1:p.end] == JUNCTION
++
++
++def test_it_returns_the_AIRR_junction_not_the_IMGT_cdr3(scene):
++    # These differ by exactly the two anchor codons, and confusing them corrupts every downstream
++    # comparison silently -- junction_aa is two residues longer than cdr3_aa.
++    p, _ = project_junction(READ, len(READ), split_checked=True, **scene)
++    assert p.junction.startswith("TGT") and p.junction.endswith("TTT")
++    assert p.cdr3 == NDN
++    assert len(p.junction) == len(p.cdr3) + 6
++
++
++def test_a_reverse_complement_hit_lands_on_the_same_junction(scene):
++    # This is the branch that matters most in practice: R2 of a paired amplicon is 100 % rc, so a
++    # sign error here would corrupt half of every paired run while the forward half looked perfect.
++    #
++    # The INPUT read is rc(READ); segmap therefore finds V and J while scanning its reverse
++    # complement, which is READ. `segmap.cpp:383` converts those back to FORWARD coordinates on the
++    # input read, giving qstart > qend. The caller passes the strand the hits were MEASURED on --
++    # revcomp(input) == READ -- because that is the frame the offsets are expressed in.
++    n = len(READ)
++    # V occupies READ 0-based [0, 32] -> qstart = n - 0 = 63, qend = n - 32 = 31.
++    v_row = {"qstart": n - 0, "qend": n - 32, "tstart": 1, "split": False}
++    # The [FW] codon begins at READ 0-based 45; the J hit runs to the end of FR4 at 0-based 62.
++    j_row = {"qstart": n - 45, "qend": n - 62, "tstart": 1, "split": False}
++    p, why = project_junction(READ, n, split_checked=True, **{**scene, "v_row": v_row, "j_row": j_row})
++    assert why == ""
++    assert p.rev_comp is True
++    assert p.junction == JUNCTION
++    assert READ[p.start - 1:p.end] == JUNCTION
++
++
++def test_a_hit_starting_mid_germline_still_projects(scene):
++    # A read that does not reach the start of V: the hit begins at germline base 11, so the anchor
++    # is 10 bases closer. If `tstart` were ignored the junction would be off by exactly 10.
++    trimmed = READ[10:]
++    v_row = {"qstart": 1, "qend": 23, "tstart": 11, "split": False}
++    j_row = {"qstart": 36, "qend": 51, "tstart": 1, "split": False}   # shifted with the read
++    p, why = project_junction(trimmed, len(trimmed), split_checked=True,
++                              **{**scene, "v_row": v_row, "j_row": j_row})
++    assert why == ""
++    assert p.junction == JUNCTION
++
++
++@pytest.mark.parametrize("mutate, expected", [
++    (lambda s: {**s, "anchors": {("V", "TRBV1*01"): anchor(30, status="no_anchor"),
++                                 ("J", "TRBJ1*01"): anchor(0)}}, "no_anchor"),
++    (lambda s: {**s, "v_row": {**s["v_row"], "split": True}}, "indel_split"),
++    (lambda s: {**s, "j_row": {"qstart": 61, "qend": 46, "tstart": 1, "split": False}},
++     "strand_mismatch"),
++    (lambda s: {**s, "j_row": {**s["j_row"], "tstart": 400}}, "order"),
++])
++def test_every_refusal_returns_no_junction_and_names_itself(scene, mutate, expected):
++    p, why = project_junction(READ, len(READ), split_checked=True, **mutate(scene))
++    assert p is None and why == expected
++
++
++def test_an_anchor_projected_past_the_end_of_the_read_is_refused(scene):
++    # The read stops before FR4, so the J anchor projects off the end. Returning a truncated
++    # junction here is exactly the "well-formed but systematically short" failure that shipped once.
++    short = READ[:40]        # junction ends at 48, so the J anchor projects past the end
++    p, why = project_junction(short, len(short), split_checked=True, **scene)
++    assert p is None and why == "off_read"
++
++
++def test_the_composite_allele_names_a_segment_target_can_carry_resolve(scene):
++    # 23 of 775 human V targets are comma-joined duplicate sequences. A bare dict lookup on the
++    # composite string misses them, which would refuse a read that is perfectly placeable.
++    p, why = project_junction(READ, len(READ), split_checked=True,
++                              **{**scene, "v_call": "TRBV1*01,TRBV1D*01"})
++    assert why == "" and p.junction == JUNCTION
++
++
++@requires_human_db
++def test_the_anchor_offsets_decode_to_real_anchor_codons_in_the_shipped_reference():
++    """The arithmetic is only meaningful if `anchor_nt` indexes the segment targets it is used with.
++
++    ⛔ This is the assertion that catches a reference rebuild silently moving the coordinate system
++    out from under the projection -- the class of failure this repo has shipped as "a reference swap
++    can silently be a no-op". It reads the REAL segments.fasta, not a fixture.
++    """
++    from arda.annotate.reference import load_reference
++    from arda.refbuild.segments import build_segment_reference
++
++    ref = load_reference("human", "nt")
++    seg = ref.target_fasta.parent / "segments.fasta"
++    if not seg.exists():
++        build_segment_reference("human", out_dir=ref.target_fasta.parent)
++
++    seqs, name = {}, None
++    for line in seg.read_text().splitlines():
++        if line.startswith(">"):
++            name = line[1:].split()[0]
++            seqs[name] = ""
++        elif name:
++            seqs[name] += line.strip()
++
++    ok = {"V": 0, "J": 0}
++    bad = {"V": [], "J": []}
++    for target, s in seqs.items():
++        kind, _, call = target.partition("|")
++        if kind not in ("V", "J"):
++            continue
++        for allele in call.split(","):
++            a = ref.anchors.get((kind, allele.strip()))
++            if a is None or a.status != "ok" or a.anchor_nt < 0:
++                continue
++            codon = s[a.anchor_nt:a.anchor_nt + 3].upper()
++            want = {"TGT", "TGC"} if kind == "V" else {"TTT", "TTC", "TGG"}
++            if codon in want:
++                ok[kind] += 1
++            else:
++                bad[kind].append((target, codon))
++            break
++
++    # Not 100 %: TRBJ2-2P*01 (GGG) and TRBJ2-7*02 (GTC) are genuine germline exceptions, and a
++    # handful of V alleles carry a non-canonical anchor. The bar is that the coordinate system is
++    # right, which a systematic off-by-one would blow straight through.
++    assert ok["V"] >= 700, f"V anchors decoding to Cys: {ok['V']}, misses {bad['V'][:5]}"
++    assert ok["J"] >= 115, f"J anchors decoding to F/W: {ok['J']}, misses {bad['J'][:5]}"
++
++
++def test_an_unvalidated_locus_is_declined_rather_than_guessed(scene):
++    """TRD is refused because it has ZERO coverage, not because it is known wrong.
++
++    The pre-registered bar was "byte-exact >= 0.99 at n >= 2,000 per locus, or the locus goes on
++    the refusal list". Across two TR amplicons the segment pass never handed a single TRD read both
++    anchors, so all 767 TRD junctions in the IgBLAST truth went to the aligner untouched -- n = 0,
++    which is not a pass. Declining costs nothing today and stops a future reference change from
++    routing TRD through arithmetic nobody has measured.
++    """
++    trd = Anchor(locus="TRD", segment="J", templated_aa="F", functionality="F", status="ok",
++                 source="test", anchor_nt=0, partial_nt=0, germline_nt="TTT")
++    anchors = {("V", "TRBV1*01"): anchor(30), ("J", "TRBJ1*01"): trd}
++    p, why = project_junction(READ, len(READ), split_checked=True, **{**scene, "anchors": anchors})
++    assert p is None and why == "unvalidated_locus"
++
++
++def test_the_locus_is_read_off_the_J_anchor_not_the_V(scene):
++    # TRAV/DV alleles rearrange to either TRAJ or TRDJ and the J decides the locus. A V-derived
++    # locus would let a TRD read through under a TRA label -- the exact asymmetry refbuild/loci.py
++    # encodes and that this project has already built, measured and reverted once.
++    v_trd = Anchor(locus="TRD", segment="V", templated_aa="C", functionality="F", status="ok",
++                   source="test", anchor_nt=30, partial_nt=0, germline_nt="TGT")
++    anchors = {("V", "TRBV1*01"): v_trd, ("J", "TRBJ1*01"): anchor(0)}
++    p, why = project_junction(READ, len(READ), split_checked=True, **{**scene, "anchors": anchors})
++    assert why == "" and p.junction == JUNCTION
++
++
++def test_an_unchecked_indel_gate_refuses_instead_of_passing_silently(scene):
++    """`split` is 0 both when there is no indel and when nobody looked. Those must not be the same.
++
++    `segment_rows` only populates `split` when `max_indel > 0`, i.e. when `--indel-rescue` is on.
++    Without it every `split` is 0 and a projection would run with its indel protection INERT --
++    this codebase's most repeated failure shape, and the reason `split_checked` has no default.
++
++    It is worth a refusal because the gate is worth something: on IGH_repertoire (91.77 % median V
++    identity) it takes byte-exact accuracy from .99634 to .99915 -- 332 wrong junctions down to 74 --
++    for 3.97 % of fast-path yield.
++    """
++    p, why = project_junction(READ, len(READ), split_checked=False, **scene)
++    assert p is None and why == "indel_unchecked"
+diff --git a/tests/unit/test_vonly_dump.py b/tests/unit/test_vonly_dump.py
+new file mode 100644
+index 00000000..a90dc82b
+--- /dev/null
++++ b/tests/unit/test_vonly_dump.py
+@@ -0,0 +1,105 @@
++"""The `v_only` calibration dump: raw scores out, nothing else changed.
++
++`_dump_vonly` exists to answer one question offline -- can a SEGMENT-scale threshold reproduce the
++kept set `--min-score 75` produces on whole-scaffold MMseqs2 bit scores? -- for the 43 % of amplicon
++mates that hit a V and never reach a J. It is a measurement harness, so the properties that matter
++are that it is inert when unset, that it selects exactly the `v_only` population, and that it emits
++the scores rather than any decision made from them.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from arda.annotate.mapper import _VONLY_COLS, _dump_vonly
++
++
++@pytest.fixture
++def scene():
++    """Four rescued reads, one of each reason. Only `v1` is `v_only`."""
++    best_v = {"v1": "IGHV3-23*01", "both": "IGHV1-2*02"}
++    best_j = {"j1": "IGHJ4*02", "both": "IGHJ6*03"}
++    seg_rows = {
++        ("v1", "V"): {"bits": 240.0, "qstart": 1, "qend": 120, "tstart": 176},
++        ("both", "V"): {"bits": 210.0, "qstart": 3, "qend": 108, "tstart": 190},
++    }
++    best = {
++        "v1": {"target": "IGH_991", "bits": 131.0},
++        "j1": {"target": "IGH_JC_3", "bits": 88.0},
++        "both": {"target": "IGH_412", "bits": 205.0},
++    }
++    seqs = {"v1": "A" * 150, "j1": "C" * 150, "both": "G" * 150, "c1": "T" * 150}
++    return ["both", "c1", "j1", "v1"], best_v, best_j, seg_rows, best, seqs
++
++
++def _rows(path):
++    lines = path.read_text().splitlines()
++    return [dict(zip(_VONLY_COLS, line.split("\t"))) for line in lines[1:]]
++
++
++def test_writes_nothing_at_all_when_the_env_var_is_unset(scene, tmp_path, monkeypatch):
++    # The whole point of an env-var harness is that a normal run is untouched. If this ever writes
++    # by default it becomes a per-chunk file append on every production run.
++    monkeypatch.delenv("ARDA_VONLY_DUMP", raising=False)
++    _dump_vonly(*scene)
++    assert list(tmp_path.iterdir()) == []
++
++
++def test_selects_v_only_and_nothing_else(scene, tmp_path, monkeypatch):
++    # `j_only`, `c_only` and reads with BOTH sides also pass through `rescue`; a dump that caught
++    # them would inflate the population whose cost this change claims to remove (93.4 %, not 100 %).
++    out = tmp_path / "vonly.tsv"
++    monkeypatch.setenv("ARDA_VONLY_DUMP", str(out))
++    _dump_vonly(*scene)
++    assert [r["read_id"] for r in _rows(out)] == ["v1"]
++
++
++def test_emits_both_scores_on_their_own_scales(scene, tmp_path, monkeypatch):
++    # The two numbers are the experiment. `seg_bits` is ungapped MATCH 2 / MISMATCH -3; the
++    # scaffold bits are MMseqs2's. Emitting only one, or a ratio, would presuppose the answer.
++    out = tmp_path / "vonly.tsv"
++    monkeypatch.setenv("ARDA_VONLY_DUMP", str(out))
++    _dump_vonly(*scene)
++    (row,) = _rows(out)
++    assert float(row["seg_bits"]) == 240.0
++    assert float(row["scaffold_bits"]) == 131.0
++    assert row["scaffold"] == "IGH_991"
++    assert row["v_allele"] == "IGHV3-23*01"
++
++
++def test_emits_the_length_terms_a_per_locus_fit_needs(scene, tmp_path, monkeypatch):
++    # An ungapped score grows with aligned length, and V genes differ in length across loci, so a
++    # single global cut on raw `seg_bits` is not defensible. The fit needs to normalise, which it
++    # can only do if the coordinates come out with the score.
++    out = tmp_path / "vonly.tsv"
++    monkeypatch.setenv("ARDA_VONLY_DUMP", str(out))
++    _dump_vonly(*scene)
++    (row,) = _rows(out)
++    assert (int(row["seg_qstart"]), int(row["seg_qend"])) == (1, 120)
++    assert int(row["read_len"]) == 150
++
++
++def test_appends_across_chunks_with_exactly_one_header(scene, tmp_path, monkeypatch):
++    # `map` calls this once per chunk (200k reads), so a second call must extend the same table.
++    # A header per chunk would break every reader silently -- the extra lines parse as data.
++    out = tmp_path / "vonly.tsv"
++    monkeypatch.setenv("ARDA_VONLY_DUMP", str(out))
++    _dump_vonly(*scene)
++    _dump_vonly(*scene)
++    text = out.read_text()
++    assert text.count("read_id") == 1
++    assert len(_rows(out)) == 2
++
++
++def test_a_v_only_read_the_rescue_could_not_place_still_appears(tmp_path, monkeypatch):
++    # A read the full reference returned nothing for is the most interesting row in the table: it
++    # is a v_only read with a segment score and NO scaffold score, i.e. one the current gate drops.
++    # Skipping it would bias the fit towards reads that already pass.
++    out = tmp_path / "vonly.tsv"
++    monkeypatch.setenv("ARDA_VONLY_DUMP", str(out))
++    _dump_vonly(["v1"], {"v1": "IGHV3-23*01"}, {},
++                {("v1", "V"): {"bits": 61.0, "qstart": 1, "qend": 40, "tstart": 250}},
++                {}, {"v1": "A" * 150})
++    (row,) = _rows(out)
++    assert float(row["seg_bits"]) == 61.0
++    assert row["scaffold_bits"] == "" and row["scaffold"] == ""

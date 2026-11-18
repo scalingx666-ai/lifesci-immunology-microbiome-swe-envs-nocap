@@ -1,0 +1,376 @@
+diff --git a/.gitignore b/.gitignore
+index d199f334..126d024d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,6 +23,7 @@ vignettes/Intro.R
+ *.html
+ tests/*.pdf
+ tests/testthat/Rplots.pdf
++/Rplots.pdf
+ inst/doc
+ /doc/
+ /Meta/
+diff --git a/NEWS.md b/NEWS.md
+index 89ca1dc5..3ea98b56 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -9,6 +9,8 @@
+ 
+ ### BUG FIXES
+ 
++-   Fix the `dcm` methods that broke when `control.dcm()` was given an explicit vector of times in `nsteps` rather than a scalar maximum, a documented input that solved correctly but that every downstream method then failed on: `as.data.frame()` errored with "'to' must be of length 1", `plot()` with "invalid 'xlim' value", and `summary()` and `comp_plot()` with "'length = 4' in coercion to 'logical(1)'". Each of these treated `control$nsteps` as a scalar; they now take their time coordinates from `control$timesteps`, which holds the times the model was actually solved over. A requested `at` is validated by membership in that vector rather than against a range, so a time between two solved times is now rejected instead of silently returning an empty summary, and a time such as `1.3` under a `dt` of `0.1` is matched despite the floating point error of the sequence. Both `print()` and `summary()` also reported the number of time steps wrongly for these models, the former printing the whole time vector and the latter a blank (it read `object$nsteps`, which does not exist); they now report the number of times solved, adding the range when those times are not `1, 2, ..., n`. Closes #1062.
++-   Fix `as.data.frame.dcm()` for an unsorted `run` selection, which errored with "numbers of columns of arguments do not match", and for a repeated one, which silently returned a single copy. Runs are now returned once per request, in the order requested.
+ -   Fix the `diss_check()` gate in `netest()`, which ran on direct STERGM fits. The call was conditioned on `nested.edapprox`, which defaults to `TRUE` and, as documented, applies only when `edapprox = TRUE`. The nesting requirement comes from the edges dissolution approximation, so a direct STERGM fit (`edapprox = FALSE`), which estimates formation and persistence jointly and has no such requirement, was rejected before `tergm()` was ever called. The check is now gated on `edapprox` as well. `?netest` also notes that `tergm` derives its EGMME starting values from the same approximation, so a direct fit whose persistence terms have no formation analog needs starting values supplied through `set.control.tergm`. Closes #1060.
+ -   Fix `list_special_params` so `param.net_from_table` correctly fails if a reserved parameter name is passed in the parameter table.
+ -   Fix the infected-count comparison in `crosscheck.net()`. Built-in network statuses are the character codes `"s"`, `"i"`, and `"r"`, but the count used `status == 1`, which never matches a character vector. The count was therefore always 0, so the "Overriding init infected settings with network status attribute" warning fired on every model that supplied both a `status` vertex attribute and `i.num`, including models where the two agreed. The comparison now uses `status == "i"`, and the warning fires only on a genuine mismatch.
+diff --git a/R/as.data.frame.R b/R/as.data.frame.R
+index 648b0f79..648f74ed 100644
+--- a/R/as.data.frame.R
++++ b/R/as.data.frame.R
+@@ -77,22 +77,18 @@ as.data.frame.dcm <- function(x, row.names = NULL, optional = FALSE, run = NULL,
+     if (max(run) > nruns) {
+       stop("Maximum run is ", nruns)
+     }
+-    for (j in run) {
+-      if (j == min(run)) {
+-        for (i in seq_along(x$epi)) {
+-          df[, i + 1] <- x$epi[[i]][, j]
+-        }
+-        df$run <- j
+-      } else {
+-        tdf <- data.frame(time = seq(1, x$control$nsteps, x$control$dt))
+-        for (i in seq_along(x$epi)) {
+-          tdf[, i + 1] <- x$epi[[i]][, j]
+-        }
+-        tdf$run <- j
+-        df <- rbind(df, tdf)
++    ## one block of rows per requested run, in the order requested, so that an
++    ## unsorted or repeated `run` selection is returned as asked for
++    df <- do.call(rbind, lapply(run, function(j) {
++      tdf <- data.frame(time = x$control$timesteps)
++      for (i in seq_along(x$epi)) {
++        tdf[, i + 1] <- x$epi[[i]][, j]
+       }
+-    }
++      tdf$run <- j
++      tdf
++    }))
+     df <- df[, c(ncol(df), 1:(ncol(df) - 1))]
++    row.names(df) <- NULL
+   }
+ 
+   if (nruns > 1) {
+diff --git a/R/dcm.R b/R/dcm.R
+index c02a479d..ff616da3 100644
+--- a/R/dcm.R
++++ b/R/dcm.R
+@@ -291,4 +291,47 @@ dcm <- function(param, init, control) {
+ 
+   class(out) <- "dcm"
+   invisible(out)
+-}
+\ No newline at end of file
++}
++
++## Match a requested time to the time vector of a solved `dcm` model.
++##
++## `control$nsteps` may hold either the maximum time or the full vector of
++## times, and `dt` may be non-integer, so requested times are matched against
++## `control$timesteps` rather than compared against a scalar. The comparison
++## allows for the floating point error of a non-integer `dt` sequence, in which
++## a time such as 1.3 is not stored exactly. Returns the index into
++## `timesteps`.
++match_dcm_time <- function(at, timesteps) {
++  if (length(at) != 1 || !is.numeric(at) || is.na(at)) {
++    stop("Specify at as a single numeric time step")
++  }
++
++  tol <- sqrt(.Machine$double.eps) * max(1, abs(at))
++  idx <- which(abs(timesteps - at) <= tol)
++
++  if (length(idx) == 0) {
++    stop("Specify at as one of the time steps of the model, between ",
++         min(timesteps), " and ", max(timesteps))
++  }
++
++  return(idx[1])
++}
++
++
++## Describe the time coordinate of a solved `dcm` model for printing. Reports
++## the number of time steps, adding the range when the model was solved over
++## times other than 1, 2, ..., n, as a non-integer `dt` or an explicit vector of
++## times in `nsteps` produces.
++format_dcm_timesteps <- function(control) {
++  timesteps <- control$timesteps
++
++  if (is.null(timesteps)) {
++    return(paste(control$nsteps, collapse = " "))
++  }
++  if (identical(as.numeric(timesteps), as.numeric(seq_along(timesteps)))) {
++    return(paste(length(timesteps)))
++  }
++
++  paste0(length(timesteps), " (", min(timesteps), " to ",
++         max(timesteps), ")")
++}
+diff --git a/R/plot.comp_plot.R b/R/plot.comp_plot.R
+index 55404f9a..40e15904 100644
+--- a/R/plot.comp_plot.R
++++ b/R/plot.comp_plot.R
+@@ -6,7 +6,8 @@
+ #'
+ #' @param x An `EpiModel` object of class `dcm`, `icm`, or
+ #'        `netsim`.
+-#' @param at Time step for model statistics.
++#' @param at Time step for model statistics. For `dcm` models, must be one of
++#'        the times the model was solved over, held in `control$timesteps`.
+ #' @param digits Number of significant digits to print.
+ #' @param ... Additional arguments passed to plot (not currently used).
+ #'
+@@ -162,7 +163,7 @@ comp_plot.dcm <- function(x, at = 1, digits = 3, run = 1, ...) {
+ 
+ 
+   ## Variables
+-  nsteps <- x$control$nsteps
++  timesteps <- x$control$timesteps
+   dis.type <- x$control$type
+   groups <- x$param$groups
+   vital <- x$param$vital
+@@ -172,12 +173,10 @@ comp_plot.dcm <- function(x, at = 1, digits = 3, run = 1, ...) {
+     stop("Only 1-group dcm models currently supported")
+   }
+ 
+-  ## Time
+-  if (at > nsteps || at < 1) {
+-    stop("Specify a time step between 1 and ", nsteps)
+-  }
+-  intime <- at
+-  at <- which(x$control$timesteps == intime)
++  ## Time: `at` is matched against the times the model was solved over, which
++  ## need be neither integer nor evenly spaced
++  at <- match_dcm_time(at, timesteps)
++  intime <- timesteps[at]
+ 
+   ## Dataframe subsets
+   df <- as.data.frame(x, run = run)
+diff --git a/R/plot.dcm.R b/R/plot.dcm.R
+index d8b0c421..5da8c45b 100644
+--- a/R/plot.dcm.R
++++ b/R/plot.dcm.R
+@@ -114,7 +114,6 @@ plot.dcm <- function(x, y = NULL, popfrac = FALSE, run = NULL, col = NULL,
+   noleg <- is.null(legend)
+ 
+   ## Model dimensions
+-  nsteps <- x$control$nsteps
+   nruns <- x$control$nruns
+   if (norun == FALSE && any(run > nruns)) {
+     stop("Specify run between 1 and", nruns)
+@@ -159,7 +158,10 @@ plot.dcm <- function(x, y = NULL, popfrac = FALSE, run = NULL, col = NULL,
+   }
+ 
+   if (is.null(xlim)) {
+-    xlim <- c(0, nsteps)
++    ## `nsteps` may hold the full time vector rather than a maximum, so the
++    ## limits come from the times the model was solved over. The lower bound
++    ## keeps the origin of the standard case, where times start at 1
++    xlim <- range(c(0, x$control$timesteps))
+   }
+ 
+   ## Defaults for lwd
+diff --git a/R/print.R b/R/print.R
+index 0139e1de..15ee0d46 100644
+--- a/R/print.R
++++ b/R/print.R
+@@ -35,7 +35,7 @@ print.dcm <- function(x, ...) {
+     cat("\nModel type:", x$control$type)
+   }
+   cat("\nNo. runs:", x$control$nruns)
+-  cat("\nNo. time steps:", x$control$nsteps)
++  cat("\nNo. time steps:", format_dcm_timesteps(x$control))
+   if (new.mod == FALSE) {
+     cat("\nNo. groups:", x$param$groups)
+   }
+diff --git a/R/summary.R b/R/summary.R
+index 033fef7e..f4a40dee 100644
+--- a/R/summary.R
++++ b/R/summary.R
+@@ -4,7 +4,10 @@
+ #' @description Extracts and prints model statistics solved with `dcm`.
+ #'
+ #' @param object An `EpiModel` object of class `dcm`.
+-#' @param at Time step for model statistics.
++#' @param at Time step for model statistics. Must be one of the times the model
++#'        was solved over, held in `control$timesteps`, which for a model with
++#'        a non-integer `dt` or an explicit vector of times in `nsteps` need be
++#'        neither integer nor evenly spaced.
+ #' @param run Model run number, for `dcm` class models with multiple runs
+ #'        (sensitivity analyses).
+ #' @param digits Number of significant digits to print.
+@@ -41,7 +44,7 @@ summary.dcm <- function(object, at, run = 1, digits = 3, ...) {
+   type <- object$control$type
+   groups <- object$param$groups
+   vital <- object$param$vital
+-  nsteps <- object$control$nsteps
++  timesteps <- object$control$timesteps
+ 
+   if (!is.null(object$control$new.mod)) {
+     stop("summary method not available for new model types in dcm")
+@@ -49,9 +52,9 @@ summary.dcm <- function(object, at, run = 1, digits = 3, ...) {
+ 
+   df <- as.data.frame(object, run = run)
+ 
+-  if (at > nsteps || at < 1) {
+-    stop("Specify at between 1 and ", nsteps)
+-  }
++  ## `at` is matched against the times the model was solved over, which need be
++  ## neither integer nor evenly spaced
++  at <- timesteps[match_dcm_time(at, timesteps)]
+   df <- df[df$time == at, ]
+ 
+   ## Prevalence calculations
+@@ -191,7 +194,7 @@ summary.dcm <- function(object, at, run = 1, digits = 3, ...) {
+   cat("\n-----------------------")
+   cat("\nModel type:", type)
+   cat("\nNo. runs:", nruns)
+-  cat("\nNo. time steps:", object$nsteps)
++  cat("\nNo. time steps:", format_dcm_timesteps(object$control))
+   cat("\nNo. groups:", groups)
+ 
+   if (groups == 1) {
+diff --git a/man/comp_plot.Rd b/man/comp_plot.Rd
+index 63c89b12..2cee00e6 100644
+--- a/man/comp_plot.Rd
++++ b/man/comp_plot.Rd
+@@ -19,7 +19,8 @@ comp_plot(x, at, digits, ...)
+ \item{x}{An \code{EpiModel} object of class \code{dcm}, \code{icm}, or
+ \code{netsim}.}
+ 
+-\item{at}{Time step for model statistics.}
++\item{at}{Time step for model statistics. For \code{dcm} models, must be one of
++the times the model was solved over, held in \code{control$timesteps}.}
+ 
+ \item{digits}{Number of significant digits to print.}
+ 
+diff --git a/man/summary.dcm.Rd b/man/summary.dcm.Rd
+index 8c64c748..6ac29bfa 100644
+--- a/man/summary.dcm.Rd
++++ b/man/summary.dcm.Rd
+@@ -9,7 +9,10 @@
+ \arguments{
+ \item{object}{An \code{EpiModel} object of class \code{dcm}.}
+ 
+-\item{at}{Time step for model statistics.}
++\item{at}{Time step for model statistics. Must be one of the times the model
++was solved over, held in \code{control$timesteps}, which for a model with
++a non-integer \code{dt} or an explicit vector of times in \code{nsteps} need be
++neither integer nor evenly spaced.}
+ 
+ \item{run}{Model run number, for \code{dcm} class models with multiple runs
+ (sensitivity analyses).}
+diff --git a/tests/testthat/test-comp-plot.R b/tests/testthat/test-comp-plot.R
+index 96acfec9..e123e02f 100644
+--- a/tests/testthat/test-comp-plot.R
++++ b/tests/testthat/test-comp-plot.R
+@@ -52,9 +52,9 @@ test_that("comp_plot.dcm validates at and rejects two-group models", {
+ 
+   mod <- run_dcm("SI")
+   expect_error(comp_plot(mod, at = 0),
+-               "Specify a time step between 1 and 12")
++               "Specify at as one of the time steps of the model, between 1 and 12")
+   expect_error(comp_plot(mod, at = 999),
+-               "Specify a time step between 1 and 12")
++               "Specify at as one of the time steps of the model, between 1 and 12")
+ 
+   # Two-group DCM should hit the 1-group guard.
+   param <- param.dcm(inf.prob = 0.3, inf.prob.g2 = 0.2, act.rate = 1,
+diff --git a/tests/testthat/test-dcm.R b/tests/testthat/test-dcm.R
+index c83486e1..e5a4a872 100644
+--- a/tests/testthat/test-dcm.R
++++ b/tests/testthat/test-dcm.R
+@@ -613,3 +613,68 @@ test_that("DCM init sensitivity: print method shows init", {
+   expect_true(any(grepl("Initial Conditions", out)))
+   expect_true(any(grepl("i.num", out)))
+ })
++
++test_that("DCM methods work with a nonuniform time vector", {
++  param <- param.dcm(inf.prob = c(0.2, 0.4), act.rate = 1)
++  init <- init.dcm(s.num = 500, i.num = 1)
++  control <- control.dcm(type = "SI", nsteps = c(0, 0.25, 1, 3),
++                         verbose = FALSE)
++  mod <- dcm(param, init, control)
++  expect_equal(mod$control$timesteps, c(0, 0.25, 1, 3))
++
++  ## the time column follows the solved times, for every run
++  df <- as.data.frame(mod)
++  expect_equal(nrow(df), 8)
++  expect_equal(df$time, rep(c(0, 0.25, 1, 3), 2))
++  expect_equal(as.data.frame(mod, run = 2)$time, c(0, 0.25, 1, 3))
++
++  ## plots take their x limits from the solved times
++  expect_silent(plot(mod))
++  expect_silent(comp_plot(mod, at = 0.25))
++
++  ## summaries are keyed on the solved times, not on a step count
++  expect_output(summary(mod, at = 3), "EpiModel Summary")
++  expect_error(summary(mod, at = 2), "Specify at as one of the time steps")
++  expect_error(comp_plot(mod, at = 2), "Specify at as one of the time steps")
++  expect_error(summary(mod, at = c(1, 3)), "single numeric time step")
++
++  ## the number of time steps is reported with its range
++  expect_output(print(mod), "No. time steps: 4 \\(0 to 3\\)")
++  expect_output(summary(mod, at = 1), "No. time steps: 4 \\(0 to 3\\)")
++})
++
++test_that("DCM methods work with a non-integer dt", {
++  param <- param.dcm(inf.prob = 0.2, act.rate = 1)
++  init <- init.dcm(s.num = 500, i.num = 1)
++  control <- control.dcm(type = "SI", nsteps = 3, dt = 0.1, verbose = FALSE)
++  mod <- dcm(param, init, control)
++
++  ## a requested time is matched despite the floating point error of the
++  ## sequence, and a time between two solved times is rejected
++  expect_output(summary(mod, at = 1.3), "EpiModel Summary")
++  expect_silent(comp_plot(mod, at = 1.3))
++  expect_error(summary(mod, at = 1.35), "Specify at as one of the time steps")
++  expect_error(summary(mod, at = 99), "Specify at as one of the time steps")
++
++  expect_equal(as.data.frame(mod)$time, mod$control$timesteps)
++  expect_output(print(mod), "No. time steps: 21 \\(1 to 3\\)")
++})
++
++test_that("as.data.frame.dcm returns runs in the order requested", {
++  param <- param.dcm(inf.prob = c(0.2, 0.4, 0.6), act.rate = 1)
++  init <- init.dcm(s.num = 500, i.num = 1)
++  control <- control.dcm(type = "SI", nsteps = 4, verbose = FALSE)
++  mod <- dcm(param, init, control)
++
++  expect_equal(unique(as.data.frame(mod, run = c(1, 3))$run), c(1, 3))
++  expect_equal(unique(as.data.frame(mod, run = c(3, 1))$run), c(3, 1))
++  expect_equal(nrow(as.data.frame(mod, run = c(3, 1))), 8)
++  ## a repeated run is returned once per request rather than collapsed
++  expect_equal(nrow(as.data.frame(mod, run = c(2, 2))), 8)
++  expect_error(as.data.frame(mod, run = 9), "Maximum run is 3")
++
++  ## the same values come back whichever order they are asked for
++  d13 <- as.data.frame(mod, run = c(1, 3))
++  d31 <- as.data.frame(mod, run = c(3, 1))
++  expect_equal(d13[d13$run == 3, "i.num"], d31[d31$run == 3, "i.num"])
++})
+diff --git a/tests/testthat/test-print.R b/tests/testthat/test-print.R
+index e74d9543..be909f33 100644
+--- a/tests/testthat/test-print.R
++++ b/tests/testthat/test-print.R
+@@ -130,8 +130,10 @@ test_that("summary.dcm rejects at outside the simulation range", {
+   control <- control.dcm(type = "SIR", nsteps = 20)
+   mod <- dcm(param, init, control)
+ 
+-  expect_error(summary(mod, at = 0), "Specify at between 1 and 20")
+-  expect_error(summary(mod, at = 25), "Specify at between 1 and 20")
++  expect_error(summary(mod, at = 0),
++               "Specify at as one of the time steps of the model, between 1 and 20")
++  expect_error(summary(mod, at = 25),
++               "Specify at as one of the time steps of the model, between 1 and 20")
+ })
+ 
+ test_that("summary.netsim rejects at outside the simulation range", {

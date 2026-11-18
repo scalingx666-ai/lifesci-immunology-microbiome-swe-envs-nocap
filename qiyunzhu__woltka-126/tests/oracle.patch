@@ -1,0 +1,372 @@
+diff --git a/doc/cli.md b/doc/cli.md
+index c64246a..af1905a 100644
+--- a/doc/cli.md
++++ b/doc/cli.md
+@@ -126,10 +126,10 @@ Option | Description
+ `--input`, `-i` (required) | Path to input profile.
+ `--map`, `-m` (required) | Path to mapping of source features to target features.
+ `--output`, `-o` (required) | Path to output profile.
+-`--frac`, `-f` | Count each target feature as 1 / _k_ (_k_ is the number of targets mapped to a source). Otherwise, count as one.
++`--divide`, `-d` | Count each target feature as 1 / _k_ (_k_ is the number of targets mapped to a source). Otherwise, count as one.
++`--field`, `-f` | Index of field to be collapsed in a stratified profile. For example, use `-f 2` to collapse "gene" in "microbe\|gene".
+ `--names`, `-n` | Path to mapping of target features to names. The names will be appended to the collapsed profile as a metadata column.
+ 
+-
+ ### Coverage
+ 
+ Calculate per-sample coverage of feature groups in a profile.
+diff --git a/doc/collapse.md b/doc/collapse.md
+index 39c8bf4..6523c45 100644
+--- a/doc/collapse.md
++++ b/doc/collapse.md
+@@ -61,6 +61,10 @@ By default, if one source feature is simultaneously mapped to _k_ targets, each
+ 
+ Whether to enable normalization depends on the nature and aim of your analysis. For example, one gene is involved in two pathways (which isn't uncommon), should each pathway be counted once, or half time?
+ 
++### Stratification
++
++Woltka supports collapsing a [stratified](stratify.md) profile using one field in the feature IDs. This can be done using the `--field` or `-f` parameter followed by the field index (starting from 1). For example, if the feature IDs are in the format of "Species|Gene", one may collapse genes into pathways while keeping species by adding `-f 2`.
++
+ ### Feature names
+ 
+ Once a profile is collapsed, the metadata of the source features ("Name", "Rank", and "Lineage") will be discarded. One may choose to supply a target feature name file by `--names` or `-n`, which will instruct the program to append names to the profile as a metadata column ("Name").
+diff --git a/woltka/biom.py b/woltka/biom.py
+index cad9ce2..5c91b1a 100644
+--- a/woltka/biom.py
++++ b/woltka/biom.py
+@@ -194,7 +194,7 @@ def biom_add_metacol(table: biom.Table, dic, name, missing=''):
+     table.add_metadata(metadata, axis='observation')
+ 
+ 
+-def collapse_biom(table: biom.Table, mapping: dict, normalize=False):
++def collapse_biom(table: biom.Table, mapping: dict, divide=False, field=None):
+     """Collapse a BIOM table in many-to-many mode.
+ 
+     Parameters
+@@ -203,14 +203,21 @@ def collapse_biom(table: biom.Table, mapping: dict, normalize=False):
+         Table to collapse.
+     mapping : dict of list of str
+         Source-to-target(s) mapping.
+-    normalize : bool, optional
+-        Whether normalize per-target counts by number of targets per source.
++    divide : bool, optional
++        Whether divide per-target counts by number of targets per source.
++    field : int, optional
++        Index of field to be collapsed in a stratified table.
+ 
+     Returns
+     -------
+     biom.Table
+         Collapsed BIOM table.
+ 
++    Raises
++    ------
++    ValueError
++        Field index is not present in a feature ID.
++
+     Notes
+     -----
+     Metadata will not be retained in the collapsed table.
+@@ -219,8 +226,29 @@ def collapse_biom(table: biom.Table, mapping: dict, normalize=False):
+     --------
+     .table.collapse_table
+     """
++    # generate metadata
++    metadata = {}
++    for id_ in table.ids('observation'):
++        feature = id_
++        if field:
++            fields = feature.split('|')
++            try:
++                feature = fields[field]
++            except IndexError:
++                raise ValueError(
++                    f'Feature "{feature}" has less than {field + 1} fields.')
++        if feature not in mapping:
++            continue
++        targets = []
++        for target in mapping[feature]:
++            if field:
++                fields[field] = target
++                target = '|'.join(fields)
++            targets.append(target)
++        metadata[id_] = dict(part=targets)
++
+     # filter table features
+-    table = table.filter(lambda data, id_, md: id_ in mapping,
++    table = table.filter(lambda data, id_, md: id_ in metadata,
+                          axis='observation', inplace=False)
+ 
+     # stop if no feature left
+@@ -228,19 +256,17 @@ def collapse_biom(table: biom.Table, mapping: dict, normalize=False):
+         return table
+ 
+     # add mapping to table metadata
+-    table.add_metadata({k: dict(part=v) for k, v in mapping.items()},
+-                       axis='observation')
++    table.add_metadata(metadata, axis='observation')
+ 
+     # determine collapsing method
+     kwargs = dict(norm=False, one_to_many=True, axis='observation',
+-                  one_to_many_mode=('divide' if normalize else 'add'))
++                  one_to_many_mode=('divide' if divide else 'add'))
+ 
+     # collapse table in many-to-many mode
+-    table = table.collapse(lambda id_, md: zip(md['part'], md['part']),
+-                           **kwargs)
++    table = table.collapse(lambda _, md: zip(md['part'], md['part']), **kwargs)
+ 
+     # round to integers
+-    if normalize:
++    if divide:
+         round_biom(table)
+ 
+     # clean up
+diff --git a/woltka/cli.py b/woltka/cli.py
+index f2dec1b..5311083 100644
+--- a/woltka/cli.py
++++ b/woltka/cli.py
+@@ -266,9 +266,12 @@ def merge_cmd(ctx, **kwargs):
+     type=click.Path(writable=True, dir_okay=False),
+     help='Path to output profile.')
+ @click.option(
+-    '--frac', '-f', is_flag=True,
++    '--divide', '-d', is_flag=True,
+     help=('Count each target feature as 1/k (k is the number of targets '
+           'mapped to a source). Otherwise, count as one.'))
++@click.option(
++    '--field', '-f', type=click.INT,
++    help='Index of field to be collapsed in a stratified profile.')
+ @click.option(
+     '--names', '-n', 'names_fp', type=click.Path(exists=True),
+     help='Names of target features to append to the output profile.')
+diff --git a/woltka/table.py b/woltka/table.py
+index f62931a..2162ecb 100644
+--- a/woltka/table.py
++++ b/woltka/table.py
+@@ -560,7 +560,7 @@ def add_metacol(table, dic, name, missing=''):
+         metadatum[name] = dic.get(feature, missing)
+ 
+ 
+-def collapse_table(table, mapping, normalize=False):
++def collapse_table(table, mapping, divide=False, field=None):
+     """Collapse a table by many-to-many mapping.
+ 
+     Parameters
+@@ -569,34 +569,51 @@ def collapse_table(table, mapping, normalize=False):
+         Table to collapse.
+     mapping : dict of list of str
+         Source-to-target(s) mapping.
+-    normalize : bool, optional
+-        Whether normalize per-target counts by number of targets per source.
++    divide : bool, optional
++        Whether divide per-target counts by number of targets per source.
++    field : int, optional
++        Index of field to be collapsed in a stratified table.
+ 
+     Returns
+     -------
+     biom.Table or tuple
+         Collapsed table.
+ 
++    Raises
++    ------
++    ValueError
++        Field index is not present in a feature ID.
++
+     Notes
+     -----
+     Metadata will not be retained in the collapsed table.
+     """
+     # redirect to BIOM module
+     if isinstance(table, Table):
+-        return collapse_biom(table, mapping, normalize)
++        return collapse_biom(table, mapping, divide, field)
+ 
+     # collapse table
+     samples = table[2]
+     width = len(samples)
+     res = defaultdict(lambda: [0] * width)
+     for datum, feature in zip(*table[:2]):
++        if field:
++            fields = feature.split('|')
++            try:
++                feature = fields[field]
++            except IndexError:
++                raise ValueError(
++                    f'Feature "{feature}" has less than {field + 1} fields.')
+         if feature not in mapping:
+             continue
+         targets = mapping[feature]
+-        if normalize:
++        if divide:
+             k = 1 / len(targets)
+             datum = [x * k for x in datum]
+         for target in targets:
++            if field:
++                fields[field] = target
++                target = '|'.join(fields)
+             res[target] = list(map(add, res[target], datum))
+ 
+     # reformat table
+diff --git a/woltka/tests/data/function/go/go2slim.map.xz b/woltka/tests/data/function/go/go2slim.map.xz
+new file mode 100644
+index 0000000..414d46b
+Binary files /dev/null and b/woltka/tests/data/function/go/go2slim.map.xz differ
+diff --git a/woltka/tests/test_biom.py b/woltka/tests/test_biom.py
+index 27b3286..1323c63 100644
+--- a/woltka/tests/test_biom.py
++++ b/woltka/tests/test_biom.py
+@@ -272,7 +272,7 @@ def test_collapse_biom(self):
+         self.assertEqual(obs.descriptive_equality(exp), 'Tables appear equal')
+ 
+         # many-to-many mapping, with normalization
+-        obs = collapse_biom(table.copy(), mapping, normalize=True)
++        obs = collapse_biom(table.copy(), mapping, divide=True)
+         exp = Table(*map(np.array, prep_table({
+             'S1': {'H1': 6, 'H2': 5, 'H3': 3, 'H4': 6, 'H5': 0},
+             'S2': {'H1': 5, 'H2': 8, 'H3': 1, 'H4': 4, 'H5': 4},
+@@ -283,11 +283,30 @@ def test_collapse_biom(self):
+         table = Table(*map(np.array, prep_table({
+             'S1': {'G1': 0}, 'S2': {'G1': 1}, 'S3': {'G1': 2}})))
+         mapping = {'G1': ['H1', 'H2', 'H3', 'H4']}
+-        obs = collapse_biom(table.copy(), mapping, normalize=True)
++        obs = collapse_biom(table.copy(), mapping, divide=True)
+         self.assertTrue(obs.is_empty())
+         self.assertListEqual(list(obs.ids('sample')), ['S1', 'S2', 'S3'])
+         self.assertListEqual(list(obs.ids('observation')), [])
+ 
++        # stratified table
++        table = Table(*map(np.array, prep_table({
++            'S1': {'A|K1': 4, 'A|K2': 5, 'B|K2': 8, 'C|K3': 3, 'C|K4': 0},
++            'S2': {'A|K1': 1, 'A|K2': 8, 'B|K2': 0, 'C|K3': 4, 'C|K4': 2}})))
++        mapping = {'K1': ['H1'], 'K2': ['H2', 'H3'], 'K3': ['H3']}
++        obs = collapse_biom(table.copy(), mapping, field=1)
++        exp = Table(*map(np.array, prep_table({
++            'S1': {'A|H1': 4, 'A|H2': 5, 'A|H3': 5, 'B|H2': 8, 'B|H3': 8,
++                   'C|H3': 3},
++            'S2': {'A|H1': 1, 'A|H2': 8, 'A|H3': 8, 'B|H2': 0, 'B|H3': 0,
++                   'C|H3': 4}})))
++        self.assertEqual(obs.descriptive_equality(exp), 'Tables appear equal')
++
++        # invalid field
++        with self.assertRaises(ValueError) as ctx:
++            collapse_biom(table, mapping, field=2)
++        errmsg = 'Feature "A|K1" has less than 3 fields.'
++        self.assertEqual(str(ctx.exception), errmsg)
++
+ 
+ if __name__ == '__main__':
+     main()
+diff --git a/woltka/tests/test_cli.py b/woltka/tests/test_cli.py
+index d9af803..a31c9aa 100644
+--- a/woltka/tests/test_cli.py
++++ b/woltka/tests/test_cli.py
+@@ -236,7 +236,7 @@ def test_collapse_cmd(self):
+                   '--map',    map_fp,
+                   '--output', output_fp,
+                   '--names',  names_fp,
+-                  '--frac']
++                  '--divide']
+         res = self.runner.invoke(collapse_cmd, params)
+         self.assertEqual(res.exit_code, 0)
+         self.assertEqual(res.output.splitlines()[-1],
+diff --git a/woltka/tests/test_table.py b/woltka/tests/test_table.py
+index ac92bcd..6e34993 100644
+--- a/woltka/tests/test_table.py
++++ b/woltka/tests/test_table.py
+@@ -714,7 +714,7 @@ def test_collapse_table(self):
+             self.assertListEqual(obs[i], exp[i])
+ 
+         # many-to-many mapping, with normalization
+-        obs = collapse_table(table, mapping, normalize=True)
++        obs = collapse_table(table, mapping, divide=True)
+         exp = prep_table({
+             'S1': {'H1': 6.5, 'H2': 5.166666666666666,
+                    'H3': 2.6666666666666665, 'H4': 5.666666666666666,
+@@ -724,6 +724,26 @@ def test_collapse_table(self):
+         for i in range(4):
+             self.assertListEqual(obs[i], exp[i])
+ 
++        # stratified table
++        table = prep_table({
++            'S1': {'A|K1': 4, 'A|K2': 5, 'B|K2': 8, 'C|K3': 3, 'C|K4': 0},
++            'S2': {'A|K1': 1, 'A|K2': 8, 'B|K2': 0, 'C|K3': 4, 'C|K4': 2}})
++        mapping = {'K1': ['H1'], 'K2': ['H2', 'H3'], 'K3': ['H3']}
++        obs = collapse_table(table, mapping, field=1)
++        exp = prep_table({
++            'S1': {'A|H1': 4, 'A|H2': 5, 'A|H3': 5, 'B|H2': 8, 'B|H3': 8,
++                   'C|H3': 3},
++            'S2': {'A|H1': 1, 'A|H2': 8, 'A|H3': 8, 'B|H2': 0, 'B|H3': 0,
++                   'C|H3': 4}})
++        for i in range(4):
++            self.assertListEqual(obs[i], exp[i])
++
++        # invalid field
++        with self.assertRaises(ValueError) as ctx:
++            collapse_table(table, mapping, field=2)
++        errmsg = 'Feature "A|K1" has less than 3 fields.'
++        self.assertEqual(str(ctx.exception), errmsg)
++
+     def test_calc_coverage(self):
+         table = prep_table({
+             'S1': {'G1': 4, 'G2': 5, 'G3': 8, 'G4': 0, 'G5': 3, 'G6': 0},
+diff --git a/woltka/tests/test_tools.py b/woltka/tests/test_tools.py
+index 4ff3be3..08c6730 100644
+--- a/woltka/tests/test_tools.py
++++ b/woltka/tests/test_tools.py
+@@ -189,10 +189,24 @@ def test_collapse_wf(self):
+         # wrong mapping file
+         map_fp = join(self.datdir, 'tree.nwk')
+         with self.assertRaises(SystemExit) as ctx:
+-            collapse_wf(input_fp, map_fp, output_fp, frac=True)
++            collapse_wf(input_fp, map_fp, output_fp, divide=True)
+         errmsg = 'No source-target relationship is found in tree.nwk.'
+         self.assertEqual(str(ctx.exception), errmsg)
+ 
++        # stratified profile
++        input_fp = join(self.datdir, 'output', 'burst.genus.process.tsv')
++        map_fp = join(self.datdir, 'function', 'go', 'go2slim.map.xz')
++        collapse_wf(input_fp, map_fp, output_fp, field=2)
++        with open(output_fp, 'r') as f:
++            obs = f.read().splitlines()
++        self.assertEqual(len(obs), 279)
++        for line in obs:
++            if line.startswith('Klebsiella|GO:0008150'):
++                self.assertEqual(line[22:], '2\t47\t0\t87\t0')
++            if line.startswith('Streptococcus|GO:0008150'):
++                self.assertEqual(line[25:], '0\t2\t9\t3\t0')
++        remove(output_fp)
++
+     def test_coverage_wf(self):
+         input_fp = join(self.datdir, 'output', 'truth.metacyc.tsv')
+         map_fp = join(self.datdir, 'function', 'metacyc', 'pathway_mbrs.txt')
+diff --git a/woltka/tools.py b/woltka/tools.py
+index 5ba6eee..7da173c 100644
+--- a/woltka/tools.py
++++ b/woltka/tools.py
+@@ -195,7 +195,8 @@ def _read_profile(fp):
+ def collapse_wf(input_fp:  str,
+                 map_fp:    str,
+                 output_fp: str,
+-                frac:     bool = False,
++                divide:   bool = False,
++                field:     int = None,
+                 names_fp:  str = None):
+     """Workflow for collapsing a profile based on many-to-many mapping.
+ 
+@@ -223,9 +224,13 @@ def collapse_wf(input_fp:  str,
+     if not mapping:
+         exit(f'No source-target relationship is found in {basename(map_fp)}.')
+ 
++    # convert field index
++    if field:
++        field -= 1
++
+     # collapse profile by mapping
+     click.echo('Collapsing profile...', nl=False)
+-    table = collapse_table(table, mapping, frac)
++    table = collapse_table(table, mapping, divide, field)
+     click.echo(' Done.')
+     n = table_shape(table)[0]
+     click.echo(f'Number of features after collapsing: {n}.')

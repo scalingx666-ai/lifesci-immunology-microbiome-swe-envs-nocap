@@ -1,0 +1,425 @@
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index 007ddf87..788b8ef9 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -120,6 +120,22 @@ jobs:
+               test/test_sra.sh --dryrun
+ 
+ 
++  genome_quantify:
++    <<: *defaults
++    environment:
++      N_THREADS: 1
++      MEM: 2
++    resource_class: medium
++    steps:
++      - attach_workspace:
++          at: /root/project/
++      - run:
++          name: Test genome quantification
++          command: |
++              source activate ./atlasenv
++              test/test_external_genomes.sh
++
++
+ 
+ 
+   get_example_data:
+@@ -235,6 +251,10 @@ workflows:
+       - sra_init:
+           requires:
+             - build_and_dryrun
++      - genome_quantify:
++          requires:
++            - build_and_dryrun
++            
+       # - get_example_data
+       # - getenvs:
+       #     requires:
+diff --git a/.gitignore b/.gitignore
+index 2b7c562f..8e11d7bc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -34,12 +34,15 @@ databases
+ #  before PyInstaller builds the exe, so as to inject date/other infos into it.
+ *.manifest
+ *.spec
++databases
++test/*
+ .test/*
+ test/*
+ !test/dryrun.sh
+ !test/test_assembly.sh
+ !test/test_binning.sh
+ !test/test_sra.sh
++!test/test_external_genomes.sh
+ # Installer logs
+ pip-log.txt
+ pip-delete-this-directory.txt
+diff --git a/atlas/workflow/Snakefile b/atlas/workflow/Snakefile
+index 970a3dc2..3d0952bd 100644
+--- a/atlas/workflow/Snakefile
++++ b/atlas/workflow/Snakefile
+@@ -225,6 +225,7 @@ include: "rules/sra.smk"
+ include: "rules/gtdbtk.smk"
+ include: "rules/cobinning.smk"
+ include: "rules/dram.smk"
++include: "rules/strains.smk"
+ 
+ 
+ CONDAENV = "envs"  # overwrite definition in download.smk
+@@ -297,11 +298,19 @@ rule genomes:
+         "genomes/counts/raw_counts_genomes.tsv",
+         "genomes/clustering/allbins2genome.tsv",
+         * get_genome_annotations(),
++        rules.strains.input,
+         "finished_binning",
+     output:
+         temp(touch("finished_genomes")),
+ 
+ 
++rule quantify_genomes:
++    input:
++        "genomes/counts/median_coverage_genomes.tsv",
++        "genomes/counts/raw_counts_genomes.tsv",
++        rules.strains.input,
++
++
+ rule binning:
+     input:
+         expand(
+diff --git a/atlas/workflow/envs/instrain.yaml b/atlas/workflow/envs/instrain.yaml
+new file mode 100644
+index 00000000..5cf6b48c
+--- /dev/null
++++ b/atlas/workflow/envs/instrain.yaml
+@@ -0,0 +1,6 @@
++channels:
++- conda-forge
++- bioconda
++- defaults
++dependencies:
++- instrain =1.5.*
+diff --git a/atlas/workflow/rules/dram.smk b/atlas/workflow/rules/dram.smk
+index cf78561a..c291dc4b 100644
+--- a/atlas/workflow/rules/dram.smk
++++ b/atlas/workflow/rules/dram.smk
+@@ -81,7 +81,7 @@ rule DRAM_annotate:
+ 
+ def get_all_dram(wildcards):
+ 
+-    all_genomes = get_genomes_(wildcards)
++    all_genomes = get_all_genomes(wildcards)
+ 
+     return expand(rules.DRAM_annotate.output.outdir, genome=all_genomes)
+ 
+diff --git a/atlas/workflow/rules/genomes.smk b/atlas/workflow/rules/genomes.smk
+index 508e66fb..0f99b147 100644
+--- a/atlas/workflow/rules/genomes.smk
++++ b/atlas/workflow/rules/genomes.smk
+@@ -169,17 +169,47 @@ checkpoint rename_genomes:
+     log:
+         "logs/genomes/rename_genomes.log",
+     script:
+-        "rename_genomes.py"
++        "../scripts/rename_genomes.py"
+ 
+ 
+-def get_genomes_(wildcards):
++def get_genome_dir():
+ 
+-    genome_dir = checkpoints.rename_genomes.get().output.dir
++    if ("genome_dir" in config) and (config["genome_dir"] is not None):
++
++        genome_dir = config["genome_dir"]
++        assert os.path.exists(genome_dir), f"{genome_dir} Doesn't exists"
++
++        logger.info(f"Set genomes from {genome_dir}.")
++
++        # check if genomes are present
++        genomes = glob_wildcards(os.path.join(genome_dir, "{genome}.fasta")).genome
++
++        if len(genomes) == 0:
++            logger.critical(f"No genomes found with fasta extension in {genome_dir} ")
++            exit(1)
++
++    else:
++        genome_dir = "genomes/genomes"
++
++    return genome_dir
++
++
++genome_dir = get_genome_dir()
++
++
++def get_all_genomes(wildcards):
++
++    global genome_dir
++
++    if genome_dir == "genomes/genomes":
++        checkpoints.rename_genomes.get()
++
++    # check if genomes are present
+     genomes = glob_wildcards(os.path.join(genome_dir, "{genome}.fasta")).genome
+ 
+     if len(genomes) == 0:
+         logger.critical(
+-            "No genomes found after dereplication. "
++            f"No genomes found with fasta extension in {genome_dir} "
+             "You don't have any Metagenome assembled genomes with sufficient quality. "
+             "You may want to change the assembly, binning or filtering parameters. "
+             "Or focus on the genecatalog workflow only."
+@@ -189,10 +219,42 @@ def get_genomes_(wildcards):
+     return genomes
+ 
+ 
++rule get_contig2genomes:
++    input:
++        genome_dir,
++    output:
++        "genomes/clustering/contig2genome.tsv",
++    run:
++        from glob import glob
++
++        fasta_files = glob(input[0] + "/*.f*")
++
++        with open(output[0], "w") as out_contigs:
++            for fasta in fasta_files:
++
++                bin_name, ext = os.path.splitext(os.path.split(fasta)[-1])
++                # if gz remove also fasta extension
++                if ext == ".gz":
++                    bin_name = os.path.splitext(bin_name)[0]
++
++                # write names of contigs in mapping file
++                with open(fasta) as f:
++                    for line in f:
++                        if line[0] == ">":
++                            header = line[1:].strip().split()[0]
++                            out_contigs.write(f"{header}\t{bin_name}\n")
++
++
++# alternative way to get to contigs2genomes for quantification with external genomes
++
++
++ruleorder: get_contig2genomes > rename_genomes
++
++
+ rule run_all_checkm_lineage_wf:
+     input:
+         touched_output="logs/checkm_init.txt",
+-        dir="genomes/genomes",
++        dir=genome_dir,
+     output:
+         "genomes/checkm/completeness.tsv",
+         "genomes/checkm/storage/tree/concatenated.fasta",
+@@ -229,7 +291,7 @@ rule run_all_checkm_lineage_wf:
+ 
+ rule build_db_genomes:
+     input:
+-        "genomes/genomes",
++        genome_dir,
+     output:
+         index="ref/genome/3/summary.txt",
+         fasta=temp("genomes/all_contigs.fasta"),
+@@ -421,7 +483,7 @@ rule combine_bined_coverages_MAGs:
+ 
+ # rule predict_genes_genomes:
+ #     input:
+-#         dir="genomes/genomes"
++#         dir= genomes_dir
+ #     output:
+ #         directory("genomes/annotations/genes")
+ #     conda:
+@@ -438,11 +500,11 @@ rule combine_bined_coverages_MAGs:
+ 
+ rule predict_genes_genomes:
+     input:
+-        "genomes/genomes/{genome}.fasta",
++        os.path.join(genome_dir, "{genome}.fasta"),
+     output:
+         fna="genomes/annotations/genes/{genome}.fna",
+         faa="genomes/annotations/genes/{genome}.faa",
+-        gff="genomes/annotations/genes/{genome}.gff",
++        gff=temp("genomes/annotations/genes/{genome}.gff"),
+     conda:
+         "%s/prodigal.yaml" % CONDAENV
+     log:
+@@ -461,7 +523,7 @@ rule predict_genes_genomes:
+ def get_all_genes(wildcards, extension=".faa"):
+     return expand(
+         "genomes/annotations/genes/{genome}{extension}",
+-        genome=get_genomes_(wildcards),
++        genome=get_all_genomes(wildcards),
+         extension=extension,
+     )
+ 
+diff --git a/atlas/workflow/rules/gtdbtk.smk b/atlas/workflow/rules/gtdbtk.smk
+index ea994c19..f35e5e4c 100644
+--- a/atlas/workflow/rules/gtdbtk.smk
++++ b/atlas/workflow/rules/gtdbtk.smk
+@@ -3,7 +3,7 @@ gtdb_dir = "genomes/taxonomy/gtdb"
+ 
+ rule identify:
+     input:
+-        dir="genomes/genomes",
++        dir=genome_dir,
+         flag=rules.download_gtdb.output,
+     output:
+         directory(f"{gtdb_dir}/identify"),
+@@ -45,7 +45,7 @@ checkpoint align:
+ rule classify:
+     input:
+         rules.align.output,
+-        genome_dir="genomes/genomes",
++        genome_dir=genome_dir,
+     output:
+         directory(f"{gtdb_dir}/classify"),
+     threads: config["threads"]  #pplacer needs much memory for not many threads
+diff --git a/atlas/workflow/rules/strains.smk b/atlas/workflow/rules/strains.smk
+new file mode 100644
+index 00000000..66eb607a
+--- /dev/null
++++ b/atlas/workflow/rules/strains.smk
+@@ -0,0 +1,77 @@
++
++rule instrain_profile:
++    input:
++        sam="genomes/alignments/{sample}.sam",
++        genomes="genomes/all_contigs.fasta",
++        # genes=lambda wc: get_all_genes(wc, extension=".fna"),
++        scaffold_to_genome="genomes/clustering/contig2genome.tsv",
++    output:
++        directory("strains/intermediate_files/{sample}"),
++    threads: config["threads"]
++    params:
++        extra=config.get("instrain_profile_extra", ""),
++    log:
++        "logs/strains/profile/{sample}.log",
++    conda:
++        "../envs/instrain.yaml"
++    benchmark:
++        "logs/benchmarks/strains/profile/{sample}.tsv"
++    resources:
++        mem=config["mem"],
++        time=config["runtime"]["long"],
++    shell:
++        #" cat {input.genes} > {resources.tmpdir}/all_genome_genes.fna 2> {log} "
++        #" ; "
++        "inStrain profile "
++        " {input.sam} {input.genomes} "
++        " -o {output} "
++        " -p {threads} "
++        #" -g {resources.tmpdir}/all_genome_genes.fna "
++        " -s {input.scaffold_to_genome} "
++        " --database_mode "
++        " {params.extra} &>> {log}"
++
++
++rule instrain_compare:
++    input:
++        profiles=expand("strains/intermediate_files/{sample}", sample=SAMPLES),
++        scaffold_to_genome="genomes/clustering/contig2genome.tsv",
++    output:
++        directory("strains/comparison"),
++    threads: config["threads"]
++    params:
++        extra=config.get("instrain_compare_extra", ""),
++    log:
++        "logs/strains/compare.log",
++    conda:
++        "../envs/instrain.yaml"
++    benchmark:
++        "logs/benchmarks/strains/compare.tsv"
++    resources:
++        mem=config["mem"],
++        time=config["runtime"]["long"],
++    shell:
++        "inStrain compare "
++        " --input {input.profiles} "
++        " -o {output} "
++        " -p {threads} "
++        " -s {input.scaffold_to_genome} "
++        " --database_mode "
++        " {params.extra} &> {log}"
++
++
++# usage: inStrain compare -i [INPUT [INPUT ...]] [-o OUTPUT] [-p PROCESSES] [-d]
++#                         [-h] [--version] [-s [STB [STB ...]]] [-c MIN_COV]
++#                         [-f MIN_FREQ] [-fdr FDR] [--database_mode]
++#                         [--breadth BREADTH] [-sc SCAFFOLDS] [--genome GENOME]
++#                         [--store_coverage_overlap]
++#                         [--store_mismatch_locations]
++#                         [--include_self_comparisons] [--skip_plot_generation]
++#                         [--group_length GROUP_LENGTH] [--force_compress]
++#                         [-ani ANI_THRESHOLD] [-cov COVERAGE_TRESHOLD]
++#                         [--clusterAlg {ward,single,complete,average,weighted,median,centroid}]
++
++
++rule strains:
++    input:
++        "strains/comparison",
+diff --git a/atlas/workflow/rules/rename_genomes.py b/atlas/workflow/scripts/rename_genomes.py
+similarity index 99%
+rename from atlas/workflow/rules/rename_genomes.py
+rename to atlas/workflow/scripts/rename_genomes.py
+index edd73b53..e96359f5 100644
+--- a/atlas/workflow/rules/rename_genomes.py
++++ b/atlas/workflow/scripts/rename_genomes.py
+@@ -1,4 +1,4 @@
+-import os, shutil, sys
++import os, sys
+ import argparse
+ from snakemake.io import glob_wildcards
+ 
+diff --git a/test/test_external_genomes.sh b/test/test_external_genomes.sh
+new file mode 100755
+index 00000000..1f0b123f
+--- /dev/null
++++ b/test/test_external_genomes.sh
+@@ -0,0 +1,44 @@
++#!/bin/bash
++set -euo pipefail
++
++
++NThreads=2
++MaxMem=3
++
++
++
++
++
++databaseDir="test/databases"
++WD='test/genome_quant'
++reads_dir='test/reads/empty'
++
++
++echo "touch reads dir"
++mkdir -p $reads_dir
++for sample in Sample1 Sample2 ; 
++  do
++  for fraction in R1 R2;
++    do
++    touch $reads_dir/${sample}_${fraction}.fastq.gz
++  done
++done
++
++
++rm -fr $WD
++
++# create genome dir
++genome_dir=$WD/other_genomes
++
++mkdir -p $genome_dir
++for i in 1::5 ; 
++do
++    touch $genome_dir/Genome_$i.fasta
++done
++
++echo "Init"
++atlas init --db-dir $databaseDir --skip-qc -w $WD $reads_dir
++
++echo "Run"
++
++atlas run None quantify_genomes -w $WD --config genome_dir="other_genomes" --dryrun $@
+\ No newline at end of file

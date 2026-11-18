@@ -1,0 +1,1769 @@
+diff --git a/src/ganon-build/CommandLineParser.cpp b/src/ganon-build/CommandLineParser.cpp
+index 1ccec4ce..5114ff3a 100644
+--- a/src/ganon-build/CommandLineParser.cpp
++++ b/src/ganon-build/CommandLineParser.cpp
+@@ -17,7 +17,8 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         ( "d,directory-reference-files", "Directory with reference files. Do not provide wildcards, just path (e.g. /path/to/folder/)", cxxopts::value< std::string >() )
+         ( "x,extension", "Extension of the files to search in the --directory-reference-files (e.g. '.fna')", cxxopts::value< std::string >() )
+ 
+-        ( "e,seqid-bin-file", "Tab-separated file linking sequences and bin identifiers. The file should contain the following fields: Seq. Identifier <tab> Pos. Seq. Start <tab> Pos. Seq. End <tab> Bin Id", cxxopts::value< std::string >() )
++        ( "e,seqid-bin-file", "Tab-separated file linking sequences identifiers, length and bin number. If not provided, each reference input file will be inserted in one bin. Sequence identifier is anything between the header start '>' and an empty space ' '. The file should contain the following fields: Seq. Identifier <tab> Pos. Seq. Start <tab> Pos. Seq. End <tab> Bin number", cxxopts::value< std::string >() )
++        
+         ( "o,output-filter-file", "Output file for filter (e.g. filter.ibf)", cxxopts::value< std::string >() )
+         ( "u,update-filter-file", "Previously generated filter file to be updated", cxxopts::value< std::string >() )
+         ( "c,update-complete", "When using --update-filter-file and all sequences are provided to update index, set this option to not only add sequences to the filter but also remove", cxxopts::value< bool >() )
+@@ -25,12 +26,12 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         ( "s,filter-size-mb", "Final filter size (MB) [mutually exclusive --filter-size-bits]", cxxopts::value< uint32_t >() )
+         ( "b,bin-size-bits", "Bin size (bit) [mutually exclusive --filter-size]", cxxopts::value< uint64_t >() )
+         
+-        ( "k,kmer-size", "k size to build filter", cxxopts::value< uint8_t >() )
+-        ( "n,hash-functions", "Number of hash functions to build filter", cxxopts::value< uint16_t >() )
++        ( "k,kmer-size", "k-mer size to build filter (only forward strand). Default: 19", cxxopts::value< uint8_t >() )
++        ( "n,hash-functions", "Number of hash functions to build filter. Default: 3", cxxopts::value< uint16_t >() )
+ 
+         ( "t,threads", "Number of threads", cxxopts::value< uint16_t >())
+-        ( "n-refs", "Number of sequences for each batch", cxxopts::value< uint32_t >() )        
+-        ( "n-batches", "Number of batches of n-refs to hold in memory", cxxopts::value< uint32_t >() )
++        ( "n-refs", "Number of sequences for each batch. Default: 400", cxxopts::value< uint32_t >() )        
++        ( "n-batches", "Number of batches of n-refs to hold in memory. Default: 1000", cxxopts::value< uint32_t >() )
+         ( "verbose", "Verbose output mode", cxxopts::value<bool>())
+         ( "quiet", "Quiet output mode (only outputs errors and warnings to the stderr)", cxxopts::value<bool>())
+         ( "h,help", "Show help commands" )
+diff --git a/src/ganon-build/GanonBuild.cpp b/src/ganon-build/GanonBuild.cpp
+index b1e4be43..7ea355d2 100644
+--- a/src/ganon-build/GanonBuild.cpp
++++ b/src/ganon-build/GanonBuild.cpp
+@@ -27,18 +27,24 @@ namespace GanonBuild
+ namespace detail
+ {
+ 
++struct FragmentBin
++{
++    uint64_t start;
++    uint64_t end;
++    uint64_t bin_id;
++};
+ 
+ struct Seqs
+ {
+     std::string                 seqid;
+     std::vector< seqan3::dna5 > seq;
++    std::vector< FragmentBin >  fragbin;
+ };
+ 
+ struct Stats
+ {
+     Stats()
+     : sumSeqLen{ 0 }
+-    , totalSeqsBinId{ 0 }
+     , totalBinsBinId{ 0 }
+     , totalSeqsFile{ 0 }
+     , totalBinsFile{ 0 }
+@@ -48,7 +54,6 @@ struct Stats
+     }
+ 
+     uint64_t sumSeqLen;
+-    uint64_t totalSeqsBinId;
+     uint32_t totalBinsBinId;
+     uint64_t totalSeqsFile;
+     uint32_t totalBinsFile;
+@@ -56,18 +61,11 @@ struct Stats
+     uint32_t newBins;
+ };
+ 
+-struct FragmentBin
+-{
+-    uint64_t start;
+-    uint64_t end;
+-    uint64_t bin_id;
+-};
+-
+ typedef std::map< std::string, std::vector< FragmentBin > > TSeqBin;
++typedef std::set< uint64_t >                                TBinIds;
++typedef seqan3::interleaved_bloom_filter<>                  TFilter;
+ 
+-typedef seqan3::interleaved_bloom_filter<> Tfilter;
+-
+-void parse_seqid_bin( const std::string& seqid_bin_file, TSeqBin& seq_bin, std::set< uint64_t >& bin_ids )
++void parse_seqid_bin( const std::string& seqid_bin_file, TSeqBin& seq_bin, TBinIds& bin_ids )
+ {
+     std::string   line;
+     std::ifstream infile( seqid_bin_file );
+@@ -81,53 +79,169 @@ void parse_seqid_bin( const std::string& seqid_bin_file, TSeqBin& seq_bin, std::
+         // seqid <tab> seqstart <tab> seqend <tab> binid
+         uint32_t binid = std::stoul( fields[3] );
+         seq_bin[fields[0]].push_back( FragmentBin{ std::stoul( fields[1] ), std::stoul( fields[2] ), binid } );
++        // save list of unique bins used
+         bin_ids.insert( binid );
+     }
+ }
+ 
+-void store_filter( Tfilter const& filter, std::string const& output_filter_file )
++void parse_refs( SafeQueue< detail::Seqs >& queue_refs,
++                 detail::TSeqBin&           seq_bin,
++                 std::mutex&                mtx,
++                 Stats&                     stats,
++                 GanonBuild::Config&        config,
++                 uint64_t                   nbin_aux )
+ {
+-    std::ofstream               os( output_filter_file, std::ios::binary ); // Where output should be stored.
+-    cereal::BinaryOutputArchive archive( os ); // Create an output archive from the output stream.
+-    archive( filter );                         // Store data.
++
++    for ( auto const& reference_file : config.reference_files )
++    {
++        // Open file (type define by extension)
++        seqan3::sequence_file_input fin{ reference_file };
++
++        // read in chuncks of config.n_refs
++        for ( auto&& records : fin | ranges::views::chunk( config.n_refs ) )
++        {
++            for ( auto& [seq, id, qual] : records )
++            {
++                // Header id goes up-to first empty space
++                std::string seqid = id.substr( 0, id.find( ' ' ) );
++
++                stats.totalSeqsFile += 1;
++                if ( seq.size() < config.kmer_size )
++                {
++                    if ( config.verbose )
++                    {
++                        std::scoped_lock lock( mtx );
++                        std::cerr << "WARNING: skipping sequence smaller than k-mer size"
++                                  << " [" << seqid << "]" << std::endl;
++                    }
++                    stats.invalidSeqs += 1;
++                    continue;
++                }
++
++                std::vector< detail::FragmentBin > fb;
++                if ( seq_bin.empty() )
++                {
++                    // insert whole sequence coordinates into the bin for the reference file
++                    // nbin_aux is set with the bin number to start adding sequences
++                    // 0 for build and first bin for update
++                    fb.push_back( detail::FragmentBin{ 1, seq.size(), nbin_aux } );
++                }
++                else
++                {
++                    // get fragments in the seq_bin
++                    if ( seq_bin.count( seqid ) > 0 )
++                    {
++                        fb = seq_bin.at( seqid );
++                    }
++                    else
++                    {
++                        // seqid not found in the seq_bin
++                        if ( config.verbose )
++                        {
++                            std::scoped_lock lock( mtx );
++                            std::cerr << "WARNING: skipping sequence not defined on seqid-bin-file"
++                                      << " [" << seqid << "]" << std::endl;
++                        }
++                        stats.invalidSeqs += 1;
++                        continue;
++                    }
++                }
++                stats.sumSeqLen += seq.size();
++                queue_refs.push( detail::Seqs{ std::move( seqid ), std::move( seq ), std::move( fb ) } );
++            }
++        }
++        nbin_aux++;
++    }
++    queue_refs.notify_push_over();
+ }
+ 
++TFilter create_filter( GanonBuild::Config& config, uint32_t bcount )
++{
++    uint64_t bsize;
++    // Calculate bin size based on filter size (1MB = 8388608bits)
++    if ( config.bin_size_bits == 0 && config.filter_size_mb > 0 )
++    {
++        uint64_t optimal_bins = ( std::floor( bcount / 64 ) + 1 ) * 64;
++        bsize                 = ( config.filter_size_mb / static_cast< float >( optimal_bins ) ) * 8388608u;
++    }
++    else
++    {
++        bsize = config.bin_size_bits;
++    }
++
++    return TFilter{ seqan3::bin_count{ bcount },
++                    seqan3::bin_size{ bsize },
++                    seqan3::hash_function_count{ config.hash_functions } };
++}
+ 
+-void load_filter( Tfilter& filter, GanonBuild::Config& config, const std::set< uint64_t >& bin_ids, Stats& stats )
++TFilter load_filter( std::string const& input_filter_file )
+ {
+ 
+-    // load filter
+-    std::ifstream              is( config.update_filter_file, std::ios::binary ); // Where input can be found.
+-    cereal::BinaryInputArchive archive( is ); // Create an input archive from the input stream.
+-    archive( filter );                        // Load data.
++    TFilter                    filter;
++    std::ifstream              is( input_filter_file, std::ios::binary );
++    cereal::BinaryInputArchive archive( is );
++    archive( filter );
++    return filter;
++}
+ 
+-    stats.totalBinsFile = filter.bin_count();
++void clear_filter( TFilter& filter, const TBinIds& bin_ids )
++{
++    // Reset bins if complete set of sequences is provided (re-create updated bins)
++    std::vector< seqan3::bin_index > updated_bins;
++    // For all binids in the file provided, only clean bins for the old bins
++    // new bins are already cleared by default when created
++    for ( auto const& binid : bin_ids )
++    {
++        if ( binid >= filter.bin_count() - 1 )
++        {
++            break;
++        }
++        updated_bins.emplace_back( seqan3::bin_index{ binid } );
++    }
++    filter.clear( updated_bins );
++}
+ 
+-    // last element (set is ordered) plus one
+-    uint32_t number_new_bins = *bin_ids.rbegin() + 1;
+-    if ( number_new_bins > stats.totalBinsFile )
++void increase_filter( TFilter& filter, uint32_t new_total_bins )
++{
++    // If new bins were added
++    if ( new_total_bins > filter.bin_count() )
+     {
+         // just resize if number of bins is bigger than amount on IBF
+         // when updating an IBF with empty bins or removing the last bins, this will not be true
+-        filter.increase_bin_number_to( seqan3::bin_count{ number_new_bins } );
+-        stats.newBins = number_new_bins - stats.totalBinsFile;
+-    } // if new bins are smaller (less bins, sequences removed) IBF still keep all bins but empty
++        // if new bins are smaller (less bins, sequences removed) IBF still keep all bins but empty
++        filter.increase_bin_number_to( seqan3::bin_count{ new_total_bins } );
++    }
++}
+ 
+-    // Reset bins if complete set of sequences is provided (re-create updated bins)
+-    if ( config.update_complete )
++void save_filter( TFilter const& filter, std::string const& output_filter_file )
++{
++    std::ofstream               os( output_filter_file, std::ios::binary );
++    cereal::BinaryOutputArchive archive( os );
++    archive( filter );
++}
++
++void build( TFilter& filter, SafeQueue< detail::Seqs >& queue_refs, GanonBuild::Config const& config )
++{
++    auto hash_adaptor = seqan3::views::kmer_hash( seqan3::ungapped{ config.kmer_size } );
++    while ( true )
+     {
+-        std::vector< seqan3::bin_index > updated_bins;
+-        // For all binids in the file provided, only clean bins for the old bins
+-        // new bins are already cleared
+-        for ( auto const& binid : bin_ids )
++        detail::Seqs val = queue_refs.pop();
++        if ( val.seqid != "" )
+         {
+-            if ( binid >= stats.totalBinsFile - 1 )
++            for ( uint64_t i = 0; i < val.fragbin.size(); i++ )
+             {
+-                break;
++                // Fragment sequences
++                auto [fragstart, fragend, binid] = val.fragbin[i];
++                for ( auto&& hash : val.seq | seqan3::views::slice( fragstart - 1, fragend ) | hash_adaptor )
++                {
++                    filter.emplace( hash, seqan3::bin_index{ binid } );
++                }
+             }
+-            updated_bins.emplace_back( seqan3::bin_index{ binid } );
+         }
+-        filter.clear( updated_bins );
++        else
++        {
++            break;
++        }
+     }
+ }
+ 
+@@ -174,8 +288,8 @@ void print_stats( Stats& stats, const StopClock& timeBuild )
+         std::cerr << " - " << stats.invalidSeqs << " invalid sequences were skipped" << std::endl;
+     if ( stats.newBins > 0 )
+         std::cerr << " - " << stats.newBins << " bins were added to the IBF" << std::endl;
+-    std::cerr << " - " << validSeqs << " sequences in " << stats.totalBinsFile + stats.newBins
+-              << " bins were written to the IBF" << std::endl;
++    std::cerr << " - " << validSeqs << " sequences in " << stats.totalBinsFile << " bins written to the IBF"
++              << std::endl;
+ }
+ 
+ } // namespace detail
+@@ -183,168 +297,124 @@ void print_stats( Stats& stats, const StopClock& timeBuild )
+ bool run( Config config )
+ {
+ 
++    // Validate configuration input
+     if ( !config.validate() )
+         return false;
+ 
+-    StopClock timeGanon;
+-    timeGanon.start();
+-    StopClock timeLoadFiles;
+-    StopClock timeLoadFilter;
+-    StopClock timeLoadSeq;
+-    StopClock timeBuild;
+-    StopClock timeSaveFilter;
+-
++    // Print config
+     if ( config.verbose )
+         std::cerr << config;
+ 
+-    //////////////////////////////
++    // Start time count
++    StopClock timeGanon;
++    timeGanon.start();
+ 
+-    detail::Stats stats;
++    // Initialize variables
++    StopClock       timeLoadFiles;
++    StopClock       timeLoadFilter;
++    StopClock       timeLoadSeq;
++    StopClock       timeBuild;
++    StopClock       timeSaveFilter;
++    std::mutex      mtx;
++    detail::Stats   stats;
++    detail::TFilter filter;
++    detail::TSeqBin seq_bin; // Map with seqid_bin file info
++    detail::TBinIds bin_ids; // Set with binids used
++
++    // SafeQueue with reference sequences
++    // config.n_batches*config.n_refs = max. amount of references in memory
++    SafeQueue< detail::Seqs > queue_refs( config.n_batches );
++
++    // load filter if provided (do it early to get number of bins)
++    timeLoadFilter.start();
++    if ( !config.update_filter_file.empty() )
++    {
++        filter = detail::load_filter( config.update_filter_file );
++    }
++    timeLoadFilter.stop();
+ 
++    // load seq_bin and bin_ids from --seqid-bin file or create bins automatically
+     timeLoadFiles.start();
+-    // parse seqid bin
+-    detail::TSeqBin      seq_bin;
+-    std::set< uint64_t > bin_ids;
+-    parse_seqid_bin( config.seqid_bin_file, seq_bin, bin_ids );
+-    stats.totalSeqsBinId = seq_bin.size();
+-    stats.totalBinsBinId = bin_ids.size();
+-    timeLoadFiles.stop();
+-
+-    //////////////////////////////
+-
+-    std::mutex                mtx;
+-    SafeQueue< detail::Seqs > queue_refs(
+-        config.n_batches ); // config.n_batches*config.n_refs = max. amount of references in memory
+-
+-    // Start extra thread for reading the input
+-    timeLoadSeq.start();
+-    std::future< void > read_task( std::async( std::launch::async, [=, &seq_bin, &queue_refs, &mtx, &stats] {
+-        for ( auto const& reference_file : config.reference_files )
++    if ( !config.seqid_bin_file.empty() )
++    {
++        detail::parse_seqid_bin( config.seqid_bin_file, seq_bin, bin_ids );
++    }
++    else
++    {
++        // seq_bin should remain empty
++        int start_bin = 0;
++        if ( !config.update_filter_file.empty() )
+         {
+-            // Open file (type define by extension)
+-            seqan3::sequence_file_input fin{ reference_file };
+-
+-            // read in chuncks of config.n_refs
+-            for ( auto&& records : fin | ranges::views::chunk( config.n_refs ) )
+-            {
+-                for ( auto& [seq, id, qual] : records )
+-                {
+-                    stats.totalSeqsFile += 1;
+-                    if ( seq.size() < config.kmer_size )
+-                    {
+-                        if ( config.verbose )
+-                        {
+-                            std::scoped_lock lock( mtx );
+-                            std::cerr << "WARNING: sequence smaller than k-mer size"
+-                                      << " [" << id << "]" << std::endl;
+-                        }
+-                        stats.invalidSeqs += 1;
+-                        continue;
+-                    }
+-
+-                    // Header id goes up-to first empty space
+-                    std::string seqid = id.substr( 0, id.find( ' ' ) );
+-
+-                    if ( seq_bin.count( seqid ) == 0 )
+-                    {
+-                        if ( config.verbose )
+-                        {
+-                            std::scoped_lock lock( mtx );
+-                            std::cerr << "WARNING: sequence not defined on seqid-bin-file"
+-                                      << " [" << seqid << "]" << std::endl;
+-                        }
+-                        stats.invalidSeqs += 1;
+-                        continue;
+-                    }
+-                    stats.sumSeqLen += seq.size();
+-                    queue_refs.push( detail::Seqs{ std::move( seqid ), std::move( seq ) } );
+-                }
+-            }
++            start_bin = filter.bin_count(); // if updating, create additional bins starting from the last
+         }
+-        queue_refs.notify_push_over();
+-    } ) );
++        bin_ids = std::views::iota( start_bin, start_bin + int( config.reference_files.size() ) )
++                  | seqan3::views::to< detail::TBinIds >; // fill bin_ids with range
++    }
++    timeLoadFiles.stop();
+ 
+-    // load new or given filter
++    // If updating: extend and clear filter
+     timeLoadFilter.start();
+-    detail::Tfilter filter;
+     if ( !config.update_filter_file.empty() )
+     {
+-        load_filter( filter, config, bin_ids, stats );
++        uint32_t old_total_bins = filter.bin_count();
++        uint32_t new_total_bins = *bin_ids.rbegin() + 1; // new total is the last bin (set is ordered) + 1
++        detail::increase_filter( filter, new_total_bins );
++        stats.newBins = new_total_bins - old_total_bins;
++        if ( config.update_complete )
++        {
++            detail::clear_filter( filter, bin_ids );
++        }
+     }
+     else
+     {
+-        uint64_t bsize;
+-        // Calculate bin size based on filter size (1MB = 8388608bits)
+-        if ( config.bin_size_bits == 0 && config.filter_size_mb > 0 )
+-        {
+-            uint64_t optimal_bins = ( std::floor( stats.totalBinsBinId / 64 ) + 1 ) * 64;
+-            bsize                 = ( config.filter_size_mb / static_cast< float >( optimal_bins ) ) * 8388608u;
+-        }
+-        else
+-        {
+-            bsize = config.bin_size_bits;
+-        }
+-
+-        // New filter
+-        filter = detail::Tfilter{ seqan3::bin_count{ stats.totalBinsBinId },
+-                                  seqan3::bin_size{ bsize },
+-                                  seqan3::hash_function_count{ config.hash_functions } };
++        // create new filter
++        filter = detail::create_filter( config, bin_ids.size() );
+     }
+-    stats.totalBinsFile = filter.bin_count();
+-
++    stats.totalBinsFile  = filter.bin_count();
++    stats.totalBinsBinId = bin_ids.size();
+     timeLoadFilter.stop();
+ 
+-    // oner hash adaptor per thread
+-    auto hash_adaptor = seqan3::views::kmer_hash( seqan3::ungapped{ config.kmer_size } );
+-
+-    // Start execution threads to add kmers
++    // Start thread for reading the input reference files
++    timeLoadSeq.start();
++    // nbin_aux loaded with first bin in case of automatic bin generation
++    uint32_t            nbin_aux  = *bin_ids.begin();
++    std::future< void > read_task = std::async( std::launch::async,
++                                                detail::parse_refs,
++                                                std::ref( queue_refs ),
++                                                std::ref( seq_bin ),
++                                                std::ref( mtx ),
++                                                std::ref( stats ),
++                                                std::ref( config ),
++                                                nbin_aux );
++
++    // Start threads to build filter
+     timeBuild.start();
+     std::vector< std::future< void > > tasks;
+     for ( uint16_t taskNo = 0; taskNo < config.threads_build; ++taskNo )
+     {
+-        tasks.emplace_back( std::async( std::launch::async, [&seq_bin, &filter, &queue_refs, &hash_adaptor] {
+-            while ( true )
+-            {
+-                detail::Seqs val = queue_refs.pop();
+-                if ( val.seqid != "" )
+-                {
+-                    for ( uint64_t i = 0; i < seq_bin.at( val.seqid ).size(); i++ )
+-                    {
+-                        // Fragment sequences based on seq_bin file and generate hashes for k-mers
+-                        auto [fragstart, fragend, binid] = seq_bin.at( val.seqid )[i];
+-                        for ( auto&& hash : val.seq | seqan3::views::slice( fragstart - 1, fragend ) | hash_adaptor )
+-                        {
+-                            filter.emplace( hash, seqan3::bin_index{ binid } );
+-                        }
+-                    }
+-                }
+-                else
+-                {
+-                    break;
+-                }
+-            }
+-        } ) );
++        tasks.emplace_back( std::async(
++            std::launch::async, detail::build, std::ref( filter ), std::ref( queue_refs ), std::ref( config ) ) );
+     }
+-    //////////////////////////////
+-
++    // Wait until all references sequences are parsed
+     read_task.get();
+     timeLoadSeq.stop();
+ 
++    // Wait until all threads building finish
+     for ( auto&& task : tasks )
+     {
+         task.get();
+     }
+     timeBuild.stop();
+-    //////////////////////////////
+ 
+     // Store filter
+     timeSaveFilter.start();
+-    detail::store_filter( filter, config.output_filter_file );
++    detail::save_filter( filter, config.output_filter_file );
+     timeSaveFilter.stop();
+-    //////////////////////////////
+ 
++    // Stop timer for ganon run
+     timeGanon.stop();
+ 
++    // Print time and statistics
+     if ( !config.quiet )
+     {
+         std::cerr << std::endl;
+diff --git a/src/ganon-build/include/ganon-build/Config.hpp b/src/ganon-build/include/ganon-build/Config.hpp
+index 295228db..571a6669 100644
+--- a/src/ganon-build/include/ganon-build/Config.hpp
++++ b/src/ganon-build/include/ganon-build/Config.hpp
+@@ -55,9 +55,9 @@ struct Config
+     bool validate()
+     {
+ 
+-        if ( seqid_bin_file.empty() || output_filter_file.empty() )
++        if ( output_filter_file.empty() )
+         {
+-            std::cerr << "--seqid-bin-file and --output-filter-file are mandatory" << std::endl;
++            std::cerr << "--output-filter-file is mandatory" << std::endl;
+             return false;
+         }
+ 
+@@ -115,7 +115,16 @@ struct Config
+         {
+             if ( bin_size_bits == 0 && filter_size_mb == 0 )
+             {
+-                std::cerr << "--filter-size-mb or --bin-size-bits are required" << std::endl;
++                std::cerr << "--filter-size-mb or --bin-size-bits should be provided" << std::endl;
++                return false;
++            }
++        }
++        if ( update_complete )
++        {
++            if ( update_filter_file.empty() || seqid_bin_file.empty() )
++            {
++                std::cerr << "--update-filter-file and --seqid-bin-file are required to perform --update-complete"
++                          << std::endl;
+                 return false;
+             }
+         }
+diff --git a/src/ganon-classify/CommandLineParser.cpp b/src/ganon-classify/CommandLineParser.cpp
+index 3fcaa423..1c0a905d 100644
+--- a/src/ganon-classify/CommandLineParser.cpp
++++ b/src/ganon-classify/CommandLineParser.cpp
+@@ -16,13 +16,13 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         ( "r,single-reads", "File[s] with single-end reads .fq .fastq .fasta .fa (e.g. file1.fq[.gz],[file2.fq[.gz] ... fileN.fq[.gz]])", cxxopts::value< std::vector< std::string > >() )
+         ( "p,paired-reads", "Pairs of files with paired-end reads .fq .fastq .fasta .fa (e.g. file1.1.fq[.gz],file1.2.fq[.gz],[file2.1.fq[.gz],file2.2.fq[.gz] ... fileN.1.fq[.gz],fileN.2.fq[.gz]])", cxxopts::value< std::vector< std::string > >() )
+         
+-        ( "i,ibf", "ibf (Interleaved Bloom Filter) file[s] (e.g. -b a.ibf,b.ibf OR -b a.ibf -b b.ibf )", cxxopts::value< std::vector< std::string > >() )
+-        ( "m,map", "map files[s]. Tab-separated file mapping target groups (taxids, assemblies) and bin identifiers with the following fields: target <tab> bin id (e.g. -g a.map,b.map OR -g a.map -g b.map)", cxxopts::value< std::vector< std::string > >() )
+-        ( "x,tax", "tax (taxonomy) files[s]. Tab-separated file with a complete tree with the following fields: node <tab> parent node <tab> rank <tab> name (e.g. -g a.tax,b.tax OR -g a.tax -g b.tax)", cxxopts::value< std::vector< std::string > >() )
++        ( "i,ibf", "IBF (Interleaved Bloom Filter) file[s] generated with ganon-build (e.g. -b a.ibf,b.ibf OR -b a.ibf -b b.ibf )", cxxopts::value< std::vector< std::string > >() )
++        ( "m,map", "Tab-separated file mapping bins in the --ibf to target groups/labels (e.g. taxids, assemblies). Targets can be repeated if multiple bins represent one group. Fields: target <tab> bin id (e.g. -g a.map,b.map OR -g a.map -g b.map)", cxxopts::value< std::vector< std::string > >() )
++        ( "x,tax", "Tab-separated file with a taxonomic tree for LCA calculation. Will link targets provided in the --map files. Root node should be 1 with parent 0. Fields: node/target <tab> parent node <tab> rank <tab> name (e.g. -g a.tax,b.tax OR -g a.tax -g b.tax)", cxxopts::value< std::vector< std::string > >() )
+         
+         ( "c,hierarchy-labels", "Hierarchy labels for the database files (hierarchy follows the order of the sorted labels) (e.g. 1_host,2_target,1_host,3). Default: '1_default'", cxxopts::value< std::vector< std::string > >() )
+         
+-        ( "b,kmer-size", "k size to query - should be the same used to create filter.  build filter. One per hiearchy label", cxxopts::value< std::vector< uint8_t > >() )
++        ( "b,kmer-size", "k size to query - should be the same used to build filter. One per hiearchy label.", cxxopts::value< std::vector< uint8_t > >() )
+         ( "k,min-kmers", "Minimum percentage of k-mers matching for a read to to be assigned [muttualy exclusive --max-error]. One per filter. Default: 0.25", cxxopts::value< std::vector< float > >() )
+         ( "e,max-error", "Maximum number of errors/mismatches allowed [muttualy exclusive --min-kmers]. One per filter.", cxxopts::value< std::vector< int16_t > >() )
+         ( "u,max-error-unique", "Maximum number of errors/mismatches allowed for unique matches after filtering. One per hiearchy label.", cxxopts::value< std::vector< int16_t > >() )
+@@ -30,10 +30,11 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         
+         ( "f,offset", "Offset for skipping k-mers while counting. Default: 1 = no offset", cxxopts::value< uint8_t >() )
+         
+-        ( "o,output-prefix", "Output prefix for output files (prefix.lca, prefix.rep, prefix.all, prefix.unc). If multi-level hiearchy is provded, files are generated accordingly (prefix.hiearchy.lca, ...). Omit for output to STDOUT (only .lca will be printed)", cxxopts::value< std::string >() )
+-        ( "a,output-all", "Output file with all matches (prefix.all) [it can be very big]", cxxopts::value< bool >() )
++        ( "o,output-prefix", "Output prefix (prefix.rep, [prefix.lca, prefix.all, prefix.unc]). If multi-level hiearchy is provided, files are generated accordingly (prefix.hiearchy.lca and prefix.hiearchy.all). Omit to output to STDOUT (only .rep will be printed)", cxxopts::value< std::string >() )
++        ( "w,output-lca", "Output file with lca classification, one for each classified read (prefix.lca)", cxxopts::value< bool >() )
++        ( "a,output-all", "Output file with all matches, one or more for each classified read (prefix.all) [it can be very big]", cxxopts::value< bool >() )
+         ( "n,output-unclassified", "Output unclassified read ids (prefix.unc)", cxxopts::value< bool >() )
+-        ( "s,output-single", "Generate only one output (prefix.lca and prefix.rep) even with multiple hierarchy levels", cxxopts::value< bool >() )
++        ( "s,output-single", "Do not split output files (lca and all) with multiple hierarchy levels", cxxopts::value< bool >() )
+         
+         ( "t,threads", "Number of threads", cxxopts::value< uint16_t >())
+         ( "n-reads", "Number of reads for each batch. Default: 400", cxxopts::value< uint32_t >())
+@@ -94,6 +95,8 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+ 
+     if ( args.count( "output-prefix" ) )
+         config.output_prefix = args["output-prefix"].as< std::string >();
++    if ( args.count( "output-lca" ) )
++        config.output_lca = args["output-lca"].as< bool >();
+     if ( args.count( "output-all" ) )
+         config.output_all = args["output-all"].as< bool >();
+     if ( args.count( "output-unclassified" ) )
+diff --git a/src/ganon-classify/GanonClassify.cpp b/src/ganon-classify/GanonClassify.cpp
+index e8a6d088..c092453e 100644
+--- a/src/ganon-classify/GanonClassify.cpp
++++ b/src/ganon-classify/GanonClassify.cpp
+@@ -35,11 +35,9 @@ namespace GanonClassify
+ namespace detail
+ {
+ 
+-typedef seqan3::interleaved_bloom_filter<> TIbf;
+-
++typedef seqan3::interleaved_bloom_filter<>                                  TFilter;
+ typedef seqan3::interleaved_bloom_filter<>::counting_agent_type< uint16_t > Tagent;
+-
+-typedef std::unordered_map< std::string, uint16_t > TMatches;
++typedef std::unordered_map< std::string, uint16_t >                         TMatches;
+ 
+ struct Node
+ {
+@@ -58,8 +56,7 @@ struct Rep
+ typedef std::unordered_map< std::string, Rep >  TRep;
+ typedef std::unordered_map< std::string, Node > TTax;
+ typedef std::map< uint32_t, std::string >       TMap;
+-
+-typedef std::unordered_set< std::string > TUniqueTarget;
++typedef std::unordered_set< std::string >       TUniqueTarget;
+ 
+ struct ReadBatches
+ {
+@@ -139,8 +136,11 @@ struct Stats
+     {
+         for ( auto& r : rep )
+         {
++            // count matches for hierarchy
+             classifiedReads_hierarchy[hierarchy_label] += r.second.unique_reads + r.second.lca_reads;
+             matches_hierarchy[hierarchy_label] += r.second.direct_matches;
++
++            // count matches overall
+             classifiedReads += r.second.unique_reads + r.second.lca_reads;
+             matches += r.second.direct_matches;
+         }
+@@ -150,7 +150,7 @@ struct Stats
+ 
+ struct Filter
+ {
+-    TIbf         ibf;
++    TFilter      ibf;
+     TMap         map;
+     TTax         tax;
+     FilterConfig filter_config;
+@@ -205,7 +205,7 @@ inline int16_t get_threshold_kmers( uint16_t read_len, uint8_t kmer_size, float
+ inline void check_unique( ReadOut& read_out_lca,
+                           uint16_t read1_len,
+                           uint16_t read2_len,
+-                          uint16_t kmer_size,
++                          uint8_t  kmer_size,
+                           uint16_t max_error_unique,
+                           uint8_t  offset,
+                           TTax&    tax,
+@@ -278,6 +278,7 @@ uint16_t find_matches( TMatches&                    matches,
+                        std::vector< Filter >&       filters,
+                        std::vector< Tagent >&       agents,
+                        std::vector< seqan3::dna5 >& read_seq,
++                       uint8_t                      kmer_size,
+                        uint8_t                      offset,
+                        auto&                        hash_adaptor )
+ {
+@@ -309,10 +310,9 @@ uint16_t find_matches( TMatches&                    matches,
+ 
+         int16_t threshold =
+             ( filters[i].filter_config.min_kmers > -1 )
+-                ? get_threshold_kmers(
+-                      read_seq.size(), filters[i].filter_config.kmer_size, filters[i].filter_config.min_kmers, offset )
+-                : get_threshold_errors(
+-                      read_seq.size(), filters[i].filter_config.kmer_size, filters[i].filter_config.max_error, offset );
++                ? get_threshold_kmers( read_seq.size(), kmer_size, filters[i].filter_config.min_kmers, offset )
++                : get_threshold_errors( read_seq.size(), kmer_size, filters[i].filter_config.max_error, offset );
++
+         // select matches above chosen threshold
+         select_matches( matches, selectedBins, selectedBinsRev, filters[i], threshold, max_kmer_count_read );
+     }
+@@ -324,6 +324,7 @@ uint16_t find_matches_paired( TMatches&                    matches,
+                               std::vector< Tagent >&       agents,
+                               std::vector< seqan3::dna5 >& read_seq,
+                               std::vector< seqan3::dna5 >& read_seq2,
++                              uint8_t                      kmer_size,
+                               uint8_t                      offset,
+                               auto&                        hash_adaptor )
+ {
+@@ -368,17 +369,14 @@ uint16_t find_matches_paired( TMatches&                    matches,
+         // Calculate error rate on one read
+         int16_t threshold =
+             ( filters[i].filter_config.min_kmers > -1 )
+-                ? get_threshold_kmers(
+-                      read_seq.size(), filters[i].filter_config.kmer_size, filters[i].filter_config.min_kmers, offset )
+-                : get_threshold_errors(
+-                      read_seq.size(), filters[i].filter_config.kmer_size, filters[i].filter_config.max_error, offset );
++                ? get_threshold_kmers( read_seq.size(), kmer_size, filters[i].filter_config.min_kmers, offset )
++                : get_threshold_errors( read_seq.size(), kmer_size, filters[i].filter_config.max_error, offset );
+ 
+         // sum kmers of second read (if using errors, get all possible kmers)
+         threshold +=
+             ( filters[i].filter_config.min_kmers > -1 )
+-                ? get_threshold_kmers(
+-                      read_seq2.size(), filters[i].filter_config.kmer_size, filters[i].filter_config.min_kmers, offset )
+-                : get_threshold_errors( read_seq2.size(), filters[i].filter_config.kmer_size, 0, offset );
++                ? get_threshold_kmers( read_seq2.size(), kmer_size, filters[i].filter_config.min_kmers, offset )
++                : get_threshold_errors( read_seq2.size(), kmer_size, 0, offset );
+ 
+         // select matches above chosen threshold
+         select_matches( matches, selectedBins, selectedBinsRev, filters[i], threshold, max_kmer_count_read );
+@@ -392,7 +390,7 @@ uint32_t filter_matches( ReadOut&  read_out,
+                          uint16_t  read1_len,
+                          uint16_t  read2_len,
+                          uint16_t  max_kmer_count_read,
+-                         uint16_t  kmer_size,
++                         uint8_t   kmer_size,
+                          uint8_t   offset,
+                          int16_t   strata_filter )
+ {
+@@ -400,7 +398,6 @@ uint32_t filter_matches( ReadOut&  read_out,
+     int16_t threshold_strata = 1; // minimum threshold (when strata_filter == -1)
+     if ( strata_filter > -1 )
+     {
+-
+         // get maximum possible number of errors
+         uint16_t max_error = get_error( read1_len, read2_len, kmer_size, max_kmer_count_read, offset );
+ 
+@@ -454,14 +451,13 @@ void classify( std::vector< Filter >&    filters,
+                bool                      hierarchy_last,
+                uint8_t                   offset,
+                int16_t                   max_error_unique,
+-               int16_t                   strata_filter )
++               int8_t                    kmer_size,
++               int16_t                   strata_filter,
++               bool                      run_lca )
+ {
+ 
+-    // k-mer sizes should be the same among filters
+-    uint8_t kmer_size = filters[0].filter_config.kmer_size;
+-
+     // oner hash adaptor per thread
+-    auto hash_adaptor = seqan3::views::kmer_hash( seqan3::ungapped{ filters[0].filter_config.kmer_size } );
++    auto hash_adaptor = seqan3::views::kmer_hash( seqan3::ungapped{ kmer_size } );
+ 
+     // one agent per thread per filter
+     std::vector< Tagent > agents;
+@@ -508,14 +504,20 @@ void classify( std::vector< Filter >&    filters,
+                         if ( hierarchy_first )
+                             stats.sumread_len += read2_len;
+ 
+-                        max_kmer_count_read = find_matches_paired(
+-                            matches, filters, agents, rb.seqs[readID], rb.seqs2[readID], offset, hash_adaptor );
++                        max_kmer_count_read = find_matches_paired( matches,
++                                                                   filters,
++                                                                   agents,
++                                                                   rb.seqs[readID],
++                                                                   rb.seqs2[readID],
++                                                                   kmer_size,
++                                                                   offset,
++                                                                   hash_adaptor );
+                     }
+                 }
+                 else // single-end mode
+                 {
+                     max_kmer_count_read =
+-                        find_matches( matches, filters, agents, rb.seqs[readID], offset, hash_adaptor );
++                        find_matches( matches, filters, agents, rb.seqs[readID], kmer_size, offset, hash_adaptor );
+                 }
+             }
+ 
+@@ -534,37 +536,40 @@ void classify( std::vector< Filter >&    filters,
+                                                                   config.offset,
+                                                                   strata_filter );
+ 
+-                // If there are matches
++                // If there are valid matches after filtering
+                 if ( count_filtered_matches > 0 )
+                 {
+-
+-                    ReadOut read_out_lca( rb.ids[readID] );
+-                    if ( count_filtered_matches == 1 )
++                    if ( run_lca )
+                     {
+-                        read_out_lca = read_out; // just one match, copy read read_out
+-                        if ( max_error_unique >= 0 )
++                        ReadOut read_out_lca( rb.ids[readID] );
++                        if ( count_filtered_matches == 1 )
+                         {
+-                            // re-classify read to parent if threshold<=max_error_unique
+-                            check_unique( read_out_lca,
+-                                          read1_len,
+-                                          read2_len,
+-                                          kmer_size,
+-                                          max_error_unique,
+-                                          config.offset,
+-                                          tax,
+-                                          rep );
++                            read_out_lca = read_out; // just one match, copy read read_out
++                            if ( max_error_unique >= 0 )
++                            {
++                                // re-classify read to parent if threshold<=max_error_unique
++                                check_unique( read_out_lca,
++                                              read1_len,
++                                              read2_len,
++                                              kmer_size,
++                                              max_error_unique,
++                                              config.offset,
++                                              tax,
++                                              rep );
++                            }
++                            else
++                            {
++                                rep.at( read_out.matches[0].target ).unique_reads++;
++                            }
+                         }
+                         else
+                         {
+-                            rep.at( read_out.matches[0].target ).unique_reads++;
++                            lca_matches( read_out, read_out_lca, max_kmer_count_read, lca, rep );
+                         }
+-                    }
+-                    else
+-                    {
+-                        lca_matches( read_out, read_out_lca, max_kmer_count_read, lca, rep );
+-                    }
+ 
+-                    classified_lca_queue.push( read_out_lca );
++                        if ( config.output_lca )
++                            classified_lca_queue.push( read_out_lca );
++                    }
+ 
+                     if ( config.output_all )
+                         classified_all_queue.push( read_out );
+@@ -602,93 +607,99 @@ void classify( std::vector< Filter >&    filters,
+     }
+ }
+ 
+-void write_report( TRep&       rep,
+-                   TTax&       tax,
+-                   Stats&      stats,
+-                   std::string output_file_rep,
+-                   std::string hierarchy_label,
+-                   bool        hierarchy_first,
+-                   bool        hierarchy_last )
++void write_report( TRep& rep, TTax& tax, std::ofstream& out_rep, std::string hierarchy_label, bool run_lca )
+ {
+-    std::ofstream out_rep;
+-    if ( hierarchy_first )
+-        out_rep.open( output_file_rep );
+-    else // append if not first and output_single
+-        out_rep.open( output_file_rep, std::ofstream::app );
+-
+     for ( auto const& [target, report] : rep )
+     {
+         if ( report.direct_matches || report.lca_reads || report.unique_reads )
+         {
+             out_rep << hierarchy_label << '\t' << target << '\t' << report.direct_matches << '\t' << report.unique_reads
+-                    << '\t' << report.lca_reads << '\t' << tax.at( target ).rank << '\t' << tax.at( target ).name
+-                    << '\n';
++                    << '\t' << report.lca_reads;
++            if ( run_lca )
++            {
++                out_rep << '\t' << tax.at( target ).rank << '\t' << tax.at( target ).name;
++            }
++            out_rep << '\n';
+         }
+     }
++}
++
++TFilter load_filter( std::string const& input_filter_file )
++{
++
++    TFilter                    filter;
++    std::ifstream              is( input_filter_file, std::ios::binary );
++    cereal::BinaryInputArchive archive( is );
++    archive( filter );
++    return filter;
++}
+ 
+-    if ( hierarchy_last )
++TMap load_map( std::string map_file, TUniqueTarget& unique_targets )
++{
++    TMap          map;
++    std::string   line;
++    std::ifstream infile;
++    infile.open( map_file );
++    while ( std::getline( infile, line, '\n' ) )
+     {
+-        out_rep << "#total_classified\t" << stats.classifiedReads << '\n';
+-        out_rep << "#total_unclassified\t" << stats.totalReads - stats.classifiedReads << '\n';
++        std::istringstream         stream_line( line );
++        std::vector< std::string > fields;
++        std::string                field;
++        while ( std::getline( stream_line, field, '\t' ) )
++            fields.push_back( field );
++        // target <tab> binid
++        map[std::stoul( fields[1] )] = fields[0];
++        unique_targets.insert( fields[0] );
+     }
+-    out_rep.close();
++    infile.close();
++    return map;
+ }
+ 
+-bool load_filters( std::vector< Filter >& filters,
+-                   TUniqueTarget&         unique_targets,
+-                   std::string            hierarchy_label,
+-                   Config&                config )
++TTax load_tax( std::string tax_file )
+ {
+-    uint16_t first_kmer_size = 0;
+-    for ( auto const& filter_config : config.parsed_hierarchy[hierarchy_label].filters )
++    TTax          tax;
++    std::string   line;
++    std::ifstream infile;
++    infile.open( tax_file );
++    while ( std::getline( infile, line, '\n' ) )
+     {
++        std::istringstream         stream_line( line );
++        std::vector< std::string > fields;
++        std::string                field;
++        while ( std::getline( stream_line, field, '\t' ) )
++            fields.push_back( field );
++        tax[fields[0]] = Node{ fields[1], fields[2], fields[3] };
++    }
++    infile.close();
++    return tax;
++}
+ 
+-        TIbf filter;
+-        TMap map;
+-        TTax tax;
+-
+-        // ibf file
+-        std::ifstream              is( filter_config.ibf_file, std::ios::binary );
+-        cereal::BinaryInputArchive archive( is );
+-        archive( filter );
++bool load_files( std::vector< Filter >& filters,
++                 TUniqueTarget&         unique_targets,
++                 std::string            hierarchy_label,
++                 Config&                config,
++                 bool                   run_lca )
++{
++    for ( auto const& filter_config : config.parsed_hierarchy[hierarchy_label].filters )
++    {
+ 
+-        if ( first_kmer_size == 0 )
+-        {
+-            first_kmer_size = filter_config.kmer_size;
+-        }
+-        else if ( first_kmer_size != filter_config.kmer_size )
+-        {
+-            std::cerr
+-                << "ERROR: filters on the same hierarchy should have same k-mer size configuration. Ignoring filter: "
+-                << filter_config.ibf_file << std::endl;
+-            continue;
+-        }
++        TMap    map;
++        TTax    tax;
++        TFilter filter = load_filter( filter_config.ibf_file );
+ 
+-        if ( config.offset > first_kmer_size )
++        if ( !filter_config.map_file.empty() )
+         {
+-            std::cerr << "WARNING: offset cannot be bigger than k-mer size. Setting offset to " << first_kmer_size
+-                      << std::endl;
+-            config.offset = first_kmer_size;
++            map = load_map( filter_config.map_file, unique_targets );
+         }
+-
+-        std::string   line;
+-        std::ifstream infile;
+-
+-        // map file
+-        infile.open( filter_config.map_file );
+-        while ( std::getline( infile, line, '\n' ) )
++        else
+         {
+-            std::istringstream         stream_line( line );
+-            std::vector< std::string > fields;
+-            std::string                field;
+-            while ( std::getline( stream_line, field, '\t' ) )
+-                fields.push_back( field );
+-            // target <tab> binid
+-            map[std::stoul( fields[1] )] = fields[0];
+-            unique_targets.insert( fields[0] );
++            // fill map with binids as targets
++            for ( uint32_t binid = 0; binid < filter.bin_count(); ++binid )
++            {
++                unique_targets.insert( std::to_string( binid ) );
++                map[binid] = std::to_string( binid );
++            }
+         }
+-        infile.close();
+-
+ 
+         // Check consistency of map file and ibf file
+         // map.size can be smaller than bins set on IBF if sequences were removed
+@@ -698,20 +709,10 @@ bool load_filters( std::vector< Filter >& filters,
+             return false;
+         }
+ 
+-        // tax file
+-        infile.open( filter_config.tax_file );
+-        while ( std::getline( infile, line, '\n' ) )
+-        {
+-            std::istringstream         stream_line( line );
+-            std::vector< std::string > fields;
+-            std::string                field;
+-            while ( std::getline( stream_line, field, '\t' ) )
+-                fields.push_back( field );
+-            tax[fields[0]] = Node{ fields[1], fields[2], fields[3] };
+-        }
+-        infile.close();
++        if ( run_lca )
++            tax = load_tax( filter_config.tax_file );
+ 
+-        filters.push_back( Filter{ std::move( filter ), map, tax, filter_config } );
++        filters.push_back( Filter{ std::move( filter ), std::move( map ), std::move( tax ), filter_config } );
+     }
+ 
+     return true;
+@@ -735,7 +736,7 @@ void print_stats( Stats& stats, const Config& config, const StopClock& timeClass
+               << " Mbp) in " << elapsed_classification << " seconds ("
+               << ( stats.totalReads / 1000.0 ) / ( elapsed_classification / 60.0 ) << " Kseq/m, "
+               << ( stats.sumread_len / 1000000.0 ) / ( elapsed_classification / 60.0 ) << " Mbp/m)" << std::endl;
+-    std::cerr << " - " << stats.classifiedReads << " sequences classified ("
++    std::cerr << " - " << stats.classifiedReads << " reads classified ("
+               << ( stats.classifiedReads / static_cast< double >( stats.totalReads ) ) * 100 << "%)" << std::endl;
+ 
+     if ( stats.matches > 0 )
+@@ -757,7 +758,7 @@ void print_stats( Stats& stats, const Config& config, const StopClock& timeClass
+         }
+     }
+ 
+-    std::cerr << " - " << stats.totalReads - stats.classifiedReads << " sequences unclassified ("
++    std::cerr << " - " << stats.totalReads - stats.classifiedReads << " reads unclassified ("
+               << ( ( stats.totalReads - stats.classifiedReads ) / static_cast< double >( stats.totalReads ) ) * 100
+               << "%)" << std::endl;
+ }
+@@ -806,11 +807,11 @@ void parse_reads( SafeQueue< detail::ReadBatches >& queue1, Stats& stats, Config
+     queue1.notify_push_over();
+ }
+ 
+-void write_classified( SafeQueue< detail::ReadOut >& classified_all_queue, std::ofstream& out )
++void write_classified( SafeQueue< detail::ReadOut >& classified_queue, std::ofstream& out )
+ {
+     while ( true )
+     {
+-        detail::ReadOut ro = classified_all_queue.pop();
++        detail::ReadOut ro = classified_queue.pop();
+         if ( ro.readID != "" )
+         {
+             for ( uint32_t i = 0; i < ro.matches.size(); ++i )
+@@ -889,53 +890,57 @@ void pre_process_lca( LCA& lca, TTax& tax )
+ bool run( Config config )
+ {
+ 
++    // Validate configuration input
+     if ( !config.validate() )
+         return false;
+ 
+-    // Time control
++    // Print config
++    if ( !config.quiet && config.verbose )
++        std::cerr << config;
++
++    // Start time count
+     StopClock timeGanon;
+     timeGanon.start();
++
++    // Initialize variables
+     StopClock timeLoadFilters;
+     StopClock timeClassPrint;
+ 
+-    if ( !config.quiet && config.verbose )
+-    {
+-        std::cerr << config;
+-    }
+-
+-    //////////////////////////////
+-
+-    // Set output stream (file or stdout)
+-    std::ofstream out;
+-    std::ofstream out_all;
++    detail::Stats stats;
++    std::ofstream out_rep; // Set default output stream (file or stdout)
++    std::ofstream out_all; // output all file
++    std::ofstream out_lca; // output lca file
+ 
+     // If there's no output prefix, redirect to STDOUT
+     if ( config.output_prefix.empty() )
+     {
+-        out.copyfmt( std::cout ); // STDOUT
+-        out.clear( std::cout.rdstate() );
+-        out.basic_ios< char >::rdbuf( std::cout.rdbuf() );
++        out_rep.copyfmt( std::cout ); // STDOUT
++        out_rep.clear( std::cout.rdstate() );
++        out_rep.basic_ios< char >::rdbuf( std::cout.rdbuf() );
++    }
++    else
++    {
++        out_rep.open( config.output_prefix + ".rep" );
+     }
+ 
+     // Queues for internal read handling
+     // queue1 get reads from file
+     // queue2 will get unclassified reads if hierachy == 2
+     // if hierachy == 3 queue1 is used for unclassified and so on
+-    SafeQueue< detail::ReadBatches > queue1(
+-        config.n_batches ); // config.n_batches*config.n_reads = max. amount of reads in memory
+-    SafeQueue< detail::ReadBatches > queue2;
+-
+-    // Statistics values
+-    detail::Stats stats;
++    // config.n_batches*config.n_reads = max. amount of reads in memory
++    SafeQueue< detail::ReadBatches >  queue1( config.n_batches );
++    SafeQueue< detail::ReadBatches >  queue2;
++    SafeQueue< detail::ReadBatches >* pointer_current = &queue1; // pointer to the queues
++    SafeQueue< detail::ReadBatches >* pointer_helper  = &queue2; // pointer to the queues
++    SafeQueue< detail::ReadBatches >* pointer_extra;             // pointer to the queues
+ 
+     // Thread for reading input files
+     std::future< void > read_task = std::async(
+         std::launch::async, detail::parse_reads, std::ref( queue1 ), std::ref( stats ), std::ref( config ) );
+ 
+-    // SafeQueue for printing unclassified
+-    SafeQueue< detail::ReadOut > unclassified_queue;
+     // Thread for printing unclassified reads
+-    std::future< void > write_unclassified_task;
++    SafeQueue< detail::ReadOut > unclassified_queue;
++    std::future< void >          write_unclassified_task;
+     if ( config.output_unclassified && !config.output_prefix.empty() )
+     {
+         write_unclassified_task = std::async( std::launch::async,
+@@ -944,52 +949,55 @@ bool run( Config config )
+                                               config.output_prefix + ".unc" );
+     }
+ 
+-
+-    // Pointer to the queues
+-    SafeQueue< detail::ReadBatches >* pointer_current = &queue1; // pointer to the queues
+-    SafeQueue< detail::ReadBatches >* pointer_helper  = &queue2; // pointer to the queues
+-    SafeQueue< detail::ReadBatches >* pointer_extra;             // pointer to the queues
+-
++    // Classify reads iteractively for each hierarchy level
+     uint16_t hierarchy_id   = 0;
+     uint16_t hierarchy_size = config.parsed_hierarchy.size();
+-
+-    // For every hierarchy level
++    // Check if tax files are present to run lca
++    bool run_lca = config.tax.size();
+     for ( auto const& [hierarchy_label, hierarchy_config] : config.parsed_hierarchy )
+     {
+         ++hierarchy_id;
+-        bool hierarchy_first = ( hierarchy_id == 1 );
+-        bool hierarchy_last  = ( hierarchy_id == hierarchy_size );
+-
+-        timeLoadFilters.start();
++        bool                          hierarchy_first = ( hierarchy_id == 1 );
++        bool                          hierarchy_last  = ( hierarchy_id == hierarchy_size );
+         std::vector< detail::Filter > filters;
+         detail::TUniqueTarget         unique_targets;
+-        bool                          loaded = detail::load_filters( filters, unique_targets, hierarchy_label, config );
++        detail::TTax                  tax;
++        detail::TRep                  rep;
++        LCA                           lca;
++
++        timeLoadFilters.start();
++        bool loaded = detail::load_files( filters, unique_targets, hierarchy_label, config, run_lca );
+         if ( !loaded )
+-        {
+             return false;
+-        }
+         timeLoadFilters.stop();
+ 
+-        // merge repeated elements
+-        detail::TTax tax = detail::merge_tax( filters );
++        if ( run_lca )
++        {
++            // merge repeated elements if tax is provided
++            tax = detail::merge_tax( filters );
+ 
+-        // Reports
+-        detail::TRep rep;
++            // initialize entries for the report with all possible taxa (to direct access it in multiple threads)
++            for ( const auto& it : tax )
++            {
++                rep[it.first]; // initialize using [] due to std::atomic being not movable/copyable
++            }
++
++            // validate targets and tax
++            // if target not found in tax, add node target with parent = "1" (root)
++            detail::validate_targets_tax( unique_targets, tax );
+ 
+-        // initialize entries for the report with all possible taxa (to direct access it in multiple threads)
+-        for ( const auto& it : tax )
++            // pre-processing of nodes
++            detail::pre_process_lca( lca, tax );
++        }
++        else
+         {
+-            rep[it.first]; // initialize using [] due to std::atomic being not movable/copyable
++            // initialize entries for the report with all possible targets
++            for ( const auto& t : unique_targets )
++            {
++                rep[t]; // initialize using [] due to std::atomic being not movable/copyable
++            }
+         }
+ 
+-        // validate targets and tax
+-        // if target not found in tax, add node target with parent = "1" (root)
+-        detail::validate_targets_tax( unique_targets, tax );
+-
+-        // pre-processing of nodes
+-        LCA lca;
+-        detail::pre_process_lca( lca, tax );
+-
+         // Thread for printing classified reads (.lca, .all)
+         std::vector< std::future< void > > write_tasks;
+ 
+@@ -1016,11 +1024,19 @@ bool run( Config config )
+ 
+         if ( !config.output_prefix.empty() )
+         {
+-            if ( hierarchy_first || !config.output_single )
+-                out.open( hierarchy_config.output_file_lca );
+-            else // append if not first and output_single
+-                out.open( hierarchy_config.output_file_lca, std::ofstream::app );
++            if ( config.output_lca && run_lca )
++            {
++                if ( hierarchy_first || !config.output_single )
++                    out_lca.open( hierarchy_config.output_file_lca );
++                else // append if not first and output_single
++                    out_lca.open( hierarchy_config.output_file_lca, std::ofstream::app );
+ 
++                // Start writing thread for lca matches
++                write_tasks.emplace_back( std::async( std::launch::async,
++                                                      detail::write_classified,
++                                                      std::ref( classified_lca_queue ),
++                                                      std::ref( out_lca ) ) );
++            }
+             if ( config.output_all )
+             {
+                 if ( hierarchy_first || !config.output_single )
+@@ -1036,9 +1052,6 @@ bool run( Config config )
+             }
+         }
+ 
+-        // Start writing thread for lca matches
+-        write_tasks.emplace_back( std::async(
+-            std::launch::async, detail::write_classified, std::ref( classified_lca_queue ), std::ref( out ) ) );
+ 
+         std::vector< std::future< void > > tasks;
+         // Threads for classification
+@@ -1062,7 +1075,9 @@ bool run( Config config )
+                                             hierarchy_last,
+                                             config.offset,
+                                             hierarchy_config.max_error_unique,
+-                                            hierarchy_config.strata_filter ) );
++                                            hierarchy_config.kmer_size,
++                                            hierarchy_config.strata_filter,
++                                            run_lca ) );
+         }
+ 
+         // Wait here until classification is over
+@@ -1071,7 +1086,7 @@ bool run( Config config )
+             task.get();
+         }
+ 
+-        // Inform that no more reads are going to be pushed
++        // After classification, no more reads are going to be pushed to the output
+         classified_all_queue.notify_push_over();
+         classified_lca_queue.notify_push_over();
+ 
+@@ -1079,11 +1094,8 @@ bool run( Config config )
+         stats.load_rep( hierarchy_label, rep );
+ 
+         // write reports
+-        if ( !config.output_prefix.empty() )
+-        {
+-            detail::write_report(
+-                rep, tax, stats, hierarchy_config.output_file_rep, hierarchy_label, hierarchy_first, hierarchy_last );
+-        }
++        detail::write_report( rep, tax, out_rep, hierarchy_label, run_lca );
++
+         // Wait here until all files are written
+         for ( auto&& task : write_tasks )
+         {
+@@ -1094,11 +1106,10 @@ bool run( Config config )
+         // Close file for writing (if not STDOUT)
+         if ( !config.output_prefix.empty() )
+         {
+-            out.close();
++            if ( config.output_lca )
++                out_lca.close();
+             if ( config.output_all )
+-            {
+                 out_all.close();
+-            }
+         }
+ 
+         if ( hierarchy_first )
+@@ -1116,6 +1127,13 @@ bool run( Config config )
+         write_unclassified_task.get();
+     }
+ 
++    out_rep << "#total_classified\t" << stats.classifiedReads << '\n';
++    out_rep << "#total_unclassified\t" << stats.totalReads - stats.classifiedReads << '\n';
++    if ( !config.output_prefix.empty() )
++    {
++        out_rep.close();
++    }
++
+     timeGanon.stop();
+ 
+     if ( !config.quiet )
+diff --git a/src/ganon-classify/include/ganon-classify/Config.hpp b/src/ganon-classify/include/ganon-classify/Config.hpp
+index fa812807..5e57e44c 100644
+--- a/src/ganon-classify/include/ganon-classify/Config.hpp
++++ b/src/ganon-classify/include/ganon-classify/Config.hpp
+@@ -14,21 +14,31 @@ namespace GanonClassify
+ 
+ struct FilterConfig
+ {
++    FilterConfig()
++    {
++    }
++
++    FilterConfig( std::string _ibf_file, int16_t _max_error, float _min_kmers )
++    {
++        ibf_file  = _ibf_file;
++        max_error = _max_error;
++        min_kmers = _min_kmers;
++    }
++
+     std::string ibf_file;
+-    std::string map_file;
+-    std::string tax_file;
++    std::string map_file = "";
++    std::string tax_file = "";
+     int16_t     max_error;
+     float       min_kmers;
+-    uint8_t     kmer_size;
+ };
+ 
+ struct HierarchyConfig
+ {
+     std::vector< FilterConfig > filters;
+     int16_t                     max_error_unique;
++    uint8_t                     kmer_size;
+     int16_t                     strata_filter;
+     std::string                 output_file_lca;
+-    std::string                 output_file_rep;
+     std::string                 output_file_all;
+ };
+ 
+@@ -53,6 +63,7 @@ struct Config
+     uint8_t                offset = 1;
+ 
+     std::string output_prefix       = "";
++    bool        output_lca          = false;
+     bool        output_all          = false;
+     bool        output_unclassified = false;
+     bool        output_single       = false;
+@@ -68,18 +79,24 @@ struct Config
+ 
+     bool validate()
+     {
+-        if ( ibf.size() == 0 || map.size() == 0 || tax.size() == 0
+-             || ( paired_reads.size() == 0 && single_reads.size() == 0 ) )
++        if ( ibf.size() == 0 || ( paired_reads.size() == 0 && single_reads.size() == 0 ) )
+         {
+-            std::cerr << "--ibf, --map, --tax, --[single|paired]-reads are mandatory" << std::endl;
++            std::cerr << "--ibf and --[single|paired]-reads are mandatory" << std::endl;
+             return false;
+         }
+-        else if ( paired_reads.size() % 2 != 0 )
++
++        if ( paired_reads.size() % 2 != 0 )
+         {
+             std::cerr << "--paired-reads should be an even number of files (pairs)" << std::endl;
+             return false;
+         }
+ 
++        if ( tax.size() > 0 && map.size() == 0 )
++        {
++            std::cerr << "--map is required to use --tax" << std::endl;
++            return false;
++        }
++
+         bool valid_val = true;
+         for ( uint16_t i = 0; i < min_kmers.size(); ++i )
+         {
+@@ -133,6 +150,7 @@ struct Config
+ 
+         if ( output_prefix.empty() )
+         {
++            output_lca          = false;
+             output_all          = false;
+             output_unclassified = false;
+         }
+@@ -145,9 +163,15 @@ struct Config
+ 
+     bool parse_hierarchy()
+     {
+-        if ( ibf.size() != map.size() || ibf.size() != tax.size() )
++        if ( map.size() > 0 && ibf.size() != map.size() )
++        {
++            std::cerr << "The number of files provided with --ibf and --map should match" << std::endl;
++            return false;
++        }
++
++        if ( tax.size() > 0 && ibf.size() != tax.size() )
+         {
+-            std::cerr << "The number of --ibf, --map and --tax should match" << std::endl;
++            std::cerr << "The number of files provided with --ibf and --tax should match" << std::endl;
+             return false;
+         }
+ 
+@@ -195,27 +219,33 @@ struct Config
+         }
+ 
+ 
+-        if ( kmer_size.size() == 1 && ibf.size() > 1 )
++        std::vector< std::string > sorted_hierarchy = hierarchy_labels;
++        std::sort( sorted_hierarchy.begin(), sorted_hierarchy.end() );
++        // get unique hierarcy labels
++        uint16_t unique_hierarchy =
++            std::unique( sorted_hierarchy.begin(), sorted_hierarchy.end() ) - sorted_hierarchy.begin();
++
++        for ( uint16_t k = 0; k < kmer_size.size(); ++k )
+         {
+-            for ( uint16_t b = 1; b < ibf.size(); ++b )
++            if ( offset > kmer_size[k] )
++            {
++                std::cerr << "Offset cannot be bigger than k-mer size" << std::endl;
++                return false;
++            }
++        }
++        if ( kmer_size.size() == 1 && unique_hierarchy > 1 )
++        {
++            for ( uint16_t b = 1; b < unique_hierarchy; ++b )
+             {
+                 kmer_size.push_back( kmer_size[0] );
+             }
+         }
+-        else if ( kmer_size.size() != ibf.size() )
++        else if ( kmer_size.size() != unique_hierarchy )
+         {
+-            std::cerr << "Please provide a single or one-per-filter --kmer-size value[s]" << std::endl;
++            std::cerr << "Please provide a single or one-per-hierarchy --kmer-size value[s]" << std::endl;
+             return false;
+         }
+ 
+-
+-        std::vector< std::string > sorted_hierarchy = hierarchy_labels;
+-        std::sort( sorted_hierarchy.begin(), sorted_hierarchy.end() );
+-        // get unique hierarcy labels
+-        uint16_t unique_hierarchy =
+-            std::unique( sorted_hierarchy.begin(), sorted_hierarchy.end() ) - sorted_hierarchy.begin();
+-
+-
+         if ( max_error_unique.size() == 1 && unique_hierarchy > 1 )
+         {
+             for ( uint16_t b = 1; b < unique_hierarchy; ++b )
+@@ -245,34 +275,34 @@ struct Config
+         uint16_t hierarchy_count = 0;
+         for ( uint16_t h = 0; h < hierarchy_labels.size(); ++h )
+         {
+-            auto filter_cfg = FilterConfig{ ibf[h], map[h], tax[h], max_error[h], min_kmers[h], kmer_size[h] };
++            auto filter_cfg = FilterConfig{ ibf[h], max_error[h], min_kmers[h] };
++            if ( map.size() > 0 )
++                filter_cfg.map_file = map[h];
++            if ( tax.size() > 0 )
++                filter_cfg.tax_file = tax[h];
+ 
+             if ( parsed_hierarchy.find( hierarchy_labels[h] ) == parsed_hierarchy.end() )
+             { // not found
+                 std::vector< FilterConfig > fc;
+                 fc.push_back( filter_cfg );
+-
+-                std::string output_file_lca;
+-                std::string output_file_rep;
+-                std::string output_file_all;
++                std::string output_file_lca = "";
++                std::string output_file_all = "";
+                 if ( !output_prefix.empty() && unique_hierarchy > 1 && !output_single )
+                 {
+                     output_file_lca = output_prefix + "." + hierarchy_labels[h] + ".lca";
+                     output_file_all = output_prefix + "." + hierarchy_labels[h] + ".all";
+-                    output_file_rep = output_prefix + ".rep";
+                 }
+                 else if ( !output_prefix.empty() )
+                 {
+                     output_file_lca = output_prefix + ".lca";
+                     output_file_all = output_prefix + ".all";
+-                    output_file_rep = output_prefix + ".rep";
+                 }
+ 
+                 parsed_hierarchy[hierarchy_labels[h]] = HierarchyConfig{ fc,
+                                                                          max_error_unique[hierarchy_count],
++                                                                         kmer_size[hierarchy_count],
+                                                                          strata_filter[hierarchy_count],
+                                                                          output_file_lca,
+-                                                                         output_file_rep,
+                                                                          output_file_all };
+                 ++hierarchy_count;
+             }
+@@ -297,7 +327,7 @@ inline std::ostream& operator<<( std::ostream& stream, const Config& config )
+         if ( !hierarchy_config.first.empty() )
+         {
+             stream << hierarchy_config.first << ")" << newl;
+-
++            stream << " --kmer-size: " << unsigned( hierarchy_config.second.kmer_size ) << newl;
+             stream << " --max-error-unique: " << hierarchy_config.second.max_error_unique << newl;
+             stream << " --strata-filter: " << hierarchy_config.second.strata_filter << newl;
+         }
+@@ -307,16 +337,21 @@ inline std::ostream& operator<<( std::ostream& stream, const Config& config )
+                 stream << "  --min-kmers: " << filter_config.min_kmers << newl;
+             if ( filter_config.max_error > -1 )
+                 stream << "  --max-error: " << filter_config.max_error << newl;
+-            stream << "  --kmer-size: " << unsigned( filter_config.kmer_size ) << newl;
+             stream << "  --ibf: " << filter_config.ibf_file << newl;
+-            stream << "  --map: " << filter_config.map_file << newl;
+-            stream << "  --tax: " << filter_config.tax_file << newl;
++            if ( !filter_config.map_file.empty() )
++                stream << "  --map: " << filter_config.map_file << newl;
++            if ( !filter_config.tax_file.empty() )
++                stream << "  --tax: " << filter_config.tax_file << newl;
++        }
++        if ( !config.output_prefix.empty() )
++        {
++            stream << "  Output files:" << newl;
++            stream << "    " << config.output_prefix + ".rep" << newl;
++            if ( config.output_lca )
++                stream << "    " << hierarchy_config.second.output_file_lca << newl;
++            if ( config.output_all )
++                stream << "    " << hierarchy_config.second.output_file_all << newl;
+         }
+-        stream << "  Output files:" << newl;
+-        stream << "    " << hierarchy_config.second.output_file_lca << newl;
+-        stream << "    " << hierarchy_config.second.output_file_rep << newl;
+-        if ( config.output_all )
+-            stream << "    " << hierarchy_config.second.output_file_all << newl;
+     }
+     stream << newl;
+     stream << "Input files:" << newl;
+@@ -330,6 +365,7 @@ inline std::ostream& operator<<( std::ostream& stream, const Config& config )
+     stream << "Parameters:" << newl;
+     stream << "--offset                    " << unsigned( config.offset ) << newl;
+     stream << "--output-prefix             " << config.output_prefix << newl;
++    stream << "--output-lca                " << config.output_lca << newl;
+     stream << "--output-all                " << config.output_all << newl;
+     stream << "--output-unclassified       " << config.output_unclassified << newl;
+     stream << "--output-single             " << config.output_single << newl;
+diff --git a/src/ganon/classify.py b/src/ganon/classify.py
+index dc764fbd..d2d41265 100644
+--- a/src/ganon/classify.py
++++ b/src/ganon/classify.py
+@@ -19,6 +19,7 @@ def classify(cfg):
+                                    "--strata-filter " + ",".join([str(sf) for sf in cfg.strata_filter]) if cfg.strata_filter else "",
+                                    "--offset " + str(cfg.offset) if cfg.offset else "",
+                                    "--output-prefix " + cfg.output_prefix if cfg.output_prefix else "",
++                                   "--output-lca" if cfg.output_lca else "",
+                                    "--output-all" if cfg.output_all else "",
+                                    "--output-unclassified" if cfg.output_unclassified else "",
+                                    "--output-single" if cfg.output_single else "",
+diff --git a/src/ganon/config.py b/src/ganon/config.py
+index 4c7e16c0..722080ee 100644
+--- a/src/ganon/config.py
++++ b/src/ganon/config.py
+@@ -93,7 +93,8 @@ def __init__(self, which: str=None, **kwargs):
+         classify_group_optional.add_argument('-f', '--offset',              type=int,              metavar='', help='Number of k-mers to skip during classification. Can speed up analysis but may reduce recall. (e.g. 1 = all k-mers, 3 = every 3rd k-mer). Default: 2')    
+         classify_group_optional.add_argument('-t', '--threads',             type=int,              metavar='', help='Number of sub-processes/threads to use. Default: 3')
+         classify_group_optional.add_argument('-r', '--ranks',               type=str,   nargs="*", metavar='', help='Ranks to show in the report (.tre). "all" for all identified ranks. empty for default ranks: superkingdom phylum class order family genus species assembly. This file can be re-generated with the ganon report command.')
+-        classify_group_optional.add_argument('--output-all',                action='store_true',               help='Output an additional file with all matches (.all). File can be very large.')
++        classify_group_optional.add_argument('--output-lca',                action='store_true',               help='Output an additional file with one lca matche for each read (.lca)')
++        classify_group_optional.add_argument('--output-all',                action='store_true',               help='Output an additional file with all matches. File can be very large (.all)')
+         classify_group_optional.add_argument('--output-unclassified',       action='store_true',               help='Output an additional file with unclassified read headers (.unc)')
+         classify_group_optional.add_argument('--output-single',             action='store_true',               help='When using multiple hierarchical levels, output everything in one file instead of one per hierarchy')
+         classify_group_optional.add_argument('--verbose',                   action='store_true',               help='Verbose output mode')
+diff --git a/tests/ganon-build/GanonBuild.test.cpp b/tests/ganon-build/GanonBuild.test.cpp
+index d568fceb..69a6ec81 100644
+--- a/tests/ganon-build/GanonBuild.test.cpp
++++ b/tests/ganon-build/GanonBuild.test.cpp
+@@ -198,6 +198,22 @@ SCENARIO( "building indices", "[ganon-build]" )
+         config_build::validate_elements( cfg.output_filter_file, cfg.kmer_size, merged_seqs, merged_bins );
+     }
+ 
++    SECTION( "with multiple --reference-files without --seqid-bin-file" )
++    {
++        // without --seqid-bin-file it should create one bin per sequence file
++        std::string prefix = "reference_files_wo_seqid_bin";
++        auto        cfg    = config_build::defaultConfig( prefix );
++        // write one sequence per file
++        config_build::write_fasta( prefix + ".S1.fasta", { seqs[0] }, { ids[0] } );
++        config_build::write_fasta( prefix + ".S2.fasta", { seqs[1] }, { ids[1] } );
++        config_build::write_fasta( prefix + ".S3.fasta", { seqs[2] }, { ids[2] } );
++        cfg.reference_files = { prefix + ".S1.fasta", prefix + ".S2.fasta", prefix + ".S3.fasta" };
++
++        REQUIRE( GanonBuild::run( cfg ) );
++        config_build::validate_filter(
++            cfg.output_filter_file, cfg.hash_functions, cfg.filter_size_mb, cfg.bin_size_bits, bins );
++        config_build::validate_elements( cfg.output_filter_file, cfg.kmer_size, seqs, bins );
++    }
+ 
+     SECTION( "with --kmer-size 11" )
+     {
+@@ -319,6 +335,34 @@ SCENARIO( "updating indices", "[ganon-build]" )
+         }
+     }
+ 
++    SECTION( "with --update-filter-file creating 3 new bins without --seqid-bin-file" )
++    {
++        // without --seqid-bin-file it should create one bin per sequence file
++        std::string prefix            = "3new_update_wo_seqid_bin";
++        auto        cfg_update        = config_build::defaultConfig( prefix );
++        cfg_update.update_filter_file = cfg_build.output_filter_file;
++
++        // write one sequence per file
++        config_build::write_fasta( prefix + ".S4.fasta", { extra_seqs[0] }, { extra_ids[0] } );
++        config_build::write_fasta( prefix + ".S5.fasta", { extra_seqs[1] }, { extra_ids[1] } );
++        config_build::write_fasta( prefix + ".S6.fasta", { extra_seqs[2] }, { extra_ids[2] } );
++        cfg_update.reference_files = { prefix + ".S4.fasta", prefix + ".S5.fasta", prefix + ".S6.fasta" };
++
++        REQUIRE( GanonBuild::run( cfg_update ) );
++
++        auto merged_seqs = aux::vconcat( seqs, extra_seqs );
++        auto merged_bins = aux::vconcat( bins, extra_bins );
++
++        config_build::validate_filter( cfg_update.output_filter_file,
++                                       cfg_update.hash_functions,
++                                       cfg_update.filter_size_mb,
++                                       cfg_update.bin_size_bits,
++                                       merged_bins );
++        config_build::validate_elements(
++            cfg_update.output_filter_file, cfg_update.kmer_size, merged_seqs, merged_bins );
++    }
++
++
+     SECTION( "with --update-filter-file creating 80 new bins" )
+     {
+         // set sequences to new bins
+diff --git a/tests/ganon-classify/GanonClassify.test.cpp b/tests/ganon-classify/GanonClassify.test.cpp
+index c48512d2..841e64ad 100644
+--- a/tests/ganon-classify/GanonClassify.test.cpp
++++ b/tests/ganon-classify/GanonClassify.test.cpp
+@@ -16,6 +16,7 @@ GanonClassify::Config defaultConfig()
+     GanonClassify::Config cfg;
+     cfg.output_single       = true;
+     cfg.output_all          = true;
++    cfg.output_lca          = true;
+     cfg.output_unclassified = false;
+     cfg.kmer_size           = { 19 };
+     cfg.threads             = 4;
+@@ -330,23 +331,7 @@ SCENARIO( "Classify with offset higher than k", "[ganon-classify]" )
+     cfg.offset        = 25; // should be limited by k-mer size (19) and give same results
+     cfg.output_prefix = "b-b_f25";
+     INFO( "output_prefix: " + cfg.output_prefix );
+-    REQUIRE( GanonClassify::run( cfg ) );
+-
+-    auto cfg2          = config_classify::defaultConfig();
+-    cfg2.ibf           = { "filters/bacteria.ibf" };
+-    cfg2.map           = { "filters/bacteria.map" };
+-    cfg2.tax           = { "filters/bacteria.tax" };
+-    cfg2.single_reads  = { "reads/bacteria.simulated.1.fq" };
+-    cfg2.offset        = 19;
+-    cfg2.output_prefix = "b-b_f19";
+-    INFO( "output_prefix2: " + cfg2.output_prefix );
+-    REQUIRE( GanonClassify::run( cfg2 ) );
+-
+-    for ( auto const& ext : config_classify::output_ext )
+-    {
+-        INFO( "extension: " + ext );
+-        REQUIRE( aux::filesAreEqualSorted( cfg.output_prefix + "." + ext, cfg2.output_prefix + "." + ext ) );
+-    }
++    REQUIRE_FALSE( GanonClassify::run( cfg ) );
+ }
+ 
+ SCENARIO( "Classify multi-filter without errors allowed", "[ganon-classify]" )
+diff --git a/tests/ganon/integration/test_classify.py b/tests/ganon/integration/test_classify.py
+index 8b90366d..fd327250 100755
+--- a/tests/ganon/integration/test_classify.py
++++ b/tests/ganon/integration/test_classify.py
+@@ -13,6 +13,7 @@ class TestClassifyOffline(unittest.TestCase):
+     results_dir = base_dir + "results/integration/classify/"
+     default_params = {"db_prefix": data_dir+"bacteria_default",
+                       "single_reads": data_dir+"bac.sim.1.fq",
++                      "output_lca": True,
+                       "output_all": True,
+                       "quiet": True}
+ 
+diff --git a/tests/ganon/integration/test_update.py b/tests/ganon/integration/test_update.py
+index 96933701..c456eaff 100755
+--- a/tests/ganon/integration/test_update.py
++++ b/tests/ganon/integration/test_update.py
+@@ -46,6 +46,7 @@ def test_default(self):
+         params_classify = {"db_prefix": params["output_db_prefix"],
+             "single_reads": [data_dir+"vir.sim.1.fq", data_dir+"bac.sim.1.fq"],
+             "max_error": 0,
++            "output_lca": True,
+             "output_all": True,
+             "quiet": True,
+             "output_prefix": self.results_dir + "test_default"}
+@@ -230,6 +231,7 @@ def test_add_existing_bins(self):
+                             "single_reads": [data_dir+"vir.sim.1.fq", data_dir+"bac.sim.1.fq"],
+                             "max_error": 0,
+                             "offset": 1,
++                            "output_lca": True,
+                             "output_all": True,
+                             "quiet": True,
+                             "output_prefix": self.results_dir + "test_add_existing_bins_classify_part1"}
+@@ -290,6 +292,7 @@ def test_update_complete_add(self):
+         params_classify = {"db_prefix": params["output_db_prefix"],
+                     "single_reads": [data_dir+"vir.sim.1.fq", data_dir+"bac.sim.1.fq"],
+                     "max_error": 0,
++                    "output_lca": True,
+                     "output_all": True,
+                     "quiet": True,
+                     "output_prefix": self.results_dir + "test_update_complete_add"}
+@@ -329,6 +332,7 @@ def test_update_complete_remove(self):
+         params_classify = {"db_prefix": params["output_db_prefix"],
+                     "single_reads": data_dir+"bac.sim.1.fq",
+                     "max_error": 0,
++                    "output_lca": True,
+                     "output_all": True,
+                     "quiet": True,
+                     "output_prefix": self.results_dir + "test_default"}
+@@ -370,6 +374,7 @@ def test_update_complete_add_remove(self):
+         params_classify = {"db_prefix": params["output_db_prefix"],
+                     "single_reads": [data_dir+"vir.sim.1.fq", data_dir+"bac.sim.1.fq"],
+                     "max_error": 0,
++                    "output_lca": True,
+                     "output_all": True,
+                     "quiet": True,
+                     "output_prefix": self.results_dir + "test_default"}
+@@ -448,6 +453,7 @@ def test_update_multiple(self):
+         params_classify = {"db_prefix": params["output_db_prefix"],
+                     "single_reads": [data_dir+"vir.sim.1.fq", data_dir+"bac.sim.1.fq"],
+                     "max_error": 0,
++                    "output_lca": True,
+                     "output_all": True,
+                     "quiet": True,
+                     "output_prefix": self.results_dir + "test_update_multiple_classify"}

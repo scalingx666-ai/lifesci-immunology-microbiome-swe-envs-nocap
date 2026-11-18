@@ -1,0 +1,322 @@
+diff --git a/notebook/ST10-timeseries-plotting-and-analysis.ipynb b/notebook/ST10-timeseries-plotting-and-analysis.ipynb
+index bf54dd3c1..d053e0ff6 100644
+--- a/notebook/ST10-timeseries-plotting-and-analysis.ipynb
++++ b/notebook/ST10-timeseries-plotting-and-analysis.ipynb
+@@ -154,7 +154,7 @@
+    "metadata": {},
+    "source": [
+     "...  and the number agents with $diameter < 5$.<br>\n",
+-    "We create a condition `cond` and pass it to the function `Count` which returns the number of agents for which `cond(agent)` evaluates to true."
++    "We create a condition `cond` and pass it to an instance of `Counter` which calculates the number of agents for which `cond(agent)` evaluates to true."
+    ]
+   },
+   {
+@@ -164,12 +164,8 @@
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "auto* ts = simulation.GetTimeSeries();\n",
+-    "auto agents_lt_5 = [](Simulation* sim) {\n",
+-    "  auto cond = L2F([](Agent* a){ return a->GetDiameter() < 5; });\n",
+-    "  return static_cast<double>(bdm::experimental::Count(sim, cond));\n",
+-    "};\n",
+-    "ts->AddCollector(\"agents_lt_5\", agents_lt_5);"
++    "auto cond = [](Agent* a) { return a->GetDiameter() < 5; };\n",
++    "ts->AddCollector(\"agents_lt_5\", new bdm::experimental::Counter<double>(cond));"
+    ]
+   },
+   {
+diff --git a/src/core/analysis/reduce.h b/src/core/analysis/reduce.h
+index 3a96e1054..d9f4f0886 100644
+--- a/src/core/analysis/reduce.h
++++ b/src/core/analysis/reduce.h
+@@ -66,6 +66,8 @@ struct Reducer : public Functor<void, Agent*> {
+ /// rm->ForEachAgentParallel(reducer);
+ /// auto result = reducer.GetResult();
+ /// \endcode
++/// The optional argument `filter` allows to reduce only a subset of
++/// all agents.
+ /// The benefit in comparison with `bdm::experimental::Reduce` is that
+ /// multiple counters can be combined and processed in one sweep over
+ /// all agents.
+@@ -77,9 +79,11 @@ class GenericReducer : public Reducer<TResult> {
+ 
+   GenericReducer(void(agent_function)(Agent*, T*),
+                  T (*reduce_partial_results)(const SharedData<T>&),
++                 bool (*filter)(Agent*) = nullptr,
+                  TResult (*post_process)(TResult) = nullptr)
+       : agent_function_(agent_function),
+         reduce_partial_results_(reduce_partial_results),
++        filter_(filter),
+         post_process_(post_process) {
+     Reset();
+     tl_results_.resize(ThreadInfo::GetInstance()->GetMaxThreads());
+@@ -91,8 +95,10 @@ class GenericReducer : public Reducer<TResult> {
+   virtual ~GenericReducer() = default;
+ 
+   void operator()(Agent* agent) override {
+-    auto tid = ThreadInfo::GetInstance()->GetMyThreadId();
+-    agent_function_(agent, &(tl_results_[tid]));
++    if (!filter_ || (filter_(agent))) {
++      auto tid = ThreadInfo::GetInstance()->GetMyThreadId();
++      agent_function_(agent, &(tl_results_[tid]));
++    }
+   }
+ 
+   void Reset() override {
+@@ -118,6 +124,7 @@ class GenericReducer : public Reducer<TResult> {
+   SharedData<T> tl_results_;                                     //!
+   void (*agent_function_)(Agent*, T*) = nullptr;                 //!
+   T (*reduce_partial_results_)(const SharedData<T>&) = nullptr;  //!
++  bool (*filter_)(Agent*) = nullptr;                             //!
+   TResult (*post_process_)(TResult) = nullptr;                   //!
+   BDM_CLASS_DEF_OVERRIDE(GenericReducer, 1)
+ };
+@@ -139,6 +146,8 @@ inline void GenericReducer<T, TResult>::Streamer(TBuffer& R__b) {
+     this->reduce_partial_results_ =
+         reinterpret_cast<T (*)(const SharedData<T>&)>(l);
+     R__b.ReadLong64(l);
++    this->filter_ = reinterpret_cast<bool (*)(Agent*)>(l);
++    R__b.ReadLong64(l);
+     this->post_process_ = reinterpret_cast<TResult (*)(TResult)>(l);
+   } else {
+     R__b.WriteClassBuffer(GenericReducer::Class(), this);
+@@ -146,6 +155,8 @@ inline void GenericReducer<T, TResult>::Streamer(TBuffer& R__b) {
+     R__b.WriteLong64(l);
+     l = reinterpret_cast<Long64_t>(this->reduce_partial_results_);
+     R__b.WriteLong64(l);
++    l = reinterpret_cast<Long64_t>(this->filter_);
++    R__b.WriteLong64(l);
+     l = reinterpret_cast<Long64_t>(this->post_process_);
+     R__b.WriteLong64(l);
+   }
+@@ -166,7 +177,8 @@ inline void GenericReducer<T, TResult>::Streamer(TBuffer& R__b) {
+ /// auto result = Reduce(sim, sum_data, combine_tl_results);
+ /// \endcode
+ /// The optional argument `filter` allows to reduce only a subset of
+-/// all agents.
++/// all agents.\n
++/// NB: For better performance consider using `GenericReducer` instead.
+ template <typename T>
+ inline T Reduce(Simulation* sim, Functor<void, Agent*, T*>& agent_functor,
+                 Functor<T, const SharedData<T>&>& reduce_partial_results,
+@@ -300,7 +312,8 @@ inline void Counter<TResult>::Streamer(TBuffer& R__b) {
+ /// auto num_infected = Count(sim, is_infected));
+ /// \endcode
+ /// The optional argument `filter` allows to count only a subset of
+-/// all agents.
++/// all agents.\n
++/// NB: For better performance consider using `Counter` instead.
+ inline uint64_t Count(Simulation* sim, Functor<bool, Agent*>& condition,
+                       Functor<bool, Agent*>* filter = nullptr) {
+   // The thread-local (partial) results
+diff --git a/src/core/analysis/time_series.cc b/src/core/analysis/time_series.cc
+index 280101e1d..3185bd17b 100644
+--- a/src/core/analysis/time_series.cc
++++ b/src/core/analysis/time_series.cc
+@@ -272,17 +272,17 @@ void TimeSeries::Update() {
+     auto* sim = Simulation::GetActive();
+     auto* scheduler = sim->GetScheduler();
+     auto* param = sim->GetParam();
++
++    // First all reducers
+     std::vector<std::pair<Reducer<double>*, const std::string>> reducers;
+     for (auto& entry : data_) {
+       auto& result_data = entry.second;
+-      if (result_data.ycollector != nullptr) {
+-        result_data.y_values.push_back(result_data.ycollector(sim));
+-      }
+-      if (result_data.y_reducer_collector != nullptr) {
+-        result_data.y_reducer_collector->Reset();
+-        reducers.push_back(
+-            std::make_pair(result_data.y_reducer_collector, entry.first));
++      if (result_data.y_reducer_collector == nullptr) {
++        continue;
+       }
++      result_data.y_reducer_collector->Reset();
++      reducers.push_back(
++          std::make_pair(result_data.y_reducer_collector, entry.first));
+       if (result_data.xcollector == nullptr) {
+         result_data.x_values.push_back(scheduler->GetSimulatedSteps() *
+                                        param->simulation_time_step);
+@@ -291,7 +291,7 @@ void TimeSeries::Update() {
+       }
+     }
+ 
+-    // execute reducers
++    //   execute reducers
+     auto execute_reducers = L2F([&](Agent* agent) {
+       for (auto& el : reducers) {
+         (*el.first)(agent);
+@@ -301,6 +301,22 @@ void TimeSeries::Update() {
+     for (auto& el : reducers) {
+       data_[el.second].y_values.push_back(el.first->GetResult());
+     }
++
++    // Second all function collectors
++    //   Thus function collectors can use the results of the reducers.
++    for (auto& entry : data_) {
++      auto& result_data = entry.second;
++      if (result_data.ycollector == nullptr) {
++        continue;
++      }
++      result_data.y_values.push_back(result_data.ycollector(sim));
++      if (result_data.xcollector == nullptr) {
++        result_data.x_values.push_back(scheduler->GetSimulatedSteps() *
++                                       param->simulation_time_step);
++      } else {
++        result_data.x_values.push_back(result_data.xcollector(sim));
++      }
++    }
+   }
+ }
+ 
+diff --git a/src/core/analysis/time_series.h b/src/core/analysis/time_series.h
+index 418826fc6..08525fd72 100644
+--- a/src/core/analysis/time_series.h
++++ b/src/core/analysis/time_series.h
+@@ -124,20 +124,25 @@ class TimeSeries {
+   /// Adds a reducer collector which is executed at each iteration.\n
+   /// The benefit (in comparison with `AddCollector` using a function pointer
+   /// to collect y-values) is that multiple reducers can be combined.
+-  /// Thus the result can be calculated faster.\n
++  /// This mechanism is more cache-friendly and calculates the result
++  /// much faster.\n
++  /// `Update` calculates the values for reducers before function pointers.
++  /// Thus, a function pointer collector can use the result of a reducer
++  /// collector. This is illustrated in the example below.
+   /// Let's assume we want to track the fraction of infected agents in an
+   /// epidemiological simulation.
+   /// \code
+   /// auto is_infected = [](Agent* a) {
+   ///   return bdm_static_cast<Person*>(a)->state_ == State::kInfected;
+   /// };
+-  /// auto post_process = [](double count) {
+-  ///   auto* rm = Simulation::GetActive()->GetResourceManager();
+-  ///   auto num_agents = rm->GetNumAgents();
++  /// ts->AddCollector("infected", new Counter<double>(is_infected);
++  ///
++  /// auto infected_rate = [](Simulation* sim) {
++  ///   auto num_agents = sim->GetResourceManager()->GetNumAgents();
++  ///   auto count = ts->GetYValues("infected").back();
+   ///   return count / static_cast<double>(num_agents);
+   /// };
+-  /// ts->AddCollector("infected", new Counter<double>(is_infected,
+-  ///                                                  post_process));
++  /// ts->AddCollector("infected_rate", infected_rate);
+   /// \endcode
+   void AddCollector(const std::string& id, Reducer<double>* y_reducer_collector,
+                     double (*xcollector)(Simulation*) = nullptr);
+diff --git a/test/unit/core/analysis/reduce_test.cc b/test/unit/core/analysis/reduce_test.cc
+index 4aead8ebf..97677cac3 100644
+--- a/test/unit/core/analysis/reduce_test.cc
++++ b/test/unit/core/analysis/reduce_test.cc
+@@ -65,7 +65,7 @@ TEST(Reduce, GenericReducer) {
+     return result;
+   };
+ 
+-  // without post processing
++  // without filter and post processing
+   {
+     GenericReducer<uint64_t> reducer(sum_data, combine_tl_results);
+     rm->ForEachAgentParallel(reducer);
+@@ -73,10 +73,21 @@ TEST(Reduce, GenericReducer) {
+     EXPECT_EQ(1999000u, result);
+   }
+ 
++  // with filter, without post processing
++  {
++    auto filter = [](Agent* a) {
++      return bdm_static_cast<TestAgent*>(a)->GetData() <= 1000;
++    };
++    GenericReducer<uint64_t> reducer(sum_data, combine_tl_results, filter);
++    rm->ForEachAgentParallel(reducer);
++    auto result = reducer.GetResult();
++    EXPECT_EQ(500500u, result);
++  }
++
+   // with post processing and reset
+   {
+     auto post_process = [](uint64_t result) { return result / 2; };
+-    GenericReducer<uint64_t> reducer(sum_data, combine_tl_results,
++    GenericReducer<uint64_t> reducer(sum_data, combine_tl_results, nullptr,
+                                      post_process);
+     rm->ForEachAgentParallel(reducer);
+     auto result = reducer.GetResult();
+@@ -93,7 +104,7 @@ TEST(Reduce, GenericReducer) {
+   {
+     auto post_process = [](double result) { return result / 2.3; };
+     GenericReducer<uint64_t, double> reducer(sum_data, combine_tl_results,
+-                                             post_process);
++                                             nullptr, post_process);
+     rm->ForEachAgentParallel(reducer);
+     auto result = reducer.GetResult();
+     EXPECT_EQ(typeid(result), typeid(double));
+@@ -191,14 +202,18 @@ TEST_F(IOTest, GenericReducer) {
+     return result;
+   };
+   auto post_process = [](uint64_t result) { return result / 2; };
+-  GenericReducer<uint64_t> reducer(sum_data, combine_tl_results, post_process);
++  auto filter = [](Agent* a) {
++    return bdm_static_cast<TestAgent*>(a)->GetData() <= 1000;
++  };
++  GenericReducer<uint64_t> reducer(sum_data, combine_tl_results, filter,
++                                   post_process);
+ 
+   GenericReducer<uint64_t>* restored;
+   BackupAndRestore(reducer, &restored);
+ 
+   rm->ForEachAgentParallel(*restored);
+   auto result = restored->GetResult();
+-  EXPECT_EQ(999500u, result);
++  EXPECT_EQ(250250u, result);
+ }
+ 
+ // -----------------------------------------------------------------------------
+diff --git a/test/unit/core/analysis/time_series_test.cc b/test/unit/core/analysis/time_series_test.cc
+index 5821bba8b..89796af03 100644
+--- a/test/unit/core/analysis/time_series_test.cc
++++ b/test/unit/core/analysis/time_series_test.cc
+@@ -265,6 +265,42 @@ TEST(TimeSeries, AddCollectorReducerAndUpdate) {
+   EXPECT_NEAR(8.0, yvals[2], abs_error<double>::value);
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(TimeSeries, ReuseAddCollectorReducerResult) {
++  Simulation sim(TEST_NAME);
++
++  // create agents
++  sim.GetResourceManager()->AddAgent(new Cell());
++  sim.GetResourceManager()->AddAgent(new Cell());
++  sim.GetResourceManager()->AddAgent(new Cell());
++
++  // Register reducer
++  auto* ts = sim.GetTimeSeries();
++  auto agent_diam_gt_0 = [](Agent* a) { return a->GetDiameter() > 0.; };
++  auto xcollector = [](Simulation* sim) {
++    return sim->GetScheduler()->GetSimulatedSteps() + 3.0;
++  };
++  auto* counter = new Counter<double>(agent_diam_gt_0);
++  ts->AddCollector("agents-diam-gt-0", counter, xcollector);
++  EXPECT_EQ(1u, ts->Size());
++  EXPECT_TRUE(ts->Contains("agents-diam-gt-0"));
++
++  // Register 2nd collector that reuses the result from reducer
++  auto agent_diam_gt0_ratio = [](Simulation* sim) {
++    double count = sim->GetTimeSeries()->GetYValues("agents-diam-gt-0").back();
++    EXPECT_EQ(3, count);
++    return count / sim->GetResourceManager()->GetNumAgents();
++  };
++  ts->AddCollector("agent-diam-gt-0-ratio", agent_diam_gt0_ratio);
++
++  ts->Update();
++
++  // check entries
++  const auto& yvals = ts->GetYValues("agents-diam-gt-0");
++  EXPECT_EQ(1u, yvals.size());
++  EXPECT_NEAR(3.0, yvals[0], abs_error<double>::value);
++}
++
+ // -----------------------------------------------------------------------------
+ TEST(TimeSeries, StoreAndLoad) {
+   Simulation sim(TEST_NAME);

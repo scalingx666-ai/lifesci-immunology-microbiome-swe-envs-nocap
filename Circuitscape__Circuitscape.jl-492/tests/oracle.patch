@@ -1,0 +1,311 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index 6413796a..c20e6858 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -389,7 +389,7 @@ Files should be in tab-delimited text with a .txt extension.
+ 
+ ### Current and Voltage Data
+ 
+-Current and voltage data for networks are written in text list formats. Raster voltage and current maps are written in ASCII raster format (or GeoTIFF if `write_as_tif = True`).
++Current and voltage data for networks are written in text list formats. Raster voltage and current maps are written in ESRI ASCII raster format (`.asc`), or GeoTIFF if `write_as_tif = True`. ASCII grids are read and written natively; when the input raster carries a projection, it is written alongside each `.asc` output as a `.prj` sidecar, as GIS tools expect.
+ 
+ ### Resistance Files
+ 
+diff --git a/src/io.jl b/src/io.jl
+index 7714327d..e319cc4c 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -150,8 +150,6 @@ function read_cellmap(habitat_file::String, is_res::Bool, ::Type{T};
+ end
+ 
+ function _grid_reader(T, file)
+-    endswith(file, ".gz") ? file = "/vsigzip/$(file)" : ()
+-
+     c, wkt, transform = read_raster(file, T)
+ 
+     rastermeta = get_raster_meta(c, wkt, transform)
+@@ -566,12 +564,103 @@ function update!(cellmap::Matrix{T}, m::String, hbmeta) where {T}
+     cellmap .= cellmap .* mask
+ end
+ 
+-# Inspired by GeoArrays.read()
++_strip_gz(path) = endswith(lowercase(path), ".gz") ? path[1:end-3] : path
++is_asc(path) = endswith(lowercase(_strip_gz(path)), ".asc")
++
++"""
++    read_raster(path, T) -> (array, wkt, transform)
++
++Read a single-band raster as a `nrows × ncols` matrix of `T` with NODATA and
++NaN mapped to -9999. ESRI ASCII grids (`.asc`, optionally gzipped) are parsed
++natively; every other format goes through GDAL.
++"""
+ function read_raster(path::String, T)
+-    # Check if file exists (ArchGDAL error is cryptic)
+-    check_path = endswith(path, ".gz") ? path[10:lastindex(path)] : path
+-    !isfile(check_path) && error("the file \"$(check_path)\" does not exist")
++    !isfile(path) && error("the file \"$(path)\" does not exist")
++    is_asc(path) ? read_asc(path, T) : read_raster_gdal(path, T)
++end
++
++const ASC_HEADER_KEYS = ("ncols", "nrows", "xllcorner", "yllcorner", "xllcenter",
++                         "yllcenter", "cellsize", "dx", "dy", "nodata_value")
++
++"""
++    read_asc(path, T)
+ 
++Native ESRI ASCII grid reader. Accepts the header variants GDAL does —
++`xllcorner`/`yllcorner` or `xllcenter`/`yllcenter`, `cellsize` or `dx`/`dy`,
++optional `NODATA_value` — in any order and case, and a gzipped file. A `.prj`
++sidecar, if present, supplies the projection WKT.
++"""
++function read_asc(path::String, ::Type{T}) where {T}
++    io = _open(path)
++    header = Dict{String,Float64}()
++    local array
++    try
++        # Header: key/value lines until the first line that is not one.
++        line = ""
++        while !eof(io)
++            line = readline(io)
++            toks = split(line)
++            isempty(toks) && continue
++            key = lowercase(toks[1])
++            (length(toks) == 2 && key in ASC_HEADER_KEYS) || break
++            header[key] = parse(Float64, toks[2])
++            line = ""
++        end
++        for k in ("ncols", "nrows")
++            haskey(header, k) || error("$path: ASCII grid header is missing $k")
++        end
++        nrows, ncols = Int(header["nrows"]), Int(header["ncols"])
++
++        # Body: one row per line, any whitespace between values (fixtures in
++        # the wild mix tabs, runs of spaces, trailing delimiters and CRLF,
++        # which trips readdlm's delimiter detection).
++        array = Matrix{T}(undef, nrows, ncols)
++        r = 0
++        while true
++            toks = split(line)
++            if !isempty(toks)
++                r += 1
++                r > nrows && error("$path: header declares $nrows rows but the file holds more")
++                length(toks) == ncols ||
++                    error("$path: row $r has $(length(toks)) values, header declares $ncols columns")
++                @inbounds for c in 1:ncols
++                    array[r, c] = parse(T, toks[c])
++                end
++            end
++            eof(io) && break
++            line = readline(io)
++        end
++        r == nrows || error("$path: header declares $nrows rows but the file holds $r")
++    finally
++        close(io)
++    end
++    nrows, ncols = size(array)
++
++    dx = get(header, "dx", get(header, "cellsize", NaN))
++    dy = get(header, "dy", dx)
++    isnan(dx) && error("$path: ASCII grid header needs cellsize or dx/dy")
++    xll = haskey(header, "xllcorner") ? header["xllcorner"] :
++          haskey(header, "xllcenter") ? header["xllcenter"] - dx / 2 :
++          error("$path: ASCII grid header needs xllcorner or xllcenter")
++    yll = haskey(header, "yllcorner") ? header["yllcorner"] :
++          haskey(header, "yllcenter") ? header["yllcenter"] - dy / 2 :
++          error("$path: ASCII grid header needs yllcorner or yllcenter")
++
++    nodata = T(get(header, "nodata_value", -9999.0))
++    @inbounds for i in eachindex(array)
++        (array[i] == nodata || isnan(array[i])) && (array[i] = T(-9999))
++    end
++
++    # GDAL-style geotransform: origin at the top-left corner, negative row step
++    transform = [xll, dx, 0.0, yll + nrows * dy, 0.0, -dy]
++    prj = _strip_gz(path)[1:end-4] * ".prj"
++    wkt = isfile(prj) ? String(strip(read(prj, String))) : ""
++    array, wkt, transform
++end
++
++# Inspired by GeoArrays.read()
++function read_raster_gdal(path::String, T)
++    endswith(path, ".gz") && (path = "/vsigzip/$(path)")
+     ArchGDAL.read(path) do raw
+         # Extract 1st band (should only be one band anyway)
+         # to get a 2D array instead of 3D
+@@ -600,7 +689,7 @@ function read_raster(path::String, T)
+ 
+         # Line to handle NaNs in datasets read from tifs
+         array[isnan.(array)] .= -9999.0
+-        
++
+         transform = ArchGDAL.getgeotransform(raw)
+         wkt = ArchGDAL.getproj(raw)
+         array, wkt, transform # wkt and transform are needed later for write_raster
+diff --git a/src/out.jl b/src/out.jl
+index c9181fae..c42ffbec 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -498,31 +498,62 @@ function write_cum_maps(cum, cellmap::Matrix{T}, cfg, hbmeta, write_max, write_c
+ 
+ end
+ 
+-# Write a single band raster, either in .tif or .asc format,
+-# inspired by GeoArrays.write()
++"""
++    write_raster(fn_prefix, array, wkt, transform, file_format)
++
++Write a single-band raster. `.asc` is written natively with `writedlm` —
++several times faster than the GDAL AAIGrid driver, and thread-safe, so it
++takes no lock; `.tif` goes through GDAL under `IO_LOCK`.
++"""
+ function write_raster(fn_prefix::String,
+                       array::Matrix{T} where T <: Number,
+                       wkt::String,
+                       transform,
+                       file_format::String)
++    if file_format == "tif"
++        write_raster_gdal(fn_prefix, array, wkt, transform)
++    else
++        write_asc(fn_prefix, array, wkt, transform)
++    end
++end
++
++function write_asc(fn_prefix::String, array::AbstractMatrix, wkt::String, transform)
++    nrows, ncols = size(array)
++    if length(transform) >= 6
++        xll, dx, dy = transform[1], transform[2], -transform[6]
++        yll = transform[4] - nrows * dy
++    else
++        xll, yll, dx, dy = 0.0, 0.0, 1.0, 1.0
++    end
++    open(fn_prefix * ".asc", "w") do io
++        println(io, "ncols         ", ncols)
++        println(io, "nrows         ", nrows)
++        println(io, "xllcorner     ", xll)
++        println(io, "yllcorner     ", yll)
++        if dx ≈ dy
++            println(io, "cellsize      ", dx)
++        else
++            println(io, "dx            ", dx)
++            println(io, "dy            ", dy)
++        end
++        println(io, "NODATA_value  -9999")
++        writedlm(io, array, ' ')
++    end
++    # Projection travels in a sidecar, as with the GDAL AAIGrid driver
++    isempty(wkt) || write(fn_prefix * ".prj", wkt)
++    nothing
++end
++
++# Inspired by GeoArrays.write()
++function write_raster_gdal(fn_prefix::String, array::AbstractMatrix, wkt::String, transform)
+     # Prepare data outside the lock
+     array_t = permutedims(array, [2, 1])
+-
+     width, height = size(array_t)
+-
+-    # Define extension and driver based in file_format
+-    file_format == "tif" ? (ext = ".tif"; driver = "GTiff") :
+-            (ext = ".asc"; driver = "AAIGrid")
+-
+-    file_format == "tif" ? (options = ["COMPRESS=LZW"]) :
+-                           (options = [])
+-
+-    # Append file extention to filename
+-    fn = string(fn_prefix, ext)
++    fn = fn_prefix * ".tif"
++    options = ["COMPRESS=LZW"]
+ 
+     # Lock only the ArchGDAL calls (GDAL is not thread safe)
+     lock(IO_LOCK) do
+-        # Create raster in memory *NEEDED* because no create driver for .asc
+         ArchGDAL.create(fn_prefix,
+                         driver = ArchGDAL.getdriver("MEM"),
+                         width = width,
+@@ -531,19 +562,14 @@ function write_raster(fn_prefix::String,
+                         dtype = eltype(array_t),
+                         options = options) do dataset
+             band = ArchGDAL.getband(dataset, 1)
+-            # Write data to band
+             ArchGDAL.write!(band, array_t)
+-
+-            # Write nodata and projection info
+             ArchGDAL.setnodatavalue!(band, -9999.0)
+             ArchGDAL.setgeotransform!(dataset, transform)
+             ArchGDAL.setproj!(dataset, wkt)
+-
+-            # Copy memory object to disk (necessary because ArchGDAL.create
+-            # does not support creation of ASCII rasters)
+             ArchGDAL.write(dataset, fn,
+-                           driver = ArchGDAL.getdriver(driver),
++                           driver = ArchGDAL.getdriver("GTiff"),
+                            options = options)
+         end
+     end
++    nothing
+ end
+diff --git a/test/internal.jl b/test/internal.jl
+index 9a687588..9a4d73b4 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -392,3 +392,60 @@ end
+     write(joinpath(dir, "reclass.txt"), "7\t9\n")
+     @test compute(d) ≈ base
+ end
++
++# Native ESRI ASCII grid I/O (no GDAL on the .asc path)
++@testset "ASCII grid I/O" begin
++    dir = mktempdir()
++    a = [1.0 2.5 -9999.0; 4.0 5.0 6.0]
++    tr = [10.0, 0.5, 0.0, 21.0, 0.0, -0.5]      # xll=10, cellsize=0.5, 2 rows -> yll=20
++
++    # Round trip with and without a projection sidecar
++    Circuitscape.write_raster(joinpath(dir, "r"), a, "PROJCS[\"x\"]", tr, "asc")
++    b, wkt, tr2 = Circuitscape.read_raster(joinpath(dir, "r.asc"), Float64)
++    @test b == a && tr2 == tr && wkt == "PROJCS[\"x\"]"
++    @test isfile(joinpath(dir, "r.prj"))
++    Circuitscape.write_raster(joinpath(dir, "q"), a, "", tr, "asc")
++    @test !isfile(joinpath(dir, "q.prj"))
++    @test Circuitscape.read_raster(joinpath(dir, "q.asc"), Float32)[1] == Float32.(a)
++    @test occursin("cellsize", read(joinpath(dir, "q.asc"), String))
++
++    # Header dialects GDAL accepts: center origin, dx/dy, no NODATA line,
++    # tabs, CRLF, mixed case, custom nodata
++    write(joinpath(dir, "c.asc"),
++          "NCOLS 3\r\nNROWS 2\r\nxllcenter\t10.25\r\nyllcenter\t20.25\r\ncellsize 0.5\r\n1 2 3\r\n4 5 6\r\n")
++    b, _, tr2 = Circuitscape.read_raster(joinpath(dir, "c.asc"), Float64)
++    @test b == [1.0 2 3; 4 5 6] && tr2 == tr
++    write(joinpath(dir, "d.asc"),
++          "ncols 3\nnrows 2\nxllcorner 0\nyllcorner 0\ndx 1\ndy 2\nNODATA_value -1\n1 -1 3\n4 5 NaN\n")
++    b, _, tr2 = Circuitscape.read_raster(joinpath(dir, "d.asc"), Float64)
++    @test b == [1.0 -9999 3; 4 5 -9999] && tr2 == [0.0, 1.0, 0.0, 4.0, 0.0, -2.0]
++    Circuitscape.write_raster(joinpath(dir, "e"), b, "", tr2, "asc")
++    @test occursin("dx", read(joinpath(dir, "e.asc"), String))
++    @test Circuitscape.read_raster(joinpath(dir, "e.asc"), Float64)[3] == tr2
++
++    # Single-row grid and gzipped input
++    write(joinpath(dir, "one.asc"), "ncols 2\nnrows 1\nxllcorner 0\nyllcorner 0\ncellsize 1\n7 8\n")
++    @test Circuitscape.read_raster(joinpath(dir, "one.asc"), Float64)[1] == [7.0 8.0]
++    Circuitscape.GZip.open(joinpath(dir, "z.asc.gz"), "w") do io
++        write(io, read(joinpath(dir, "r.asc")))
++    end
++    @test Circuitscape.read_raster(joinpath(dir, "z.asc.gz"), Float64)[1] == a
++
++    # Bad headers are reported by file
++    write(joinpath(dir, "bad.asc"), "ncols 3\nnrows 3\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2 3\n4 5 6\n")
++    @test_throws ErrorException Circuitscape.read_raster(joinpath(dir, "bad.asc"), Float64)
++
++    # Every .asc shipped with the tests reads the same as through GDAL. GDAL's
++    # AAIGrid driver stores these values as Float32 (2.002 -> 2.0020000934);
++    # the native parser is exact, hence the Float32-level tolerance.
++    files = String[]
++    for (root, _, fs) in walkdir("input"), f in fs
++        endswith(f, ".asc") && push!(files, joinpath(root, f))
++    end
++    @test length(files) > 100
++    for f in files
++        a1, w1, t1 = Circuitscape.read_asc(f, Float64)
++        a2, w2, t2 = Circuitscape.read_raster_gdal(f, Float64)
++        @test isapprox(a1, a2; rtol = 1e-6) && t1 ≈ t2 && w1 == w2
++    end
++end

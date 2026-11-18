@@ -1,0 +1,785 @@
+diff --git a/docs/announcements.md b/docs/announcements.md
+index 2ab1990e..feffdd1c 100644
+--- a/docs/announcements.md
++++ b/docs/announcements.md
+@@ -8,12 +8,13 @@ nav_order: 1
+ # Announcements
+ 
+ **Note (x, 2020)**:
+- * GTDB-Tk v1.1.1 has been released 
++ * GTDB-Tk v??? has been released 
+    * *Bug fixes:*
+-        * none?
++        * Fixed an issue where `--scratch_dir` would fail, and not clean-up the mmap file.
+     * *Features:*
+         * Added the `infer_rank` method which established the taxonomic ranks of internal nodes of user trees based on RED
+         * Added the `decorate` command allowing the `de novo workflow` to be run
++        * Skip gene calling if existing files are found.
+ 
+ **Note (Apr 9, 2020)**:
+ * GTDB-Tk v1.1.0 has been released (**we recommend all users update to this version**)
+diff --git a/gtdbtk/classify.py b/gtdbtk/classify.py
+index f64bbe72..b1129bbe 100644
+--- a/gtdbtk/classify.py
++++ b/gtdbtk/classify.py
+@@ -94,13 +94,13 @@ def place_genomes(self,
+         mem_gb = get_memory_gb()
+         if mem_gb is not None:
+             mem_total = mem_gb['MemTotal']
+-            if marker_set_id == 'bac120' and mem_total < 114:
++            if marker_set_id == 'bac120' and mem_total < 100:
+                 self.logger.warning(f'pplacer requires ~113 GB of RAM to fully '
+                                     f'load the bacterial tree into memory. '
+                                     f'However, {mem_total}GB was detected. '
+                                     f'This may affect pplacer performance, '
+                                     f'or fail if there is insufficient scratch space.')
+-            elif marker_set_id == 'ar122' and mem_total < 7:
++            elif marker_set_id == 'ar122' and mem_total < 5:
+                 self.logger.warning(f'pplacer requires ~6.2 GB of RAM to fully '
+                                     f'load the archaeal tree into memory. '
+                                     f'However, {mem_total}GB was detected. '
+@@ -127,10 +127,10 @@ def place_genomes(self,
+         # check if a scratch file is to be created
+         pplacer_mmap_file = None
+         if scratch_dir:
+-            self.logger.info(
+-                'Using a scratch file for pplacer allocations. This decreases memory usage and performance.')
+-            pplacer_mmap_file = ' --mmap-file {}'.format(
+-                os.path.join(scratch_dir, prefix + ".pplacer.scratch"))
++            self.logger.info('Using a scratch file for pplacer allocations. '
++                             'This decreases memory usage and performance.')
++            pplacer_mmap_file = os.path.join(scratch_dir, prefix + ".pplacer.scratch")
++            make_sure_path_exists(scratch_dir)
+ 
+         # get path to pplacer reference package
+         if marker_set_id == 'bac120':
+diff --git a/gtdbtk/external/pfam_search.py b/gtdbtk/external/pfam_search.py
+index 9cbe8f17..deb82e3e 100644
+--- a/gtdbtk/external/pfam_search.py
++++ b/gtdbtk/external/pfam_search.py
+@@ -14,7 +14,7 @@
+ #    along with this program. If not, see <http://www.gnu.org/licenses/>.     #
+ #                                                                             #
+ ###############################################################################
+-
++import logging
+ import multiprocessing as mp
+ import os
+ import sys
+@@ -22,7 +22,7 @@
+ from gtdbtk.exceptions import GTDBTkExit
+ from gtdbtk.external.pypfam.Scan.PfamScan import PfamScan
+ from gtdbtk.io.marker.tophit import TopHitPfamFile
+-from gtdbtk.tools import sha256
++from gtdbtk.tools import sha256, file_has_checksum
+ 
+ 
+ class PfamSearch(object):
+@@ -39,7 +39,8 @@ def __init__(self,
+         """Initialization."""
+ 
+         self.threads = threads
+-
++        self.logger = logging.getLogger('timestamp')
++        self.warnings = logging.getLogger('warnings')
+         self.pfam_hmm_dir = pfam_hmm_dir
+         self.protein_file_suffix = protein_file_suffix
+         self.pfam_suffix = pfam_suffix
+@@ -80,7 +81,7 @@ def _topHit(self, pfam_file):
+ 
+         tophit_file.write()
+ 
+-    def _workerThread(self, queueIn, queueOut):
++    def _workerThread(self, queueIn, queueOut, n_skipped):
+         """Process each data item in parallel."""
+         try:
+             while True:
+@@ -93,16 +94,23 @@ def _workerThread(self, queueIn, queueOut):
+                 output_hit_file = os.path.join(self.output_dir, genome_id, filename.replace(self.protein_file_suffix,
+                                                                                             self.pfam_suffix))
+ 
+-                pfam_scan = PfamScan(cpu=self.cpus_per_genome, fasta=gene_file, dir=self.pfam_hmm_dir)
+-                pfam_scan.search()
+-                pfam_scan.write_results(output_hit_file, None, None, None, None)
++                # Check if this has already been processed.
++                out_files = (output_hit_file, TopHitPfamFile.get_path(self.output_dir, genome_id))
++                if all([file_has_checksum(x) for x in out_files]):
++                    self.warnings.info(f'Skipped Pfam processing for: {genome_id}')
++                    with n_skipped.get_lock():
++                        n_skipped.value += 1
++                else:
++                    pfam_scan = PfamScan(cpu=self.cpus_per_genome, fasta=gene_file, dir=self.pfam_hmm_dir)
++                    pfam_scan.search()
++                    pfam_scan.write_results(output_hit_file, None, None, None, None)
+ 
+-                # calculate checksum
+-                with open(output_hit_file + self.checksum_suffix, 'w') as fh:
+-                    fh.write(sha256(output_hit_file))
++                    # calculate checksum
++                    with open(output_hit_file + self.checksum_suffix, 'w') as fh:
++                        fh.write(sha256(output_hit_file))
+ 
+-                # identify top hit for each gene
+-                self._topHit(output_hit_file)
++                    # identify top hit for each gene
++                    self._topHit(output_hit_file)
+ 
+                 queueOut.put(gene_file)
+         except Exception as error:
+@@ -138,6 +146,7 @@ def run(self, gene_files):
+         # populate worker queue with data to process
+         workerQueue = mp.Queue()
+         writerQueue = mp.Queue()
++        n_skipped = mp.Value('i', 0)
+ 
+         for f in gene_files:
+             workerQueue.put(f)
+@@ -147,7 +156,7 @@ def run(self, gene_files):
+ 
+         try:
+             workerProc = [mp.Process(target=self._workerThread, args=(
+-                workerQueue, writerQueue)) for _ in range(self.threads)]
++                workerQueue, writerQueue, n_skipped)) for _ in range(self.threads)]
+             writeProc = mp.Process(target=self._writerThread, args=(
+                 len(gene_files), writerQueue))
+ 
+@@ -169,3 +178,8 @@ def run(self, gene_files):
+ 
+             writeProc.terminate()
+             raise
++
++        if n_skipped.value > 0:
++            genome_s = 'genome' if n_skipped.value == 1 else 'genomes'
++            self.logger.warning(f'Pfam skipped {n_skipped.value} {genome_s} '
++                                f'due to pre-existing data, see warnings.log')
+diff --git a/gtdbtk/external/pplacer.py b/gtdbtk/external/pplacer.py
+index 6caabab0..96c86fc7 100644
+--- a/gtdbtk/external/pplacer.py
++++ b/gtdbtk/external/pplacer.py
+@@ -16,80 +16,15 @@
+ ###############################################################################
+ 
+ import logging
++import multiprocessing as mp
+ import os
++import queue
+ import re
+ import subprocess
+ import sys
+ 
+ from gtdbtk.exceptions import PplacerException, TogException
+-
+-
+-class PplacerLogger(object):
+-    """Helper class for writing pplacer output."""
+-
+-    def __init__(self, fh):
+-        """Initialise the class.
+-
+-        Parameters
+-        ----------
+-        fh : BinaryIO
+-            The file to write to .
+-        """
+-        self.fh = fh
+-
+-    def _disp_progress(self, line):
+-        """Calculates the progress and writes it to stdout.
+-
+-        Parameters
+-        ----------
+-        line : str
+-            The line passed from pplacer stdout.
+-        """
+-        if not line.startswith('working on '):
+-            sys.stdout.write(f'\rInitialising pplacer [{line[0:50].center(50)}]')
+-            sys.stdout.flush()
+-        else:
+-            re_hits = re.search(r'\((\d+)\/(\d+)\)', line)
+-            current = int(re_hits.group(1))
+-            total = int(re_hits.group(2))
+-            sys.stdout.write('\r{}'.format(self._get_progress_str(current,
+-                                                                  total)))
+-            sys.stdout.flush()
+-
+-    def _get_progress_str(self, current, total):
+-        """Determines the format of the genomes % string.
+-
+-        Parameters
+-        ----------
+-        current : int
+-            The current number of genomes which have been placed.
+-        total : int
+-            The total number of genomes which are to be placed.
+-
+-        Returns
+-        -------
+-        out : str
+-            A string formatted to show the progress of placement.
+-        """
+-        width = 50
+-        bar = str()
+-        prop = float(current) / total
+-        bar += '#' * int(prop * width)
+-        bar += '-' * (width - len(bar))
+-        return 'Placing genomes |{}| {}/{} ({:.2f}%)'.format(bar, current,
+-                                                             total, prop * 100)
+-
+-    def read(self, line):
+-        """Reads a line and writes the progress to stdout and the file.
+-
+-        Parameters
+-        ----------
+-        line : str
+-            A line returned from Prodigal stdout.
+-        """
+-        self.fh.write(line)
+-        line = line.strip()
+-        self._disp_progress(line)
++from gtdbtk.tools import get_proc_memory_gb
+ 
+ 
+ class Pplacer(object):
+@@ -106,7 +41,7 @@ def _get_version(self):
+         try:
+             env = os.environ.copy()
+             proc = subprocess.Popen(['pplacer', '--version'], stdout=subprocess.PIPE,
+-                                stderr=subprocess.PIPE, env=env, encoding='utf-8')
++                                    stderr=subprocess.PIPE, env=env, encoding='utf-8')
+ 
+             output, error = proc.communicate()
+             return output.strip()
+@@ -131,7 +66,6 @@ def run(self, cpus, model, ref_pkg, json_out, msa_file, pplacer_out,
+                               file isn't generated.
+ 
+         """
+-
+         args = ['pplacer', '-m', model, '-j', str(cpus), '-c', ref_pkg, '-o',
+                 json_out, msa_file]
+         if mmap_file:
+@@ -139,27 +73,121 @@ def run(self, cpus, model, ref_pkg, json_out, msa_file, pplacer_out,
+             args.append(mmap_file)
+         self.logger.debug(' '.join(args))
+ 
+-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, encoding='utf-8')
+-        with open(pplacer_out, 'w') as fh:
+-            pplacer_logger = PplacerLogger(fh)
+-            while True:
+-                line = proc.stdout.readline()
+-                if not line:
+-                    sys.stdout.write('\n')
+-                    break
+-                pplacer_logger.read(line)
+-        proc.wait()
++        out_q = mp.Queue()
++        pid = mp.Value('i', 0)
++        p_worker = mp.Process(target=self._worker, args=(args, out_q, pplacer_out, pid))
++        p_writer = mp.Process(target=self._writer, args=(out_q, pid))
+ 
+-        if proc.returncode != 0:
+-            raise PplacerException('An error was encountered while '
+-                                   'running pplacer, check the log '
+-                                   'file: {}'.format(pplacer_out))
++        try:
++            p_worker.start()
++            p_writer.start()
++
++            p_worker.join()
++            out_q.put(None)
++            p_writer.join()
++
++            if p_worker.exitcode != 0:
++                raise PplacerException('An error was encountered while running pplacer.')
++        except Exception:
++            p_worker.terminate()
++            p_writer.terminate()
++            raise
++        finally:
++            if mmap_file:
++                os.remove(mmap_file)
+ 
+         if not os.path.isfile(json_out):
+             self.logger.error('pplacer returned a zero exit code but no output '
+                               'file was generated.')
+             raise PplacerException
+ 
++    def _worker(self, args, out_q, pplacer_out, pid):
++        """The worker thread writes the piped output of pplacer to disk and
++        shares it with the writer thread for logging."""
++        with subprocess.Popen(args, stdout=subprocess.PIPE, encoding='utf-8') as proc:
++            with pid.get_lock():
++                pid.value = proc.pid
++
++            with open(pplacer_out, 'w') as fh:
++                while True:
++                    line = proc.stdout.readline()
++                    if not line:
++                        break
++                    fh.write(f'{line}')
++                    out_q.put(line)
++            proc.wait()
++
++            if proc.returncode != 0:
++                raise PplacerException('An error was encountered while '
++                                       'running pplacer, check the log '
++                                       'file: {}'.format(pplacer_out))
++
++    def _writer(self, out_q, pid):
++        """The writer subprocess is able to report on newly piped events from
++        subprocess in the worker thread, and report on memory usage while
++        waiting for new comands."""
++        states = ['Reading user alignment',
++                  'Reading reference alignment',
++                  'Pre-masking sequences',
++                  'Determining figs',
++                  'Allocating memory for internal nodes',
++                  'Caching likelihood information on reference tree',
++                  'Pulling exponents',
++                  'Preparing the edges for baseball',
++                  'Placing genomes']
++        cur_state = None
++        n_total, n_placed = None, 0
++        while True:
++            try:
++                state = out_q.get(block=True, timeout=5)
++                if not state:
++                    break
++                elif state.startswith('Running pplacer'):
++                    cur_state = 0
++                elif state.startswith("Didn't find any reference"):
++                    cur_state = 1
++                elif state.startswith('Pre-masking sequences'):
++                    cur_state = 2
++                elif state.startswith('Determining figs'):
++                    cur_state = 3
++                elif state.startswith('Allocating memory for internal'):
++                    cur_state = 4
++                elif state.startswith('Caching likelihood information'):
++                    cur_state = 5
++                elif state.startswith('Pulling exponents'):
++                    cur_state = 6
++                elif state.startswith('Preparing the edges'):
++                    cur_state = 7
++                elif state.startswith('working on '):
++                    cur_state = 8
++                else:
++                    cur_state = None
++                    sys.stdout.write(f'\r==> {state}')
++
++                if cur_state and cur_state == 8:
++                    if not n_total:
++                        n_total = int(re.search(r'\((\d+)\/(\d+)\)', state).group(2))
++                    n_placed += 1
++                    sys.stdout.write(
++                        f'\r==> Step 9 of 9: placing genome {n_placed} of {n_total} ({n_placed / n_total:.2%})')
++                elif cur_state and (cur_state >= 0 or cur_state < 8):
++                    sys.stdout.write(f'\r==> Step {cur_state + 1} of 9: {states[cur_state + 1]}.')
++                sys.stdout.flush()
++
++            # Report the memory usage if at a memory-reportable state.
++            except queue.Empty:
++                if cur_state == 3:
++                    virt, res = get_proc_memory_gb(pid.value)
++                    sys.stdout.write(f'\r==> Step {cur_state + 1} of 9: {states[4]} ({virt:.2f} GB)')
++                elif cur_state == 4:
++                    virt, res = get_proc_memory_gb(pid.value)
++                    sys.stdout.write(
++                        f'\r==> Step {cur_state + 1} of 9: {states[5]} ({res:.2f}/{virt:.2f} GB, {res / virt:.2%})')
++                sys.stdout.flush()
++            except Exception:
++                pass
++        sys.stdout.write('\n')
++
+     def tog(self, pplacer_json_out, tree_file):
+         """ Convert the pplacer json output into a newick tree.
+ 
+diff --git a/gtdbtk/external/prodigal.py b/gtdbtk/external/prodigal.py
+index 7c8cbc71..54c4499b 100644
+--- a/gtdbtk/external/prodigal.py
++++ b/gtdbtk/external/prodigal.py
+@@ -24,7 +24,8 @@
+ 
+ from gtdbtk.biolib_lite.prodigal_biolib import Prodigal as BioLibProdigal
+ from gtdbtk.exceptions import ProdigalException
+-from gtdbtk.tools import sha256
++from gtdbtk.io.prodigal.tln_table import TlnTableFile
++from gtdbtk.tools import sha256, file_has_checksum
+ from gtdbtk.config.output import CHECKSUM_SUFFIX
+ 
+ 
+@@ -33,7 +34,6 @@ class Prodigal(object):
+ 
+     def __init__(self,
+                  threads,
+-                 proteins,
+                  marker_gene_dir,
+                  protein_file_suffix,
+                  nt_gene_file_suffix,
+@@ -46,8 +46,6 @@ def __init__(self,
+ 
+         self.threads = threads
+ 
+-        self.proteins = proteins
+-
+         self.marker_gene_dir = marker_gene_dir
+         self.protein_file_suffix = protein_file_suffix
+         self.nt_gene_file_suffix = nt_gene_file_suffix
+@@ -80,11 +78,25 @@ def _run_prodigal(self, genome_id, fasta_path, usr_tln_table):
+             False if an error occurred.
+         """
+ 
++        # Set the paths for output files.
+         output_dir = os.path.join(self.marker_gene_dir, genome_id)
+-
++        aa_gene_file = os.path.join(output_dir, genome_id + self.protein_file_suffix)
++        nt_gene_file = os.path.join(output_dir, genome_id + self.nt_gene_file_suffix)
++        gff_file = os.path.join(output_dir, genome_id + self.gff_file_suffix)
++        translation_table_file = os.path.join(output_dir, 'prodigal_translation_table.tsv')
++        out_files = (nt_gene_file, gff_file, translation_table_file, aa_gene_file)
++
++        # Check if this genome has already been processed (skip).
++        if all([file_has_checksum(x) for x in out_files]):
++            tln_table_file = TlnTableFile(translation_table_file)
++            tln_table_file.read()
++            self.warnings.info(f'Skipped Prodigal processing for: {genome_id}')
++            return aa_gene_file, nt_gene_file, gff_file, translation_table_file, tln_table_file.best_tln_table, True
++
++        # Run Prodigal
+         prodigal = BioLibProdigal(1, False)
+         summary_stats = prodigal.run(
+-            [fasta_path], output_dir, called_genes=self.proteins,
++            [fasta_path], output_dir, called_genes=False,
+             translation_table=usr_tln_table)
+ 
+         # An error occurred in BioLib Prodigal.
+@@ -99,42 +111,26 @@ def _run_prodigal(self, genome_id, fasta_path, usr_tln_table):
+ 
+         # rename output files to adhere to GTDB conventions and desired genome
+         # ID
+-        aa_gene_file = os.path.join(
+-            output_dir, genome_id + self.protein_file_suffix)
+         shutil.move(summary_stats.aa_gene_file, aa_gene_file)
++        shutil.move(summary_stats.nt_gene_file, nt_gene_file)
++        shutil.move(summary_stats.gff_file, gff_file)
+ 
+-        nt_gene_file = None
+-        gff_file = None
+-        translation_table_file = None
+-        if not self.proteins:
+-            nt_gene_file = os.path.join(
+-                output_dir, genome_id + self.nt_gene_file_suffix)
+-            shutil.move(summary_stats.nt_gene_file, nt_gene_file)
+-
+-            gff_file = os.path.join(
+-                output_dir, genome_id + self.gff_file_suffix)
+-            shutil.move(summary_stats.gff_file, gff_file)
+-
+-            # save translation table information
+-            translation_table_file = os.path.join(
+-                output_dir, 'prodigal_translation_table.tsv')
+-            with open(translation_table_file, 'w') as fout:
+-                fout.write('%s\t%d\n' % ('best_translation_table',
+-                                         summary_stats.best_translation_table))
+-                fout.write('%s\t%.2f\n' % ('coding_density_4',
+-                                           summary_stats.coding_density_4 * 100))
+-                fout.write('%s\t%.2f\n' % ('coding_density_11',
+-                                           summary_stats.coding_density_11 * 100))
++        # save translation table information
++        tln_table_file = TlnTableFile(translation_table_file,
++                                      best_tln_table=summary_stats.best_translation_table,
++                                      coding_density_4=round(summary_stats.coding_density_4 * 100, 2),
++                                      coding_density_11=round(summary_stats.coding_density_11 * 100, 2))
++        tln_table_file.write()
+ 
+         # Create a hash of each file
+-        for out_file in [nt_gene_file, gff_file, translation_table_file, aa_gene_file]:
++        for out_file in out_files:
+             if out_file is not None:
+                 with open(out_file + CHECKSUM_SUFFIX, 'w') as fh:
+                     fh.write(sha256(out_file))
+ 
+-        return aa_gene_file, nt_gene_file, gff_file, translation_table_file, summary_stats.best_translation_table
++        return aa_gene_file, nt_gene_file, gff_file, translation_table_file, summary_stats.best_translation_table, False
+ 
+-    def _worker(self, out_dict, worker_queue, writer_queue):
++    def _worker(self, out_dict, worker_queue, writer_queue, n_skipped):
+         """This worker function is invoked in a process."""
+ 
+         while True:
+@@ -148,7 +144,10 @@ def _worker(self, out_dict, worker_queue, writer_queue):
+ 
+             # Only proceed if an error didn't occur in BioLib Prodigal
+             if rtn_files:
+-                aa_gene_file, nt_gene_file, gff_file, translation_table_file, best_translation_table = rtn_files
++                aa_gene_file, nt_gene_file, gff_file, translation_table_file, best_translation_table, was_skipped = rtn_files
++                if was_skipped:
++                    with n_skipped.get_lock():
++                        n_skipped.value += 1
+                 prodigal_infos = {"aa_gene_path": aa_gene_file,
+                                   "nt_gene_path": nt_gene_file,
+                                   "gff_path": gff_file,
+@@ -199,10 +198,12 @@ def run(self, genomic_files, tln_tables):
+         try:
+             manager = mp.Manager()
+             out_dict = manager.dict()
++            n_skipped = mp.Value('i', 0)
+ 
+             worker_proc = [mp.Process(target=self._worker, args=(out_dict,
+                                                                  worker_queue,
+-                                                                 writer_queue)) for _ in range(self.threads)]
++                                                                 writer_queue,
++                                                                 n_skipped)) for _ in range(self.threads)]
+             writer_proc = mp.Process(target=self._writer, args=(
+                 len(genomic_files), writer_queue))
+ 
+@@ -228,6 +229,12 @@ def run(self, genomic_files, tln_tables):
+             raise ProdigalException(
+                 'An exception was caught while running Prodigal.')
+ 
++        # Report if any genomes were skipped due to having already been processed.
++        if n_skipped.value > 0:
++            genome_s = 'genome' if n_skipped.value == 1 else 'genomes'
++            self.logger.warning(f'Prodigal skipped {n_skipped.value} {genome_s} '
++                                f'due to pre-existing data, see warnings.log')
++
+         # Report on any genomes which failed to have any genes called
+         result_dict = dict()
+         lq_gids = list()
+diff --git a/gtdbtk/external/tigrfam_search.py b/gtdbtk/external/tigrfam_search.py
+index 46b51061..649a4b74 100644
+--- a/gtdbtk/external/tigrfam_search.py
++++ b/gtdbtk/external/tigrfam_search.py
+@@ -23,7 +23,7 @@
+ 
+ from gtdbtk.exceptions import GTDBTkExit
+ from gtdbtk.io.marker.tophit import TopHitTigrFile
+-from gtdbtk.tools import sha256
++from gtdbtk.tools import sha256, file_has_checksum
+ 
+ 
+ class TigrfamSearch(object):
+@@ -39,6 +39,7 @@ def __init__(self,
+                  output_dir):
+         """Initialization."""
+         self.logger = logging.getLogger('timestamp')
++        self.warnings = logging.getLogger('warnings')
+         self.threads = threads
+         self.tigrfam_hmms = tigrfam_hmms
+         self.protein_file_suffix = protein_file_suffix
+@@ -97,7 +98,7 @@ def _topHit(self, tigrfam_file):
+         # Write the top-hit file to disk and calculate checksum.
+         tophit_file.write()
+ 
+-    def _workerThread(self, queueIn, queueOut):
++    def _workerThread(self, queueIn, queueOut, n_skipped):
+         """Process each data item in parallel."""
+         while True:
+             gene_file = queueIn.get(block=True, timeout=None)
+@@ -106,26 +107,36 @@ def _workerThread(self, queueIn, queueOut):
+ 
+             assembly_dir, filename = os.path.split(gene_file)
+             genome_id = filename.replace(self.protein_file_suffix, '')
+-            output_hit_file = os.path.join(self.output_dir, genome_id, filename.replace(self.protein_file_suffix,
++            genome_dir = os.path.join(self.output_dir, genome_id)
++            output_hit_file = os.path.join(genome_dir, filename.replace(self.protein_file_suffix,
+                                                                                         self.tigrfam_suffix))
+ 
+-            hmmsearch_out = os.path.join(self.output_dir, genome_id, filename.replace(self.protein_file_suffix,
++            hmmsearch_out = os.path.join(genome_dir, filename.replace(self.protein_file_suffix,
+                                                                                       '_tigrfam.out'))
+-            cmd = 'hmmsearch -o %s --tblout %s --noali --notextw --cut_nc --cpu %d %s %s' % (hmmsearch_out,
+-                                                                                             output_hit_file,
+-                                                                                             self.cpus_per_genome,
+-                                                                                             self.tigrfam_hmms,
+-                                                                                             gene_file)
+-            os.system(cmd)
+-
+-            # calculate checksum
+-            for out_file in [output_hit_file, hmmsearch_out]:
+-                checksum = sha256(out_file)
+-                with open(out_file + self.checksum_suffix, 'w') as fh:
+-                    fh.write(checksum)
+-
+-            # identify top hit for each gene
+-            self._topHit(output_hit_file)
++
++            # Check if this has already been processed.
++            out_files = (output_hit_file, hmmsearch_out, TopHitTigrFile.get_path(self.output_dir, genome_id))
++            if all([file_has_checksum(x) for x in out_files]):
++                self.warnings.info(f'Skipped TIGRFAM processing for: {genome_id}')
++                with n_skipped.get_lock():
++                    n_skipped.value += 1
++
++            else:
++                cmd = 'hmmsearch -o %s --tblout %s --noali --notextw --cut_nc --cpu %d %s %s' % (hmmsearch_out,
++                                                                                                 output_hit_file,
++                                                                                                 self.cpus_per_genome,
++                                                                                                 self.tigrfam_hmms,
++                                                                                                 gene_file)
++                os.system(cmd)
++
++                # calculate checksum
++                for out_file in [output_hit_file, hmmsearch_out]:
++                    checksum = sha256(out_file)
++                    with open(out_file + self.checksum_suffix, 'w') as fh:
++                        fh.write(checksum)
++
++                # identify top hit for each gene
++                self._topHit(output_hit_file)
+ 
+             # allow results to be processed or written to file
+             queueOut.put(gene_file)
+@@ -163,6 +174,7 @@ def run(self, gene_files):
+         # populate worker queue with data to process
+         workerQueue = mp.Queue()
+         writerQueue = mp.Queue()
++        n_skipped = mp.Value('i', 0)
+ 
+         for f in gene_files:
+             workerQueue.put(f)
+@@ -172,7 +184,7 @@ def run(self, gene_files):
+ 
+         try:
+             workerProc = [mp.Process(target=self._workerThread, args=(
+-                workerQueue, writerQueue)) for _ in range(self.threads)]
++                workerQueue, writerQueue, n_skipped)) for _ in range(self.threads)]
+             writeProc = mp.Process(target=self._writerThread, args=(
+                 len(gene_files), writerQueue))
+ 
+@@ -198,3 +210,8 @@ def run(self, gene_files):
+ 
+             writeProc.terminate()
+             raise
++
++        if n_skipped.value > 0:
++            genome_s = 'genome' if n_skipped.value == 1 else 'genomes'
++            self.logger.warning(f'TIGRFAM skipped {n_skipped.value} {genome_s} '
++                                f'due to pre-existing data, see warnings.log')
+diff --git a/gtdbtk/io/marker/tophit.py b/gtdbtk/io/marker/tophit.py
+index 0f35257a..30b8e08b 100644
+--- a/gtdbtk/io/marker/tophit.py
++++ b/gtdbtk/io/marker/tophit.py
+@@ -163,17 +163,25 @@ class TopHitPfamFile(TopHitFile):
+     """The top hit file given the Pfam output."""
+ 
+     def __init__(self, out_dir: str, gid: str):
+-        path = os.path.join(out_dir, gid, f'{gid}{PFAM_TOP_HIT_SUFFIX}')
++        path = self.get_path(out_dir, gid)
+         super().__init__(path)
+ 
++    @staticmethod
++    def get_path(out_dir: str, gid: str):
++        return os.path.join(out_dir, gid, f'{gid}{PFAM_TOP_HIT_SUFFIX}')
++
+ 
+ class TopHitTigrFile(TopHitFile):
+     """The top hit file given the Tigrfam output."""
+ 
+     def __init__(self, out_dir: str, gid: str):
+-        path = os.path.join(out_dir, gid, f'{gid}{TIGRFAM_TOP_HIT_SUFFIX}')
++        path = self.get_path(out_dir, gid)
+         super().__init__(path)
+ 
++    @staticmethod
++    def get_path(out_dir: str, gid: str):
++        return os.path.join(out_dir, gid, f'{gid}{TIGRFAM_TOP_HIT_SUFFIX}')
++
+     def add_hit(self, gene_id: str, hmm_id: str, e_val: float, bit_score: float):
+         """Only store the most significant HMM hit per gene as per GTDBNCBI."""
+         if self.contains_gene_id(gene_id):
+diff --git a/gtdbtk/io/prodigal/tln_table.py b/gtdbtk/io/prodigal/tln_table.py
+new file mode 100644
+index 00000000..5e7509d8
+--- /dev/null
++++ b/gtdbtk/io/prodigal/tln_table.py
+@@ -0,0 +1,41 @@
++from typing import Optional
++
++from gtdbtk.exceptions import GTDBTkExit
++
++
++class TlnTableFile(object):
++
++    def __init__(self, path: str,
++                 best_tln_table: Optional[int] = None,
++                 coding_density_4: Optional[float] = None,
++                 coding_density_11: Optional[float] = None):
++        self.path = path
++        self.best_tln_table = best_tln_table
++        self.coding_density_4 = coding_density_4
++        self.coding_density_11 = coding_density_11
++
++    def read(self):
++        with open(self.path, 'r') as fh:
++            for line in fh.readlines():
++                idx, val = line.strip().split('\t')
++                if idx == 'best_translation_table':
++                    try:
++                        self.best_tln_table = int(val)
++                    except ValueError:
++                        raise GTDBTkExit(f'Invalid translation table: {val} for {self.path}')
++                elif idx == 'coding_density_4':
++                    try:
++                        self.coding_density_4 = float(val)
++                    except ValueError:
++                        raise GTDBTkExit(f'Invalid coding density: {val} for {self.path}')
++                elif idx == 'coding_density_11':
++                    try:
++                        self.coding_density_11 = float(val)
++                    except ValueError:
++                        raise GTDBTkExit(f'Invalid coding density: {val} for {self.path}')
++
++    def write(self):
++        with open(self.path, 'w') as fh:
++            fh.write(f'best_translation_table\t{self.best_tln_table}\n')
++            fh.write(f'coding_density_4\t{self.coding_density_4}\n')
++            fh.write(f'coding_density_11\t{self.coding_density_11}\n')
+diff --git a/gtdbtk/markers.py b/gtdbtk/markers.py
+index cc8e57c0..81b81e49 100644
+--- a/gtdbtk/markers.py
++++ b/gtdbtk/markers.py
+@@ -135,7 +135,6 @@ def identify(self, genomes, tln_tables, out_dir, prefix, force):
+ 
+         self.marker_gene_dir = os.path.join(out_dir, DIR_MARKER_GENE)
+         prodigal = Prodigal(self.cpus,
+-                            False,
+                             self.marker_gene_dir,
+                             self.protein_file_suffix,
+                             self.nt_gene_file_suffix,
+diff --git a/gtdbtk/tools.py b/gtdbtk/tools.py
+index 5ea19c00..43e17cac 100644
+--- a/gtdbtk/tools.py
++++ b/gtdbtk/tools.py
+@@ -1,15 +1,13 @@
+ import hashlib
++import math
+ import os
+ import random
+ import re
+ import time
+ from itertools import islice
+ 
+-import math
+-
+-from gtdbtk.config.output import CHECKSUM_SUFFIX
+-
+ import gtdbtk.config.config as Config
++from gtdbtk.config.output import CHECKSUM_SUFFIX
+ 
+ 
+ ##################################################
+@@ -195,3 +193,14 @@ def get_memory_gb():
+         return {k: round(int(v) / 1e6, 2) for k, v in hits}
+     except Exception:
+         return None
++
++
++def get_proc_memory_gb(pid):
++    virt, res = None, None
++    try:
++        with open(f'/proc/{pid}/status', 'r') as fh:
++            contents = fh.read()
++        virt = int(re.search(r'VmSize:[^\d]+(\d+)', contents).group(1)) / 1e6
++        res = int(re.search(r'VmRSS:[^\d]+(\d+)', contents).group(1)) / 1e6
++    finally:
++        return virt, res

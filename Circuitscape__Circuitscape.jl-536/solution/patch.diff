@@ -1,0 +1,89 @@
+diff --git a/docs/src/compute.md b/docs/src/compute.md
+index 5393b8b0..e1c8f5af 100644
+--- a/docs/src/compute.md
++++ b/docs/src/compute.md
+@@ -41,11 +41,12 @@ relative residual `‖Gv − b‖ / ‖b‖` is below `residual_tolerance` (by d
+ `1e-4` in double precision and `1e-3` in single). For `cg+amg` there is a subtlety: Krylov's stopping test is on the
+ *preconditioned* residual, and when the multigrid preconditioner is a poor fit
+ for a particular component the two norms can disagree — CG reports success
+-while the true residual is still too large. Circuitscape then tightens the
+-Krylov tolerance and retries (up to three attempts) before failing, so a single
+-awkward component does not abort a long run. The retry is logged as a warning;
+-if you see many of them, the grid probably has extreme resistance contrasts
+-worth examining.
++while the true residual is still too large. Circuitscape then continues CG
++from the solution it returned, asking for a further 100-fold reduction (up to
++three attempts in all) before failing, so a single awkward component does not
++abort a long run. This is routine for grounded problems such as Omniscape's
++moving windows and costs a few extra iterations; the retries are logged at
++the debug level.
+ 
+ Single precision (`precision = single`) halves memory at a cost in accuracy
+ that depends on the problem: on the largest raster in the test suite,
+diff --git a/docs/src/options.md b/docs/src/options.md
+index 99626609..a27b9bb2 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -93,7 +93,7 @@ Keys and option values are case-insensitive: `solver = CHOLMOD`, `Solver = cholm
+ | `precision` | String | `double` | Floating-point precision. Values: `double`, `single`. Single precision is supported and tested for `cg+amg`, `cholmod`, `accelerate` and `amgx`; `pardiso` is double-only and switches to double with a warning. See the accuracy note under *Convergence Checks* in [On Solvers and Computation Time](compute.md). |
+ | `use_64bit_indexing` | Boolean | `False` | If `True`, always use 64-bit integer indices for node numbers and the sparse matrices. If `False`, 32-bit indices are used whenever the input fits (fewer than 100 million cells or network nodes with `cg+amg`, fewer than 8 million with the direct solvers whose Cholesky factor must fit 32-bit indices too, and a network's twice-edge count below 2^31), and 64-bit indices otherwise. 32-bit indices halve the memory of the graph's index arrays, the connected components, the AMG hierarchy and the index arrays of the CHOLMOD factor; the results are identical. |
+ | `cholmod_batch_size` | Integer | `32` | Number of right-hand sides the direct solvers (`cholmod`, `pardiso`, `accelerate`) and `amgx` solve per batch in pairwise mode. Postprocessing of each batch runs across threads. Ignored by `cg+amg`. |
+-| `residual_tolerance` | Float | `auto` | Every linear solve is accepted only if its true relative residual `‖Gv − b‖ / ‖b‖` is below this. `auto` means `1e-4` in double precision and `1e-3` in single. With `cg+amg`, a solve that stops short is retried with tighter Krylov tolerances before the run is aborted. |
++| `residual_tolerance` | Float | `auto` | Every linear solve is accepted only if its true relative residual `‖Gv − b‖ / ‖b‖` is below this. `auto` means `1e-4` in double precision and `1e-3` in single. With `cg+amg`, a solve that stops short is continued from its solution with tighter Krylov tolerances before the run is aborted. |
+ | `parallelize` | Boolean | `False` | If `True`, run pair solves (or per-focal-node solves) in parallel using Julia threads. Start Julia with `julia -t N` for N threads; see *Parallelism* below. |
+ | `low_memory_mode` | Boolean | `False` | Circuitscape 4 option, not implemented in Circuitscape.jl. Setting it to `True` is an error so that it cannot be relied on silently. |
+ | `preemptive_memory_release` | Boolean | `False` | Circuitscape 4 option, not implemented in Circuitscape.jl. Setting it to `True` is an error. |
+diff --git a/src/core.jl b/src/core.jl
+index 8d42ee68..fe5eb277 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -770,30 +770,37 @@ Preconditioned CG. Krylov's stopping test is on the *preconditioned* residual
+ `sqrt(r' M⁻¹ r)`, while the result is accepted on the true 2-norm relative
+ residual. When the AMG preconditioner is a poor fit for a component the two
+ diverge: CG reports success in its own norm while the true residual is still
+-above `tol` (issue #470). Rather than abort a multi-hour job on one such
+-solve, tighten the stopping tolerances and retry; solves that pass first time
++above `tol` (issue #470). This is the rule rather than the exception for a
++grounded window, as Omniscape solves: there CG stops after about 28
++iterations at a true residual near 1e-3. Rather than abort, CG is restarted
++from the solution it returned and asked for a further 100-fold reduction;
++that takes about 7 more iterations, where restarting from zero with a tighter
++`rtol` repeated the whole solve (34 iterations). Solves that pass first time
+ are unaffected.
+ """
+ function solve_linear_system(
+             G::SparseMatrixCSC{T,V},
+             curr::Vector{T}, M; tol = TOL_DOUBLE)::Vector{T} where {T,V}
+     # Krylov's own default for atol; in Float32 it is ~3e-4 and is what
+-    # actually stops CG, so it has to be tightened along with rtol.
++    # actually stops CG, so it has to be tightened on every retry.
+     atol = sqrt(eps(T))
+     rtol = T === Float32 ? T(1e-5) : T(1e-6)
+-    local v, stats, residual
+-    for attempt in 1:3
+-        v, stats = Krylov.cg(G, curr, M=M, ldiv=true, atol=atol, rtol=rtol, itmax=100_000)
+-        residual = norm(G*v .- curr) / norm(curr)
++    v, stats = Krylov.cg(G, curr, M=M, ldiv=true, atol=atol, rtol=rtol, itmax=100_000)
++    residual = norm(G*v .- curr) / norm(curr)
++    iters = stats.niter
++    for retry in 1:2
+         residual < tol && return v
+-        attempt < 3 && @warn("CG stopped after $(stats.niter) iterations ($(stats.status)) " *
+-                             "but the relative residual $residual exceeds $tol; " *
+-                             "retrying with rtol = $(rtol / 100)")
++        @debug("CG stopped after $(stats.niter) iterations ($(stats.status)) but the " *
++               "relative residual $residual exceeds $tol; continuing from that solution")
++        # Restarted from `v`, rtol is relative to the residual of `v`.
+         atol /= 100
+-        rtol /= 100
++        v, stats = Krylov.cg(G, curr, v; M=M, ldiv=true, atol=atol, rtol=T(1e-2), itmax=100_000)
++        residual = norm(G*v .- curr) / norm(curr)
++        iters += stats.niter
+     end
++    residual < tol && return v
+     error("CG solver did not converge: relative residual $residual exceeds tolerance $tol " *
+-          "after 3 attempts (last rtol = $(rtol * 100), $(stats.niter) iterations, $(stats.status))")
++          "after 3 attempts ($iters iterations in all, last status $(stats.status))")
+ end
+ 
+ """

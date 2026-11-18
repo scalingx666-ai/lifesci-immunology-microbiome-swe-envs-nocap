@@ -1,0 +1,199 @@
+diff --git a/R/emuFit.R b/R/emuFit.R
+index 661676d..0a830cf 100644
+--- a/R/emuFit.R
++++ b/R/emuFit.R
+@@ -602,6 +602,9 @@ emuFit <- function(Y,
+                                 null_window = null_window)
+       
+       if (is.null(test_result)) {
++        # Null estimation errored on every attempt, so mark down the reason why
++        # it didn't converge.
++        score_test_hyperparams$converged[test_ind] <- "failed with error"
+         if (control$return_nullB) {
+           nullB_list[[test_ind]] <- NA
+         }
+@@ -832,5 +835,3 @@ emuFit <- function(Y,
+   
+   return(structure(results, class = "emuFit"))
+ }
+-
+-
+diff --git a/R/score_test.R b/R/score_test.R
+index faf8ccd..508093c 100644
+--- a/R/score_test.R
++++ b/R/score_test.R
+@@ -298,9 +298,20 @@ score_test <- function(
+       null_diagnostic_plots = null_diagnostic_plots
+     ))
+    
+-    if (inherits(constrained_fit, "try-error")) {
+-      accept_try <- FALSE
+-    } else {
++    # If this attempt errored, nothing is updated here: `accept_try` stays
++    # `FALSE`, so the loop retries (until `ntries` is reached). Errors are
++    # handled once, after the loop, based on the final `constrained_fit`.
++    #
++    # NOTE: `tau` and `inner_maxit` only change in the non-converged branch
++    # below, and `fit_null()` is deterministic, so once an attempt errors, every
++    # remaining attempt gets identical inputs and errors the same way.
++    #
++    # Even so, do NOT "simplify" this by returning NULL (or breaking) on the
++    # first error. That gives the same result today only because of that
++    # determinism. If retries ever change something after an error (e.g.,
++    # adjusting `tau`), or `fit_null()` gains randomness, an early exit would
++    # silently skip retries that could succeed.
++    if (!inherits(constrained_fit, "try-error")) {
+       if (
+         (constrained_fit$converged)
+       ) {
+@@ -320,7 +331,39 @@ retrying with smaller penalty scaling parameter tau and larger inner_maxit."
+       accept_try <- TRUE
+     }
+   }
+-  
++
++  # The final attempt errored, so there is no null fit to compute a score
++  # statistic from. `emuFit` treats a NULL result as "this test could not be
++  # run".
++  #
++  # NOTE: Because errors repeat deterministically (see the retry loop above), a
++  # final try-error means one of two things:
++  #
++  # 1. Every attempt errored, so no B was ever produced and NULL is the only
++  #    option; or
++  # 2. One or more earlier attempts (in the loop above, or in the other
++  #    algorithms before it) finished without converging, producing a usable
++  #    B, and then an attempt with the adjusted tau / inner_maxit errored and
++  #    overwrote it in `constrained_fit`.
++  #
++  # In case 2, the earlier B is discarded. Yet when no fit converges at all, a
++  # non-converged fit is still used to compute the test (see the
++  # !good_enough_fit warning below), so reusing the most recent non-errored fit
++  # here is probably the intended behavior. Previously these cases crashed, so
++  # that fit was never used anyway; addressing this is left for later.
++  if (inherits(constrained_fit, "try-error")) {
++    warning(
++      "Optimization for null fit with k = ",
++      k_constr,
++      " and j = ",
++      j_constr,
++      " failed with an error (",
++      conditionMessage(attr(constrained_fit, "condition")),
++      "). This score test cannot be run."
++    )
++    return(NULL)
++  }
++
+   if (!good_enough_fit) {
+     
+     warning(
+diff --git a/tests/testthat/test-score_test.R b/tests/testthat/test-score_test.R
+index 824ef73..dc900f5 100644
+--- a/tests/testthat/test-score_test.R
++++ b/tests/testthat/test-score_test.R
+@@ -106,6 +106,105 @@ we do *not* get same results if we use incorrect info", {
+     expect_true(score_stat_with_other_mat !=score_test_as_is$score_stat)
+ 
+ })
++
++# Small data set for the "fit_null errors" tests below. The values don't matter,
++# since those tests only check how a failing `fit_null()` is handled.
++make_fit_null_error_data <- function() {
++  set.seed(1)
++  n <- 10
++  J <- 5
++  X <- cbind(1, rep(0:1, each = n / 2))
++  Y <- matrix(rpois(n * J, 5), n, J)
++  list(X = X, Y = Y, J = J)
++}
++
++# `score_test()` wraps `fit_null()` in a non-silent `try()`, which prints each
++# caught error with `cat()` to `getOption("try.outFile")` (stderr by default).
++# That isn't a message or warning, so `suppressMessages()` and
++# `suppressWarnings()` can't silence it. Send that output to the null device
++# while `expr` runs. Warnings still propagate, so `expect_warning()` works.
++without_try_output <- function(expr) {
++  old <- options(try.outFile = nullfile())
++  on.exit(options(old))
++  expr
++}
++
++test_that("if fit_null errors on every attempt, score_test warns and returns NULL", {
++  local_mocked_bindings(
++    fit_null = function(...) stop("injected fit_null failure")
++  )
++  
++  dat <- make_fit_null_error_data()
++  X <- dat$X
++  Y <- dat$Y
++  J <- dat$J
++
++  # `fit_null()` is mocked, but the full (unconstrained) fit doesn't use it.
++  fit <- suppressMessages(
++    emuFit(Y = Y, X = X, run_score_tests = FALSE, verbose = FALSE)
++  )
++
++  # `constraint_fn` has no "constraint_type" attribute, so `score_test()` treats
++  # it as "other" and goes straight to the `fit_null()` retry loop. It needs one
++  # entry per row of B (p = 2) because it is indexed by `k_constr`.
++  expect_warning(
++    res <- without_try_output(suppressMessages(score_test(
++      B = fit$B,
++      Y = fit$Y_augmented,
++      X = X,
++      X_cup = X_cup_from_X_fast(X, J),
++      k_constr = 2,
++      j_constr = 1,
++      j_ref = J,
++      ntries = 2,
++      constraint_fn = rep(list(mean), 2),
++      constraint_grad_fn = rep(
++        list(function(x) rep(1 / length(x), length(x))),
++        2
++      )
++    ))),
++    "failed with an error \\(injected fit_null failure\\)"
++  )
++  
++  expect_null(res)
++})
++
++test_that("if fit_null errors on every attempt, emuFit reports NA and marks the tests as failed", {
++  local_mocked_bindings(
++    fit_null = function(...) stop("injected fit_null failure")
++  )
++  
++  dat <- make_fit_null_error_data()
++  X <- dat$X
++  Y <- dat$Y
++
++  # The mocked `fit_null()` is only reached when constraint_type is "other",
++  # which is what `null_fit_alg = "augmented_lagrangian"` sets. With J = 5,
++  # emuFit already forces augmented Lagrangian (it does so whenever J < 20), so
++  # the argument is technically redundant. It's kept explicit so the test still
++  # works if J is raised: for J >= 20, this X (intercept + one binary covariate)
++  # would make emuFit pick the "discrete" algorithm, which calls
++  # `fit_null_discrete()` and might never reach `fit_null()`.
++  #
++  # `ntries = 2` (default 4) just makes the test faster; every attempt fails.
++  full <- without_try_output(suppressWarnings(suppressMessages(emuFit(
++    Y = Y,
++    X = X,
++    test_kj = data.frame(k = 2, j = 1:2),
++    null_fit_alg = "augmented_lagrangian",
++    control = list(ntries = 2),
++    verbose = FALSE
++  ))))
++  
++  expect_true(all(is.na(full$coef$score_stat[1:2])))
++  expect_true(all(is.na(full$coef$pval[1:2])))
++  expect_equal(
++    full$score_test_hyperparams$converged,
++    rep("failed with error", 2)
++  )
++  expect_equal(full$null_estimation_unconverged$j, 1:2)
++})
++
+ # test_that("simple negative binomial example fits reasonably fast and returns reasonable output", {
+ #   
+ #   set.seed(343234)

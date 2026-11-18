@@ -1,0 +1,979 @@
+diff --git a/cmd/distance.go b/cmd/distance.go
+index a321ab9..200f627 100644
+--- a/cmd/distance.go
++++ b/cmd/distance.go
+@@ -33,13 +33,14 @@ import (
+ var (
+ 	sketch1 *string // the first sketch to compare
+ 	sketch2 *string // the second sketch to compare
++	metric  *string // the distance metric to use
+ )
+ 
+ // distanceCmd represents the distance command
+ var distanceCmd = &cobra.Command{
+ 	Use:   "distance",
+-	Short: "Distance will compare two sketches and return the Jaccard Similarity (atm)",
+-	Long:  `Distance will compare two sketches and return the Jaccard Similarity (atm).`,
++	Short: "Distance will compare two sketches and a distance metric",
++	Long:  `Distance will compare two sketches and a distance metric (braycurtis/canberra/euclidean/jaccard).`,
+ 	Run: func(cmd *cobra.Command, args []string) {
+ 		runDistance()
+ 	},
+@@ -52,22 +53,26 @@ var distanceCmd = &cobra.Command{
+ func init() {
+ 	sketch1 = distanceCmd.Flags().StringP("sketch1", "1", "", "the first sketch to compare")
+ 	sketch2 = distanceCmd.Flags().StringP("sketch2", "2", "", "the second sketch to compare")
++	metric = distanceCmd.Flags().StringP("metric", "m", "jaccard", "the distance metric to use (braycurtis/canberra/euclidean/jaccard)")
+ 	distanceCmd.MarkFlagRequired("sketch1")
+ 	distanceCmd.MarkFlagRequired("sketch2")
+ 	RootCmd.AddCommand(distanceCmd)
+ }
+ 
++/*
++  The main function for the distance subcommand
++*/
+ func runDistance() {
+ 	// load sketches
+ 	s1, err := histosketch.LoadSketch(*sketch1)
+ 	misc.ErrorCheck(err)
+ 	s2, err := histosketch.LoadSketch(*sketch2)
+ 	misc.ErrorCheck(err)
+-	// check them, calcJS and print the value
+-	js, err := s1.CalcJS(s2)
++	// check them, calculate the specified distance and print the value
++	dist, err := s1.GetDistance(s2, *metric)
+ 	if err != nil {
+ 		fmt.Println(err)
+ 		os.Exit(1)
+ 	}
+-	fmt.Println(js)
++	fmt.Println(dist)
+ }
+diff --git a/cmd/index.go b/cmd/index.go
+new file mode 100644
+index 0000000..60cf5d1
+--- /dev/null
++++ b/cmd/index.go
+@@ -0,0 +1,194 @@
++// Copyright © 2018 Will Rowe <will.rowe@stfc.ac.uk>
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package cmd
++
++import (
++	"fmt"
++	"log"
++	"os"
++	"path/filepath"
++	"runtime"
++
++	"github.com/spf13/cobra"
++	"github.com/will-rowe/hulk/src/histosketch"
++	"github.com/will-rowe/hulk/src/lshForest"
++	"github.com/will-rowe/hulk/src/misc"
++	"github.com/will-rowe/hulk/src/version"
++)
++
++// the command line arguments
++var (
++	indexName      *string  // the name of the index that is to be created/augmented/searched
++	indexFunc      *string  // the indexing function to run
++	indexSketchDir *string  // the directory containing the sketches to create an index from/add to an index/search against and index
++	indexRecursive *bool    // recursively search the supplied directory
++	jsThresh       *float64 // the jaccard similarity theshold for lsh indexing
++)
++
++// the available indexing functions
++var indexFuncs = []string{"create", "add", "search"}
++
++// the sketches
++var hulkSketches map[string]*histosketch.SketchStore
++var sketchLength int
++
++// indexCmd represents the distance command
++var indexCmd = &cobra.Command{
++	Use:   "index <create | add | search>",
++	Short: "Index will create, add to, or search an LSH Forest index of HULK sketches",
++	Long:  `Index will create, add to, or search an LSH Forest index of HULK sketches.`,
++	Run: func(cmd *cobra.Command, args []string) {
++		runIndex()
++	},
++	PreRunE: func(cmd *cobra.Command, args []string) error {
++		return misc.CheckRequiredFlags(cmd.Flags())
++	},
++}
++
++// a function to initialise the command line arguments
++func init() {
++	indexFunc = indexCmd.Flags().StringP("run", "r", "create", "the indexing function to run (create/add/search)")
++	indexName = indexCmd.Flags().StringP("indexName", "n", "", "the name of the index that is to be created/augmented/searched")
++	indexSketchDir = indexCmd.Flags().StringP("sketchDir", "d", "./", "the directory containing the sketches to use")
++	indexRecursive = indexCmd.Flags().Bool("recursive", false, "recursively search the supplied sketch directory (-d)")
++	jsThresh = indexCmd.Flags().Float64P("jsThresh", "j", 0.97, "the jaccard similarity threshold for the LSH Forest index")
++	indexCmd.MarkFlagRequired("indexName")
++	RootCmd.AddCommand(indexCmd)
++}
++
++//  a function to check user supplied parameters
++func indexParamCheck() error {
++	var err error
++	// check the index function
++	funCheck := false
++	for _, fun := range indexFuncs {
++		if fun == *indexFunc {
++			funCheck = true
++		}
++	}
++	if funCheck == false {
++		return fmt.Errorf("unrecognised index function: %v\n", *indexFunc)
++	}
++	// create the sketch pile
++	hulkSketches, sketchLength, err = histosketch.CreateSketchCollection(*indexSketchDir, *indexRecursive)
++	if err != nil {
++		return err
++	}
++	// setup the outFile
++	filePath := filepath.Dir(*outFile)
++	if filePath != "." {
++		if _, err := os.Stat(filePath); os.IsNotExist(err) {
++			if err := os.MkdirAll(filePath, 0700); err != nil {
++				return fmt.Errorf("can't create specified output directory: ", err)
++			}
++		}
++	}
++	// set number of processors to use
++	if *proc <= 0 || *proc > runtime.NumCPU() {
++		*proc = runtime.NumCPU()
++	}
++	runtime.GOMAXPROCS(*proc)
++	return nil
++}
++
++/*
++  The main function for the index subcommand
++*/
++func runIndex() {
++	// start logging
++	logFH := misc.StartLogging((*outFile + ".log"))
++	defer logFH.Close()
++	log.SetOutput(logFH)
++	log.Printf("hulk (version %s)", version.VERSION)
++	log.Printf("starting the index subcommand")
++	// check the supplied files and then log some stuff
++	log.Printf("checking parameters...")
++	misc.ErrorCheck(indexParamCheck())
++	log.Printf("\tno. sketches: %d", len(hulkSketches))
++	log.Printf("\tsketch length: %d", sketchLength)
++	log.Printf("\tno. processors: %d", *proc)
++
++	// run the specified index function
++	log.Printf("\tindexing function: %v", *indexFunc)
++	switch *indexFunc {
++	case "create":
++		log.Printf("creating index...")
++		log.Printf("\tjaccard similarity: %.2f", *jsThresh)
++		// create the forest
++		hulkForest := lshForest.NewLSHforest(sketchLength, *jsThresh)
++		numHF, numB := hulkForest.Settings()
++		log.Printf("\tno. hashes per bucket: %d", numHF)
++		log.Printf("\tno. buckets: %d", numB)
++		// add entries
++		counter := 0
++		for filename, sketchStore := range hulkSketches {
++			hulkForest.Add(filename, sketchStore.Sketch)
++			counter++
++		}
++		log.Printf("added %d sketches to the index", counter)
++		// save the index to disk
++		misc.ErrorCheck(hulkForest.Dump(*indexName))
++		log.Printf("written to disk (%v)", *indexName)
++	case "add":
++		// load the index, check it and index it // TODO: need to add a check to make sure the length and jsThresh are the same as the original parameters
++		log.Printf("loading index...")
++		hulkForest := lshForest.NewLSHforest(sketchLength, *jsThresh)
++		misc.ErrorCheck(hulkForest.Load(*indexName))
++		numHF, numB := hulkForest.Settings()
++		log.Printf("\tno. hashes per bucket: %d", numHF)
++		log.Printf("\tno. buckets: %d", numB)
++		// now add to the index
++		log.Printf("adding to index...")
++		counter := 0
++		for filename, sketchStore := range hulkSketches {
++			hulkForest.Add(filename, sketchStore.Sketch)
++			counter++
++		}
++		log.Printf("\t no. sketches added: %d", counter)
++		// rewrite it to disk
++		misc.ErrorCheck(hulkForest.Dump(*indexName))
++		log.Printf("written to disk (%v)", *indexName)
++	case "search":
++		log.Printf("loading index...")
++		hulkForest := lshForest.NewLSHforest(sketchLength, *jsThresh)
++		misc.ErrorCheck(hulkForest.Load(*indexName))
++		hulkForest.Index()
++		numHF, numB := hulkForest.Settings()
++		log.Printf("\tno. hashes per bucket: %d", numHF)
++		log.Printf("\tno. buckets: %d", numB)
++		// now search the index
++		log.Printf("searching index...")
++		counter := 0
++		for filename, sketchStore := range hulkSketches {
++			counter++
++			results := hulkForest.Query(sketchStore.Sketch)
++			fmt.Printf("query:\t%v\n", filename)
++			for i, hit := range results {
++				fmt.Printf("hit %d:\t%v\n", i, hit)
++			}
++			fmt.Println("----")
++		}
++		log.Printf("\t no. sketches queried: %d", counter)
++	default:
++		log.Fatal("unsupported indexing function")
++	}
++
++}
+diff --git a/cmd/sketch.go b/cmd/sketch.go
+index 1f06359..7033729 100644
+--- a/cmd/sketch.go
++++ b/cmd/sketch.go
+@@ -42,6 +42,7 @@ var (
+ 	epsilon    *float64  // relative accuracy for countmin sketching
+ 	delta      *float64  // relative probability for countmin sketching
+ 	kSize      *int      // size of k-mer
++	minCount   *int      // minimum count number for a kmer to be added to the histosketch from this interval
+ 	interval   *int      // size of read sampling interval (0 == no interval)
+ 	sketchSize *uint     // size of sketch
+ 	decayRatio *float64  // the decay ratio used for concept drift (1.00 = concept drift disabled)
+@@ -67,6 +68,7 @@ func init() {
+ 	epsilon = sketchCmd.Flags().Float64P("epsilon", "e", 0.0001, "relative accuracy factor for countmin sketching")
+ 	delta = sketchCmd.Flags().Float64P("delta", "d", 0.99, "relative accuracy probability for countmin sketching")
+ 	kSize = sketchCmd.Flags().IntP("kmerSize", "k", 11, "size of k-mer")
++	minCount = sketchCmd.Flags().IntP("minCount", "m", 1, "minimum k-mer count for it to be histosketched for a given interval")
+ 	interval = sketchCmd.Flags().IntP("interval", "i", 0, "size of read sampling interval (default 0 (= no interval))")
+ 	sketchSize = sketchCmd.Flags().UintP("sketchSize", "s", 256, "size of sketch")
+ 	decayRatio = sketchCmd.Flags().Float64P("decayRatio", "x", 1.0, "decay ratio used for concept drift (1.0 = concept drift disabled)")
+@@ -128,7 +130,7 @@ func sketchParamCheck() error {
+ }
+ 
+ /*
+-  The main function for the sketch command
++  The main function for the sketch subcommand
+ */
+ func runSketch() {
+ 	// set up profiling
+@@ -147,6 +149,7 @@ func runSketch() {
+ 	misc.ErrorCheck(sketchParamCheck())
+ 	log.Printf("\tno. processors: %d", *proc)
+ 	log.Printf("\tk-mer size: %d", *kSize)
++	log.Printf("\tmin. k-mer count: %d", *minCount)
+ 	log.Printf("\tepsilon value: %.4f", *epsilon)
+ 	log.Printf("\tdelta value: %.2f", *delta)
+ 	log.Printf("\tsketch size: %d", *sketchSize)
+@@ -183,6 +186,7 @@ func runSketch() {
+ 	counter.Spectrum, sketcher.Spectrum = spectrum.Copy(), spectrum.Copy()
+ 	counter.NumCPU, sketcher.NumCPU = *proc, *proc
+ 	counter.SketchSize, sketcher.SketchSize = *sketchSize, *sketchSize
++	sketcher.MinCount = float64(*minCount)
+ 	sketcher.DecayRatio = *decayRatio
+ 	sketcher.OutFile = *outFile
+ 	sketcher.Stream = *streaming
+diff --git a/cmd/smash.go b/cmd/smash.go
+index af03ec1..5509003 100644
+--- a/cmd/smash.go
++++ b/cmd/smash.go
+@@ -23,15 +23,12 @@ package cmd
+ import (
+ 	"encoding/csv"
+ 	"fmt"
+-	//"log"
+ 	"os"
+-	"path/filepath"
+ 	"strconv"
+ 
+ 	"github.com/spf13/cobra"
+ 	"github.com/will-rowe/hulk/src/histosketch"
+ 	"github.com/will-rowe/hulk/src/misc"
+-	//"github.com/will-rowe/hulk/src/version"
+ )
+ 
+ // the command line arguments
+@@ -40,12 +37,9 @@ var (
+ 	recursive    *bool   // recursively search the supplied directory
+ 	jsMatrix     *bool   // create a pairwise Jaccard Similarity matrix
+ 	bannerMatrix *bool   // create a matrix to train banner on
+-	label        *int    // used in the bannerMatrix - assigns all sketches to a single label
++	label        *string    // used in the bannerMatrix - assigns all sketches to a single label
+ )
+ 
+-// the sketches
+-var hulkSketches map[string]*histosketch.SketchStore
+-
+ // smashCmd represents the smash command
+ var smashCmd = &cobra.Command{
+ 	Use:   "smash",
+@@ -75,55 +69,10 @@ func init() {
+ 	recursive = smashCmd.Flags().Bool("recursive", false, "recursively search the supplied sketch directory (-d)")
+ 	jsMatrix = smashCmd.Flags().Bool("jsMatrix", false, "create a pairwise Jaccard Similarity matrix")
+ 	bannerMatrix = smashCmd.Flags().Bool("bannerMatrix", false, "create a matrix to train banner on")
+-	label = smashCmd.Flags().IntP("label", "l", 0, "assign a class to all the sketches (for bannerMatrix)")
++	label = smashCmd.Flags().StringP("label", "l", "0", "assign a class to all the sketches (for bannerMatrix)")
+ 	RootCmd.AddCommand(smashCmd)
+ }
+ 
+-// sketchGrabber is a function to collect all the sketches in the supplied directory
+-func sketchGrabber(dir string) error {
+-	// grab all the sketches in the directory
+-	fp := dir + "*.sketch"
+-	files, err := filepath.Glob(fp)
+-	if err != nil {
+-		return err
+-	}
+-	// load and check all the sketches
+-	for _, file := range files {
+-		// load the sketch
+-		sketch, err := histosketch.LoadSketch(file)
+-		// add the sketch to the pile
+-		hulkSketches[file] = sketch
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-// recursiveSketchGrabber is a function to recursively collect all the sketches in the supplied directory and subdirectories
+-func recursiveSketchGrabber(fp string, fi os.FileInfo, err error) error {
+-	if err != nil {
+-		return err
+-	}
+-	if fi.IsDir() {
+-		return nil
+-	}
+-	matched, err := filepath.Match("*.sketch", fi.Name())
+-	if err != nil {
+-		return err
+-	}
+-	if matched {
+-		// load the sketch
+-		sketch, err := histosketch.LoadSketch(fp)
+-		if err != nil {
+-			return err
+-		}
+-		// add the sketch to the pile
+-		hulkSketches[fp] = sketch
+-	}
+-	return nil
+-}
+-
+ // makeJSMatrix perform pairwise Jaccard SImilarity estimates, populates a matrix and writes to csv
+ func makeJSMatrix() error {
+ 	// create the jaccard similarity matrix csv outfile
+@@ -149,10 +98,11 @@ func makeJSMatrix() error {
+ 	for _, id := range ordering {
+ 		jsVals := make([]string, len(ordering))
+ 		for i, id2 := range ordering {
+-			// the CalcJS method will call the sketch check, which will make sure the sketches are compatible (in terms of length etc)
+-			js, err := hulkSketches[id].CalcJS(hulkSketches[id2])
++			// the GetDistance method will call the sketch check, which will make sure the sketches are compatible (in terms of length etc)
++			jd, err := hulkSketches[id].GetDistance(hulkSketches[id2], "jaccard")
+ 			misc.ErrorCheck(err)
+-			// convert js to string so it can be written with the csv library
++			// convert js to the Jaccard Similarity, then to string so it can be written with the csv library
++			js := 100 - (jd * 100)
+ 			jsVals[i] = strconv.FormatFloat(js, 'f', 2, 64)
+ 		}
+ 		if jsmWriter.Write(jsVals) != nil {
+@@ -179,7 +129,7 @@ func makeBannerMatrix() error {
+ 			printString[i] = fmt.Sprintf("%d", element)
+ 		}
+ 		// append the label to the line and then write it
+-		printString = append(printString, strconv.Itoa(*label))
++		printString = append(printString, *label)
+ 		if bannerWriter.Write(printString) != nil {
+ 			return err
+ 		}
+@@ -188,26 +138,16 @@ func makeBannerMatrix() error {
+ }
+ 
+ /*
+-  The main function for the smash command
++  The main function for the smash subcommand
+ */
+ func runSmash() {
+-	// start logging
+-	//logFH := misc.StartLogging((*outFile + ".log"))
+-	//defer logFH.Close()
+-	//log.SetOutput(logFH)
+-	//log.Printf("hulk (version %s)", version.VERSION)
+-	//log.Printf("starting the smash subcommand")
+-
+ 	// create the sketch pile
+-	hulkSketches = make(map[string]*histosketch.SketchStore)
+-	// load and check the sketches
+-	if *recursive == true {
+-		misc.ErrorCheck(filepath.Walk(*sketchDir, recursiveSketchGrabber))
+-	} else {
+-		misc.ErrorCheck(sketchGrabber(*sketchDir))
+-	}
++	hulkSketches, _, err := histosketch.CreateSketchCollection(*sketchDir, *recursive)
++	misc.ErrorCheck(err)
++	// check we have at least 2 sketches
+ 	if len(hulkSketches) < 2 {
+-		misc.ErrorCheck(fmt.Errorf("need at least 2 sketches for hulk smash!"))
++		fmt.Println("need at least 2 sketches for hulk smash!")
++		os.Exit(1)
+ 	}
+ 	// run the requested smash
+ 	if *jsMatrix {
+@@ -219,6 +159,6 @@ func runSmash() {
+ 	// exit if no smash option requested
+ 	if *jsMatrix == false && *bannerMatrix == false {
+ 		fmt.Println("please rerun with a smash option (--jsMatrix, --bannerMatrix)")
+-		os.Exit(0)
++		os.Exit(1)
+ 	}
+ }
+diff --git a/paper/analysis-notebooks/1.clustering-cami.ipynb b/paper/analysis-notebooks/1.clustering-cami.ipynb
+index c63c9f5..889fb9b 100644
+--- a/paper/analysis-notebooks/1.clustering-cami.ipynb
++++ b/paper/analysis-notebooks/1.clustering-cami.ipynb
+@@ -457,9 +457,9 @@
+     "for site in *; do for i in ./${site}/*.gz; do filename=${i%%.fastq.gz}; echo \"${site}.${filename##*/}\": `pwd $i`/${site}/${i##*/} >> simka-input.list; done; done\n",
+     "```\n",
+     "\n",
+-    "* then run SIMKA using LSF with the same parameters as for HULK\n",
++    "* then run SIMKA using LSF with the same LSF parameters as for HULK\n",
+     "```bash\n",
+-    "./bin/simka -count-file job_count.bash -merge-file job_merge.bash -count-cmd 'bsub -n 12 -R \"span[ptile=12]\" -W 0:20 -q scafellpikeSKL' -merge-cmd 'bsub -n 12 -R \"span[ptile=12]\" -W 0:20 -q scafellpikeSKL' -kmer-size 21 -complex-dist -in simka-input.list -out RESULTS -out-tmp ./\n",
++    "time ./bin/simka -count-file job_count.bash -merge-file job_merge.bash -count-cmd 'bsub -W 0:20 -q scafellpikeSKL' -merge-cmd 'bsub -W 0:20 -q scafellpikeSKL' -kmer-size 21 -complex-dist -in simka-input.list -out RESULTS -out-tmp ./ -max-count 48 -max-merge 48 -nb-cores 576\n",
+     "```"
+    ]
+   },
+diff --git a/src/histosketch/histosketch.go b/src/histosketch/histosketch.go
+index 4da932d..bc69be0 100644
+--- a/src/histosketch/histosketch.go
++++ b/src/histosketch/histosketch.go
+@@ -15,6 +15,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 
++	"github.com/JSchwehn/goDistances"
+ 	"github.com/leesper/go_rng"
+ )
+ 
+@@ -190,20 +191,44 @@ func LoadSketch(infile string) (*SketchStore, error) {
+ 	return store, err
+ }
+ 
+-// CalcJS is a method to calculate the Jaccard Similarity between 2 sketches
+-func (SketchStore *SketchStore) CalcJS(SketchStore2 *SketchStore) (float64, error) {
++// Distance is a method to calculate a distance metric between 2 sketches
++func (SketchStore *SketchStore) GetDistance(SketchStore2 *SketchStore, metric string) (float64, error) {
+ 	// check that the sketches are compatible
+ 	if err := SketchStore.SketchCheck(SketchStore2); err != nil {
+ 		return 0.0, err
+ 	}
+-	// calculate js
+-	intersect := 0
+-	for i := range SketchStore.Sketch {
+-		if SketchStore.Sketch[i] == SketchStore2.Sketch[i] {
+-			intersect++
++	// convert to float64 slices (for use with goDistances)
++	s1 := make([]float64, len(SketchStore.Sketch))
++	s2 := make([]float64, len(SketchStore2.Sketch))
++	for i := range s1 {
++		s1[i] = float64(SketchStore.Sketch[i])
++		s2[i] = float64(SketchStore2.Sketch[i])
++	}
++	// return the required distance
++	var distance float64
++	var distErr error
++	switch metric {
++	case "braycurtis":
++		bc := new(goDistances.BrayCurtisDistance)
++		distance, distErr = bc.Distance(s1, s2)
++	case "canberra":
++		cd := new(goDistances.CanberraDistance)
++		distance, distErr = cd.Distance(s1, s2)
++	case "euclidean":
++		ed := new(goDistances.EuclideanDistance)
++		distance, distErr = ed.Distance(s1, s2)
++	case "jaccard":
++		intersect := 0.0
++		for i := range s1 {
++			if s1[i] == s2[i] {
++				intersect++
++			}
+ 		}
++		distance = 1.0 - (intersect / float64(SketchStore.Length))
++	default:
++		distErr = fmt.Errorf("unknown distance metric: %v\n", metric)
+ 	}
+-	return float64(intersect) / float64(SketchStore.Length), nil
++	return distance, distErr
+ }
+ 
+ // SketchCheck is a method to check that two sketches are compatible
+@@ -219,3 +244,68 @@ func (SketchStore *SketchStore) SketchCheck(SketchStore2 *SketchStore) error {
+ 	}
+ 	return nil
+ }
++
++// CreateSketchCollection returns a map of SketchStores and the sketch length
++func CreateSketchCollection(sketchDir string, recursive bool) (map[string]*SketchStore, int, error) {
++	collection := make(map[string]*SketchStore)
++	// load and check the sketches
++	if recursive == true {
++		recursiveSketchGrabber := func(fp string, fi os.FileInfo, err error) error {
++			if err != nil {
++				return err
++			}
++			if fi.IsDir() {
++				return nil
++			}
++			matched, err := filepath.Match("*.sketch", fi.Name())
++			if err != nil {
++				return err
++			}
++			if matched {
++				// load the sketch
++				sketch, err := LoadSketch(fp)
++				if err != nil {
++					return err
++				}
++				// add the sketch to the pile
++				collection[fp] = sketch
++			}
++			return nil
++		}
++		filepath.Walk(sketchDir, recursiveSketchGrabber)
++	} else {
++		// grab all the sketches in the directory
++		fp := sketchDir + "*.sketch"
++		files, err := filepath.Glob(fp)
++		if err != nil {
++			return nil, 0, err
++		}
++		// load and check all the sketches
++		for _, file := range files {
++			// load the sketch
++			sketch, err := LoadSketch(file)
++			if err != nil {
++				return nil, 0, err
++			}
++			// add the sketch to the pile
++			collection[file] = sketch
++		}
++	}
++	// make sure we have collected some sketches
++	if len(collection) == 0 {
++		return nil, 0, fmt.Errorf("no sketches found in supplied dir(s)")
++	}
++	// check they are all compatible
++	counter := 0
++	var prevSketch *SketchStore
++	for _, sketchStore := range collection {
++		if counter != 0 {
++			if err := sketchStore.SketchCheck(prevSketch); err != nil {
++				return nil, 0, err
++			}
++		}
++		prevSketch = sketchStore
++		counter++
++	}
++	return collection, int(prevSketch.Length), nil
++}
+diff --git a/src/histosketch/histosketch_test.go b/src/histosketch/histosketch_test.go
+index 77d0421..2cc4af4 100644
+--- a/src/histosketch/histosketch_test.go
++++ b/src/histosketch/histosketch_test.go
+@@ -41,3 +41,27 @@ func Test_Update(t *testing.T) {
+ 	hs.Update(1, 49.24353553)
+ 	t.Log(hs.GetSketch())
+ }
++
++// TODO: test SketchStore
++
++/*
++// test the GetDistance method on SketchStore
++func Test_GetDistance(t *testing.T) {
++	h := createHistogram()
++	// histoSketch of 24 minimums
++	hs1 := NewHistoSketch(24, h, EPSILON, DELTA, DR)
++	hs2 := NewHistoSketch(24, h, EPSILON, DELTA, DR)
++	// get jaccard distance
++	if dist, err := hs1.GetDistance(hs2, "jaccard"); err != nil {
++		if dist != 0 {
++			t.Fatal("jaccard distance should be 0!")
++		}
++	} else {
++		t.Fatal("could not get Jaccard Distance!")
++	}
++	// unrecognised distance
++	if dist, err := hs1.GetDistance(hs2, "hellinger"); err == nil {
++		t.Fatal("should through unrecognised distance metric error")
++	}
++}
++*/
+diff --git a/src/lshForest/lshForest.go b/src/lshForest/lshForest.go
+new file mode 100644
+index 0000000..b0645cf
+--- /dev/null
++++ b/src/lshForest/lshForest.go
+@@ -0,0 +1,318 @@
++package lshForest
++
++import (
++	"encoding/binary"
++	"encoding/gob"
++	"fmt"
++	"github.com/will-rowe/groot/src/seqio"
++	"math"
++	"os"
++	"sort"
++	"sync"
++)
++
++/*
++	The LSH forest
++*/
++type LSHforest struct {
++	numHashFuncs        int
++	numBands            int
++	initialHashTables   []initialHashTable
++	hashTables          []hashTables
++	hashedSignatureFunc hashedSignatureFunc
++	hashValueSize       int
++	KeyLookup           KeyLookupMap
++}
++
++/*
++	A function to construct the LSH forest
++*/
++func NewLSHforest(sigSize int, jsThresh float64) *LSHforest {
++	// calculate the optimal number of bands and hash functions to use based on the length of MinHash signature and a Jaccard Similarity theshhold
++	numHashFuncs, numBands, _, _ := optimise(sigSize, jsThresh)
++	hashValueSize := 4
++	// create the initial hash tables
++	initialHashTables := make([]initialHashTable, numBands)
++	for i := range initialHashTables {
++		initialHashTables[i] = make(initialHashTable)
++	}
++	// create the hash tables that will be populated once the LSH forest indexing method has been run
++	indexedHashTables := make([]hashTables, numBands)
++	for i := range indexedHashTables {
++		indexedHashTables[i] = make(hashTables, 0)
++	}
++	// create the KeyLookup map to relate signatures to graph locations
++	KeyLookup := make(KeyLookupMap)
++	// return the address of the new LSH forest
++	newLSHforest := new(LSHforest)
++	newLSHforest.numHashFuncs = numHashFuncs
++	newLSHforest.numBands = numBands
++	newLSHforest.hashValueSize = hashValueSize
++	newLSHforest.initialHashTables = initialHashTables
++	newLSHforest.hashTables = indexedHashTables
++	newLSHforest.hashedSignatureFunc = hashedSignatureFuncGen(hashValueSize)
++	newLSHforest.KeyLookup = KeyLookup
++	return newLSHforest
++}
++
++/*
++	The types needed by the LSH forest
++*/
++// this map relates the stringified seqio.Key to the original, allowing LSHforest search results to easily be related to graph locations
++type KeyLookupMap map[string]seqio.Key
++
++// graphKeys is a slice containing all the stringified graphKeys for a given hashed signature
++type graphKeys []string
++
++// the initial hash table uses the hashed signature as a key - the values are the corresponding graphKeys
++type initialHashTable map[string]graphKeys
++
++// a band is a single hash table that is stored in the indexedHashTables - it contains the band of a hash signature and the corresponding graphKeys
++type band struct {
++	HashedSignature string
++	graphKeys       graphKeys
++}
++
++// this is populated during indexing -- it is a slice of bands and can be sorted
++type hashTables []band
++
++//methods to satisfy the sort interface
++func (h hashTables) Len() int           { return len(h) }
++func (h hashTables) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
++func (h hashTables) Less(i, j int) bool { return h[i].HashedSignature < h[j].HashedSignature }
++
++// the hashkey function type and the generator function
++type hashedSignatureFunc func([]uint) string
++
++func hashedSignatureFuncGen(hashValueSize int) hashedSignatureFunc {
++	return func(sig []uint) string {
++		hashedSig := make([]byte, hashValueSize*len(sig))
++		buf := make([]byte, 8)
++		for i, v := range sig {
++			// use the ByteOrder interface to write binary data
++			// use the LittleEndian implementation and call the Put method
++			binary.LittleEndian.PutUint64(buf, uint64(v))
++			copy(hashedSig[i*hashValueSize:(i+1)*hashValueSize], buf[:hashValueSize])
++		}
++		return string(hashedSig)
++	}
++}
++
++/*
++	A method to return the number of hash functions and number of bands set by the LSH forest
++*/
++func (self *LSHforest) Settings() (numHashFuncs, numBands int) {
++	return self.numHashFuncs, self.numBands
++}
++
++/*
++	A method to add a minhash signature and graph key to the LSH forest
++*/
++func (self *LSHforest) Add(key string, sig []uint) {
++	// split the signature into the right number of bands and then hash each one
++	hashedSignature := make([]string, self.numBands)
++	for i := 0; i < self.numBands; i++ {
++		hashedSignature[i] = self.hashedSignatureFunc(sig[i*self.numHashFuncs : (i+1)*self.numHashFuncs])
++	}
++	// iterate over each band in the LSH forest
++	for i := 0; i < len(self.initialHashTables); i++ {
++		// if the current band in the signature isn't in the current band in the LSH forest, add it
++		if _, ok := self.initialHashTables[i][hashedSignature[i]]; !ok {
++			self.initialHashTables[i][hashedSignature[i]] = make(graphKeys, 1)
++			self.initialHashTables[i][hashedSignature[i]][0] = key
++			// if it is, append the current key (graph location) to this hashed signature band
++		} else {
++			self.initialHashTables[i][hashedSignature[i]] = append(self.initialHashTables[i][hashedSignature[i]], key)
++		}
++	}
++}
++
++/*
++	A method to index the graph (transfers contents of each initialHashTable so they can be sorted and searched)
++*/
++func (self *LSHforest) Index() {
++	// iterate over the empty indexed hash tables
++	for i := range self.hashTables {
++		// transfer contents from the corresponding band in the initial hash table
++		for HashedSignature, keys := range self.initialHashTables[i] {
++			self.hashTables[i] = append(self.hashTables[i], band{HashedSignature, keys})
++		}
++		// sort the new hashtable and store it in the corresponding slot in the indexed hash tables
++		sort.Sort(self.hashTables[i])
++		// clear the initial hashtable that has just been processed
++		self.initialHashTables[i] = make(initialHashTable)
++	}
++}
++
++/*
++	Methods to dump the LSH forest to disk and then load it again
++*/
++func (self *LSHforest) Dump(path string) error {
++	if len(self.hashTables[0]) != 0 {
++		return fmt.Errorf("cannot dump the LSH Forest after running the indexing method")
++	}
++	file, err := os.Create(path)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	encoder := gob.NewEncoder(file)
++	for _, bandContents := range self.initialHashTables {
++		err := encoder.Encode(bandContents)
++		if err != nil {
++			return err
++		}
++	}
++	err = encoder.Encode(self.KeyLookup)
++	if err != nil {
++		return err
++	}
++	return nil
++}
++func (self *LSHforest) Load(path string) error {
++	file, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	decoder := gob.NewDecoder(file)
++	for _, bandContents := range self.initialHashTables {
++		err = decoder.Decode(&bandContents)
++		if err != nil {
++			return err
++		}
++	}
++	err = decoder.Decode(&self.KeyLookup)
++	if err != nil {
++		return err
++	}
++	return nil
++}
++
++/*
++	A method to query a MinHash signature against the LSH forest
++*/
++func (self *LSHforest) Query(sig []uint) []string {
++	result := make([]string, 0)
++	// more info on done chans for explicit cancellation in concurrent pipelines: https://blog.golang.org/pipelines
++	done := make(chan struct{})
++	defer close(done)
++	// collect query results and aggregate in a single array to send back
++	for key := range self.runQuery(sig, done) {
++		result = append(result, key)
++	}
++	return result
++}
++
++func (self *LSHforest) runQuery(sig []uint, done <-chan struct{}) <-chan string {
++	queryResultChan := make(chan string)
++	go func() {
++		defer close(queryResultChan)
++		//  hash the query signature
++		hashedSignature := make([]string, self.numBands)
++		for i := 0; i < self.numBands; i++ {
++			hashedSignature[i] = self.hashedSignatureFunc(sig[i*self.numHashFuncs : (i+1)*self.numHashFuncs])
++		}
++		// don't send back multiple copies of the same key
++		seens := make(map[string]bool)
++		// compress internal nodes using a prefix
++		prefixSize := self.hashValueSize * self.numHashFuncs
++		// run concurrent hashtable queries
++		keyChan := make(chan string)
++		var wg sync.WaitGroup
++		wg.Add(self.numBands)
++		for i := 0; i < self.numBands; i++ {
++			go func(band hashTables, queryChunk string) {
++				defer wg.Done()
++				// sort.Search uses binary search to find and return the smallest index i in [0, n) at which f(i) is true
++				index := sort.Search(len(band), func(x int) bool { return band[x].HashedSignature[:prefixSize] >= queryChunk })
++				// k is the index returned by the search
++				if index < len(band) && band[index].HashedSignature[:prefixSize] == queryChunk {
++					for j := index; j < len(band) && band[j].HashedSignature[:prefixSize] == queryChunk; j++ {
++						// copies key values from this hashtable to the keyChan until all values from band[j] copied or done is closed
++						for _, key := range band[j].graphKeys {
++							select {
++							case keyChan <- key:
++							case <-done:
++								return
++							}
++						}
++					}
++				}
++			}(self.hashTables[i], hashedSignature[i])
++		}
++		go func() {
++			wg.Wait()
++			close(keyChan)
++		}()
++		for key := range keyChan {
++			if _, seen := seens[key]; seen {
++				continue
++			}
++			queryResultChan <- key
++			seens[key] = true
++		}
++	}()
++	return queryResultChan
++}
++
++//  the following funcs are taken from https://github.com/ekzhu/minhash-lsh
++
++// optimise returns the optimal number of hash functions and the optimal number of bands for Jaccard similarity search, as well as  the false positive and negative probabilities.
++func optimise(sigSize int, jsThresh float64) (int, int, float64, float64) {
++	optimumNumHashFuncs, optimumNumBands := 0, 0
++	fp, fn := 0.0, 0.0
++	minError := math.MaxFloat64
++	for l := 1; l <= sigSize; l++ {
++		for k := 1; k <= sigSize; k++ {
++			if l*k > sigSize {
++				break
++			}
++			currFp := probFalsePositive(l, k, jsThresh, 0.01)
++			currFn := probFalseNegative(l, k, jsThresh, 0.01)
++			currErr := currFn + currFp
++			if minError > currErr {
++				minError = currErr
++				optimumNumHashFuncs = k
++				optimumNumBands = l
++				fp = currFp
++				fn = currFn
++			}
++		}
++	}
++	return optimumNumHashFuncs, optimumNumBands, fp, fn
++}
++
++// Compute the integral of function f, lower limit a, upper limit l, and
++// precision defined as the quantize step
++func integral(f func(float64) float64, a, b, precision float64) float64 {
++	var area float64
++	for x := a; x < b; x += precision {
++		area += f(x+0.5*precision) * precision
++	}
++	return area
++}
++
++// Probability density function for false positive
++func falsePositive(l, k int) func(float64) float64 {
++	return func(j float64) float64 {
++		return 1.0 - math.Pow(1.0-math.Pow(j, float64(k)), float64(l))
++	}
++}
++
++// Probability density function for false negative
++func falseNegative(l, k int) func(float64) float64 {
++	return func(j float64) float64 {
++		return 1.0 - (1.0 - math.Pow(1.0-math.Pow(j, float64(k)), float64(l)))
++	}
++}
++
++// Compute the cummulative probability of false negative given threshold t
++func probFalseNegative(l, k int, t, precision float64) float64 {
++	return integral(falseNegative(l, k), t, 1.0, precision)
++}
++
++// Compute the cummulative probability of false positive given threshold t
++func probFalsePositive(l, k int, t, precision float64) float64 {
++	return integral(falsePositive(l, k), 0, t, precision)
++}
+diff --git a/src/stream/stream.go b/src/stream/stream.go
+index 2d6a451..ee15fa0 100644
+--- a/src/stream/stream.go
++++ b/src/stream/stream.go
+@@ -269,6 +269,7 @@ type Sketcher struct {
+ 	NumCPU     int
+ 	OutFile    string
+ 	SketchSize uint
++	MinCount   float64
+ 	DecayRatio float64
+ 	Spectrum   *histosketch.CountMinSketch
+ 	Stream     bool
+@@ -291,7 +292,7 @@ func (proc *Sketcher) Run() {
+ 		i := uint64(0)
+ 		for cmsCounter := range proc.Spectrum.Dump() {
+ 			// only process counters that have been incremented
+-			if cmsCounter != 0 {
++			if cmsCounter >= proc.MinCount {
+ 				// each counter position corresponds to a bin in the underlying histogram of the histosketch
+ 				hulkSketch.Update(i, cmsCounter)
+ 			}

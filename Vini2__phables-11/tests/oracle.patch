@@ -1,0 +1,172 @@
+diff --git a/phables/config/config.yaml b/phables/config/config.yaml
+index 07ae329..ff44c77 100644
+--- a/phables/config/config.yaml
++++ b/phables/config/config.yaml
+@@ -6,8 +6,12 @@ log: 'phables/phables.log'
+ # Databases 
+ databases:
+ 
+-# Threads per job (will be scaled down if more than --threads)
+-threads: 8
++# Job resources for use with Snakemake profiles
++  # jobCPU will be scaled down if running locally with less than 8 threads
++  # jobMem is ignored when running locally
++resources:
++  jobCPU: 8
++  jobMem: 16000       # in Mb
+ 
+ # Phable parameters
+ minlength: 2000
+diff --git a/phables/workflow/envs/mapping.yaml b/phables/workflow/envs/mapping.yaml
+index 6b86cec..44a3f15 100644
+--- a/phables/workflow/envs/mapping.yaml
++++ b/phables/workflow/envs/mapping.yaml
+@@ -3,5 +3,5 @@ channels:
+   - bioconda
+ dependencies:
+   - minimap2
+-  - samtools==1.15
+-  - coverm
++  - samtools
++#  - coverm
+diff --git a/phables/workflow/phables.smk b/phables/workflow/phables.smk
+index bbade0c..f2445b1 100644
+--- a/phables/workflow/phables.smk
++++ b/phables/workflow/phables.smk
+@@ -28,7 +28,7 @@ def targetRule(fn):
+     target_rules.append(fn.__name__[2:])
+     return fn
+ 
+-localrules: all, preprocess, phables, print_stages
++localrules: all, preprocess, phables, print_stages, rpkm_coverage
+ 
+ 
+ """Run stages"""
+diff --git a/phables/workflow/rules/02_phables_preflight.smk b/phables/workflow/rules/02_phables_preflight.smk
+index 4b13b32..038e7c4 100644
+--- a/phables/workflow/rules/02_phables_preflight.smk
++++ b/phables/workflow/rules/02_phables_preflight.smk
+@@ -9,7 +9,7 @@ This preflight check to confirm the database filepaths
+ Setting the directory variables
+ """
+ 
+-THREADS = config['threads']
++# THREADS = config['threads']
+ INPUT = config['input']
+ OUTDIR = config['output']
+ print(f"Output files will be saved to directory, {OUTDIR}\n")
+diff --git a/phables/workflow/rules/coverm.smk b/phables/workflow/rules/coverm.smk
+index 2293e53..b755e4f 100644
+--- a/phables/workflow/rules/coverm.smk
++++ b/phables/workflow/rules/coverm.smk
+@@ -3,30 +3,56 @@ Use CoverM to map to calculate coverage of unitigs.
+ Use combine_cov to combine the coverage values of multiple samples into one file.
+ """
+ 
+-rule run_coverm:
++rule raw_coverage:
++    """Map and collect the raw read counts for each sample"""
+     input:
+         edges = EDGES_FILE,
+-        r1 = os.path.join(READ_DIR, PATTERN_R1),
+-        r2 = os.path.join(READ_DIR, PATTERN_R2)
++        r1 = os.path.join(READ_DIR,PATTERN_R1),
++        r2 = os.path.join(READ_DIR,PATTERN_R2)
+     output:
+-        os.path.join(COVERM_PATH, "{sample}_rpkm.tsv")
++        tsv = temp(os.path.join(COVERM_PATH, "{sample}.counts.tsv")),
++        r1 = temp(os.path.join(COVERM_PATH, "{sample}.R1.counts")),
++        r2 = temp(os.path.join(COVERM_PATH, "{sample}.R2.counts")),
+     threads:
+-        THREADS
++        config["resources"]["jobCPU"]
++    resources:
++        mem_mb = config["resources"]["jobMem"]
+     params:
+-        tempdir = os.path.join(OUTDIR, "{sample}.coverm_temp")
+-    log:
+-        os.path.join(LOGSDIR, "{sample}_coverm.log")
+-    conda: 
++        minimap = "-x sr --secondary=no"
++    conda:
+         os.path.join("..", "envs", "mapping.yaml")
++    log:
++        os.path.join(LOGSDIR, "{sample}.minimap.log")
+     shell:
+         """
+-        mkdir -p {params.tempdir}
+-        TMPDIR={params.tempdir}
+-        coverm contig -m rpkm -1 {input.r1} -2 {input.r2} -r {input.edges} -t {threads} --output-file {output} 2>&1 | tee {log}
+-        rm -rf {params.tempdir}
++        minimap2 -t {threads} {params.minimap} {input.edges} \
++            <(zcat {input.r1} | tee >( wc -l | awk '{{print $1 / 4}}' > {output.r1})) \
++            <(zcat {input.r2} | tee >( wc -l | awk '{{print $1 / 4}}' > {output.r2})) \
++        | awk -F '\t' '{{ edges[$6]+=1; len[$6]=$7 }} END {{ for (edge in edges) {{ print edge, len[edge], edges[edge] }} }}' \
++        > {output.tsv}
+         """
+ 
+ 
++rule rpkm_coverage:
++    """convert raw coverages to RPKM values"""
++    input:
++        tsv = os.path.join(COVERM_PATH,"{sample}.counts.tsv"),
++        r1 = os.path.join(COVERM_PATH,"{sample}.R1.counts"),
++        r2 = os.path.join(COVERM_PATH,"{sample}.R2.counts")
++    output:
++        os.path.join(COVERM_PATH,"{sample}_rpkm.tsv")
++    run:
++        with open(input.r1, 'r') as f:
++            lib = int(f.readline().strip()) / 1000000
++        with open(output[0], 'w') as o:
++            o.write(f"Contig\t{wildcards.sample}\n")
++            with open(input.tsv, 'r') as t:
++                for line in t:
++                    l = line.strip().split()
++                    rpkm = int(l[1]) / ( int(l[2]) / lib )
++                    o.write(f"{l[0]}\t{rpkm}\n")
++
++
+ rule run_combine_cov:
+     input:
+         files=expand(os.path.join(COVERM_PATH, "{sample}_rpkm.tsv"), sample=SAMPLES)
+diff --git a/phables/workflow/rules/genes.smk b/phables/workflow/rules/genes.smk
+index a85238d..476717f 100644
+--- a/phables/workflow/rules/genes.smk
++++ b/phables/workflow/rules/genes.smk
+@@ -8,7 +8,9 @@ rule scan_smg:
+         genome = EDGES_FILE,
+         hmm = os.path.join(DBPATH, "marker.hmm"),
+     threads:
+-        THREADS
++        config["resources"]["jobCPU"]
++    resources:
++        mem_mb = config["resources"]["jobMem"]
+     output:
+         hmmout = os.path.join(OUTDIR, "edges.fasta.hmmout")
+     params:
+@@ -33,7 +35,9 @@ rule scan_phrogs:
+         genome = EDGES_FILE,
+         db = os.path.join(DBPATH,"phrogs_mmseqs_db","phrogs_profile_db")
+     threads:
+-        THREADS
++        config["resources"]["jobCPU"]
++    resources:
++        mem_mb = config["resources"]["jobMem"]
+     output:
+         os.path.join(OUTDIR, "phrogs_annotations.tsv")
+     params:
+diff --git a/phables/workflow/rules/mapping.smk b/phables/workflow/rules/mapping.smk
+index 045e3cd..cacba76 100644
+--- a/phables/workflow/rules/mapping.smk
++++ b/phables/workflow/rules/mapping.smk
+@@ -12,7 +12,9 @@ rule map_reads_to_unitigs:
+         bam = os.path.join(BAM_PATH, "{sample}.bam"),
+         index = os.path.join(BAM_PATH, "{sample}.bam.bai")
+     threads:
+-         THREADS
++        config["resources"]["jobCPU"]
++    resources:
++        mem_mb = config["resources"]["jobMem"]
+     log:
+         os.path.join(LOGSDIR, "{sample}_mapping.log")
+     conda: 

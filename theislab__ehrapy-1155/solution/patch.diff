@@ -1,0 +1,361 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index f5e2455d..d76a3323 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -6,6 +6,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🚀 Features
+ 
++* {func}`ep.tl.kaplan_meier <ehrapy.tools.kaplan_meier>` estimates the cumulative incidence of an `event_of_interest` with the Aalen-Johansen estimator when the event column holds competing events, {func}`ep.tl.nelson_aalen <ehrapy.tools.nelson_aalen>` its cause-specific cumulative hazard, and {func}`ep.pl.kaplan_meier <ehrapy.plot.kaplan_meier>` plots the cumulative incidence ([#1155](https://github.com/theislab/ehrapy/pull/1155)) @Zethson
++
++  Without `event_of_interest`, the univariate survival models raise an error for event columns with more than one event type instead of silently treating every event type as the same event.
+ * Models of time series in `ep.ml` measure the time since the last observation with the times of the timepoints in `edata.tem[time_key]`, a new argument of {func}`ep.ml.fit <ehrapy.ml.fit>`, instead of counting timepoints, so that irregular timepoints are spaced correctly ([#1151](https://github.com/theislab/ehrapy/pull/1151)) @Zethson
+ * {class}`ep.ml.Task <ehrapy.ml.Task>` with `rolling=True` predicts a longitudinal variable, such as the hourly sepsis label of PhysioNet 2019, at every timepoint from the timepoints before it, and every function of `ep.ml` fits, stores, evaluates, calibrates and explains these predictions per timepoint while keeping patients together ([#1152](https://github.com/theislab/ehrapy/pull/1152)) @Zethson
+ 
+diff --git a/ehrapy/plot/_survival_analysis.py b/ehrapy/plot/_survival_analysis.py
+index dd5d0a5a..f603de3c 100644
+--- a/ehrapy/plot/_survival_analysis.py
++++ b/ehrapy/plot/_survival_analysis.py
+@@ -6,6 +6,7 @@
+ import numpy as np
+ import pandas as pd
+ from bokeh.palettes import Category10
++from lifelines import AalenJohansenFitter
+ from numpy import ndarray
+ 
+ from ehrapy.get import obs_df
+@@ -174,7 +175,7 @@ def ols(
+ 
+ @load_hv_extensions()
+ def kaplan_meier(
+-    kmfs: Sequence[KaplanMeierFitter],
++    kmfs: Sequence[KaplanMeierFitter | AalenJohansenFitter],
+     *,
+     display_survival_statistics: bool = False,
+     ci_alpha: Sequence[float] | None = None,
+@@ -194,11 +195,13 @@ def kaplan_meier(
+ ) -> hv.Layout | hv.Overlay | hv.Curve | None:
+     """Plots a pretty figure of the Fitted KaplanMeierFitter model.
+ 
+-    See also: :class:`~lifelines.fitters.kaplan_meier_fitter.KaplanMeierFitter`.
++    Fitted AalenJohansenFitter objects are plotted as cumulative incidence instead of survival.
++
++    See also: :class:`~lifelines.fitters.kaplan_meier_fitter.KaplanMeierFitter` and :class:`~lifelines.fitters.aalen_johansen_fitter.AalenJohansenFitter`.
+ 
+     Args:
+-        kmfs: Iterables of fitted KaplanMeierFitter objects.
+-        display_survival_statistics: Whether to show survival statistics in a table below the plot.
++        kmfs: Iterables of fitted KaplanMeierFitter or AalenJohansenFitter objects.
++        display_survival_statistics: Whether to show survival statistics, or the cumulative incidence, in a table below the plot.
+         ci_alpha: The transparency level of the confidence interval. If more than one kmfs, this should be a list.
+         ci_force_lines: Force the confidence intervals to be line plots (versus default shaded areas).
+                         If more than one kmfs, this should be a list.
+@@ -247,7 +250,10 @@ def kaplan_meier(
+     plot = None
+ 
+     for i, kmf in enumerate(kmfs):
+-        sf = kmf.survival_function_
++        if isinstance(kmf, AalenJohansenFitter):
++            sf, ci, vdim = kmf.cumulative_density_, kmf.confidence_interval_cumulative_density_, "Cumulative incidence"
++        else:
++            sf, ci, vdim = kmf.survival_function_, kmf.confidence_interval_survival_function_, "Survival"
+         times = sf.index.values
+         survival = sf.iloc[:, 0].values
+ 
+@@ -256,10 +262,9 @@ def kaplan_meier(
+         if color[i] is not None:
+             curve_opts["color"] = color[i]
+ 
+-        curve = hv.Curve((times, survival), kdims="Time", vdims="Survival", label=label).opts(**curve_opts)
++        curve = hv.Curve((times, survival), kdims="Time", vdims=vdim, label=label).opts(**curve_opts)
+ 
+-        if ci_show[i] and hasattr(kmf, "confidence_interval_survival_function_"):
+-            ci = kmf.confidence_interval_survival_function_
++        if ci_show[i] and ci is not None:
+             ci_lower = ci.iloc[:, 0].values
+             ci_upper = ci.iloc[:, 1].values
+ 
+@@ -301,7 +306,7 @@ def kaplan_meier(
+         if xlim:
+             time_points = np.linspace(xlim[0], xlim[1], 10)
+         else:
+-            all_times = np.concatenate([kmf.survival_function_.index.values for kmf in kmfs])
++            all_times = np.concatenate([kmf.timeline for kmf in kmfs])
+             time_points = np.linspace(all_times.min(), all_times.max(), 10)
+ 
+         # Create table data in wide format (one row per group, columns are time points)
+@@ -311,7 +316,7 @@ def kaplan_meier(
+         for kmf in kmfs:
+             label = kmf.label if kmf.label else "Group"
+             table_data["Group"].append(label)
+-            survival_probs = kmf.survival_function_at_times(time_points).values
++            survival_probs = kmf.predict(time_points).values
+ 
+             for _, (t, prob) in enumerate(zip(time_points, survival_probs, strict=False)):
+                 col_name = f"{t:.0f}"
+diff --git a/ehrapy/tools/_survival_analysis.py b/ehrapy/tools/_survival_analysis.py
+index a5fc3221..95aa414c 100644
+--- a/ehrapy/tools/_survival_analysis.py
++++ b/ehrapy/tools/_survival_analysis.py
+@@ -10,6 +10,7 @@
+ from ehrdata.core.constants import CATEGORICAL_TAG, FEATURE_TYPE_KEY, NUMERIC_TAG
+ from formulaic import Formula
+ from lifelines import (
++    AalenJohansenFitter,
+     CoxPHFitter,
+     KaplanMeierFitter,
+     LogLogisticAFTFitter,
+@@ -186,11 +187,15 @@ def kaplan_meier(
+     fit_options: Mapping[str, Any] | None = None,
+     censoring: Literal["right", "left"] = "right",
+     layer: str | None = None,
+-) -> KaplanMeierFitter:
++    event_of_interest: int | None = None,
++    random_state: int = 0,
++) -> KaplanMeierFitter | AalenJohansenFitter:
+     """Fit the Kaplan-Meier estimate for the survival function.
+ 
+     The Kaplan–Meier estimator, also known as the product limit estimator, is a non-parametric statistic used to estimate the survival function from lifetime data.
+     In medical research, it is often used to measure the fraction of patients living for a certain amount of time after treatment.
++    With competing events, such as death before the event of interest, one minus the Kaplan-Meier estimate overestimates the probability of the event.
++    Passing `event_of_interest` instead estimates its cumulative incidence with the Aalen-Johansen estimator, which accounts for the competing events.
+     The results will be stored in the `.uns` slot of the data object under the key 'kaplan_meier' unless specified otherwise in the `key_added` parameter.
+ 
+     See `Kaplan Meier on Wikipedia <https://en.wikipedia.org/wiki/Kaplan%E2%80%93Meier_estimator>`_ and `Kaplan Meier on Lifelines <https://lifelines.readthedocs.io/en/latest/fitters/univariate/KaplanMeierFitter.html#module-lifelines.fitters.kaplan_meier_fitter>`_.
+@@ -214,9 +219,13 @@ def kaplan_meier(
+         censoring: 'right' for fitting the model to a right-censored dataset. (default, calls fit).
+                    'left' for fitting the model to a left-censored dataset (calls fit_left_censoring).
+         layer: The layer to take variables from.
++        event_of_interest: The event type in `event_col` to estimate the cumulative incidence of.
++            `event_col` then holds 0 for censored subjects and a positive integer per event type, and all event types other than `event_of_interest` are competing events.
++            Supports only `censoring='right'`.
++        random_state: Seed for breaking tied event times when `event_of_interest` is set.
+ 
+     Returns:
+-        Fitted KaplanMeierFitter.
++        Fitted KaplanMeierFitter, or fitted AalenJohansenFitter if `event_of_interest` is set.
+ 
+     Examples:
+         >>> import ehrdata as ed
+@@ -226,12 +235,19 @@ def kaplan_meier(
+         >>> # Flip 'censor_fl' because 0 = death and 1 = censored
+         >>> edata[:, ["censor_flg"]].X = np.where(edata[:, ["censor_flg"]].X == 0, 1, 0)
+         >>> kmf = ep.tl.kaplan_meier(edata, duration_col="mort_day_censored", event_col="censor_flg", label="Mortality")
++
++        Cumulative incidence of death in hospital, with death after discharge as competing event:
++
++        >>> edata = ed.dt.mimic_2()
++        >>> died, died_in_hospital = edata[:, ["censor_flg", "hosp_exp_flg"]].X.T.astype(float)
++        >>> edata.obs["death"] = np.select([died_in_hospital == 1, died == 1], [1, 2], 0)
++        >>> ajf = ep.tl.kaplan_meier(edata, duration_col="mort_day_censored", event_col="death", event_of_interest=1)
+     """
+     return _univariate_model(
+         edata,
+         duration_col,
+         event_col,
+-        KaplanMeierFitter,
++        KaplanMeierFitter if event_of_interest is None else AalenJohansenFitter,
+         key_added,
+         True,
+         timeline,
+@@ -243,6 +259,8 @@ def kaplan_meier(
+         fit_options,
+         censoring,
+         layer,
++        event_of_interest,
++        random_state,
+     )
+ 
+ 
+@@ -729,32 +747,48 @@ def _univariate_model(
+     fit_options: Mapping[str, Any] | None = None,
+     censoring: Literal["right", "left"] = "right",
+     layer: str | None = None,
++    event_of_interest: int | None = None,
++    random_state: int = 0,
+ ):
+     """Convenience function for univariate models."""
+     df = _model_frame(edata, [duration_col, event_col, entry_col, weights_col], layer=layer)
+     if not accept_zero_duration:
+         df = _shift_zero_durations(df, duration_col)
+ 
+-    model = model_class()
+-    function_name = "fit" if censoring == "right" else "fit_left_censoring"
+-    # get fit function, default to fit if not found
+-    fit_function = getattr(model, function_name, model.fit)
+-
+-    fit_function(
+-        df[duration_col],
+-        event_observed=None if event_col is None else df[event_col],
+-        timeline=timeline,
+-        entry=None if entry_col is None else df[entry_col],
+-        label=label,
+-        alpha=alpha,
+-        ci_labels=ci_labels,
+-        weights=None if weights_col is None else df[weights_col],
+-        fit_options=fit_options,
+-    )
+-
+-    if isinstance(model, NelsonAalenFitter) or isinstance(
+-        model, KaplanMeierFitter
+-    ):  # NelsonAalenFitter and KaplanMeierFitter have no summary attribute
++    events = None if event_col is None else df[event_col]
++    if event_of_interest is None:
++        if events is not None and not events.isin([0, 1]).all():
++            raise ValueError(
++                f"`{event_col}` has more than one event type, pass the one to estimate as `event_of_interest`."
++            )
++    elif events is None:
++        raise ValueError("`event_of_interest` requires an `event_col`.")
++    elif model_class is not AalenJohansenFitter:
++        events = events == event_of_interest
++
++    fit_kwargs = {
++        "timeline": timeline,
++        "entry": None if entry_col is None else df[entry_col],
++        "label": label,
++        "alpha": alpha,
++        "ci_labels": ci_labels,
++        "weights": None if weights_col is None else df[weights_col],
++    }
++    if model_class is AalenJohansenFitter:
++        if censoring != "right" or fit_options is not None:
++            raise ValueError("The cumulative incidence supports neither `censoring='left'` nor `fit_options`.")
++        model = AalenJohansenFitter(seed=random_state)
++        model.fit(df[duration_col], events.astype(int), event_of_interest, **fit_kwargs)
++    else:
++        model = model_class()
++        function_name = "fit" if censoring == "right" else "fit_left_censoring"
++        # get fit function, default to fit if not found
++        fit_function = getattr(model, function_name, model.fit)
++        fit_function(df[duration_col], event_observed=events, fit_options=fit_options, **fit_kwargs)
++
++    if isinstance(
++        model, NelsonAalenFitter | KaplanMeierFitter | AalenJohansenFitter
++    ):  # the non-parametric fitters have no summary attribute
+         summary = model.event_table
+     else:
+         summary = model.summary
+@@ -778,6 +812,7 @@ def nelson_aalen(
+     fit_options: Mapping[str, Any] | None = None,
+     censoring: Literal["right", "left"] = "right",
+     layer: str | None = None,
++    event_of_interest: int | None = None,
+ ) -> NelsonAalenFitter:
+     """Employ the Nelson-Aalen estimator to estimate the cumulative hazard function from censored survival data.
+ 
+@@ -806,6 +841,8 @@ def nelson_aalen(
+         censoring: 'right' for fitting the model to a right-censored dataset. (default, calls fit).
+                    'left' for fitting the model to a left-censored dataset (calls fit_left_censoring).
+         layer: The layer to take variables from.
++        event_of_interest: The event type in `event_col` to estimate the cause-specific cumulative hazard of.
++            `event_col` then holds 0 for censored subjects and a positive integer per event type, and subjects with other event types count as censored at their event.
+ 
+     Returns:
+         Fitted NelsonAalenFitter.
+@@ -835,6 +872,7 @@ def nelson_aalen(
+         fit_options=fit_options,
+         censoring=censoring,
+         layer=layer,
++        event_of_interest=event_of_interest,
+     )
+ 
+ 
+diff --git a/tests/plot/test_survival_analysis.py b/tests/plot/test_survival_analysis.py
+index 784711a7..f5cf4306 100644
+--- a/tests/plot/test_survival_analysis.py
++++ b/tests/plot/test_survival_analysis.py
+@@ -53,6 +53,24 @@ def test_kaplan_meier(mimic_2: EHRData):
+     assert isinstance(plot, hv.Layout)
+ 
+ 
++def test_kaplan_meier_cumulative_incidence(mimic_2: EHRData):
++    died, died_in_hospital = np.asarray(mimic_2[:, ["censor_flg", "hosp_exp_flg"]].X, dtype=float).T
++    mimic_2.obs["death"] = np.select([died_in_hospital == 1, died == 1], [1, 2], 0)
++    ajf = ep.tl.kaplan_meier(mimic_2, duration_col="mort_day_censored", event_col="death", event_of_interest=1)
++
++    plot = ep.pl.kaplan_meier([ajf])
++    assert isinstance(plot, hv.Overlay)
++    (curve,) = (element for element in plot if type(element) is hv.Curve)
++    assert curve.vdims[0].name == "Cumulative incidence"
++    np.testing.assert_allclose(curve.dimension_values(1), ajf.cumulative_density_.iloc[:, 0])
++
++    plot = ep.pl.kaplan_meier([ajf], display_survival_statistics=True, xlim=(0, 700))
++    assert isinstance(plot, hv.Layout)
++    table = plot.Table.I.dframe()
++    expected = ajf.cumulative_density_.iloc[:, 0].asof(np.linspace(0, 700, 10)).to_numpy()
++    np.testing.assert_allclose(table.iloc[0, 1:].astype(float), expected, atol=0.005)
++
++
+ def test_coxph_forestplot(mimic_2: EHRData):
+     edata_subset = mimic_2[
+         :, ["mort_day_censored", "censor_flg", "gender_num", "afib_flg", "day_icu_intime_num"]
+diff --git a/tests/tools/test_sa.py b/tests/tools/test_sa.py
+index c1e9fe18..87586b3d 100644
+--- a/tests/tools/test_sa.py
++++ b/tests/tools/test_sa.py
+@@ -5,6 +5,7 @@
+ import statsmodels
+ from ehrdata.core.constants import DEFAULT_TEM_LAYER_NAME
+ from lifelines import (
++    AalenJohansenFitter,
+     CoxPHFitter,
+     KaplanMeierFitter,
+     LogLogisticAFTFitter,
+@@ -272,6 +273,7 @@ def survival_obs_edata(rng):
+             "sex": rng.choice(["female", "male"], n),
+             "entry": rng.uniform(0, 0.05, n),
+             "weight": rng.uniform(0.5, 1.5, n),
++            "cause": rng.integers(0, 3, n),
+         },
+         index=[str(i) for i in range(n)],
+     )
+@@ -315,6 +317,48 @@ def test_kaplan_meier_without_event_col(survival_obs_edata):
+     assert kmf.event_observed.all()
+ 
+ 
++@pytest.mark.parametrize("from_obs", [True, False])
++def test_kaplan_meier_event_of_interest_matches_lifelines(survival_obs_edata, from_obs):
++    obs = survival_obs_edata.obs
++    edata = survival_obs_edata
++    if not from_obs:
++        edata = ed.EHRData(X=obs[["duration", "cause"]].to_numpy(float), var=pd.DataFrame(index=["duration", "cause"]))
++
++    ajf = ep.tl.kaplan_meier(edata, "duration", event_col="cause", event_of_interest=2, key_added="aj")
++
++    expected = AalenJohansenFitter(seed=0).fit(obs["duration"], obs["cause"], event_of_interest=2)
++    assert isinstance(ajf, AalenJohansenFitter)
++    np.testing.assert_allclose(ajf.cumulative_density_.to_numpy(), expected.cumulative_density_.to_numpy())
++    np.testing.assert_allclose(ajf.confidence_interval_.to_numpy(), expected.confidence_interval_.to_numpy())
++    assert edata.uns["aj"].equals(ajf.event_table)
++
++
++def test_kaplan_meier_event_of_interest_without_competing_events(survival_obs_edata):
++    ajf = ep.tl.kaplan_meier(survival_obs_edata, "duration", event_col="event", event_of_interest=1)
++    kmf = ep.tl.kaplan_meier(survival_obs_edata, "duration", event_col="event")
++    np.testing.assert_allclose(ajf.cumulative_density_.iloc[:, 0], 1 - kmf.survival_function_.iloc[:, 0])
++
++
++def test_nelson_aalen_event_of_interest(survival_obs_edata):
++    obs = survival_obs_edata.obs
++    naf = ep.tl.nelson_aalen(survival_obs_edata, "duration", event_col="cause", event_of_interest=2)
++    expected = NelsonAalenFitter().fit(obs["duration"], obs["cause"] == 2)
++    pd.testing.assert_frame_equal(naf.cumulative_hazard_, expected.cumulative_hazard_)
++
++
++@pytest.mark.parametrize("sa_function", [ep.tl.kaplan_meier, ep.tl.nelson_aalen])
++def test_competing_events_require_event_of_interest(survival_obs_edata, sa_function):
++    with pytest.raises(ValueError, match="event_of_interest"):
++        sa_function(survival_obs_edata, "duration", event_col="cause")
++    with pytest.raises(ValueError, match="requires an `event_col`"):
++        sa_function(survival_obs_edata, "duration", event_of_interest=1)
++
++
++def test_kaplan_meier_event_of_interest_left_censoring(survival_obs_edata):
++    with pytest.raises(ValueError, match="censoring='left'"):
++        ep.tl.kaplan_meier(survival_obs_edata, "duration", event_col="cause", event_of_interest=1, censoring="left")
++
++
+ def _survival_edata(X) -> ed.EHRData:
+     return ed.EHRData(X=X, var=pd.DataFrame(index=["duration", "event", "a", "b"]))
+ 

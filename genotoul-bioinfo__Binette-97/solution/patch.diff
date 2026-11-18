@@ -1,0 +1,2518 @@
+diff --git a/README.md b/README.md
+index 6081765..4a70f1b 100644
+--- a/README.md
++++ b/README.md
+@@ -170,7 +170,7 @@ In this directory you will find:
+ - **`final_bins/`**: This directory stores all the selected bins in fasta format. Can be skipped with `--no-write-fasta-bins`.
+ - **`final_contig_to_bin.tsv`**: A headerless TSV file mapping each contig to its assigned bin. This format is much lighter than the fasta output to describe the final Binette bins.
+ - **`input_bins_quality_reports/`**: A directory storing quality reports for the input bin sets, with files following the same structure as `final_bins_quality_reports.tsv`.
+-- **`temporary_files/`**: This directory contains intermediate files. If you choose to use the `--resume` option, Binette will utilize files in this directory to prevent the recomputation of time-consuming steps.
++- **`temporary_files/`**: This directory contains intermediate files (predicted proteins, DIAMOND alignments and a `checkpoint.json` file tracking them). They are reused to avoid recomputing time-consuming steps when Binette is run again in the same output directory (see [Resuming a run](#resuming-a-run-and-reusing-an-output-directory)).
+ 
+ 
+ The `final_bins_quality_reports.tsv` file contains the following columns:
+@@ -186,11 +186,23 @@ The `final_bins_quality_reports.tsv` file contains the following columns:
+ | **score**          | Computed score: `completeness - contamination * weight`. The contamination weight can be customized using the `--contamination_weight` option. |
+ | **size**           | Total size of the bin in nucleotides.                                                                                                          |
+ | **N50**            | The N50 of the bin, representing the length for which 50% of the total nucleotides are in contigs of that length or longer.                    |
+-| **coding\_density** | The percentage of the bin that codes for proteins (genes length / total bin length × 100). Only computed when genes are freshly identified. Empty when using `--proteins` or `--resume` options. |
++| **coding\_density** | The percentage of the bin that codes for proteins (genes length / total bin length × 100). Only computed when genes are freshly identified. Empty when using the `--proteins` option. |
+ | **contig\_count**  | Number of contigs contained within the bin.                                                                                                    |
+    
+ 
+ 
++### Resuming a run and reusing an output directory
++
++Binette keeps track of its intermediate results in `temporary_files/`. When it is run again with the same output directory, it automatically reuses whatever was already computed. Resuming is on by default, so the same command can be resubmitted after a failed or interrupted job (e.g. a SLURM job that ran out of time or memory) without any change:
++
++- Predicted proteins and DIAMOND alignments are reused only when they were computed from the same inputs (contig sequences, input bin sets, `--proteins` file and CheckM2 database) and their files are complete and unmodified. Otherwise they are recomputed, and Binette logs why.
++- If a previous run already completed with the same inputs and parameters, Binette reports that there is nothing to do and exits successfully.
++- Changing only parameters that affect bin selection (e.g. `--min_completeness`, `--contamination_weight`, `--prefix`) reuses the proteins and DIAMOND alignments and overwrites the final results.
++- `--no-write-fasta-bins` does not change the results: rerunning a completed run with or without it does not recompute anything. If bin FASTA files are missing or modified, they are written again from `final_contig_to_bin.tsv`.
++- Use `--no-resume` to recompute everything.
++
++To prevent accidentally mixing results from different analyses, Binette stops with an error if the output directory contains results computed from **different inputs**, or results from an older Binette version that cannot be verified. Use a different `--outdir`, or add `--force` to discard the previous intermediate files and overwrite the results.
++
+ ## Help, feature requests and bug reporting
+ 
+ To report bugs, request new features, or seek help and support, please open an [issue](https://github.com/genotoul-bioinfo/Binette/issues). 
+diff --git a/binette/cds.py b/binette/cds.py
+index 2959193..d18564a 100644
+--- a/binette/cds.py
++++ b/binette/cds.py
+@@ -11,6 +11,8 @@
+ import pyfastx
+ import pyrodigal
+ 
++from binette.checkpoint import atomic_replace, partial_path
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -95,9 +97,11 @@ def write_faa(outfaa: str, contig_to_genes: list[tuple[str, pyrodigal.Genes]]) -
+ 
+     """
+     logger.info("Writing predicted protein sequences")
+-    with gzip.open(outfaa, "wt") as fl:
++    tmp_faa = partial_path(Path(outfaa))
++    with gzip.open(tmp_faa, "wt") as fl:
+         for contig_id, genes in contig_to_genes:
+             genes.write_translations(fl, contig_id)
++    atomic_replace(tmp_faa, Path(outfaa))
+ 
+ 
+ def is_nucleic_acid(sequence: str) -> bool:
+@@ -259,13 +263,15 @@ def filter_faa_file(
+     contigs_parsed = set()
+ 
+     # Process the input FASTA file and filter sequences based on contigs_to_keep
+-    with proper_open(filtered_faa_file, "wt") as fl:
+-        for name, seq in pyfastx.Fastx(input_faa_file):
++    tmp_faa_file = partial_path(Path(filtered_faa_file))
++    with proper_open(tmp_faa_file, "wt") as fl:
++        for name, seq in pyfastx.Fastx(str(input_faa_file)):
+             contig = get_contig_from_cds_name(name)
+             contigs_parsed.add(contig)
+             if contig in contigs_to_keep:
+                 contigs_with_genes.add(contig)
+                 fl.write(f">{name}\n{seq}\n")
++    atomic_replace(tmp_faa_file, Path(filtered_faa_file))
+ 
+     # Calculate metrics
+     total_contigs = len(contigs_to_keep)
+diff --git a/binette/checkpoint.py b/binette/checkpoint.py
+new file mode 100644
+index 0000000..41a90a6
+--- /dev/null
++++ b/binette/checkpoint.py
+@@ -0,0 +1,319 @@
++"""
++Module      : checkpoint
++Description : Track intermediate results so that a run can be safely resumed.
++
++Binette stores a small JSON manifest in its temporary directory. The manifest
++records the identity of the run (fingerprints of its data inputs) and, for each
++completed step, the inputs it was computed from and the files it produced
++(size + sha256). A step is only reused when its inputs match the current run
++and its output files are intact on disk.
++
++Copyright   : (c) Jean Mainguy
++License     : GPL-3.0
++"""
++
++import hashlib
++import json
++import logging
++import os
++from collections.abc import Iterable
++from pathlib import Path
++from typing import Any
++
++import binette as binette_init
++
++logger = logging.getLogger(__name__)
++
++FORMAT_VERSION = 1
++CHECKPOINT_FILENAME = "checkpoint.json"
++
++# Files and directories written by Binette in its output directory. Their presence
++# without a checkpoint manifest indicates a run from an older Binette version.
++BINETTE_OUTPUT_MARKERS = (
++    "final_bins_quality_reports.tsv",
++    "final_contig_to_bin.tsv",
++    "final_bins",
++    "input_bins_quality_reports",
++    "temporary_files/assembly_proteins.faa.gz",
++    "temporary_files/diamond_result.tsv.gz",
++)
++
++RUN_INPUT_LABELS = {
++    "contigs": "contig sequences (--contigs)",
++    "bins": "input bin sets (--bin_dirs / --contig2bin_tables)",
++    "proteins": "protein file (--proteins)",
++    "checkm2_db": "CheckM2 database (--checkm2_db)",
++}
++
++
++class OutputDirConflictError(Exception):
++    """Raised when the output directory holds results from a different run."""
++
++
++def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
++    """Compute the sha256 hex digest of a file."""
++    digest = hashlib.sha256()
++    with open(path, "rb") as fl:
++        while chunk := fl.read(chunk_size):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def hash_json(obj: Any) -> str:
++    """Compute a stable sha256 hex digest of a JSON-serialisable object."""
++    return hashlib.sha256(
++        json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++
++
++def contigs_fingerprint(contig_to_seq_digest: dict[str, str]) -> str:
++    """
++    Fingerprint a set of contigs from per-contig sequence digests.
++
++    The fingerprint is independent of the order of contigs in the FASTA file.
++
++    :param contig_to_seq_digest: Mapping of contig name to the digest of its sequence.
++    """
++    digest = hashlib.sha256()
++    for name in sorted(contig_to_seq_digest):
++        digest.update(f"{name}\t{contig_to_seq_digest[name]}\n".encode())
++    return digest.hexdigest()
++
++
++def bins_fingerprint(bin_set_name_to_bins_info: dict[str, list[dict]]) -> str:
++    """
++    Fingerprint input bin sets: bin set names, bin names and their contigs.
++
++    :param bin_set_name_to_bins_info: Mapping of bin set name to a list of bin info dicts
++        with keys "bin_name" and "contigs".
++    """
++    normalized = {
++        set_name: sorted(
++            (str(info["bin_name"]), sorted(info["contigs"])) for info in bins_info
++        )
++        for set_name, bins_info in bin_set_name_to_bins_info.items()
++    }
++    return hash_json(normalized)
++
++
++def checkm2_db_identity(db_path: Path) -> dict[str, Any]:
++    """
++    Identify a CheckM2 diamond database by file name and size.
++
++    The database is too large to hash. The path is not used, so a database copied
++    to another location (e.g. node-local scratch) is still recognised.
++    """
++    return {"name": db_path.name, "size": db_path.stat().st_size}
++
++
++def partial_path(path: Path) -> Path:
++    """Temporary path used to write a file before atomically moving it into place."""
++    return path.with_name(f"partial_{path.name}")
++
++
++def atomic_replace(tmp_path: Path, final_path: Path) -> None:
++    """Move a fully written temporary file to its final location."""
++    os.replace(tmp_path, final_path)
++
++
++class Checkpoint:
++    """Manifest of the intermediate results of a Binette run."""
++
++    def __init__(self, manifest_path: Path, root: Path, data: dict[str, Any]):
++        """
++        :param manifest_path: Path of the JSON manifest.
++        :param root: Directory that recorded output paths are relative to.
++        :param data: Manifest content.
++        """
++        self.manifest_path = manifest_path
++        self.root = root
++        self.data = data
++
++    @classmethod
++    def new(
++        cls, manifest_path: Path, root: Path, run_inputs: dict[str, Any]
++    ) -> "Checkpoint":
++        return cls(
++            manifest_path,
++            root,
++            {
++                "format_version": FORMAT_VERSION,
++                "binette_version": binette_init.__version__,
++                "run_inputs": run_inputs,
++                "steps": {},
++            },
++        )
++
++    @classmethod
++    def load(cls, manifest_path: Path, root: Path) -> tuple["Checkpoint | None", str]:
++        """
++        Load a manifest from disk.
++
++        :return: The checkpoint (or None) and a reason when it could not be loaded.
++        """
++        if not manifest_path.exists():
++            return None, f"no checkpoint file '{manifest_path}'"
++        try:
++            with open(manifest_path) as fl:
++                data = json.load(fl)
++        except (OSError, json.JSONDecodeError) as exc:
++            return None, f"checkpoint file '{manifest_path}' is unreadable ({exc})"
++
++        if not isinstance(data, dict) or data.get("format_version") != FORMAT_VERSION:
++            return None, (
++                f"checkpoint file '{manifest_path}' has an unsupported format version"
++            )
++        data.setdefault("steps", {})
++        return cls(manifest_path, root, data), ""
++
++    @property
++    def run_inputs(self) -> dict[str, Any]:
++        return self.data.get("run_inputs", {})
++
++    def save(self) -> None:
++        """Write the manifest atomically."""
++        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = partial_path(self.manifest_path)
++        with open(tmp, "w") as fl:
++            json.dump(self.data, fl, indent=2, sort_keys=True)
++        atomic_replace(tmp, self.manifest_path)
++
++    def _relative(self, path: Path) -> str:
++        return Path(os.path.relpath(path, self.root)).as_posix()
++
++    def step_status(self, step: str, inputs: dict[str, Any]) -> tuple[bool, str]:
++        """
++        Check whether a recorded step can be reused.
++
++        :param step: Step name.
++        :param inputs: Inputs of the step in the current run.
++        :return: (is_valid, reason). The reason explains why a step is not reusable.
++        """
++        record = self.data["steps"].get(step)
++        if record is None:
++            return False, "no record of a completed previous run of this step"
++
++        if record.get("inputs") != inputs:
++            changed = sorted(
++                key
++                for key in set(inputs) | set(record.get("inputs", {}))
++                if inputs.get(key) != record.get("inputs", {}).get(key)
++            )
++            return False, f"inputs changed since previous run ({', '.join(changed)})"
++
++        for rel_path, expected in record.get("outputs", {}).items():
++            path = self.root / rel_path
++            if not path.is_file():
++                return False, f"file '{path}' is missing"
++            if path.stat().st_size != expected["size"]:
++                return False, f"file '{path}' has changed or is incomplete"
++            if sha256_file(path) != expected["sha256"]:
++                return False, f"file '{path}' has changed"
++
++        return True, ""
++
++    def step_output_digest(self, step: str, path: Path) -> str | None:
++        """Return the recorded sha256 of an output file of a step."""
++        record = self.data["steps"].get(step, {})
++        output = record.get("outputs", {}).get(self._relative(path))
++        return None if output is None else output["sha256"]
++
++    def record_step(
++        self, step: str, inputs: dict[str, Any], outputs: Iterable[Path]
++    ) -> None:
++        """Record a completed step and save the manifest."""
++        self.data["steps"][step] = {
++            "inputs": inputs,
++            "outputs": {
++                self._relative(path): {
++                    "size": path.stat().st_size,
++                    "sha256": sha256_file(path),
++                }
++                for path in outputs
++            },
++        }
++        self.save()
++
++    def invalidate(self, *steps: str) -> None:
++        """Forget steps (e.g. before their outputs are rewritten) and save."""
++        changed = False
++        for step in steps:
++            if self.data["steps"].pop(step, None) is not None:
++                changed = True
++        if changed:
++            self.save()
++
++
++def find_binette_outputs(outdir: Path) -> list[Path]:
++    """List Binette output files/directories present in an output directory."""
++    return [outdir / m for m in BINETTE_OUTPUT_MARKERS if (outdir / m).exists()]
++
++
++def check_outdir(
++    outdir: Path,
++    manifest_path: Path,
++    run_inputs: dict[str, Any],
++    force: bool,
++) -> Checkpoint:
++    """
++    Make sure the output directory can be used for the current run.
++
++    - Empty/new output directory: a new checkpoint is created.
++    - Output directory from a run with the same inputs: its checkpoint is returned.
++    - Output directory from a run with different inputs, or from an older Binette
++      version that cannot be verified: raises OutputDirConflictError, unless
++      ``force`` is set, in which case a new checkpoint is created.
++
++    :param outdir: Output directory of the run.
++    :param manifest_path: Path of the checkpoint manifest.
++    :param run_inputs: Fingerprints of the data inputs of the current run.
++    :param force: Allow reusing an output directory from a different run.
++    :raises OutputDirConflictError: When the output directory belongs to another run.
++    """
++    checkpoint, reason = Checkpoint.load(manifest_path, root=outdir)
++
++    if checkpoint is not None:
++        if checkpoint.run_inputs == run_inputs:
++            logger.debug(f"Output directory '{outdir}' matches the current inputs")
++            return checkpoint
++
++        changed = [
++            RUN_INPUT_LABELS.get(key, key)
++            for key in sorted(set(run_inputs) | set(checkpoint.run_inputs))
++            if run_inputs.get(key) != checkpoint.run_inputs.get(key)
++        ]
++        problem = (
++            f"Output directory '{outdir}' contains results from a previous Binette run "
++            f"with different inputs. Changed: {'; '.join(changed)}."
++        )
++    else:
++        existing = find_binette_outputs(outdir)
++        if not existing and not manifest_path.exists():
++            checkpoint = Checkpoint.new(manifest_path, outdir, run_inputs)
++            checkpoint.save()
++            return checkpoint
++        if manifest_path.exists():
++            problem = (
++                f"Output directory '{outdir}' contains results from a previous "
++                f"Binette run that cannot be verified: {reason}."
++            )
++        else:
++            problem = (
++                f"Output directory '{outdir}' contains results from a previous Binette "
++                "run that cannot be verified (no checkpoint information, "
++                "probably produced by an older Binette version)."
++            )
++
++    if not force:
++        raise OutputDirConflictError(
++            f"{problem} Use a different output directory, or use --force to discard "
++            "the previous intermediate files and overwrite the results."
++        )
++
++    logger.warning(
++        f"{problem} --force is set: previous intermediate files are discarded "
++        "and results will be overwritten."
++    )
++    checkpoint = Checkpoint.new(manifest_path, outdir, run_inputs)
++    checkpoint.save()
++    return checkpoint
+diff --git a/binette/diamond.py b/binette/diamond.py
+index a1402a7..aa20b46 100644
+--- a/binette/diamond.py
++++ b/binette/diamond.py
+@@ -4,10 +4,13 @@
+ import subprocess
+ import sys
+ from collections import Counter
++from pathlib import Path
+ 
+ import pandas as pd
+ from checkm2 import keggData
+ 
++from binette.checkpoint import atomic_replace, partial_path
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -58,6 +61,16 @@ def check_tool_exists(tool_name: str):
+         )
+ 
+ 
++def get_block_size(low_mem: bool) -> float:
++    """
++    DIAMOND block size used by Binette. It changes memory usage and can also
++    slightly change alignment results.
++
++    :param low_mem: Use low memory mode if True.
++    """
++    return 0.5 if low_mem else 2
++
++
+ def run(
+     faa_file: str,
+     output: str,
+@@ -86,12 +99,17 @@ def run(
+     """
+     check_tool_exists("diamond")
+ 
+-    blocksize = 0.5 if low_mem else 2
++    # DIAMOND writes to a temporary file which is moved to its final location
++    # only on success, so an interrupted job never leaves a truncated result file.
++    final_output = Path(output)
++    tmp_output = partial_path(final_output)
++
++    blocksize = get_block_size(low_mem)
+ 
+     cmd = (
+         "diamond blastp --outfmt 6 --max-target-seqs 1 "
+         f"--query {faa_file} "
+-        f"-o {output} "
++        f"-o {tmp_output} "
+         f"--threads {threads} "
+         f"--db {db} "
+         f"--compress 1 "
+@@ -110,6 +128,7 @@ def run(
+         logger.error(f"An error occurred while running DIAMOND. Check log file '{log}'")
+         sys.exit(1)
+ 
++    atomic_replace(tmp_output, final_output)
+     logger.info("Finished running DIAMOND")
+ 
+ 
+diff --git a/binette/io_manager.py b/binette/io_manager.py
+index 1ae1578..fad73c5 100644
+--- a/binette/io_manager.py
++++ b/binette/io_manager.py
+@@ -1,3 +1,4 @@
++import gzip
+ import logging
+ from collections import defaultdict
+ from collections.abc import Iterable
+@@ -7,6 +8,7 @@
+ import pyfastx
+ 
+ from binette.bin_manager import Bin
++from binette.checkpoint import atomic_replace, partial_path
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -192,25 +194,44 @@ def write_bins_fasta(
+     :param outdir: Directory to save bin FASTA files.
+     :param max_buffer_size: Maximum total character size to buffer before flushing.
+     """
+-    outdir.mkdir(parents=True, exist_ok=True)
+-
+-    # Clear existing files for selected bins
+-    for sbin in selected_bins:
+-        out_path = outdir / f"{sbin.name}.fa"
+-        if out_path.exists():
+-            out_path.unlink()  # remove the file
+-
+     # Map contig name to bin IDs
+-    contig_to_bins = {}
++    contig_to_bin = {}
+     for sbin in selected_bins:
+         for contig_id in sbin.contigs:
+             contig_name = contigs_names[contig_id]
+-            contig_to_bins[contig_name] = sbin.name
++            contig_to_bin[contig_name] = sbin.name
+ 
+-    assert len(contig_to_bins) == sum(len(sbin.contigs) for sbin in selected_bins), (
++    assert len(contig_to_bin) == sum(len(sbin.contigs) for sbin in selected_bins), (
+         "Some contigs are present in multiple bins but should be unique."
+     )
+ 
++    write_bins_fasta_from_contig_to_bin(
++        contig_to_bin, contigs_fasta, outdir, max_buffer_size
++    )
++
++
++def write_bins_fasta_from_contig_to_bin(
++    contig_to_bin: dict[str, str],
++    contigs_fasta: Path,
++    outdir: Path,
++    max_buffer_size: int = 50_000_000,
++):
++    """
++    Write one FASTA file per bin from a mapping of contig name to bin name.
++
++    :param contig_to_bin: Mapping of contig name to bin name.
++    :param contigs_fasta: Path to the input FASTA file.
++    :param outdir: Directory to save bin FASTA files.
++    :param max_buffer_size: Maximum total character size to buffer before flushing.
++    """
++    outdir.mkdir(parents=True, exist_ok=True)
++
++    # Clear existing files for the bins to write
++    for bin_name in set(contig_to_bin.values()):
++        out_path = outdir / f"{bin_name}.fa"
++        if out_path.exists():
++            out_path.unlink()  # remove the file
++
+     buffer = defaultdict(list)
+     buffer_size = 0
+ 
+@@ -224,7 +245,7 @@ def flush_buffer():
+         buffer_size = 0
+ 
+     for name, seq in pyfastx.Fastx(contigs_fasta.as_posix()):
+-        bin_name = contig_to_bins.get(name)
++        bin_name = contig_to_bin.get(name)
+         if not bin_name:
+             continue
+ 
+@@ -269,29 +290,58 @@ def check_contig_consistency(
+     assert are_contigs_consistent, message
+ 
+ 
+-def check_resume_file(faa_file: Path, diamond_result_file: Path) -> None:
++def write_contig_coding_length(
++    contig_to_coding_length: dict[str, int | None], output_file: Path
++) -> None:
++    """
++    Write the coding length of each contig to a (gzipped) TSV file.
++
++    The file is written atomically so an interrupted run never leaves a partial file.
++
++    :param contig_to_coding_length: Mapping of contig name to coding length (or None).
++    :param output_file: Output path. Compressed with gzip if it ends with '.gz'.
+     """
+-    Check the existence of files required for resuming the process.
++    proper_open = gzip.open if output_file.name.endswith(".gz") else open
++    tmp_file = partial_path(output_file)
++    with proper_open(tmp_file, "wt") as fl:
++        for contig, coding_length in contig_to_coding_length.items():
++            value = "NA" if coding_length is None else int(coding_length)
++            fl.write(f"{contig}\t{value}\n")
++    atomic_replace(tmp_file, output_file)
++
+ 
+-    :param faa_file: Path to the protein file.
+-    :param diamond_result_file: Path to the Diamond result file.
+-    :raises FileNotFoundError: If the required files don't exist for resuming.
++def read_contig_coding_length(input_file: Path) -> dict[str, int | None]:
+     """
++    Read a file written by :func:`write_contig_coding_length`.
+ 
+-    if faa_file.exists() and diamond_result_file.exists():
+-        return
++    :param input_file: Path of the coding length file.
++    :return: Mapping of contig name to coding length (or None).
++    """
++    proper_open = gzip.open if input_file.name.endswith(".gz") else open
++    contig_to_coding_length: dict[str, int | None] = {}
++    with proper_open(input_file, "rt") as fl:
++        for line in fl:
++            contig, value = line.rstrip("\n").split("\t")
++            contig_to_coding_length[contig] = None if value == "NA" else int(value)
++    return contig_to_coding_length
+ 
+-    if not faa_file.exists():
+-        error_msg = (
+-            f"Protein file '{faa_file}' does not exist. Resuming is not possible."
+-        )
+-        logger.error(error_msg)
+-        raise FileNotFoundError(error_msg)
+ 
+-    if not diamond_result_file.exists():
+-        error_msg = f"Diamond result file '{diamond_result_file}' does not exist. Resuming is not possible."
+-        logger.error(error_msg)
+-        raise FileNotFoundError(error_msg)
++def clear_previous_outputs(final_bins_dir: Path, original_bin_report_dir: Path) -> None:
++    """
++    Remove final outputs from a previous run that may not be overwritten by the current
++    one (e.g. bins written with another prefix). Only files written by Binette are removed.
++
++    :param final_bins_dir: Directory of final bin FASTA files.
++    :param original_bin_report_dir: Directory of input bin quality reports.
++    """
++    to_remove = [
++        *final_bins_dir.glob("*.fa"),
++        *original_bin_report_dir.glob("input_bins_*.tsv"),
++    ]
++    if to_remove:
++        logger.info(f"Removing {len(to_remove)} result files from a previous run")
++    for path in to_remove:
++        path.unlink()
+ 
+ 
+ def write_contig2bin_table(
+@@ -322,6 +372,22 @@ def write_contig2bin_table(
+     logger.debug(f"Successfully wrote contig2bin table with {total_entries} entries")
+ 
+ 
++def read_contig2bin_table(input_file: Path) -> dict[str, str]:
++    """
++    Read a headerless contig-to-bin TSV file written by :func:`write_contig2bin_table`.
++
++    :param input_file: Path to the contig2bin table.
++    :return: Mapping of contig name to bin name.
++    """
++    contig_to_bins = {}
++    with open(input_file) as fl:
++        for line in fl:
++            if line.strip():
++                contig, bin_name = line.rstrip("\n").split("\t")
++                contig_to_bins[contig] = bin_name
++    return contig_to_bins
++
++
+ def write_original_bin_metrics(original_bins: list[Bin], original_bin_report_dir: Path):
+     """
+     Write metrics of original input bins to a specified directory.
+diff --git a/binette/main.py b/binette/main.py
+index bb594c4..afff9f1 100755
+--- a/binette/main.py
++++ b/binette/main.py
+@@ -8,9 +8,11 @@
+ Portability : POSIX
+ """
+ 
++import hashlib
++import inspect
+ import logging
+-import os
+ import sys
++from collections import Counter
+ from pathlib import Path
+ from typing import Annotated
+ 
+@@ -20,7 +22,7 @@
+ from rich.logging import RichHandler
+ 
+ import binette as binette_init
+-from binette import bin_manager, bin_quality, cds, contig_manager, diamond
++from binette import bin_manager, bin_quality, cds, checkpoint, contig_manager, diamond
+ from binette import io_manager as io
+ 
+ logger = logging.getLogger(__name__)
+@@ -152,9 +154,11 @@ def parse_input_files(
+     :param fasta_extensions: Possible fasta extensions to look for in the bin directory.
+ 
+     :return: A tuple containing:
+-        - List of original bins.
+-        - Dictionary mapping bins to lists of contigs.
+-        - Dictionary mapping contig names to their lengths.
++        - Dictionary mapping contig keys to original bins.
++        - List of contigs found in the input bins.
++        - Dictionary mapping contig indexes to their lengths.
++        - Dictionary mapping contig names to their indexes.
++        - Dictionary of input fingerprints ("contigs" and "bins") identifying the run.
+     """
+     if fasta_extensions is None:
+         fasta_extensions = {".fasta", ".fa", ".fna"}
+@@ -194,11 +198,12 @@ def parse_input_files(
+     )
+ 
+     contigs_in_bins_set = set(contigs_in_bins)
+-    contig_to_length = {
+-        name: len(seq)
+-        for name, seq in pyfastx.Fastx(contigs_fasta.as_posix())
+-        if name in contigs_in_bins_set
+-    }
++    contig_to_length = {}
++    contig_to_seq_digest = {}
++    for name, seq in pyfastx.Fastx(contigs_fasta.as_posix()):
++        if name in contigs_in_bins_set:
++            contig_to_length[name] = len(seq)
++            contig_to_seq_digest[name] = hashlib.sha256(seq.encode()).hexdigest()
+ 
+     logger.debug("Finished parsing contig fasta file")
+     # check if all contigs from input bins are present in contigs file
+@@ -220,55 +225,105 @@ def parse_input_files(
+         contig_to_index[name]: length for name, length in contig_to_length.items()
+     }
+ 
++    input_fingerprints = {
++        "contigs": checkpoint.contigs_fingerprint(contig_to_seq_digest),
++        "bins": checkpoint.bins_fingerprint(bin_set_name_to_bins_info),
++    }
++
+     return (
+         contig_key_to_bin,
+         contigs_in_bins,
+         contig_id_to_length,
+         contig_to_index,
++        input_fingerprints,
+     )
+ 
+ 
+-def manage_protein_alignement(
++def resolve_checkm2_db(checkm2_db: Path | None) -> Path:
++    """
++    Return the path of the CheckM2 diamond database to use.
++
++    :param checkm2_db: Database given by the user, or None to use the one set via `checkm2 database`.
++    :raises FileNotFoundError: If the given database does not exist.
++    """
++    if checkm2_db is None:
++        return Path(diamond.get_checkm2_db())
++    if not checkm2_db.exists():
++        raise FileNotFoundError(checkm2_db)
++    return checkm2_db
++
++
++def can_reuse_step(
++    ckpt: checkpoint.Checkpoint,
++    step: str,
++    inputs: dict,
++    resume: bool,
++    description: str,
++) -> bool:
++    """
++    Decide whether a checkpointed step can be reused and log the decision.
++
++    :param ckpt: Checkpoint of the run.
++    :param step: Name of the step.
++    :param inputs: Inputs of the step in the current run.
++    :param resume: Whether resuming is enabled.
++    :param description: Human readable description of the step results.
++    """
++    if not resume:
++        return False
++
++    if step not in ckpt.data["steps"]:
++        logger.debug(f"No {description} from a previous run to reuse")
++        return False
++
++    is_valid, reason = ckpt.step_status(step, inputs)
++    if is_valid:
++        logger.info(f"Resuming: reusing {description} from a previous run")
++    else:
++        logger.info(f"Cannot reuse {description} from a previous run: {reason}")
++    return is_valid
++
++
++def get_proteins(
+     faa_file: Path,
++    coding_length_file: Path,
+     contigs_fasta: Path,
+     contigs_in_bins: set[str],
+-    diamond_result_file: Path,
+-    checkm2_db: Path | None,
++    proteins: Path | None,
+     threads: int,
+-    use_existing_protein_file: bool,
+-    resume_diamond: bool,
+-    low_mem: bool,
+-) -> tuple[dict[str, int], dict[str, list[str]], dict[str, int | None] | None]:
++    reuse: bool,
++) -> tuple[dict[str, list[str]], dict[str, int | None] | None, list[Path]]:
+     """
+-    Predicts or reuses proteins prediction and runs diamond on them.
++    Predict genes, filter user-provided proteins, or reuse proteins from a previous run.
+ 
+-    :param faa_file: The path to the .faa file.
+-    :param contigs_fasta: The path to the contigs FASTA file.
++    :param faa_file: Path of the protein file used by Binette.
++    :param coding_length_file: Path of the file storing contig coding lengths.
++    :param contigs_fasta: Path to the contigs FASTA file.
+     :param contigs_in_bins: Set of contigs in bins.
+-    :param diamond_result_file: The path to the diamond result file.
+-    :param checkm2_db: The path to the CheckM2 database.
+-    :param threads: Number of threads for parallel processing.
+-    :param use_existing_protein_file: Boolean indicating whether to use an existing protein file.
+-    :param resume_diamond: Boolean indicating whether to resume diamond alignment.
+-    :param low_mem: Boolean indicating whether to use low memory mode.
+-
+-    :return: A tuple containing dictionaries - contig_to_kegg_counter, contig_to_genes, and contig_to_coding_len.
+-    """
++    :param proteins: Protein file provided by the user, or None to predict genes.
++    :param threads: Number of threads for gene prediction.
++    :param reuse: Reuse files of a previous run instead of computing them.
+ 
+-    # Predict or reuse proteins prediction and run diamond on them
+-    if use_existing_protein_file:
++    :return: contig_to_genes, contig_to_coding_length (None when not computable) and
++        the list of files produced.
++    """
++    if reuse:
+         logger.info(f"Parsing protein sequences from '{faa_file}'")
+         contig_to_genes = cds.parse_faa_file(faa_file.as_posix())
+-        io.check_contig_consistency(
++        contig_to_coding_len = (
++            None if proteins else io.read_contig_coding_length(coding_length_file)
++        )
++
++    elif proteins:
++        logger.info(f"Using the provided protein sequences file '{proteins}'")
++        cds.filter_faa_file(
+             contigs_in_bins,
+-            contig_to_genes,
+-            contigs_fasta.as_posix(),
+-            faa_file.as_posix(),
++            input_faa_file=proteins,
++            filtered_faa_file=faa_file,
+         )
++        logger.info(f"Parsing protein sequences from '{faa_file}'")
++        contig_to_genes = cds.parse_faa_file(faa_file.as_posix())
+         contig_to_coding_len = None
+-        logger.info(
+-            "Coding density will not be computed (using provided protein sequences)"
+-        )
+ 
+     else:
+         logger.info(f"Loading {len(contigs_in_bins)} contigs from '{contigs_fasta}'")
+@@ -280,17 +335,52 @@ def manage_protein_alignement(
+         contig_to_genes, contig_to_coding_len = cds.predict(
+             contigs_iterator, faa_file.as_posix(), threads
+         )
+-        logger.info("Coding density will be computed from freshly identified genes")
+-
+-    if not resume_diamond:
+-        if checkm2_db is None:
+-            # get checkm2 db stored in checkm2 install
+-            diamond_db_path = diamond.get_checkm2_db()
+-        elif checkm2_db.exists():
+-            diamond_db_path = checkm2_db.as_posix()
+-        else:
+-            raise FileNotFoundError(checkm2_db)
++        io.write_contig_coding_length(contig_to_coding_len, coding_length_file)
+ 
++    if proteins:
++        io.check_contig_consistency(
++            contigs_in_bins,
++            contig_to_genes,
++            contigs_fasta.as_posix(),
++            faa_file.as_posix(),
++        )
++        logger.info(
++            "Coding density will not be computed (using provided protein sequences)"
++        )
++        outputs = [faa_file]
++    else:
++        logger.info("Coding density will be computed from identified genes")
++        outputs = [faa_file, coding_length_file]
++
++    return contig_to_genes, contig_to_coding_len, outputs
++
++
++def get_diamond_hits(
++    faa_file: Path,
++    contigs_fasta: Path,
++    contigs_in_bins: set[str],
++    diamond_result_file: Path,
++    diamond_db_path: Path,
++    threads: int,
++    low_mem: bool,
++    reuse: bool,
++) -> dict[str, Counter]:
++    """
++    Run DIAMOND on proteins against the CheckM2 database (or reuse a previous result)
++    and parse its results.
++
++    :param faa_file: Path to the protein file.
++    :param contigs_fasta: Path to the contigs FASTA file.
++    :param contigs_in_bins: Set of contigs in bins.
++    :param diamond_result_file: Path of the DIAMOND result file.
++    :param diamond_db_path: Path of the CheckM2 diamond database.
++    :param threads: Number of threads.
++    :param low_mem: Use DIAMOND low memory mode.
++    :param reuse: Reuse the result file of a previous run instead of running DIAMOND.
++
++    :return: Mapping of contig name to a counter of KEGG annotations.
++    """
++    if not reuse:
+         diamond_log = (
+             diamond_result_file.parents[0]
+             / f"{diamond_result_file.stem.split('.')[0]}.log"
+@@ -299,7 +389,7 @@ def manage_protein_alignement(
+         diamond.run(
+             faa_file.as_posix(),
+             diamond_result_file.as_posix(),
+-            diamond_db_path,
++            diamond_db_path.as_posix(),
+             diamond_log.as_posix(),
+             threads,
+             low_mem=low_mem,
+@@ -318,7 +408,87 @@ def manage_protein_alignement(
+         diamond_result_file.as_posix(),
+     )
+ 
+-    return contig_to_kegg_counter, contig_to_genes, contig_to_coding_len
++    return contig_to_kegg_counter
++
++
++def diamond_result_parameters(low_mem: bool) -> dict:
++    """
++    DIAMOND parameters that can change its results. Threads do not, but the block
++    size set by --low_mem does.
++
++    :param low_mem: Whether DIAMOND low memory mode is used.
++    """
++    params = inspect.signature(diamond.run).parameters
++    result_params = {
++        name: params[name].default
++        for name in ("query_cover", "subject_cover", "percent_id", "evalue")
++    }
++    result_params["block_size"] = diamond.get_block_size(low_mem)
++    return result_params
++
++
++def make_diamond_step_inputs(
++    ckpt: checkpoint.Checkpoint, faa_file: Path, checkm2_db: dict, low_mem: bool
++) -> dict:
++    """
++    Inputs of the DIAMOND step: the proteins it runs on (as recorded in the
++    checkpoint), the CheckM2 database and the DIAMOND parameters.
++    """
++    return {
++        "proteins_sha256": ckpt.step_output_digest("proteins", faa_file),
++        "checkm2_db": checkm2_db,
++        "parameters": diamond_result_parameters(low_mem),
++    }
++
++
++def bins_fasta_step_inputs(contig2bin_table: Path) -> dict:
++    """Inputs of the bins FASTA step: the final bins it was written from."""
++    return {"contig2bin_table_sha256": checkpoint.sha256_file(contig2bin_table)}
++
++
++def record_bins_fasta_step(
++    ckpt: checkpoint.Checkpoint, contig2bin_table: Path, final_bins_dir: Path
++) -> None:
++    """Record the final bins FASTA files in the checkpoint."""
++    ckpt.record_step(
++        "bins_fasta",
++        bins_fasta_step_inputs(contig2bin_table),
++        sorted(final_bins_dir.glob("*.fa")),
++    )
++
++
++def ensure_bins_fasta(
++    ckpt: checkpoint.Checkpoint,
++    contig2bin_table: Path,
++    contigs_fasta: Path,
++    final_bins_dir: Path,
++) -> None:
++    """
++    Make sure the FASTA files of the final bins of a completed run are present and
++    intact. Missing or modified files are written again from the final contig2bin
++    table, without recomputing bin selection.
++
++    :param ckpt: Checkpoint of the run.
++    :param contig2bin_table: Final contig2bin table of the completed run.
++    :param contigs_fasta: Path to the contigs FASTA file.
++    :param final_bins_dir: Directory of the final bins FASTA files.
++    """
++    is_valid, reason = ckpt.step_status(
++        "bins_fasta", bins_fasta_step_inputs(contig2bin_table)
++    )
++    if is_valid:
++        return
++
++    logger.info(
++        f"Writing selected bins FASTA files to '{final_bins_dir}' from "
++        f"'{contig2bin_table}' ({reason})"
++    )
++    for fasta_file in final_bins_dir.glob("*.fa"):
++        fasta_file.unlink()
++    io.write_bins_fasta_from_contig_to_bin(
++        io.read_contig2bin_table(contig2bin_table), contigs_fasta, final_bins_dir
++    )
++    record_bins_fasta_step(ckpt, contig2bin_table, final_bins_dir)
+ 
+ 
+ def log_selected_bin_info(
+@@ -543,7 +713,23 @@ def binette(
+     resume: Annotated[
+         bool,
+         typer.Option(
+-            help="Resume mode: reuse existing temporary files if possible.",
++            help=(
++                "Reuse intermediate results (proteins, DIAMOND hits) "
++                "from a previous run with the same inputs "
++                "(disable with --no-resume)."
++            ),
++            rich_help_panel="Advanced Options",
++        ),
++    ] = True,
++    force: Annotated[
++        bool,
++        typer.Option(
++            "--force",
++            help=(
++                "Allow using an output directory that contains results of a run with "
++                "different inputs. Previous intermediate "
++                "files are discarded and results are overwritten."
++            ),
+             rich_help_panel="Advanced Options",
+         ),
+     ] = False,
+@@ -592,27 +778,25 @@ def binette(
+ 
+     # Temporary files #
+     out_tmp_dir: Path = outdir / "temporary_files"
+-    os.makedirs(out_tmp_dir, exist_ok=True)
+-
+-    use_existing_protein_file = False
+-
++    manifest_path = out_tmp_dir / checkpoint.CHECKPOINT_FILENAME
+     faa_file = out_tmp_dir / "assembly_proteins.faa.gz"
+-
++    coding_length_file = out_tmp_dir / "contig_coding_length.tsv.gz"
+     diamond_result_file = out_tmp_dir / "diamond_result.tsv.gz"
+ 
+     # Output files #
+     final_bin_report: Path = outdir / "final_bins_quality_reports.tsv"
++    final_contig2bin_table: Path = outdir / "final_contig_to_bin.tsv"
+     original_bin_report_dir: Path = outdir / "input_bins_quality_reports"
+-
+-    if resume:
+-        io.check_resume_file(faa_file, diamond_result_file)
+-        use_existing_protein_file = True
++    final_bins_dir: Path = outdir / "final_bins"
++    index_to_contig_file: Path = outdir / "index_to_contig.tsv"
++    all_bin_compo_file: Path = outdir / "all_bins_quality_reports.tsv"
+ 
+     (
+         contig_key_to_original_bin,
+         contigs_in_bins,
+         contig_to_length,
+         contig_to_index,
++        input_fingerprints,
+     ) = parse_input_files(
+         bin_dirs,
+         contig2bin_tables,
+@@ -620,35 +804,108 @@ def binette(
+         fasta_extensions=set(fasta_extensions),
+     )
+ 
++    diamond_db_path = resolve_checkm2_db(checkm2_db)
++
++    # Identity of the run: data inputs only. Parameters that only affect bin
++    # selection can change between runs sharing an output directory.
++    run_inputs = {
++        "contigs": input_fingerprints["contigs"],
++        "bins": input_fingerprints["bins"],
++        "proteins": checkpoint.sha256_file(proteins) if proteins else None,
++        "checkm2_db": checkpoint.checkm2_db_identity(diamond_db_path),
++    }
++
++    try:
++        ckpt = checkpoint.check_outdir(outdir, manifest_path, run_inputs, force)
++    except checkpoint.OutputDirConflictError as exc:
++        logger.error(str(exc))
++        raise typer.Exit(code=1) from exc
++
++    final_step_inputs = {
++        "binette_version": binette_init.__version__,
++        "parameters": {
++            "min_completeness": min_completeness,
++            "max_contamination": max_contamination,
++            "min_length": min_length,
++            "max_length": max_length,
++            "contamination_weight": contamination_weight,
++            "prefix": prefix,
++            "debug": debug,
++        },
++        # Chain to upstream steps: final results are only reusable if the DIAMOND
++        # results (and through them, the proteins) of the previous run match.
++        "diamond": make_diamond_step_inputs(
++            ckpt, faa_file, run_inputs["checkm2_db"], low_mem
++        ),
++    }
++
++    if resume and not ckpt.data["steps"]:
++        logger.info(
++            "No intermediate results from a previous run to resume from: starting from scratch"
++        )
++
++    if can_reuse_step(ckpt, "final", final_step_inputs, resume, "final results"):
++        if write_fasta_bins:
++            ensure_bins_fasta(ckpt, final_contig2bin_table, contigs, final_bins_dir)
++        logger.info(
++            f"Binette already completed with identical inputs and parameters in '{outdir}': "
++            "nothing to do. Use --no-resume to rerun."
++        )
++        return 0
++
++    # Results of this run will be rewritten: they no longer reflect a completed run.
++    ckpt.invalidate("final", "bins_fasta")
++
+     if debug:
+-        index_to_contig_file = outdir / "index_to_contig.tsv"
+         logger.info(f"Writing index to contig mapping to '{index_to_contig_file}'")
+         with open(index_to_contig_file, "w") as flout:
+             flout.write("\n".join((f"{i}\t{c}" for i, c in enumerate(contigs_in_bins))))
+ 
+-    if proteins and not resume:
+-        logger.info(f"Using the provided protein sequences file '{proteins}'")
+-        use_existing_protein_file = True
+-
+-        cds.filter_faa_file(
+-            set(contigs_in_bins),
+-            input_faa_file=proteins,
+-            filtered_faa_file=faa_file,
+-        )
++    # Proteins #
++    proteins_step_inputs = {
++        "contigs": run_inputs["contigs"],
++        "proteins": run_inputs["proteins"],
++    }
++    reuse_proteins = can_reuse_step(
++        ckpt, "proteins", proteins_step_inputs, resume, "protein sequences"
++    )
++    if not reuse_proteins:
++        ckpt.invalidate("proteins", "diamond")
++
++    contig_name_to_genes, contig_to_coding_length, protein_outputs = get_proteins(
++        faa_file=faa_file,
++        coding_length_file=coding_length_file,
++        contigs_fasta=contigs,
++        contigs_in_bins=set(contigs_in_bins),
++        proteins=proteins,
++        threads=threads,
++        reuse=reuse_proteins,
++    )
++    if not reuse_proteins:
++        ckpt.record_step("proteins", proteins_step_inputs, protein_outputs)
+ 
+-    contig_name_to_kegg_counter, contig_name_to_genes, contig_to_coding_length = (
+-        manage_protein_alignement(
+-            faa_file=faa_file,
+-            contigs_fasta=contigs,
+-            contigs_in_bins=set(contigs_in_bins),
+-            diamond_result_file=diamond_result_file,
+-            checkm2_db=checkm2_db,
+-            threads=threads,
+-            use_existing_protein_file=use_existing_protein_file,
+-            resume_diamond=resume,
+-            low_mem=low_mem,
+-        )
++    # DIAMOND #
++    diamond_step_inputs = make_diamond_step_inputs(
++        ckpt, faa_file, run_inputs["checkm2_db"], low_mem
+     )
++    reuse_diamond = can_reuse_step(
++        ckpt, "diamond", diamond_step_inputs, resume, "DIAMOND results"
++    )
++    if not reuse_diamond:
++        ckpt.invalidate("diamond")
++
++    contig_name_to_kegg_counter = get_diamond_hits(
++        faa_file=faa_file,
++        contigs_fasta=contigs,
++        contigs_in_bins=set(contigs_in_bins),
++        diamond_result_file=diamond_result_file,
++        diamond_db_path=diamond_db_path,
++        threads=threads,
++        low_mem=low_mem,
++        reuse=reuse_diamond,
++    )
++    if not reuse_diamond:
++        ckpt.record_step("diamond", diamond_step_inputs, [diamond_result_file])
+ 
+     contig_to_kegg_counter = contig_manager.apply_contig_index(
+         contig_to_index, contig_name_to_kegg_counter
+@@ -682,6 +939,8 @@ def binette(
+     if contig_to_coding_length:
+         bin_quality.add_bin_coding_density(original_bins, contig_to_coding_length)
+ 
++    io.clear_previous_outputs(final_bins_dir, original_bin_report_dir)
++
+     logger.info(
+         f"Writing original input bin metrics to directory '{original_bin_report_dir}'"
+     )
+@@ -717,7 +976,6 @@ def binette(
+     bin_quality.add_bin_size_and_N50(contig_key_to_all_bin.values(), contig_to_length)
+ 
+     if debug:
+-        all_bin_compo_file = outdir / "all_bins_quality_reports.tsv"
+         logger.info(f"Writing all bins to '{all_bin_compo_file}'")
+         io.write_bin_info(
+             contig_key_to_all_bin.values(), all_bin_compo_file, add_contigs=True
+@@ -738,21 +996,34 @@ def binette(
+ 
+     io.write_contig2bin_table(
+         selected_bins,
+-        outdir / "final_contig_to_bin.tsv",
++        final_contig2bin_table,
+         contigs_in_bins,
+     )
+ 
+     if write_fasta_bins:
+-        logger.info(f"Writing selected bins FASTA files to '{outdir / 'final_bins'}'")
++        logger.info(f"Writing selected bins FASTA files to '{final_bins_dir}'")
+         io.write_bins_fasta(
+             selected_bins,
+             contigs,
+-            outdir=outdir / "final_bins",
++            outdir=final_bins_dir,
+             contigs_names=contigs_in_bins,
+         )
+ 
+     log_selected_bin_info(selected_bins, hq_min_completeness, hq_max_conta)
+ 
++    final_outputs = [
++        final_bin_report,
++        final_contig2bin_table,
++        *sorted(original_bin_report_dir.glob("input_bins_*.tsv")),
++    ]
++    if debug:
++        final_outputs += [index_to_contig_file, all_bin_compo_file]
++    final_step_inputs["diamond"] = diamond_step_inputs
++    ckpt.record_step("final", final_step_inputs, final_outputs)
++
++    if write_fasta_bins:
++        record_bins_fasta_step(ckpt, final_contig2bin_table, final_bins_dir)
++
+     return 0
+ 
+ 
+diff --git a/docs/usage.md b/docs/usage.md
+index 6d1d1d1..4567812 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -86,7 +86,7 @@ In this directory you will find:
+ - `final_bins/`: This directory stores all the selected bins in fasta format. Can be skipped with `--no-write-fasta-bins`.
+ - `final_contig_to_bin.tsv`: A headerless TSV file mapping each contig to its assigned bin. This format is much lighter than the fasta output to describe the final Binette bins.
+ - `input_bins_quality_reports/`: A directory storing quality reports for the input bin sets, with files following the same structure as `final_bins_quality_reports.tsv`.
+-- `temporary_files/`: This directory contains intermediate files. If you choose to use the `--resume` option, Binette will utilize files in this directory to prevent the recomputation of time-consuming steps.
++- `temporary_files/`: This directory contains intermediate files (predicted proteins, DIAMOND alignments and a `checkpoint.json` file tracking them). They are reused to avoid recomputing time-consuming steps when Binette is run again in the same output directory (see [Resuming a run](#resuming-a-run-and-reusing-an-output-directory)).
+ 
+ 
+ The `final_bins_quality_reports.tsv` file contains the following columns:
+@@ -102,8 +102,18 @@ The `final_bins_quality_reports.tsv` file contains the following columns:
+ | **score**          | Computed score: `completeness - contamination * weight`. The contamination weight can be customized using the `--contamination_weight` option. |
+ | **size**           | Total size of the bin in nucleotides.                                                                                                          |
+ | **N50**            | The N50 of the bin, representing the length for which 50% of the total nucleotides are in contigs of that length or longer.                    |
+-| **coding\_density** | The percentage of the bin that codes for proteins (genes length / total bin length × 100). Only computed when genes are freshly identified. Empty when using `--proteins` or `--resume` options. |
++| **coding\_density** | The percentage of the bin that codes for proteins (genes length / total bin length × 100). Only computed when genes are freshly identified. Empty when using the `--proteins` option. |
+ | **contig\_count**  | Number of contigs contained within the bin.                                                                                                    |
+-   
+ 
+ 
++## Resuming a run and reusing an output directory
++
++Binette keeps track of its intermediate results in `temporary_files/`. When it is run again with the same output directory, it automatically reuses whatever was already computed. Resuming is on by default, so the same command can be resubmitted after a failed or interrupted job (e.g. a SLURM job that ran out of time or memory) without any change:
++
++- Predicted proteins and DIAMOND alignments are reused only when they were computed from the same inputs (contig sequences, input bin sets, `--proteins` file and CheckM2 database) and their files are complete and unmodified. Otherwise they are recomputed, and Binette logs why.
++- If a previous run already completed with the same inputs and parameters, Binette reports that there is nothing to do and exits successfully.
++- Changing only parameters that affect bin selection (e.g. `--min_completeness`, `--contamination_weight`, `--prefix`) reuses the proteins and DIAMOND alignments and overwrites the final results.
++- `--no-write-fasta-bins` does not change the results: rerunning a completed run with or without it does not recompute anything. If bin FASTA files are missing or modified, they are written again from `final_contig_to_bin.tsv`.
++- Use `--no-resume` to recompute everything.
++
++To prevent accidentally mixing results from different analyses, Binette stops with an error if the output directory contains results computed from **different inputs**, or results from an older Binette version that cannot be verified. Use a different `--outdir`, or add `--force` to discard the previous intermediate files and overwrite the results.
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 80fcd9e..b51c952 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1,6 +1,6 @@
++import logging
+ import os
+ import warnings
+-import logging
+ from pathlib import Path
+ 
+ import pytest
+diff --git a/tests/functional_tests/test_binette_command.py b/tests/functional_tests/test_binette_command.py
+index 7c1ef10..0e1a774 100644
+--- a/tests/functional_tests/test_binette_command.py
++++ b/tests/functional_tests/test_binette_command.py
+@@ -119,53 +119,197 @@ def test_bin_dir_input(test_data_path: Path, tmp_path):
+     compare_results(result_table, expected_table)
+ 
+ 
+-@pytest.mark.requires_test_data
+-def test_bin_tables_input_and_resume(test_data_path: Path, tmp_path):
++def bin_tables_cmd(test_data_path: Path, outdir: Path, bin_sets=("A", "B", "C")):
+     binning_results_dir = test_data_path / "binning_results"
+-
+-    cmd_args = [
+-        "-b",
+-        binning_results_dir / "A.binning",
+-        "-b",
+-        binning_results_dir / "B.binning",
+-        "-b",
+-        binning_results_dir / "C.binning",
++    cmd_args = []
++    for bin_set in bin_sets:
++        cmd_args += ["-b", binning_results_dir / f"{bin_set}.binning"]
++    cmd_args += [
+         "--contigs",
+         test_data_path / "all_contigs.fna",
+         "--checkm2_db",
+         test_data_path / "checkm2_tiny_db/checkm2_tiny_db.dmnd",
+         "-o",
+-        tmp_path / "test_results_from_dirs",
+-        "-q",
++        outdir,
+     ]
+-    cmd_args = [arg.as_posix() if isinstance(arg, Path) else arg for arg in cmd_args]
++    return [arg.as_posix() if isinstance(arg, Path) else arg for arg in cmd_args]
++
+ 
++def run_binette(cmd_args, caplog):
++    caplog.clear()
+     result = runner.invoke(app, cmd_args)
+     print(result.output)
+     print(result.stderr)
++    print(caplog.text)
++    return result
+ 
+-    assert result.exit_code == 0
+ 
+-    result_table = (
+-        tmp_path / "test_results_from_dirs" / "final_bins_quality_reports.tsv"
+-    )
++@pytest.mark.requires_test_data
++def test_bin_tables_input_and_resume(test_data_path: Path, tmp_path, caplog):
++    caplog.set_level(logging.INFO, logger="binette")
++    outdir = tmp_path / "test_results"
++    cmd_args = bin_tables_cmd(test_data_path, outdir)
++
++    result_table = outdir / "final_bins_quality_reports.tsv"
+     expected_table = Path("tests/expected_results/final_bins_quality_reports.tsv")
++    diamond_file = outdir / "temporary_files" / "diamond_result.tsv.gz"
++    faa_file = outdir / "temporary_files" / "assembly_proteins.faa.gz"
++
++    # Fresh run: resume is on by default and nothing can be resumed
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "No intermediate results from a previous run" in caplog.text
++    assert "Running diamond" in caplog.text
+     compare_results(result_table, expected_table)
++    faa_mtime = faa_file.stat().st_mtime_ns
++    diamond_mtime = diamond_file.stat().st_mtime_ns
++    report_mtime = result_table.stat().st_mtime_ns
+ 
+-    cmd_args.append("--resume")
+-    result = runner.invoke(app, cmd_args)
+-    print(result.output)
+-    print(result.stderr)
++    # Same inputs and parameters: nothing to do
++    result = run_binette(cmd_args, caplog)
+     assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++    assert result_table.stat().st_mtime_ns == report_mtime
+ 
+-    expected_table = Path(
+-        "tests/expected_results/final_bins_quality_reports_from_proteins_input.tsv"
+-    )
++    # Explicit --resume behaves the same
++    result = run_binette(cmd_args + ["--resume"], caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++
++    # --no-write-fasta-bins does not change results: nothing to do
++    final_bins_dir = outdir / "final_bins"
++    bins_fasta = {p.name: p.read_text() for p in final_bins_dir.glob("*.fa")}
++    assert bins_fasta
++    result = run_binette(cmd_args + ["--no-write-fasta-bins"], caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++    assert "Creating intermediate bins" not in caplog.text
++    assert {p.name: p.read_text() for p in final_bins_dir.glob("*.fa")} == bins_fasta
++
++    # Missing bin FASTA file: rewritten without recomputing bin selection
++    removed = sorted(final_bins_dir.glob("*.fa"))[0]
++    removed.unlink()
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++    assert "Creating intermediate bins" not in caplog.text
++    assert {p.name: p.read_text() for p in final_bins_dir.glob("*.fa")} == bins_fasta
++
++    # --low_mem changes DIAMOND block size: DIAMOND and bin selection are rerun,
++    # proteins are reused
++    result = run_binette(cmd_args + ["--low_mem"], caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" not in caplog.text
++    assert "Resuming: reusing protein sequences" in caplog.text
++    assert "Cannot reuse DIAMOND results" in caplog.text
++    assert "--block-size 0.5" in caplog.text
++    result = run_binette(cmd_args + ["--low_mem"], caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++
++    # Back to default memory mode: DIAMOND is rerun with the default block size
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "--block-size 2" in caplog.text
+     compare_results(result_table, expected_table)
++    diamond_mtime = diamond_file.stat().st_mtime_ns
++
++    # Different selection parameter: proteins and DIAMOND results are reused
++    result = run_binette(cmd_args + ["--prefix", "other"], caplog)
++    assert result.exit_code == 0
++    assert "Resuming: reusing protein sequences" in caplog.text
++    assert "Resuming: reusing DIAMOND results" in caplog.text
++    assert "Running diamond" not in caplog.text
++    assert faa_file.stat().st_mtime_ns == faa_mtime
++    assert diamond_file.stat().st_mtime_ns == diamond_mtime
++    # Bins of the previous run (other prefix) are removed
++    final_bins = list((outdir / "final_bins").glob("*.fa"))
++    assert final_bins
++    assert all(path.name.startswith("other_") for path in final_bins)
++
++    # Back to the original parameters: same results as the fresh run
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "Running diamond" not in caplog.text
++    compare_results(result_table, expected_table)
++
++    # Truncated DIAMOND result and no final results (e.g. job killed while
++    # DIAMOND was writing): proteins are reused and DIAMOND is run again
++    diamond_file.write_bytes(diamond_file.read_bytes()[:100])
++    result_table.unlink()
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "Cannot reuse DIAMOND results" in caplog.text
++    assert "Resuming: reusing protein sequences" in caplog.text
++    assert "Running diamond" in caplog.text
++    compare_results(result_table, expected_table)
++
++    # --no-resume recomputes everything
++    result = run_binette(cmd_args + ["--no-resume"], caplog)
++    assert result.exit_code == 0
++    assert "Predicting CDS sequences" in caplog.text
++    assert "Running diamond" in caplog.text
++    compare_results(result_table, expected_table)
++
++
++@pytest.mark.requires_test_data
++def test_outdir_with_different_inputs(test_data_path: Path, tmp_path, caplog):
++    caplog.set_level(logging.INFO, logger="binette")
++    outdir = tmp_path / "test_results"
++
++    result = run_binette(bin_tables_cmd(test_data_path, outdir), caplog)
++    assert result.exit_code == 0
++
++    # Different bin sets in the same output directory: refuse to run
++    other_cmd = bin_tables_cmd(test_data_path, outdir, bin_sets=("A", "B"))
++    result = run_binette(other_cmd, caplog)
++    assert result.exit_code == 1
++    assert "different inputs" in caplog.text
++    assert "input bin sets" in caplog.text
++    assert "--force" in caplog.text
++
++    # --force allows it and recomputes from scratch
++    result = run_binette(other_cmd + ["--force"], caplog)
++    assert result.exit_code == 0
++    assert "--force is set" in caplog.text
++    assert "Running diamond" in caplog.text
++
++    # First run without FASTA bins, then ask for them: only the FASTA files are written
++    result = run_binette(other_cmd + ["--no-write-fasta-bins", "--no-resume"], caplog)
++    assert result.exit_code == 0
++    assert not list((outdir / "final_bins").glob("*.fa"))
++
++    # The output directory now belongs to the new run
++    result = run_binette(other_cmd, caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++    assert "Creating intermediate bins" not in caplog.text
++    assert list((outdir / "final_bins").glob("*.fa"))
+ 
+ 
+ @pytest.mark.requires_test_data
+-def test_bin_tables_input_and_protein_input(test_data_path: Path, tmp_path):
++def test_outdir_from_older_binette_version(test_data_path: Path, tmp_path, caplog):
++    caplog.set_level(logging.INFO, logger="binette")
++    outdir = tmp_path / "test_results"
++    (outdir / "temporary_files").mkdir(parents=True)
++    (outdir / "temporary_files" / "diamond_result.tsv.gz").write_text("old")
++    cmd_args = bin_tables_cmd(test_data_path, outdir)
++
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 1
++    assert "cannot be verified" in caplog.text
++
++    result = run_binette(cmd_args + ["--force"], caplog)
++    assert result.exit_code == 0
++    compare_results(
++        outdir / "final_bins_quality_reports.tsv",
++        Path("tests/expected_results/final_bins_quality_reports.tsv"),
++    )
++
++
++@pytest.mark.requires_test_data
++def test_bin_tables_input_and_protein_input(test_data_path: Path, tmp_path, caplog):
++    caplog.set_level(logging.INFO, logger="binette")
+     binning_results_dir = test_data_path / "binning_results"
+ 
+     cmd_args = [
+@@ -201,3 +345,14 @@ def test_bin_tables_input_and_protein_input(test_data_path: Path, tmp_path):
+         "tests/expected_results/final_bins_quality_reports_from_proteins_input.tsv"
+     )
+     compare_results(result_table, expected_table)
++
++    # Same run again: nothing to do
++    result = run_binette(cmd_args, caplog)
++    assert result.exit_code == 0
++    assert "Binette already completed" in caplog.text
++
++    # Different selection parameter: the filtered proteins and DIAMOND results are reused
++    result = run_binette(cmd_args + ["--min_completeness", "50"], caplog)
++    assert result.exit_code == 0
++    assert "Resuming: reusing protein sequences" in caplog.text
++    assert "Resuming: reusing DIAMOND results" in caplog.text
+diff --git a/tests/unit_tests/bin_manager_test.py b/tests/unit_tests/bin_manager_test.py
+index 04053b8..0f866f2 100644
+--- a/tests/unit_tests/bin_manager_test.py
++++ b/tests/unit_tests/bin_manager_test.py
+@@ -482,36 +482,6 @@ def test_parse_contig2bin_tables(tmp_path):
+             assert result_bin in expected
+ 
+ 
+-@pytest.fixture
+-def create_temp_bin_files(tmpdir):
+-    # Create temporary bin files
+-    bin_dir = tmpdir.mkdir("bins")
+-    bin1 = bin_dir.join("bin1.fasta")
+-    bin1.write(">contig1\nATGC\n>contig2\nGCTA")
+-
+-    bin2 = bin_dir.join("bin2.fasta")
+-    bin2.write(">contig3\nTTAG\n>contig4\nCGAT")
+-
+-    return bin_dir
+-
+-
+-@pytest.fixture
+-def create_temp_bin_directories(tmpdir, create_temp_bin_files):
+-    # Create temporary bin directories
+-    bin_dir1 = tmpdir.mkdir("set1")
+-    bin1 = bin_dir1.join("bin1.fasta")
+-    bin1.write(">contig1\nATGC\n>contig2\nGCTA")
+-
+-    bin2 = bin_dir1.join("bin2.fasta")
+-    bin2.write(">contig3\nTTAG\n>contig4\nCGAT")
+-
+-    bin_dir2 = tmpdir.mkdir("set2")
+-    bin2 = bin_dir2.join("binA.fasta")
+-    bin2.write(">contig3\nTTAG\n>contig4\nCGAT\n>contig5\nCGGC")
+-
+-    return {"set1": Path(bin_dir1), "set2": Path(bin_dir2)}
+-
+-
+ def test_get_bins_from_directory(create_temp_bin_files):
+     bin_dir = create_temp_bin_files
+     set_name = "TestSet"
+diff --git a/tests/unit_tests/checkpoint_test.py b/tests/unit_tests/checkpoint_test.py
+new file mode 100644
+index 0000000..7732511
+--- /dev/null
++++ b/tests/unit_tests/checkpoint_test.py
+@@ -0,0 +1,224 @@
++import json
++import logging
++from pathlib import Path
++
++import pytest
++
++from binette import checkpoint
++from binette.checkpoint import Checkpoint, OutputDirConflictError, check_outdir
++
++RUN_INPUTS = {
++    "contigs": "c" * 64,
++    "bins": "b" * 64,
++    "proteins": None,
++    "checkm2_db": {"name": "db.dmnd", "size": 10},
++}
++
++
++@pytest.fixture
++def outdir(tmp_path) -> Path:
++    return tmp_path / "results"
++
++
++@pytest.fixture
++def manifest_path(outdir) -> Path:
++    return outdir / "temporary_files" / checkpoint.CHECKPOINT_FILENAME
++
++
++def write(path: Path, content: str) -> Path:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(content)
++    return path
++
++
++def test_sha256_file(tmp_path):
++    path = write(tmp_path / "f.txt", "hello")
++    assert (
++        checkpoint.sha256_file(path)
++        == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
++    )
++
++
++def test_bins_fingerprint_order_independent():
++    bins_a = {
++        "A": [
++            {"bin_name": "bin1", "contigs": ["c1", "c2"]},
++            {"bin_name": "bin2", "contigs": ["c3"]},
++        ]
++    }
++    bins_b = {
++        "A": [
++            {"bin_name": "bin2", "contigs": ["c3"]},
++            {"bin_name": "bin1", "contigs": ["c2", "c1"]},
++        ]
++    }
++    assert checkpoint.bins_fingerprint(bins_a) == checkpoint.bins_fingerprint(bins_b)
++
++    bins_renamed = {"B": bins_a["A"]}
++    assert checkpoint.bins_fingerprint(bins_a) != checkpoint.bins_fingerprint(
++        bins_renamed
++    )
++
++
++def test_checkm2_db_identity_ignores_location(tmp_path):
++    db1 = write(tmp_path / "a" / "db.dmnd", "database")
++    db2 = write(tmp_path / "b" / "db.dmnd", "database")
++    assert checkpoint.checkm2_db_identity(db1) == checkpoint.checkm2_db_identity(db2)
++
++
++def test_record_and_reload(outdir, manifest_path):
++    output = write(outdir / "temporary_files" / "proteins.faa", ">p\nMMM\n")
++    ckpt = Checkpoint.new(manifest_path, outdir, RUN_INPUTS)
++    ckpt.record_step("proteins", {"x": 1}, [output])
++
++    assert manifest_path.exists()
++    assert not checkpoint.partial_path(manifest_path).exists()
++
++    reloaded, reason = Checkpoint.load(manifest_path, outdir)
++    assert reason == ""
++    assert reloaded.run_inputs == RUN_INPUTS
++    assert reloaded.step_status("proteins", {"x": 1}) == (True, "")
++    assert reloaded.step_output_digest("proteins", output) == checkpoint.sha256_file(
++        output
++    )
++
++    # Output paths are stored relative to the root directory
++    data = json.loads(manifest_path.read_text())
++    assert list(data["steps"]["proteins"]["outputs"]) == [
++        "temporary_files/proteins.faa"
++    ]
++
++
++def test_step_status_invalid_cases(outdir, manifest_path):
++    output = write(outdir / "out.txt", "complete content")
++    ckpt = Checkpoint.new(manifest_path, outdir, RUN_INPUTS)
++    ckpt.record_step("step", {"x": 1}, [output])
++
++    is_valid, reason = ckpt.step_status("unknown", {"x": 1})
++    assert not is_valid and "no record" in reason
++
++    is_valid, reason = ckpt.step_status("step", {"x": 2})
++    assert not is_valid and "inputs changed" in reason
++
++    # Truncated file (e.g. job killed while writing)
++    output.write_text("complete")
++    is_valid, reason = ckpt.step_status("step", {"x": 1})
++    assert not is_valid and "incomplete" in reason
++
++    # Same size, different content
++    output.write_text("COMPLETE content")
++    is_valid, reason = ckpt.step_status("step", {"x": 1})
++    assert not is_valid and "changed" in reason
++
++    output.unlink()
++    is_valid, reason = ckpt.step_status("step", {"x": 1})
++    assert not is_valid and "missing" in reason
++
++
++def test_invalidate(outdir, manifest_path):
++    output = write(outdir / "out.txt", "x")
++    ckpt = Checkpoint.new(manifest_path, outdir, RUN_INPUTS)
++    ckpt.record_step("a", {}, [output])
++    ckpt.record_step("b", {}, [output])
++
++    ckpt.invalidate("a", "not_recorded")
++
++    reloaded, _ = Checkpoint.load(manifest_path, outdir)
++    assert set(reloaded.data["steps"]) == {"b"}
++
++
++@pytest.mark.parametrize(
++    "content, expected_reason",
++    [
++        ("{not json", "unreadable"),
++        (json.dumps({"format_version": 999}), "unsupported format version"),
++        (json.dumps([1, 2]), "unsupported format version"),
++    ],
++)
++def test_load_bad_manifest(outdir, manifest_path, content, expected_reason):
++    write(manifest_path, content)
++    ckpt, reason = Checkpoint.load(manifest_path, outdir)
++    assert ckpt is None
++    assert expected_reason in reason
++
++
++def test_load_missing_manifest(outdir, manifest_path):
++    ckpt, reason = Checkpoint.load(manifest_path, outdir)
++    assert ckpt is None
++    assert "no checkpoint file" in reason
++
++
++def test_check_outdir_new(outdir, manifest_path):
++    ckpt = check_outdir(outdir, manifest_path, RUN_INPUTS, force=False)
++    assert ckpt.data["steps"] == {}
++    assert manifest_path.exists()
++
++
++def test_check_outdir_existing_unrelated_files(outdir, manifest_path):
++    # An existing output directory without Binette results can be used
++    write(outdir / "slurm.log", "log")
++    ckpt = check_outdir(outdir, manifest_path, RUN_INPUTS, force=False)
++    assert ckpt.run_inputs == RUN_INPUTS
++
++
++def test_check_outdir_same_inputs(outdir, manifest_path):
++    output = write(outdir / "out.txt", "x")
++    first = check_outdir(outdir, manifest_path, RUN_INPUTS, force=False)
++    first.record_step("step", {}, [output])
++
++    second = check_outdir(outdir, manifest_path, dict(RUN_INPUTS), force=False)
++    assert "step" in second.data["steps"]
++
++
++def test_check_outdir_different_inputs(outdir, manifest_path, caplog):
++    output = write(outdir / "out.txt", "x")
++    check_outdir(outdir, manifest_path, RUN_INPUTS, force=False).record_step(
++        "step", {}, [output]
++    )
++    other_inputs = RUN_INPUTS | {"bins": "z" * 64}
++
++    with pytest.raises(OutputDirConflictError) as exc_info:
++        check_outdir(outdir, manifest_path, other_inputs, force=False)
++    assert "input bin sets" in str(exc_info.value)
++    assert "contig sequences" not in str(exc_info.value)
++    assert "--force" in str(exc_info.value)
++
++    caplog.set_level(logging.WARNING)
++    ckpt = check_outdir(outdir, manifest_path, other_inputs, force=True)
++    assert ckpt.data["steps"] == {}
++    assert ckpt.run_inputs == other_inputs
++    assert "--force is set" in caplog.text
++
++    # The directory now belongs to the new run
++    reloaded, _ = Checkpoint.load(manifest_path, outdir)
++    assert reloaded.run_inputs == other_inputs
++
++
++@pytest.mark.parametrize(
++    "legacy_output",
++    [
++        "final_bins_quality_reports.tsv",
++        "temporary_files/diamond_result.tsv.gz",
++        "final_bins/bin1.fa",
++    ],
++)
++def test_check_outdir_legacy_results(outdir, manifest_path, legacy_output):
++    write(outdir / legacy_output, "old")
++
++    with pytest.raises(OutputDirConflictError) as exc_info:
++        check_outdir(outdir, manifest_path, RUN_INPUTS, force=False)
++    assert "cannot be verified" in str(exc_info.value)
++
++    ckpt = check_outdir(outdir, manifest_path, RUN_INPUTS, force=True)
++    assert ckpt.run_inputs == RUN_INPUTS
++
++
++def test_check_outdir_corrupted_manifest(outdir, manifest_path):
++    write(manifest_path, "{corrupted")
++
++    with pytest.raises(OutputDirConflictError) as exc_info:
++        check_outdir(outdir, manifest_path, RUN_INPUTS, force=False)
++    assert "unreadable" in str(exc_info.value)
++
++    ckpt = check_outdir(outdir, manifest_path, RUN_INPUTS, force=True)
++    assert ckpt.run_inputs == RUN_INPUTS
+diff --git a/tests/unit_tests/conftest.py b/tests/unit_tests/conftest.py
+new file mode 100644
+index 0000000..9e51cba
+--- /dev/null
++++ b/tests/unit_tests/conftest.py
+@@ -0,0 +1,35 @@
++"""Fixtures shared by several unit test modules."""
++
++from pathlib import Path
++
++import pytest
++
++
++@pytest.fixture
++def create_temp_bin_files(tmpdir):
++    # Create temporary bin files
++    bin_dir = tmpdir.mkdir("bins")
++    bin1 = bin_dir.join("bin1.fasta")
++    bin1.write(">contig1\nATGC\n>contig2\nGCTA")
++
++    bin2 = bin_dir.join("bin2.fasta")
++    bin2.write(">contig3\nTTAG\n>contig4\nCGAT")
++
++    return bin_dir
++
++
++@pytest.fixture
++def create_temp_bin_directories(tmpdir, create_temp_bin_files):
++    # Create temporary bin directories
++    bin_dir1 = tmpdir.mkdir("set1")
++    bin1 = bin_dir1.join("bin1.fasta")
++    bin1.write(">contig1\nATGC\n>contig2\nGCTA")
++
++    bin2 = bin_dir1.join("bin2.fasta")
++    bin2.write(">contig3\nTTAG\n>contig4\nCGAT")
++
++    bin_dir2 = tmpdir.mkdir("set2")
++    bin2 = bin_dir2.join("binA.fasta")
++    bin2.write(">contig3\nTTAG\n>contig4\nCGAT\n>contig5\nCGGC")
++
++    return {"set1": Path(bin_dir1), "set2": Path(bin_dir2)}
+diff --git a/tests/unit_tests/diamonds_test.py b/tests/unit_tests/diamonds_test.py
+index 53c15aa..47234a7 100644
+--- a/tests/unit_tests/diamonds_test.py
++++ b/tests/unit_tests/diamonds_test.py
+@@ -1,7 +1,5 @@
+-import logging
+ import shutil
+ import subprocess
+-import sys
+ from collections import Counter
+ from unittest.mock import patch
+ 
+@@ -129,9 +127,9 @@ def mock_shutil_which(*args, **kwargs):
+ 
+ 
+ def test_run_diamond_tool_found(monkeypatch, tmp_path):
+-    monkeypatch.setattr(
+-        sys, "exit", lambda x: None
+-    )  # Patch sys.exit to avoid test interruption
++    log_path = tmp_path / "log.txt"
++    output_file = tmp_path / "output.txt"
++    partial_output_file = tmp_path / "partial_output.txt"
+ 
+     # Mocking subprocess.run
+     def mock_subprocess_run(*args, **kwargs):
+@@ -139,17 +137,18 @@ class CompletedProcess:
+             def __init__(self, returncode):
+                 self.returncode = returncode
+ 
+-        # Simulating successful run of diamond command
+-        if (
+-            args[0]
+-            == f"diamond blastp --outfmt 6 --max-target-seqs 1 --query test.faa -o {output_file.as_posix()} --threads 1 --db db --compress 1 --query-cover 80 --subject-cover 80 --id 30 --evalue 1e-05 --block-size 2 2> {log_path.as_posix()}"
+-        ):
+-            return CompletedProcess(0)
++        # DIAMOND writes to a temporary file that is moved on success
++        expected_cmd = (
++            "diamond blastp --outfmt 6 --max-target-seqs 1 --query test.faa "
++            f"-o {partial_output_file.as_posix()} --threads 1 --db db --compress 1 "
++            "--query-cover 80 --subject-cover 80 --id 30 --evalue 1e-05 "
++            f"--block-size 2 2> {log_path.as_posix()}"
++        )
++        assert args[0] == expected_cmd
++        partial_output_file.write_text("diamond results")
++        return CompletedProcess(0)
+ 
+-    log_path = tmp_path / "log.txt"
+-    output_file = tmp_path / "output.txt"
+     monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
+-    monkeypatch.setattr(logging, "error", lambda x: None)  # Avoid logging during test
+ 
+     # Call the function
+     diamond.run(
+@@ -165,32 +164,37 @@ def __init__(self, returncode):
+         low_mem=False,
+     )
+ 
++    assert output_file.read_text() == "diamond results"
++    assert not partial_output_file.exists()
+ 
+-def test_run_diamond_tool_not_found(monkeypatch, tmp_path):
+-    # Mocking check_tool_exists to simulate tool not found scenario
+-    def mock_check_tool_exists(*args, **kwargs):
+-        raise FileNotFoundError
+-
+-    monkeypatch.setattr(logging, "error", lambda x: None)  # Avoid logging during test
+ 
++def test_run_diamond_fails(monkeypatch, tmp_path):
+     log_file = tmp_path / "log.txt"
+     output_file = tmp_path / "output.txt"
+-    # Call the function and expect it to raise FileNotFoundError
+-    with patch("sys.exit") as mock_exit:
++
++    def mock_subprocess_run(*args, **kwargs):
++        class CompletedProcess:
++            returncode = 1
++
++        # Simulate a partial output left by a failing DIAMOND run
++        (tmp_path / "partial_output.txt").write_text("truncated")
++        return CompletedProcess()
++
++    monkeypatch.setattr(subprocess, "run", mock_subprocess_run)
++    monkeypatch.setattr(diamond, "check_tool_exists", lambda tool: None)
++
++    with pytest.raises(SystemExit) as exc_info:
+         diamond.run(
+             "test.faa",
+             output_file.as_posix(),
+             "db",
+             log_file.as_posix(),
+             threads=1,
+-            query_cover=80,
+-            subject_cover=80,
+-            percent_id=30,
+-            evalue=1e-05,
+-            low_mem=False,
+         )
+ 
+-    mock_exit.assert_called_once_with(1)
++    assert exc_info.value.code == 1
++    # A failed run never produces the final result file
++    assert not output_file.exists()
+ 
+ 
+ def test_get_contig_to_kegg_id():
+diff --git a/tests/unit_tests/io_manager_test.py b/tests/unit_tests/io_manager_test.py
+index a229956..002cfb1 100644
+--- a/tests/unit_tests/io_manager_test.py
++++ b/tests/unit_tests/io_manager_test.py
+@@ -279,42 +279,48 @@ def test_check_contig_consistency_no_error():
+     )
+ 
+ 
+-@pytest.fixture
+-def temp_files(tmp_path):
+-    # Create temporary files for testing
+-    faa_file = tmp_path / "test_protein.faa"
+-    diamond_result_file = tmp_path / "test_diamond_result.txt"
+-    faa_file.touch()
+-    diamond_result_file.touch()
+-    yield str(faa_file), str(diamond_result_file)
+-
+-
+-def test_check_resume_file_exists(temp_files, caplog):
+-    # Test when both files exist
+-    faa_file, diamond_result_file = temp_files
+-    io_manager.check_resume_file(Path(faa_file), Path(diamond_result_file))
+-    assert "Protein file" not in caplog.text
+-    assert "Diamond result file" not in caplog.text
+-
+-
+-def test_check_resume_file_missing_faa(temp_files, caplog):
+-    # Test when faa_file is missing
+-    _, diamond_result_file = temp_files
+-    with pytest.raises(FileNotFoundError):
+-        io_manager.check_resume_file(Path("nonexistent.faa"), Path(diamond_result_file))
+-    assert "Protein file" in caplog.text
+-    assert "Diamond result file" not in caplog.text
+-
+-
+-def test_check_resume_file_missing_diamond(temp_files, caplog):
+-    # Test when diamond_result_file is missing
+-    faa_file, _ = temp_files
+-    with pytest.raises(FileNotFoundError):
+-        io_manager.check_resume_file(
+-            Path(faa_file), Path("nonexistent_diamond_result.txt")
+-        )
+-    assert "Protein file" not in caplog.text
+-    assert "Diamond result file" in caplog.text
++@pytest.mark.parametrize("filename", ["coding_length.tsv", "coding_length.tsv.gz"])
++def test_write_and_read_contig_coding_length(tmp_path, filename):
++    output = tmp_path / filename
++    contig_to_coding_length = {"contig1": 120, "contig_2": 0, "contig3": None}
++
++    io_manager.write_contig_coding_length(contig_to_coding_length, output)
++
++    assert output.exists()
++    assert not (tmp_path / f"partial_{filename}").exists()
++    assert io_manager.read_contig_coding_length(output) == contig_to_coding_length
++
++
++def test_write_contig_coding_length_casts_float_to_int(tmp_path):
++    output = tmp_path / "coding_length.tsv"
++    io_manager.write_contig_coding_length({"contig1": 120.0}, output)
++    assert output.read_text() == "contig1\t120\n"
++
++
++def test_clear_previous_outputs(tmp_path):
++    final_bins_dir = tmp_path / "final_bins"
++    report_dir = tmp_path / "input_bins_quality_reports"
++    final_bins_dir.mkdir()
++    report_dir.mkdir()
++
++    old_bin = final_bins_dir / "old_prefix_bin1.fa"
++    old_report = report_dir / "input_bins_1.A.tsv"
++    unrelated_file = final_bins_dir / "notes.txt"
++    for path in (old_bin, old_report, unrelated_file):
++        path.write_text("x")
++
++    io_manager.clear_previous_outputs(final_bins_dir, report_dir)
++
++    assert not old_bin.exists()
++    assert not old_report.exists()
++    assert unrelated_file.exists()
++
++
++def test_clear_previous_outputs_missing_dirs(tmp_path):
++    # Nothing to clear on a fresh output directory
++    io_manager.clear_previous_outputs(
++        tmp_path / "final_bins", tmp_path / "input_bins_quality_reports"
++    )
+ 
+ 
+ def test_write_original_bin_metrics(bin1, bin2, tmp_path):
+@@ -339,3 +345,30 @@ def test_write_original_bin_metrics(bin1, bin2, tmp_path):
+ 
+     for file in expected_files:
+         assert file.exists(), f"Expected file {file} was not created."
++
++
++def test_read_contig2bin_table(tmp_path):
++    table = tmp_path / "final_contig_to_bin.tsv"
++    table.write_text("contig1\tbin1\ncontig2\tbin1\ncontig3\tbin2\n")
++    assert io_manager.read_contig2bin_table(table) == {
++        "contig1": "bin1",
++        "contig2": "bin1",
++        "contig3": "bin2",
++    }
++
++
++def test_write_bins_fasta_from_contig_to_bin(tmp_path):
++    contigs_fasta = tmp_path / "contigs.fasta"
++    contigs_fasta.write_text(">contig1\nAAAA\n>contig2\nCCCC\n>contig3\nGGGG\n")
++    outdir = tmp_path / "final_bins"
++    outdir.mkdir()
++    (outdir / "bin1.fa").write_text(">stale\nTTTT\n")
++
++    io_manager.write_bins_fasta_from_contig_to_bin(
++        {"contig1": "bin1", "contig3": "bin1", "contig2": "bin2"},
++        contigs_fasta,
++        outdir,
++    )
++
++    assert (outdir / "bin1.fa").read_text() == ">contig1\nAAAA\n>contig3\nGGGG\n"
++    assert (outdir / "bin2.fa").read_text() == ">contig2\nCCCC\n"
+diff --git a/tests/unit_tests/main_binette_test.py b/tests/unit_tests/main_binette_test.py
+index f917ea8..6cbbd3b 100644
+--- a/tests/unit_tests/main_binette_test.py
++++ b/tests/unit_tests/main_binette_test.py
+@@ -1,6 +1,4 @@
+ import logging
+-import os
+-import sys
+ from collections import Counter
+ from pathlib import Path
+ from unittest.mock import patch
+@@ -8,16 +6,16 @@
+ import pytest
+ from pyroaring import BitMap
+ 
++from binette import checkpoint
+ from binette.bin_manager import Bin
+ from binette.main import (
++    can_reuse_step,
++    diamond_result_parameters,
++    get_diamond_hits,
++    get_proteins,
+     log_selected_bin_info,
+-    main,
+-    manage_protein_alignement,
+     parse_input_files,
+-)
+-from tests.unit_tests.bin_manager_test import (  # noqa: F401
+-    create_temp_bin_directories,
+-    create_temp_bin_files,
++    resolve_checkm2_db,
+ )
+ 
+ 
+@@ -65,53 +63,111 @@ def test_log_selected_bin_info(caplog, bins):
+     assert expected_logs in caplog.text
+ 
+ 
+-def test_manage_protein_alignement_resume(tmp_path):
+-    # Create temporary directories and files for testing
+-
+-    faa_file = tmp_path / "proteins.faa"
+-    faa_file_content = (
+-        ">contig1_1\nMCGT\n>contig2_1\nTGCA\n>contig2_2\nAAAA\n>contig3_1\nCCCC\n"
+-    )
++FAA_CONTENT = ">contig1_1\nMLKPACGT\n>contig2_1\nMMMKPTGCA\n>contig2_2\nMMMAAAA\n>contig3_1\nMLPALP\n"
++CONTIGS_IN_BINS = {"contig1", "contig2", "contig3"}
+ 
+-    faa_file.write_text(faa_file_content)
+ 
+-    contig_to_kegg_id = {
+-        "contig1": Counter({"K12345": 1, "K67890": 1}),
+-        "contig2": Counter({"K23456": 1}),
+-    }
++@pytest.fixture
++def contigs_fasta(tmp_path):
++    fasta = tmp_path / "contigs.fasta"
++    fasta.write_text(">contig1\nACGT\n>contig2\nACGT\n>contig3\nACGT\n")
++    return fasta
+ 
+-    with patch("binette.diamond.get_contig_to_kegg_id", return_value=contig_to_kegg_id):
+-        # Call the function
+ 
+-        # Run the function with test data
+-        contig_to_kegg_counter, contig_to_genes, _ = manage_protein_alignement(
+-            faa_file=Path(faa_file),
+-            contigs_fasta=Path("contigs_fasta"),
+-            contigs_in_bins=set(("contig1", "contig2", "contig3")),
+-            diamond_result_file=Path("diamond_result_file"),
+-            checkm2_db=None,
++def test_get_proteins_reuse_predicted(tmp_path, contigs_fasta):
++    faa_file = tmp_path / "proteins.faa"
++    faa_file.write_text(FAA_CONTENT)
++    coding_length_file = tmp_path / "coding_length.tsv"
++    coding_length_file.write_text("contig1\t3\ncontig2\t4\ncontig3\t2\n")
++
++    with patch("binette.cds.predict") as mock_predict:
++        contig_to_genes, contig_to_coding_len, outputs = get_proteins(
++            faa_file=faa_file,
++            coding_length_file=coding_length_file,
++            contigs_fasta=contigs_fasta,
++            contigs_in_bins=CONTIGS_IN_BINS,
++            proteins=None,
+             threads=1,
+-            use_existing_protein_file=True,
+-            resume_diamond=True,
+-            low_mem=False,
++            reuse=True,
+         )
++        mock_predict.assert_not_called()
+ 
+-    # Assertions to check the function output or file existence
+-    assert isinstance(contig_to_genes, dict)
+-    assert isinstance(contig_to_kegg_counter, dict)
+     assert len(contig_to_genes) == 3
++    assert contig_to_genes["contig2"] == ["MMMKPTGCA", "MMMAAAA"]
++    assert contig_to_coding_len == {"contig1": 3, "contig2": 4, "contig3": 2}
++    assert outputs == [faa_file, coding_length_file]
+ 
+ 
+-def test_manage_protein_alignement_not_resume(tmpdir, tmp_path):
+-    # Create temporary directories and files for testing
+-
++def test_get_proteins_reuse_user_proteins(tmp_path, contigs_fasta):
+     faa_file = tmp_path / "proteins.faa"
+-    faa_file_content = ">contig1_1\nMLKPACGT\n>contig2_1\nMMMKPTGCA\n>contig2_2\nMMMAAAA\n>contig3_1\nMLPALP\n"
++    faa_file.write_text(FAA_CONTENT)
++
++    with patch("binette.cds.filter_faa_file") as mock_filter:
++        contig_to_genes, contig_to_coding_len, outputs = get_proteins(
++            faa_file=faa_file,
++            coding_length_file=tmp_path / "coding_length.tsv",
++            contigs_fasta=contigs_fasta,
++            contigs_in_bins=CONTIGS_IN_BINS,
++            proteins=tmp_path / "user_proteins.faa",
++            threads=1,
++            reuse=True,
++        )
++        mock_filter.assert_not_called()
+ 
+-    faa_file.write_text(faa_file_content)
++    assert len(contig_to_genes) == 3
++    assert contig_to_coding_len is None
++    assert outputs == [faa_file]
++
++
++def test_get_proteins_from_user_proteins(tmp_path, contigs_fasta):
++    user_proteins = tmp_path / "user_proteins.faa"
++    user_proteins.write_text(FAA_CONTENT + ">contig_not_in_bins_1\nMMMM\n")
++    faa_file = tmp_path / "filtered_proteins.faa"
++
++    contig_to_genes, contig_to_coding_len, outputs = get_proteins(
++        faa_file=faa_file,
++        coding_length_file=tmp_path / "coding_length.tsv",
++        contigs_fasta=contigs_fasta,
++        contigs_in_bins=CONTIGS_IN_BINS,
++        proteins=user_proteins,
++        threads=1,
++        reuse=False,
++    )
+ 
+-    contigs_fasta = os.path.join(str(tmpdir), "contigs.fasta")
+-    diamond_result_file = os.path.join(str(tmpdir), "diamond_results.tsv")
++    assert set(contig_to_genes) == CONTIGS_IN_BINS
++    assert contig_to_coding_len is None
++    assert outputs == [faa_file]
++    assert "contig_not_in_bins" not in faa_file.read_text()
++
++
++def test_get_proteins_predict(tmp_path, contigs_fasta):
++    faa_file = tmp_path / "proteins.faa.gz"
++    coding_length_file = tmp_path / "coding_length.tsv"
++
++    with patch("binette.cds.predict") as mock_predict:
++        mock_predict.return_value = ({"contig1": ["MLK"]}, {"contig1": 9.0})
++        contig_to_genes, contig_to_coding_len, outputs = get_proteins(
++            faa_file=faa_file,
++            coding_length_file=coding_length_file,
++            contigs_fasta=contigs_fasta,
++            contigs_in_bins={"contig1"},
++            proteins=None,
++            threads=2,
++            reuse=False,
++        )
++        mock_predict.assert_called_once()
++
++    assert contig_to_genes == {"contig1": ["MLK"]}
++    assert contig_to_coding_len == {"contig1": 9.0}
++    assert outputs == [faa_file, coding_length_file]
++    assert coding_length_file.read_text() == "contig1\t9\n"
++
++
++@pytest.mark.parametrize("reuse", [True, False])
++def test_get_diamond_hits(tmp_path, contigs_fasta, reuse):
++    faa_file = tmp_path / "proteins.faa"
++    diamond_result_file = tmp_path / "diamond_result.tsv.gz"
++    db = tmp_path / "db.dmnd"
+ 
+     contig_to_kegg_id = {
+         "contig1": Counter({"K12345": 1, "K67890": 1}),
+@@ -119,27 +175,85 @@ def test_manage_protein_alignement_not_resume(tmpdir, tmp_path):
+     }
+ 
+     with (
+-        patch("binette.diamond.get_contig_to_kegg_id", return_value=contig_to_kegg_id),
+-        patch("binette.diamond.run", return_value=None),
++        patch(
++            "binette.diamond.get_contig_to_kegg_id", return_value=contig_to_kegg_id
++        ) as mock_parse,
++        patch("binette.diamond.run") as mock_run,
++    ):
++        result = get_diamond_hits(
++            faa_file=faa_file,
++            contigs_fasta=contigs_fasta,
++            contigs_in_bins=CONTIGS_IN_BINS,
++            diamond_result_file=diamond_result_file,
++            diamond_db_path=db,
++            threads=3,
++            low_mem=True,
++            reuse=reuse,
++        )
++
++    assert result == contig_to_kegg_id
++    mock_parse.assert_called_once_with(diamond_result_file.as_posix())
++    if reuse:
++        mock_run.assert_not_called()
++    else:
++        mock_run.assert_called_once_with(
++            faa_file.as_posix(),
++            diamond_result_file.as_posix(),
++            db.as_posix(),
++            (tmp_path / "diamond_result.log").as_posix(),
++            3,
++            low_mem=True,
++        )
++
++
++def test_get_diamond_hits_inconsistent_contigs(tmp_path, contigs_fasta):
++    with (
++        patch(
++            "binette.diamond.get_contig_to_kegg_id",
++            return_value={"unknown_contig": Counter({"K1": 1})},
++        ),
++        pytest.raises(AssertionError),
+     ):
+-        # Call the function
+-
+-        contig_to_kegg_counter, contig_to_genes, _ = manage_protein_alignement(
+-            faa_file=Path(faa_file),
+-            contigs_fasta=Path(contigs_fasta),
+-            contigs_in_bins=set(("contig1", "contig2", "contig3")),
+-            diamond_result_file=Path(diamond_result_file),
+-            checkm2_db=None,
++        get_diamond_hits(
++            faa_file=tmp_path / "proteins.faa",
++            contigs_fasta=contigs_fasta,
++            contigs_in_bins=CONTIGS_IN_BINS,
++            diamond_result_file=tmp_path / "diamond_result.tsv.gz",
++            diamond_db_path=tmp_path / "db.dmnd",
+             threads=1,
+-            use_existing_protein_file=True,
+-            resume_diamond=True,
+             low_mem=False,
++            reuse=True,
+         )
+ 
+-    # Assertions to check the function output or file existence
+-    assert isinstance(contig_to_genes, dict)
+-    assert isinstance(contig_to_kegg_counter, dict)
+-    assert len(contig_to_genes) == 3
++
++def test_resolve_checkm2_db(tmp_path):
++    db = tmp_path / "db.dmnd"
++    db.write_text("db")
++    assert resolve_checkm2_db(db) == db
++
++    with pytest.raises(FileNotFoundError):
++        resolve_checkm2_db(tmp_path / "missing.dmnd")
++
++    with patch("binette.diamond.get_checkm2_db", return_value="/some/db.dmnd"):
++        assert resolve_checkm2_db(None) == Path("/some/db.dmnd")
++
++
++def test_can_reuse_step(tmp_path, caplog):
++    caplog.set_level(logging.INFO)
++    output = tmp_path / "out.txt"
++    output.write_text("result")
++    ckpt = checkpoint.Checkpoint.new(tmp_path / "checkpoint.json", tmp_path, {})
++    ckpt.record_step("step", {"a": 1}, [output])
++
++    assert can_reuse_step(ckpt, "step", {"a": 1}, True, "step results")
++    assert "Resuming: reusing step results" in caplog.text
++
++    assert not can_reuse_step(ckpt, "step", {"a": 1}, False, "step results")
++
++    assert not can_reuse_step(ckpt, "step", {"a": 2}, True, "step results")
++    assert "inputs changed since previous run (a)" in caplog.text
++
++    assert not can_reuse_step(ckpt, "other_step", {"a": 1}, True, "other results")
+ 
+ 
+ def test_parse_input_files_with_contig2bin_tables(tmp_path):
+@@ -158,6 +272,7 @@ def test_parse_input_files_with_contig2bin_tables(tmp_path):
+         contigs_in_bins,
+         contig_id_to_length,
+         contig_to_index,
++        input_fingerprints,
+     ) = parse_input_files(None, [bin_set1, bin_set2], fasta_file, tmp_path)
+ 
+     # # Perform assertions on the returned values
+@@ -168,6 +283,47 @@ def test_parse_input_files_with_contig2bin_tables(tmp_path):
+     assert len(contig_key_to_bin) == 4
+     assert set(contigs_in_bins) == {"contig1", "contig2", "contig3", "contig4"}
+     assert len(contig_id_to_length) == 4
++    assert set(input_fingerprints) == {"contigs", "bins"}
++
++
++def test_parse_input_files_fingerprints(tmp_path):
++    fasta_file = tmp_path / "assembly.fasta"
++    fasta_file.write_text(">contig1\nACGT\n>contig2\nTGCA\n>contig3\nAAAA\n")
++    bin_table = tmp_path / "bin_set1.tsv"
++
++    def fingerprints(table_content, fasta_content=None):
++        bin_table.write_text(table_content)
++        if fasta_content is not None:
++            fasta_file.write_text(fasta_content)
++        return parse_input_files(None, [bin_table], fasta_file)[-1]
++
++    reference = fingerprints("contig1\tbinA\ncontig2\tbinB\n")
++
++    # Same input gives the same fingerprints
++    assert fingerprints("contig1\tbinA\ncontig2\tbinB\n") == reference
++
++    # Same contigs, different bin membership: only bins fingerprint changes
++    moved = fingerprints("contig1\tbinA\ncontig2\tbinA\n")
++    assert moved["contigs"] == reference["contigs"]
++    assert moved["bins"] != reference["bins"]
++
++    # Different set of contigs in bins
++    assert (
++        fingerprints("contig1\tbinA\ncontig3\tbinB\n")["contigs"]
++        != (reference["contigs"])
++    )
++
++    # Same names, modified sequence
++    modified = fingerprints(
++        "contig1\tbinA\ncontig2\tbinB\n", ">contig1\nACGT\n>contig2\nTGCC\n"
++    )
++    assert modified["contigs"] != reference["contigs"]
++
++    # Contig order in the FASTA file does not matter
++    reordered = fingerprints(
++        "contig1\tbinA\ncontig2\tbinB\n", ">contig2\nTGCA\n>contig1\nACGT\n"
++    )
++    assert reordered == reference
+ 
+ 
+ def test_parse_input_files_with_contig2bin_tables_with_unknown_contig(tmp_path):
+@@ -198,6 +354,7 @@ def test_parse_input_files_bin_dirs(create_temp_bin_directories, tmp_path):
+         contigs_in_bins,
+         contig_id_to_length,
+         contig_to_index,
++        input_fingerprints,
+     ) = parse_input_files(bin_dirs, contig2bin_tables, fasta_file)
+ 
+     # # Perform assertions on the returned values
+@@ -216,86 +373,13 @@ def test_parse_input_files_bin_dirs(create_temp_bin_directories, tmp_path):
+     assert len(contig_id_to_length) == 5
+ 
+ 
+-# @patch('diamond.run')
+-def test_manage_protein_alignment_no_resume(tmp_path):
+-    # Set up the input parameters
+-    faa_file = Path("test.faa")
+-    contigs_fasta = Path("test.fasta")
+-    contigs_in_bins = {"bin1": ["contig1"]}
+-    diamond_result_file = Path("test_diamond_result.txt")
+-    checkm2_db = tmp_path / "checkm2_db"
+-    with open(checkm2_db, "w"):
+-        pass
+-    threads = 4
+-    resume = False
+-    low_mem = False
+-
+-    # Mock the necessary functions
+-    with (
+-        patch("pyfastx.Fastx") as mock_pyfastx_Fastx,
+-        patch("binette.cds.predict") as mock_predict,
+-        patch("binette.diamond.get_checkm2_db"),
+-        patch("binette.diamond.run") as mock_diamond_run,
+-        patch(
+-            "binette.diamond.get_contig_to_kegg_id"
+-        ) as mock_diamond_get_contig_to_kegg_id,
+-    ):
+-        # Set the return value of the mocked functions
+-        mock_pyfastx_Fastx.return_value = [("contig1", "ATCG")]
+-        mock_predict.return_value = (
+-            {
+-                "contig1": ["gene1"],
+-            },
+-            {"contig1": 50},
+-        )
+-
+-        # Call the function
+-        contig_to_kegg_counter, contig_to_genes, _ = manage_protein_alignement(
+-            faa_file,
+-            contigs_fasta,
+-            contigs_in_bins,
+-            diamond_result_file,
+-            checkm2_db,
+-            threads,
+-            resume,
+-            resume,
+-            low_mem,
+-        )
+-
+-        # Assertions to check if functions were called
+-        mock_pyfastx_Fastx.assert_called_once()
+-        mock_predict.assert_called_once()
+-        mock_diamond_get_contig_to_kegg_id.assert_called_once()
+-        mock_diamond_run.assert_called_once_with(
+-            faa_file.as_posix(),
+-            diamond_result_file.as_posix(),
+-            checkm2_db.as_posix(),
+-            f"{os.path.splitext(diamond_result_file.as_posix())[0]}.log",
+-            threads,
+-            low_mem=low_mem,
+-        )
+-
++def test_diamond_result_parameters_include_block_size():
++    default = diamond_result_parameters(low_mem=False)
++    low_mem = diamond_result_parameters(low_mem=True)
+ 
+-def test_main_resume_when_not_possible(monkeypatch, test_environment, tmp_path):
+-    # Define or mock the necessary inputs/arguments
+-    folder1, folder2, contigs_file = test_environment
+-
+-    outdir = tmp_path / "results"
+-    # Mock sys.argv to use test_args
+-    test_args = [
+-        "-d",
+-        str(folder1),
+-        str(folder2),
+-        "-c",
+-        str(contigs_file),
+-        # ... more arguments as required ...
+-        "--debug",
+-        "--resume",
+-        "-o",
+-        outdir.as_posix(),
+-    ]
+-    monkeypatch.setattr(sys, "argv", ["your_script.py"] + test_args)
+-
+-    # Call the main function
+-    with pytest.raises(FileNotFoundError):
+-        main()
++    assert default["block_size"] == 2
++    assert low_mem["block_size"] == 0.5
++    assert {k: v for k, v in default.items() if k != "block_size"} == {
++        k: v for k, v in low_mem.items() if k != "block_size"
++    }
++    assert {"query_cover", "subject_cover", "percent_id", "evalue"} <= set(default)

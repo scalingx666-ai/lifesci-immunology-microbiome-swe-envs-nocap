@@ -1,0 +1,675 @@
+diff --git a/extras/lyrebird_metapackage_creation/envs/create_metapackage.yml b/extras/lyrebird_metapackage_creation/envs/create_metapackage.yml
+index b0528ef1..43d64b5b 100644
+--- a/extras/lyrebird_metapackage_creation/envs/create_metapackage.yml
++++ b/extras/lyrebird_metapackage_creation/envs/create_metapackage.yml
+@@ -6,6 +6,7 @@ channels:
+ dependencies:
+   - python>=3.7
+   - snakemake>=6.0.5
++  - snakemake-executor-plugin-cluster-generic
+   - numpy
+   - pandas
+   - biopython
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/Snakefile b/extras/lyrebird_metapackage_creation/prepare_genomes/Snakefile
+new file mode 100644
+index 00000000..1abff2ad
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/Snakefile
+@@ -0,0 +1,198 @@
++"""
++Steps:
++1. Create base environment:
++    conda env create -f ../envs/create_metapackage.yml -n lyrebird-metapackage
++2. Install vcontact3 and download the latest vcontact3 database
++    conda env create -f /envs/vcontact3.yml -n vcontact3
++    conda activate vcontact3
++    vcontact3 prepare_databases --get-version 230 --set-location ./db (or use --get-version latest)
++3. Update the variables vcontact_env and vcontact_db_path below with your conda environment name and database path
++4. Download metaVR metadata and genomes, and update the variables (this is a >77GB download, ensure you have enough space)
++    wget https://www.meta-virome.org/DownloadUvigMetadata
++    wget https://www.meta-virome.org/DownloadUvigFasta
++5. Run the Snakefile:
++    conda activate lyrebird-metapackage
++    snakemake --use-conda --conda-frontend mamba --cores 64 --profile aqua --directory <output_directory> --conda-prefix <path_to_conda_envs>  
++"""
++import os
++from Bio import SeqIO
++
++vcontact_env = "" # Specify your pre-installed vcontact3 conda environment
++vcontact_db_path = "" # Specify your downloaded vcontact3 database path
++metavr_metadata_fp = "/mnt/hpccs01/work/microbiome/msingle/rossenzhao/metaVR/uvig_metadata.tsv.gz" # Specify your downloaded metaVR metadata file path
++metavr_genomes_fp = "/mnt/hpccs01/work/microbiome/msingle/rossenzhao/metaVR/IMGVR5_UViG.fna.gz" # Specify your downloaded metaVR genomes file path
++
++localrules: order_genomes_fps, process_taxonomy
++
++rule all:
++    input:
++        "prodigal_gv.done",
++        # "vcontact3.done",
++        #TODO: fill in final output files
++
++rule get_ictv_genomes:
++    params:
++        url = 'https://ictv.global/vmr/current'
++    output:
++        done = touch("ictv/done"),
++        outdir = directory("ictv")
++    log:
++        "logs/get_ictv_genomes.log"
++    resources:
++        mem_mb = 20 * 1024,
++    conda:
++        "envs/ictv-download.yml"
++    shell:
++        "python {workflow.basedir}/scripts/ictv-download.py --url {params.url} --outdir {output.outdir} &> {log}"
++
++rule get_metavr_genomes:
++    input:
++        metadata_fp = metavr_metadata_fp,
++        genomes_fp = metavr_genomes_fp,
++    output:
++        done = touch("metavr/done"),
++        outdir = directory("metavr")
++    log:
++        "logs/get_metavr_genomes.log"
++    resources:
++        mem_mb = 128 * 1024,
++    conda:
++        "envs/ictv-download.yml"
++    shell:
++        "python {workflow.basedir}/scripts/metavr-download.py "\
++        "--metadata-file {input.metadata_fp} " \
++        "--genome-file {input.genomes_fp} " \
++        "--outdir {output.outdir} &> {log}"
++
++rule order_genomes_fps:
++    input:
++        ictv_done = "ictv/done",
++        ictv_dir = "ictv",
++        metavr_done = "metavr/done",
++        metavr_dir = "metavr"
++    params:
++        ictv_metadata = "ictv/genome_metadata.tsv",
++        metavr_metadata = "metavr/metavr_filtered_metadata.tsv"
++    output:
++        done = touch("ordered_genomes.done"),
++        ordered_filepaths = "ordered_genome_filepaths.txt"
++    run:
++        from os.path import join
++        from csv import DictReader
++        # order ictv first, then metavr by length descending
++        ictv_fps = []
++        with open(params.ictv_metadata, 'r') as infile:
++            reader = DictReader(infile, delimiter='\t')
++            for row in reader:
++                genome_fp = join(input.ictv_dir, "genomes", f"{row['genome']}.fna")
++                ictv_fps.append( (int(row['length']), genome_fp) )
++        metavr_fps = []
++        with open(params.metavr_metadata, 'r') as infile:
++            reader = DictReader(infile, delimiter='\t')
++            for row in reader:
++                genome_fp = join(input.metavr_dir, "genomes", f"{row['uvig']}.fna")
++                metavr_fps.append( (int(row['length']), genome_fp) )
++        # sort by length descending
++        ictv_fps.sort(key=lambda x: x[0], reverse=True)
++        metavr_fps.sort(key=lambda x: x[0], reverse=True)
++        with open(output.ordered_filepaths, 'w') as outfile:
++            for _, fp in ictv_fps:
++                outfile.write(f"{fp}\n")
++            for _, fp in metavr_fps:
++                outfile.write(f"{fp}\n")
++
++rule galah_cluster:
++    input:
++        genome_filepaths = "ordered_genome_filepaths.txt",
++        ordered_genomes_done = "ordered_genomes.done"
++    output:
++        done = touch("galah_clustering.done"),
++        cluster_rep_tsv = "galah_cluster_representatives.tsv",
++        cluster_dir = directory("galah_clusters")
++    log:
++        "logs/galah_clustering.log"
++    threads: 64
++    resources:
++        mem_mb = 256 * 1024,
++    conda:
++        "envs/galah.yml"
++    shell: # use finch preclustering for speed
++        "galah cluster --genome-fasta-list {input.genome_filepaths} --threads {threads} "\
++        "--ani 95 --min-aligned-fraction 85 --fragment-length 500 "\
++        "--precluster-method finch --precluster-ani 95 "\
++        "--output-cluster-definition {output.cluster_rep_tsv} "\
++        "--output-representative-fasta-directory {output.cluster_dir} "\
++        "-v &> {log}"
++
++rule prodigal_gv:
++    input:
++        cluster_dir = "galah_clusters"
++    params:
++        log_dir = "logs/prodigal_gv"
++    output:
++        done = touch("prodigal_gv.done"),
++        transcripts_dir = directory("prodigal_transcripts"),
++        proteins_dir = directory("prodigal_proteins")
++    threads: 64
++    resources:
++        mem_mb = 500 * 1024,
++    conda:
++        "envs/prodigal-gv.yml"
++    shell: # use GNU parallel to speed this up
++        "mkdir -p {params.log_dir} ; " \
++        "mkdir -p {output.transcripts_dir} ; " \
++        "mkdir -p {output.proteins_dir} ; " \
++        "find {input.cluster_dir} -name '*.fasta' | " \
++        "parallel -j {threads} --will-cite -- 'prodigal-gv -i {{}} -a {output.proteins_dir}/{{/}}_protein.faa -d {output.transcripts_dir}/{{/}}_transcript.fna -p meta &> {params.log_dir}/{{/}}.log'" \
++
++rule prepare_for_vcontact3:
++    input:
++        galah_dir = "galah_clusters",
++        galah_done = "galah_clustering.done",
++    output:
++        done = touch("vcontact3_prepared.done"),
++        concat_genomes = "vcontact3_concat_genomes.fna",
++    shell: # there are many files, so use cat with find
++        "find {input.galah_dir} -name '*.fna' -exec cat {{}} + > {output.concat_genomes}"
++
++rule vcontact3:
++    input:
++        genomes_fna = "vcontact3_concat_genomes.fna",
++        vcontact_prep_done = "vcontact3_prepared.done"
++    params:
++        vcontact3_db = vcontact_db_path
++    output:
++        done = touch("vcontact3.done"),
++        vcontact_output_dir = directory("vcontact3_output")
++    threads: 64
++    resources:
++        mem_mb = 500 * 1024,
++    log:
++        "logs/vcontact3.log"
++    conda:
++        vcontact_env
++    shell:
++        "vcontact3 run -n {input.genomes_fna} "\
++        "-d {params.vcontact3_db} "\
++        "-t {threads} "\
++        "-o {output.vcontact_output_dir} "\
++        "--pyrodigal-gv "\
++        "&> {log}"
++
++rule process_taxonomy: #TODO: script for processing vcontact3 taxonomy
++    input:
++        vcontact_output_dir = "vcontact3_output",
++        vcontact_done = "vcontact3.done"
++    params:
++        ictv_metadata = "ictv/genome_metadata.tsv",
++        metavr_metadata = "metavr/metavr_filtered_metadata.tsv"
++    output:
++        done = touch("vcontact3_taxonomy_processed.done"),
++        taxonomy_tsv = "final_reconstructed_metadata.tsv"
++    resources:
++        mem_mb = 12 * 1024,
++    log:
++        "logs/process_vcontact3_taxonomy.log"
++    script:
++        "{workflow.basedir}/scripts/process_vcontact3_taxonomy.py"
++
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/envs/galah.yml b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/galah.yml
+new file mode 100644
+index 00000000..a1cf3c55
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/galah.yml
+@@ -0,0 +1,7 @@
++name: galah
++channels:
++  - conda-forge
++  - bioconda
++  - defaults
++dependencies:
++  - galah=0.4.2
+\ No newline at end of file
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/envs/ictv-download.yml b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/ictv-download.yml
+new file mode 100644
+index 00000000..c216af73
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/ictv-download.yml
+@@ -0,0 +1,11 @@
++name: ictv-download
++channels:
++  - conda-forge
++  - bioconda
++  - defaults
++dependencies:
++  - python >=3.7
++  - polars >= 1.0
++  - entrez-direct >= 24.0
++  - extern
++  - fastexcel
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/envs/prodigal-gv.yml b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/prodigal-gv.yml
+new file mode 100644
+index 00000000..5d0f859b
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/prodigal-gv.yml
+@@ -0,0 +1,8 @@
++name: prodigal-gv
++channels:
++  - bioconda
++  - conda-forge
++  - defaults
++dependencies:
++  - prodigal-gv >= 2.11
++  - parallel >= 20210822
+\ No newline at end of file
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/envs/vcontact3.yml b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/vcontact3.yml
+new file mode 100644
+index 00000000..4d07f12b
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/envs/vcontact3.yml
+@@ -0,0 +1,8 @@
++name: vcontact3
++channels:
++  - bioconda
++  - conda-forge
++  - defaults
++dependencies:
++  - python = 3.10
++  - vcontact3 >= 3.1.5
+\ No newline at end of file
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/ictv-download.py b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/ictv-download.py
+new file mode 100644
+index 00000000..0d10ee50
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/ictv-download.py
+@@ -0,0 +1,166 @@
++import polars as pl
++import argparse
++import logging
++import os
++import extern
++
++### taboos and known typos stolen from https://github.com/christopher-riccardi/ICTVdump
++taboo = {'JAEILC010000038', 
++        'GECV01031551', 
++        'AE006468', 
++        'CP015418', 
++        'CP000031', 
++        'CP000830', 
++        'CP001312', 
++        'CP001357', 
++        'BX897699', 
++        'AUXO01792325', 
++        'OQ735257', 
++        'QQ198719', 
++        'QQ198717', 
++        'QQ198718',
++        'OQ7219011',
++        'QNQ73380',
++        'QMP84020',
++        'QJT73696',
++        'QJT73701',
++        'QJT73698',
++        'SRR2729873', 
++        'AUXO017923253', 
++        'K03573', 
++        'C978956',
++        'AF181082',
++        'D01221',
++        'MT29357',
++        'N5326222'} # known invalid accessions
++
++known_typos = {'HQHQ847905':'HQ847905', 
++               'EU7257772':'EU725772', 
++               'LCM141331':'KX884774', 
++               'SKR870013':'KR870013', 
++               'AF4362513':'AF362513', 
++               'JX4782635':'JX478263',
++               'NC010308':'NC_010308',
++               'NC021720':'NC_021720',
++               'NC035620':'NC_035620',
++               'NC028131':'NC_028131',
++               'NC027432':'NC_027432',
++               'NC012805':'NC_012805',
++               'NC012127':'NC_012127'
++               } # known typos due to manual annotation, we salvage those by replacing with a list containing the polished accessions
++
++def parse_arguments():
++    parser = argparse.ArgumentParser(description="Download and process ICTV phage genomes.")
++    parser.add_argument("-u", "--url", default='https://ictv.global/vmr/current', help="URL to desired VMR version. Default: https://ictv.global/vmr/current")
++    parser.add_argument("-o", "--outdir", type=str, required=True, help="Output directory for the processed genomes.")
++    return parser.parse_args()
++
++logging.basicConfig(level=logging.INFO, 
++                    format='%(asctime)s - %(levelname)s - %(message)s', 
++                    datefmt='%Y-%m-%d %H:%M:%S')
++
++def download_vmr_data(url, outfile):
++    logging.info(f"Downloading VMR data from {url}")
++    cmd = f"wget {url} --no-check-certificate -O {outfile}"
++    extern.run(cmd)
++    if not os.path.isfile(outfile):
++        logging.error("Failed to download VMR data.")
++        raise FileNotFoundError(f"File {outfile} not found after download.")
++    logging.info(f"VMR data downloaded to {outfile}")
++
++def read_and_fetch_phage_accessions(vmr_file):
++    logging.info("Reading VMR data and fetching phage accessions.")
++    xls = pl.read_excel(vmr_file, sheet_id=0)
++    vmr_sheet = next((s for s in xls.keys() if 'VMR' in s), None)
++    if vmr_sheet is None:
++        logging.error("No VMR sheet found in the Excel file.")
++        raise ValueError("No VMR sheet found in the Excel file.")
++    vmr_df = xls[vmr_sheet]
++    logging.info("Reading sheet name: " + vmr_sheet)
++    vmr_df = vmr_df.filter(pl.col('Host source').str.contains_any(['bacteria', 'archaea'], ascii_case_insensitive=True))
++    vmr_df = vmr_df.filter(pl.col('Genome') == 'dsDNA')
++    vmr_df = vmr_df.filter(pl.col('Genome coverage') == 'Complete genome')
++    vmr_df = vmr_df.filter(pl.col("Phylum").is_not_null())
++    logging.info(f"Filtered to {vmr_df.height} dsDNA phage genomes with complete coverage and known phylum.")
++    
++    clean_accessions = {}
++    for record in vmr_df.iter_rows(named=True):
++        acc = record['Virus GENBANK accession'].split()[0]
++        if acc in taboo:
++            continue
++        if acc in known_typos:
++            acc = known_typos[acc]
++        taxlist = ['Viruses', 
++                    record['Phylum'], record['Class'], 
++                    record['Order'], record['Family'], 
++                    record['Genus'], record['Species'].replace(' ', '_')]
++        taxonomy = fix_and_propogate_taxonomy(taxlist)
++        clean_accessions[acc] = taxonomy
++    logging.info(f"Fetched {len(clean_accessions)} unique phage accessions.")
++
++    return clean_accessions
++
++def fix_and_propogate_taxonomy(taxonomy):
++    levels = ['d__', 'p__', 'c__', 'o__', 'f__', 'g__', 's__']
++    fixed_tax = []
++    last_known = 'unclassified'
++    for level, name in zip(levels, taxonomy):
++        if name is None or len(name.strip()) == 0:
++            fixed_tax.append(f"{level}{last_known}")
++        else:
++            last_known = name
++            fixed_tax.append(f"{level}{name}")
++    return ';'.join(fixed_tax)
++
++def download_genomes(accessions, output_dir):
++    logging.info(f"Preparing to download genomes to {output_dir}")
++    if not os.path.exists(output_dir):
++        os.makedirs(output_dir)
++    # write accession list to file
++    accession_file = os.path.join(output_dir, 'accessions.txt')
++    with open(accession_file, 'w') as accfile:
++        for acc in accessions.keys():
++            accfile.write(f"{acc}\n")
++    logging.info(f"Accession list written to {accession_file}")
++    
++    logging.info("Downloading genomes using efetch.")
++    cmd = f"efetch -db nuccore -input {accession_file} -format fasta > {os.path.join(output_dir, 'genomes.fna')}"
++    extern.run(cmd)
++    logging.info("Genome download completed.")
++    
++    # split multi-fasta into individual files
++    logging.info("Splitting multi-fasta into individual files.")
++    genomes_to_info = {}
++    with open(os.path.join(output_dir, 'genomes.fna'), 'r') as infile:
++        fasta_data = infile.read().strip().split('>')
++    os.makedirs(output_dir + "/genomes", exist_ok=True)
++    for entry in fasta_data:
++        if entry:
++            lines = entry.split('\n')
++            header = lines[0].split()[0]
++            seq = '\n'.join(lines[1:])
++            with open(os.path.join(output_dir, "genomes", f"{header}.fna"), 'w') as outfile:
++                outfile.write(f">{header}\n{seq}\n")
++            no_version_acc = header.split('.')[0]
++            genomes_to_info[header] = (len(seq.replace('\n', '')), accessions[no_version_acc])
++    os.remove(os.path.join(output_dir, 'genomes.fna'))
++    logging.info("Individual genome files created.")
++    # write metadata file
++    with open(os.path.join(output_dir, 'genome_metadata.tsv'), 'w+') as metadata:
++        metadata.write("genome\tlength\ttaxonomy\n")
++        for genome, (length, taxonomy) in genomes_to_info.items():
++            metadata.write(f"{genome}\t{length}\t{taxonomy}\n")
++    logging.info("Genome metadata file created.")
++
++def main():
++    args = parse_arguments()
++    vmr_file = os.path.join(args.outdir, 'vmr.xlsx')
++    if not os.path.exists(args.outdir):
++        os.makedirs(args.outdir)
++    download_vmr_data(args.url, vmr_file)
++    accessions = read_and_fetch_phage_accessions(vmr_file)
++    download_genomes(accessions, args.outdir)
++    logging.info("ICTV phage genome processing completed.")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/metavr-download.py b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/metavr-download.py
+new file mode 100644
+index 00000000..a04fcc30
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/metavr-download.py
+@@ -0,0 +1,139 @@
++import os
++import logging
++import argparse
++import extern
++import polars as pl
++import gzip
++
++def parse_arguments():
++    parser = argparse.ArgumentParser(description="Download and process MetaVR phages.")
++    metadata_exclusive = parser.add_mutually_exclusive_group(required=True)
++    metadata_exclusive.description = "Specify either a URL to download the MetaVR metadata or a local file path."
++    metadata_exclusive.add_argument("--metadata-download", help="URL to desired MetaVR metadata download. Default: https://www.meta-virome.org/DownloadUvigMetadata")
++    metadata_exclusive.add_argument("--metadata-file", type=str, help="Path to local MetaVR metadata file.")
++    genome_exclusive = parser.add_mutually_exclusive_group(required=True)
++    genome_exclusive.description = "Specify either a URL to download the MetaVR genomes or a local file path."
++    genome_exclusive.add_argument("--genome-download", help="URL to desired MetaVR genome download. Default: https://www.meta-virome.org/DownloadUvigSequences")
++    genome_exclusive.add_argument("--genome-file", type=str, help="Path to local MetaVR genome file.")
++    parser.add_argument("-o", "--outdir", type=str, required=True, help="Output directory for the processed genomes.")
++    return parser.parse_args()
++
++logging.basicConfig(level=logging.INFO, 
++                    format='%(asctime)s - %(levelname)s - %(message)s', 
++                    datefmt='%Y-%m-%d %H:%M:%S')
++
++def download_metadata(url: str, outdir: str):
++    logging.info(f"Downloading MetaVR metadata from {url}")
++    metadata_path = os.path.join(outdir, "metavr_metadata.tsv.gz")
++    cmd = f"wget {url} --no-check-certificate -O {metadata_path}"
++    extern.run(cmd)
++    if not os.path.isfile(metadata_path):
++        logging.error("Failed to download MetaVR metadata.")
++        return None
++    return metadata_path
++
++def download_genomes(url: str, outdir: str):
++    logging.info(f"Downloading MetaVR genomes from {url}")
++    genomes_path = os.path.join(outdir, "metavr_genomes.fna.gz")
++    cmd = f"wget {url} --no-check-certificate -O {genomes_path}"
++    extern.run(cmd)
++    if not os.path.isfile(genomes_path):
++        logging.error("Failed to download MetaVR genomes.")
++        return None
++    return genomes_path
++
++def filter_metadata(metadata_path) -> pl.DataFrame:
++    logging.info("Reading MetaVR metadata into DataFrame")
++    df = pl.read_csv(metadata_path, separator="\t", 
++                     null_values=["NA", "\\N"], 
++                     schema_overrides={"uvig": pl.Utf8, 
++                             "length": pl.Int64, 
++                             "ictv_taxonomy": pl.Utf8, 
++                             "host_taxonomy": pl.Utf8, 
++                             "completeness": pl.Float64, 
++                             "checkv_contamination": pl.Float64
++                            },
++                    infer_schema_length=10000)
++    # df.select([
++    #     pl.col('uvig'),
++    #     pl.col('length'),
++    #     pl.col('ictv_taxonomy'),
++    #     pl.col('host_taxonomy'),
++    #     pl.col('completeness'),
++    #     pl.col('checkv_contamination'),
++    #     pl.col('genome_type')
++    # ])
++    df = df.filter(pl.col('host_taxonomy').str.contains('Bacteria|Archaea'))
++    df = df.filter(pl.col('completeness') >= 80.0)
++    df = df.filter(pl.col('checkv_contamination') <= 10)
++    df = df.filter(pl.col('genome_type') == 'dsDNA')
++    return df
++
++def extract_genomes(genomes_path: str, valid_uvigs: set, outdir: str):
++    logging.info("Extracting valid genomes to directory")
++    output_genomes_dir = os.path.join(outdir, "genomes")
++    os.makedirs(output_genomes_dir, exist_ok=True)
++    
++    with gzip.open(genomes_path, 'rt') as infile:
++        current_uvig_id = None
++        current_outfile = None
++        
++        for line in infile:
++            if line.startswith('>'):
++                # Close previous file if open
++                if current_outfile:
++                    current_outfile.close()
++                    current_outfile = None
++                
++                # Extract UVIG ID
++                uvig_id = line[1:].split('|')[0]
++                current_uvig_id = uvig_id
++                
++                # Open new file if this UVIG is valid
++                if uvig_id in valid_uvigs:
++                    output_path = os.path.join(output_genomes_dir, f"{uvig_id}.fna")
++                    current_outfile = open(output_path, 'w')
++                    current_outfile.write(line)
++            else:
++                # Write sequence line if we have an open file
++                if current_outfile:
++                    current_outfile.write(line)
++        
++        # Close final file if still open
++        if current_outfile:
++            current_outfile.close()
++    
++    logging.info(f"Extracted genomes are saved in {output_genomes_dir}")
++
++def main():
++    args = parse_arguments()
++    outdir = args.outdir
++    os.makedirs(outdir, exist_ok=True)
++
++    if args.metadata_file:
++        metadata_path = args.metadata_file
++    else:
++        metadata_url = args.metadata_download or 'https://www.meta-virome.org/DownloadUvigMetadata'
++        metadata_path = download_metadata(metadata_url, outdir)
++        if not metadata_path:
++            logging.error("Metadata download failed, exiting.")
++            return
++
++    if args.genome_file:
++        genomes_path = args.genome_file
++    else:
++        genome_url = args.genome_download or 'https://www.meta-virome.org/DownloadUvigSequences'
++        genomes_path = download_genomes(genome_url, outdir)
++        if not genomes_path:
++            logging.error("Genome download failed, exiting.")
++            return
++
++    filtered_df = filter_metadata(metadata_path)
++    filtered_df.write_csv(os.path.join(outdir, "metavr_filtered_metadata.tsv"), separator="\t")
++    logging.info(f"Filtered metadata saved to {os.path.join(outdir, 'metavr_filtered_metadata.tsv')}")
++    valid_uvigs = set(filtered_df['uvig'].to_list())
++    extract_genomes(genomes_path, valid_uvigs, outdir)
++
++if __name__ == "__main__":
++    main()
++
+diff --git a/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/process_vcontact3_taxonomy.py b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/process_vcontact3_taxonomy.py
+new file mode 100644
+index 00000000..09533035
+--- /dev/null
++++ b/extras/lyrebird_metapackage_creation/prepare_genomes/scripts/process_vcontact3_taxonomy.py
+@@ -0,0 +1,73 @@
++import polars as pl
++from csv import DictReader
++import logging
++
++logging.basicConfig(level=logging.INFO, 
++                    format='%(asctime)s - %(levelname)s - %(message)s', 
++                    datefmt='%Y-%m-%d %H:%M:%S',
++                    filename=snakemake.log[0])
++
++vcontact_assignments = snakemake.input.vcontact_output_dir + "/exports/final_assignments.csv"
++ictv_metadata = snakemake.params.ictv_metadata
++metavr_metadata = snakemake.params.metavr_metadata
++output_taxonomy = snakemake.output.taxonomy_tsv
++
++genome_to_length = {}
++
++draft_taxa = {}
++with open(ictv_metadata, 'r') as ictv_file:
++    reader = DictReader(ictv_file, delimiter='\t')
++    for row in reader:
++        genome = row['genome']
++        taxonomy = row['taxonomy']
++        draft_taxa[genome] = taxonomy.split(';')
++        genome_to_length[genome] = int(row['length'])
++
++with open(metavr_metadata, 'r') as metavr_file:
++    reader = DictReader(metavr_file, delimiter='\t')
++    for row in reader:
++        uvig = row['uvig']
++        taxonomy = row['ictv_taxonomy']
++        draft_taxa[uvig] = taxonomy.split(';') #TODO: check format
++        genome_to_length[uvig] = int(row['length'])
++
++new_taxa = {}
++df = pl.DataFrame.read_csv(vcontact_assignments, infer_schema_length=10000)
++for genome in draft_taxa.keys():
++    draft = draft_taxa[genome]
++    vcontact_row = df.filter(pl.col('genome') == genome)
++    if vcontact_row.height == 0:
++        logging.warning(f"No vContact3 assignment found for genome {genome}, using original taxonomy.")
++        new_taxa[genome] = draft
++        continue
++    tax_levels = ['phylum', 'class', 'order', 'family', 'genus']
++    tax_ranks = ['p__', 'c__', 'o__', 'f__', 'g__']
++    reference_cols = vcontact_row.select([pl.col(c) for c in df.columns if c.startswith('reference_') and any(lvl in c for lvl in tax_levels)])
++    prediction_cols = vcontact_row.select([pl.col(c) for c in df.columns if c.startswith('prediction_') and any(lvl in c for lvl in tax_levels)])
++
++    taxbuilder = []
++    for level in tax_levels:
++        previous_tax = taxbuilder[-1] if len(taxbuilder) > 0 else None
++        ref_col = f'reference_{level}'
++        pred_col = f'prediction_{level}'
++        ref_tax = reference_cols.select(pl.col(ref_col)).to_series()[0]
++        pred_tax = prediction_cols.select(pl.col(pred_col)).to_series()[0]
++        if ref_tax is not None and ref_tax != '':
++            taxbuilder.append(tax_ranks[tax_levels.index(level)] + ref_tax)
++        elif pred_tax is not None and pred_tax != '':
++            taxbuilder.append(tax_ranks[tax_levels.index(level)] + pred_tax)
++        else:
++            if previous_tax is not None:
++                last_known = previous_tax.split('__')[1]
++            else:
++                last_known = 'unclassified'
++            taxbuilder.append(tax_ranks[tax_levels.index(level)] + last_known)
++    taxbuilder.append('s__' + (draft[6] if len(draft) > 6 and draft[6] != '' else 'unclassified'))
++    new_taxa[genome] = taxbuilder
++
++with open(output_taxonomy, 'w') as outfile:
++    outfile.write("genome\tlength\ttaxonomy\n")
++    for genome, taxonomy in new_taxa.items():
++        length = genome_to_length.get(genome, 'NA')
++        tax_string = ';'.join(taxonomy)
++        outfile.write(f"{genome}\t{length}\t{tax_string}\n")
+\ No newline at end of file

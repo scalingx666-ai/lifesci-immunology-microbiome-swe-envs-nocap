@@ -1,0 +1,280 @@
+diff --git a/atlas/Snakefile b/atlas/Snakefile
+index 539e2be0..1c8dd9fd 100644
+--- a/atlas/Snakefile
++++ b/atlas/Snakefile
+@@ -89,17 +89,15 @@ def get_alls_samples_of_group(wildcards):
+ 
+ 
+ PAIRED_END = sampleTable.columns.str.contains('R2').any() or config.get('interleaved_fastqs',False)
+-RAW_INPUT_FRACTIONS = ['R1', 'R2'] if PAIRED_END else ['se']
++
+ 
+ colum_headers_QC= sampleTable.columns[sampleTable.columns.str.startswith("Reads_QC_")]
+ if len(colum_headers_QC)>=1:
+     MULTIFILE_FRACTIONS= list(colum_headers_QC.str.replace('Reads_QC_',''))
+ 
+     if (len(MULTIFILE_FRACTIONS)==1 ) and config.get('interleaved_fastqs',False):
+-        raise NotImplementedError("To start from QC reads that are interleaved is not implemented."
+-                                  "Do deinterleave the fastq files with e.g."
+-                                  "reformat.sh in=file.fastq.gz out1=file_R1.fastq.gz out2=file_R2.fastq.gz"
+-                                  )
++        MULTIFILE_FRACTIONS=['R1','R2']
++
+ else:
+     MULTIFILE_FRACTIONS = ['R1', 'R2', 'se'] if PAIRED_END else ['se']
+ 
+@@ -108,6 +106,16 @@ if len(colum_headers_raw) ==0:
+     SKIP_QC=True
+ 
+     logger.info("Didn't find raw reads in sampleTable - skip QC")
++    RAW_INPUT_FRACTIONS = MULTIFILE_FRACTIONS
++else:
++    RAW_INPUT_FRACTIONS = ['R1', 'R2'] if PAIRED_END else ['se']
++
++
++if (len(colum_headers_raw) ==0) and (len(colum_headers_QC) ==0):
++
++    raise IOError("Either raw reas or QC reads need to be in the sample table. "
++                  "I din't find any collums with 'Reads_raw_<fraction>' or 'Reads_QC_<fraction>'  "
++                  )
+ 
+ 
+ class FileNotInSampleTableException(Exception):
+@@ -157,13 +165,16 @@ def get_quality_controlled_reads(wildcards):
+     externaly and run ATLAS workflow assembly, we expect R1, R2 or se.
+     """
+ 
+-    QC_Headers=['Reads_QC_'+f for f in MULTIFILE_FRACTIONS]
++    if config.get('interleaved_fastqs',False) and SKIP_QC:
++        QC_Headers=['Reads_QC_se']
++    else:
++        QC_Headers=['Reads_QC_'+f for f in MULTIFILE_FRACTIONS]
+ 
+     try:
+         return get_files_from_sampleTable(wildcards.sample,QC_Headers)
+     except FileNotInSampleTableException:
+ 
+-        # return files as nabed by atlas pipeline
++        # return files as named by atlas pipeline
+         return expand("{sample}/sequence_quality_control/{sample}_QC_{fraction}.fastq.gz",
+                         fraction=MULTIFILE_FRACTIONS,sample=wildcards.sample)
+ 
+diff --git a/atlas/atlas.py b/atlas/atlas.py
+index 5fcf9429..fb8d0a6d 100644
+--- a/atlas/atlas.py
++++ b/atlas/atlas.py
+@@ -131,7 +131,7 @@ def run_workflow(workflow, working_dir,config_file, jobs, no_conda, dryrun, snak
+ 
+     cmd = (
+         "snakemake --snakefile {snakefile} --directory {working_dir} "
+-        "--printshellcmds --jobs {jobs} --rerun-incomplete "
++        "--jobs {jobs} --rerun-incomplete "
+         "--configfile '{config_file}' --nolock "
+         " {conda}  {conda_prefix} {dryrun} "
+         " {target_rule} "
+@@ -186,7 +186,7 @@ def run_download(db_dir,jobs, snakemake_args):
+ 
+     cmd = (
+         "snakemake --snakefile {snakefile} "
+-        "--printshellcmds --jobs {jobs} --rerun-incomplete "
++        "--jobs {jobs} --rerun-incomplete "
+         "--nolock  --use-conda  --conda-prefix {conda_prefix} "
+         "--config database_dir='{db_dir}' {add_args} "
+         "{args}"
+diff --git a/atlas/default_values.py b/atlas/default_values.py
+index 0b886b4f..da009ba5 100644
+--- a/atlas/default_values.py
++++ b/atlas/default_values.py
+@@ -115,7 +115,11 @@ def make_default_config():
+     conf = {}
+     conf['data_type']='metagenome'
+     conf["tmpdir"] = tempfile.gettempdir()
+-    conf["threads"] = multiprocessing.cpu_count()
++    conf["threads"] = 6
++
++    conf["simplejob_mem"]=10
++    conf["simplejob_threads"]=4
++
+     conf["java_mem"] = JAVA_MEM
+     conf["diamond_mem"] = 100
+     conf["diamond_threads"] = 12
+diff --git a/atlas/rules/assemble.snakefile b/atlas/rules/assemble.snakefile
+index 6398f1c3..6dc0a186 100644
+--- a/atlas/rules/assemble.snakefile
++++ b/atlas/rules/assemble.snakefile
+@@ -28,16 +28,48 @@ def get_preprocessing_steps(config):
+ 
+ assembly_preprocessing_steps = get_preprocessing_steps(config)
+ 
+-localrules: init_pre_assembly_processing
++
++
+ rule init_pre_assembly_processing:
+     input:
+         get_quality_controlled_reads #expect SE or R1,R2 or R1,R2,SE
+     output:
+-         temp("{sample}/assembly/reads/QC_{fraction}.fastq.gz")
+-    run:
++         temp(expand("{{sample}}/assembly/reads/QC_{fraction}.fastq.gz",fraction= MULTIFILE_FRACTIONS))
++    params:
++        inputs = lambda wc, input: io_params_for_tadpole(input,'in'),
++        interleaved = lambda wc: "t" if (config.get('interleaved_fastqs',False) & SKIP_QC) else "f",
++        outputs = lambda wc, output: io_params_for_tadpole(output,'out'),
++        verifypaired = "t" if PAIRED_END else "f"
++    log:
++        "{sample}/logs/assembly/init.log"
++    conda:
++        "%s/required_packages.yaml" % CONDAENV
++    threads:
++        config.get("simplejob_threads", 1)
++    resources:
++        mem = config.get("simplejob_mem", JAVA_MEM),
++        java_mem = int(int(config.get("simplejob_mem", JAVA_MEM) * JAVA_MEM_FRACTION))
++    shell:
++        """
++        reformat.sh {params.inputs} \
++            interleaved={params.interleaved} \
++            {params.outputs} \
++            iupacToN=t \
++            touppercase=t \
++            qout=33 \
++            overwrite=true \
++            verifypaired={params.verifypaired} \
++            addslash=t \
++            trimreaddescription=t \
++            threads={threads} \
++            -Xmx{resources.java_mem}G 2> {log}
++        """
++
++    #run:
+     # make symlink
+-        infile = input[MULTIFILE_FRACTIONS.index(wildcards.fraction)]
+-        os.symlink(os.path.relpath(infile,os.path.dirname(output[0])),output[0])
++
++        #infile = input[MULTIFILE_FRACTIONS.index(wildcards.fraction)]
++        #os.symlink(os.path.relpath(infile,os.path.dirname(output[0])),output[0])
+ #
+ # rule normalize_coverage_across_kmers:
+ #     input:
+@@ -632,9 +664,9 @@ rule bam_2_sam_contigs:
+     output:
+         temp("{sample}/sequence_alignment/{sample}.sam")
+     threads:
+-        config['threads']
++        config['simplejob_threads']
+     resources:
+-        mem = config["java_mem"],
++        mem = config["simplejob_mem"],
+     shadow:
+         "shallow"
+     conda:
+@@ -687,11 +719,11 @@ rule convert_sam_to_bam:
+     conda:
+         "%s/required_packages.yaml" % CONDAENV
+     threads:
+-        config.get("threads", 1)
++        config.get("simplejob_threads", 1)
+     shadow:
+         "shallow"
+     resources:
+-        mem = 2 * config.get("threads", 1)
++        mem = 2 * config.get("simplejob_threads", 1)
+     shell:
+         """samtools view \
+                -m 1G \
+@@ -714,6 +746,8 @@ rule create_bam_index:
+         "%s/required_packages.yaml" % CONDAENV
+     threads:
+         1
++    resources:
++        mem = 2 * config.get("simplejob_threads", 1)
+     shell:
+         "samtools index {input}"
+ 
+diff --git a/atlas/rules/qc.snakefile b/atlas/rules/qc.snakefile
+index 315e22a8..d5d7840b 100644
+--- a/atlas/rules/qc.snakefile
++++ b/atlas/rules/qc.snakefile
+@@ -51,15 +51,13 @@ else:
+         else:
+             Raw_Headers= ['Reads_raw_se']
+ 
++        #get file
+         if not (wildcards.sample in sampleTable.index):
+             return expand("Impossible/file/{sample}_{fraction}.fastq.gz",sample=wildcards.sample,fraction=RAW_INPUT_FRACTIONS)
+             logger.debug(f"Searched for qc reads for inexisitng sample. wildcards: {wildcards}")
+         else:
+-            try:
+-                return get_files_from_sampleTable(wildcards.sample,Raw_Headers)
+-            except FileNotInSampleTableException:
+-                raise Exception(f"Raw files are not in sampleTable. Are you trying to run QC on files that are already quality controlled?\nsample: {wildcards.sample}\nHeaders: {Raw_Headers}")
+ 
++            return get_files_from_sampleTable(wildcards.sample,Raw_Headers)
+ 
+ 
+ 
+@@ -72,7 +70,7 @@ rule initialize_qc:
+     priority: 80
+     params:
+         inputs = lambda wc, input: io_params_for_tadpole(input,'in'),
+-        interleaved = lambda wc: "t" if config.get('interleaved_fastqs',False )else "f",
++        interleaved = lambda wc: "t" if config.get('interleaved_fastqs',False) else "f",
+         outputs = lambda wc, output: io_params_for_tadpole(output,'out'),
+         verifypaired = "t" if PAIRED_END else "f"
+     log:
+@@ -80,10 +78,10 @@ rule initialize_qc:
+     conda:
+         "%s/required_packages.yaml" % CONDAENV
+     threads:
+-        config.get("threads", 1)
++        config.get("simplejob_threads", 1)
+     resources:
+-        mem = config.get("java_mem", JAVA_MEM),
+-        java_mem = int(int(config.get("java_mem", JAVA_MEM) * JAVA_MEM_FRACTION))
++        mem = config.get("simplejob_mem", JAVA_MEM),
++        java_mem = int(int(config.get("simplejob_mem", JAVA_MEM) * JAVA_MEM_FRACTION))
+ #    group:
+ #        "qc"
+     shell:
+@@ -119,10 +117,10 @@ rule get_read_stats:
+     # conda:
+     #     "%s/required_packages.yaml" % CONDAENV
+     threads:
+-        config.get("threads", 1)
++        config.get("simplejob_threads", 1)
+     resources:
+-        mem = config.get("java_mem", JAVA_MEM),
+-        java_mem = int(config.get("java_mem", JAVA_MEM) * JAVA_MEM_FRACTION)
++        mem = config["simplejob_mem"],
++        java_mem = int(config["simplejob_mem"] * JAVA_MEM_FRACTION)
+     params:
+         folder = lambda wc, output: os.path.splitext(output[0])[0],
+         single_end_file = "{sample}/sequence_quality_control/{sample}_{step}_se.fastq.gz"
+@@ -433,10 +431,10 @@ if PAIRED_END:
+             ihist = "{sample}/sequence_quality_control/read_stats/QC_insert_size_hist.txt",
+             read_length= "{sample}/sequence_quality_control/read_stats/QC_read_length_hist.txt"
+         threads:
+-            config.get("threads", 1)
++            config.get("simplejob_threads", 1)
+         resources:
+-            mem = config.get("java_mem", JAVA_MEM),
+-            java_mem = int(config.get("java_mem", JAVA_MEM) * JAVA_MEM_FRACTION)
++            mem = config.get("simplejob_mem", JAVA_MEM),
++            java_mem = int(config.get("simplejob_mem", JAVA_MEM) * JAVA_MEM_FRACTION)
+         conda:
+             "%s/required_packages.yaml" % CONDAENV
+         log:
+@@ -472,10 +470,10 @@ else:
+         params:
+             kmer = config.get("merging_k", MERGING_K),
+         threads:
+-            config.get("threads", 1)
++            config.get("simplejob_threads", 1)
+         resources:
+-            mem = config.get("java_mem", JAVA_MEM),
+-            java_mem = int(config.get("java_mem", JAVA_MEM) * JAVA_MEM_FRACTION)
++            mem = config.get("simplejob_mem", JAVA_MEM),
++            java_mem = int(config.get("simplejob_mem", JAVA_MEM) * JAVA_MEM_FRACTION)
+         conda:
+             "%s/required_packages.yaml" % CONDAENV
+         log:

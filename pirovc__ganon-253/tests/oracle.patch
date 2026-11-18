@@ -1,0 +1,624 @@
+diff --git a/src/ganon-classify/CommandLineParser.cpp b/src/ganon-classify/CommandLineParser.cpp
+index 2b0bb3c9..344c23ca 100644
+--- a/src/ganon-classify/CommandLineParser.cpp
++++ b/src/ganon-classify/CommandLineParser.cpp
+@@ -23,6 +23,7 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         
+         ( "c,rel-cutoff", "Relative cutoff (i.e. percentage of minimizers). 0 for no cutoff. One or one per filter (comma-separated). Default: 0.2", cxxopts::value< std::vector< double > >() )
+         ( "d,rel-filter", "Relative filter. Additional percentage of matches allowed (relative to the best match). 1 for no filtering. one or one per hierarchy label (comma-separated). Default: 0.0", cxxopts::value< std::vector< double > >() )
++        ( "f,fpr-query", "Min. False positive for a query. 1 for no filtering. one or one per hierarchy label (comma-separated). Default: 1.0", cxxopts::value< std::vector< double > >() )
+         
+         ( "o,output-prefix", "Output prefix (prefix.rep, [prefix.lca, prefix.all, prefix.unc]). If multi-level --hierarchy-labels is provided, files are generated accordingly (prefix.hierarchy.lca and prefix.hierarchy.all). Omit to output to STDOUT (only .rep will be printed)", cxxopts::value< std::string >() )
+         ( "l,output-lca", "Runs and outputs file with lca classification (prefix.lca)", cxxopts::value< bool >() )
+@@ -80,6 +81,8 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         config.rel_cutoff = args["rel-cutoff"].as< std::vector< double > >();
+     if ( args.count( "rel-filter" ) )
+         config.rel_filter = args["rel-filter"].as< std::vector< double > >();
++    if ( args.count( "fpr-query" ) )
++        config.fpr_query = args["fpr-query"].as< std::vector< double > >();
+ 
+     if ( args.count( "output-prefix" ) )
+         config.output_prefix = args["output-prefix"].as< std::string >();
+diff --git a/src/ganon-classify/GanonClassify.cpp b/src/ganon-classify/GanonClassify.cpp
+index 3132f295..8a304693 100644
+--- a/src/ganon-classify/GanonClassify.cpp
++++ b/src/ganon-classify/GanonClassify.cpp
+@@ -48,9 +48,10 @@ typedef uint16_t TIntCount;
+ 
+ typedef raptor::hierarchical_interleaved_bloom_filter< seqan3::data_layout::uncompressed > THIBF;
+ typedef seqan3::interleaved_bloom_filter< seqan3::data_layout::uncompressed >              TIBF;
+-typedef robin_hood::unordered_map< std::string, size_t >                                   TMatches;
++typedef robin_hood::unordered_map< std::string, std::tuple< size_t, double > >             TMatches;
+ typedef std::vector< std::tuple< size_t, std::string > >                                   TBinMap;
+ typedef robin_hood::unordered_map< std::string, std::vector< size_t > >                    TMap;
++typedef robin_hood::unordered_map< std::string, double >                                   TTargetFpr;
+ 
+ struct Node
+ {
+@@ -98,6 +99,16 @@ struct ReadBatches
+ 
+ struct ReadMatch
+ {
++    ReadMatch()
++    {
++    }
++
++    ReadMatch( std::string _target, size_t _kmer_count )
++    {
++        target     = _target;
++        kmer_count = _kmer_count;
++    }
++
+     std::string target;
+     size_t      kmer_count;
+ };
+@@ -188,6 +199,7 @@ struct FilterConfig
+     std::string tax_file = "";
+     double      rel_cutoff;
+     IBFConfig   ibf_config;
++    TTargetFpr  target_fpr;
+ };
+ 
+ struct HierarchyConfig
+@@ -196,6 +208,7 @@ struct HierarchyConfig
+     uint8_t                     kmer_size;
+     uint32_t                    window_size;
+     double                      rel_filter;
++    double                      fpr_query;
+     std::string                 output_file_lca;
+     std::string                 output_file_all;
+ };
+@@ -247,8 +260,13 @@ std::map< std::string, HierarchyConfig > parse_hierarchy( Config& config )
+                 output_file_all = config.output_prefix + ".all";
+             }
+ 
+-            parsed_hierarchy[config.hierarchy_labels[h]] =
+-                HierarchyConfig{ fc, 0, 0, config.rel_filter[hierarchy_count], output_file_lca, output_file_all };
++            parsed_hierarchy[config.hierarchy_labels[h]] = HierarchyConfig{ fc,
++                                                                            0,
++                                                                            0,
++                                                                            config.rel_filter[hierarchy_count],
++                                                                            config.fpr_query[hierarchy_count],
++                                                                            output_file_lca,
++                                                                            output_file_all };
+             ++hierarchy_count;
+         }
+         else
+@@ -268,6 +286,7 @@ void print_hierarchy( Config const& config, auto const& parsed_hierarchy )
+     {
+         std::cerr << hierarchy_config.first << newl;
+         std::cerr << "--rel-filter " << hierarchy_config.second.rel_filter << newl;
++        std::cerr << "--fpr-query " << hierarchy_config.second.fpr_query << newl;
+         for ( auto const& filter_config : hierarchy_config.second.filters )
+         {
+             std::cerr << "    " << filter_config.ibf_file;
+@@ -311,31 +330,42 @@ inline size_t threshold_rel( size_t n_hashes, double p )
+     return std::ceil( n_hashes * p );
+ }
+ 
++// https://stackoverflow.com/questions/44718971/calculate-binomial-coffeficient-very-reliably
++inline double binom( double n, double k ) noexcept
++{
++    return std::exp( std::lgamma( n + 1 ) - std::lgamma( n - k + 1 ) - std::lgamma( k + 1 ) );
++}
++
++
+ void select_matches( Filter< TIBF >&        filter,
+                      TMatches&              matches,
+                      std::vector< size_t >& hashes,
+                      auto&                  agent,
+                      size_t                 threshold_cutoff,
+-                     size_t&                max_kmer_count_read )
++                     size_t&                max_kmer_count_read,
++                     size_t                 n_hashes )
+ {
+-    // Count every occurance on IBF
++    // Count every occurrence on IBF
+     seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes );
+ 
+     for ( auto const& [target, bins] : filter.map )
+     {
+-        // Sum counts among bins (split target (user bins) into several tecnical bins)
++        // Sum counts among bins (split target (user bins) into several technical bins)
+         size_t summed_count = 0;
+         for ( auto const& binno : bins )
+         {
+             summed_count += counts[binno];
+         }
++        // summed_count can be higher than n_hashes for matches in several technical bins
++        if ( summed_count > n_hashes )
++            summed_count = n_hashes;
+         if ( summed_count >= threshold_cutoff )
+         {
+             // ensure that count was not already found for target with higher count
+             // can happen in case of ambiguos targets in multiple filters
+-            if ( summed_count > matches[target] )
++            if ( summed_count > std::get< 0 >( matches[target] ) )
+             {
+-                matches[target] = summed_count;
++                matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
+                 if ( summed_count > max_kmer_count_read )
+                     max_kmer_count_read = summed_count;
+             }
+@@ -348,39 +378,59 @@ void select_matches( Filter< THIBF >&       filter,
+                      std::vector< size_t >& hashes,
+                      auto&                  agent,
+                      size_t                 threshold_cutoff,
+-                     size_t&                max_kmer_count_read )
++                     size_t&                max_kmer_count_read,
++                     size_t                 n_hashes )
+ {
+     // Count only matches above threhsold
+     seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes, threshold_cutoff );
+ 
+-
+     // Only one bin per target
+     for ( auto const& [target, bins] : filter.map )
+     {
+         if ( counts[bins[0]] > 0 )
+         {
+-            const size_t count = counts[bins[0]];
++            // Sum counts among bins (split target (user bins) into several technical bins)
++            size_t summed_count = counts[bins[0]];
++            // summed_count can be higher than n_hashes for matches in several technical bins
++            if ( summed_count > n_hashes )
++                summed_count = n_hashes;
+             // ensure that count was not already found for target with higher count
+-            // can happen in case of ambiguos targets in multiple filters
+-            if ( count > matches[target] )
++            // can happen in case of ambiguous targets in multiple filters
++            if ( summed_count > std::get< 0 >( matches[target] ) )
+             {
+-                matches[target] = count;
+-                if ( count > max_kmer_count_read )
+-                    max_kmer_count_read = count;
++                matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
++                if ( summed_count > max_kmer_count_read )
++                    max_kmer_count_read = summed_count;
+             }
+         }
+     }
+ }
+ 
+-size_t filter_matches( ReadOut& read_out, TMatches& matches, TRep& rep, size_t threshold_filter )
++size_t filter_matches(
++    ReadOut& read_out, TMatches& matches, TRep& rep, size_t threshold_filter, size_t n_hashes, double min_fpr_query )
+ {
+ 
+-    for ( auto const& [target, kmer_count] : matches )
++    for ( auto const& [target, count_fpr] : matches )
+     {
+-        if ( kmer_count >= threshold_filter )
++        if ( std::get< 0 >( count_fpr ) >= threshold_filter )
+         {
++            // Filter by fpr-query
++            if ( min_fpr_query < 1.0 )
++            {
++                double q = 1;
++                for ( size_t i = 0; i <= std::get< 0 >( count_fpr ); i++ )
++                {
++                    q -= binom( n_hashes, i ) * pow( std::get< 1 >( count_fpr ), i )
++                         * pow( 1 - std::get< 1 >( count_fpr ), n_hashes - i );
++                }
++                if ( q > min_fpr_query )
++                {
++                    continue;
++                }
++            }
++
+             rep[target].matches++;
+-            read_out.matches.push_back( ReadMatch{ target, kmer_count } );
++            read_out.matches.push_back( ReadMatch{ target, std::get< 0 >( count_fpr ) } );
+         }
+     }
+ 
+@@ -459,7 +509,7 @@ void classify( std::vector< Filter< TFilter > >& filters,
+ 
+             // Best scoring kmer count
+             size_t max_kmer_count_read = 0;
+-
++            size_t n_hashes            = 0;
+             // if length is smaller than window, skip read
+             if ( read1_len >= hierarchy_config.window_size )
+             {
+@@ -473,7 +523,7 @@ void classify( std::vector< Filter< TFilter > >& filters,
+                     hashes.insert( hashes.end(), h2.begin(), h2.end() );
+                 }
+ 
+-                const size_t n_hashes = hashes.size();
++                n_hashes = hashes.size();
+                 // if n_hashes are bigger than int limit, skip read
+                 if ( n_hashes <= hashes_limit )
+                 {
+@@ -495,7 +545,8 @@ void classify( std::vector< Filter< TFilter > >& filters,
+                             threshold_cutoff = 1;
+ 
+                         // count and select matches
+-                        select_matches( filters[i], matches, hashes, agents[i], threshold_cutoff, max_kmer_count_read );
++                        select_matches(
++                            filters[i], matches, hashes, agents[i], threshold_cutoff, max_kmer_count_read, n_hashes );
+                     }
+                 }
+             }
+@@ -506,52 +557,58 @@ void classify( std::vector< Filter< TFilter > >& filters,
+             // if read got valid matches (above cutoff)
+             if ( max_kmer_count_read > 0 )
+             {
+-                total.reads_classified++;
+ 
+                 // Calculate threshold for filtering (keep matches above)
+                 const size_t threshold_filter =
+                     max_kmer_count_read - threshold_rel( max_kmer_count_read, hierarchy_config.rel_filter );
+ 
+                 // Filter matches
+-                const size_t count_filtered_matches = filter_matches( read_out, matches, rep, threshold_filter );
++                const size_t count_filtered_matches =
++                    filter_matches( read_out, matches, rep, threshold_filter, n_hashes, hierarchy_config.fpr_query );
+ 
+-                if ( !config.skip_lca )
++                if ( count_filtered_matches > 0 )
+                 {
+-                    ReadOut read_out_lca( rb.ids[readID] );
+-                    if ( count_filtered_matches == 1 )
+-                    {
+-                        // just one match, copy read read_out and set as unique
+-                        read_out_lca = read_out;
+-                        rep[read_out.matches[0].target].unique_reads++;
+-                    }
+-                    else
+-                    {
+-                        lca_matches( read_out, read_out_lca, max_kmer_count_read, lca, rep );
+-                    }
+ 
+-                    if ( config.output_lca )
+-                        classified_lca_queue.push( read_out_lca );
+-                }
+-                else
+-                {
+-                    // Not running lca and has unique match
+-                    if ( count_filtered_matches == 1 )
++                    total.reads_classified++;
++
++                    if ( !config.skip_lca )
+                     {
+-                        rep[read_out.matches[0].target].unique_reads++;
++                        ReadOut read_out_lca( rb.ids[readID] );
++                        if ( count_filtered_matches == 1 )
++                        {
++                            // just one match, copy read read_out and set as unique
++                            read_out_lca = read_out;
++                            rep[read_out.matches[0].target].unique_reads++;
++                        }
++                        else
++                        {
++                            lca_matches( read_out, read_out_lca, max_kmer_count_read, lca, rep );
++                        }
++
++                        if ( config.output_lca )
++                            classified_lca_queue.push( read_out_lca );
+                     }
+                     else
+                     {
+-                        // without tax, no lca, count multi-matches to a root node
+-                        // to keep consistency among reports (no. of classified reads)
+-                        rep[config.tax_root_node].unique_reads++;
++                        // Not running lca and has unique match
++                        if ( count_filtered_matches == 1 )
++                        {
++                            rep[read_out.matches[0].target].unique_reads++;
++                        }
++                        else
++                        {
++                            // without tax, no lca, count multi-matches to a root node
++                            // to keep consistency among reports (no. of classified reads)
++                            rep[config.tax_root_node].unique_reads++;
++                        }
+                     }
+-                }
+ 
+-                if ( config.output_all )
+-                    classified_all_queue.push( read_out );
++                    if ( config.output_all )
++                        classified_all_queue.push( read_out );
+ 
+-                // read classified, continue to the next
+-                continue;
++                    // read classified, continue to the next
++                    continue;
++                }
+             }
+ 
+             // not classified
+@@ -597,7 +654,11 @@ void write_report( TRep& rep, TTax& tax, std::ofstream& out_rep, std::string hie
+     }
+ }
+ 
+-size_t load_filter( THIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std::string const& input_filter_file )
++size_t load_filter( THIBF&             filter,
++                    IBFConfig&         ibf_config,
++                    TBinMap&           bin_map,
++                    std::string const& input_filter_file,
++                    TTargetFpr&        target_fpr )
+ {
+     std::ifstream              is( input_filter_file, std::ios::binary );
+     cereal::BinaryInputArchive archive( is );
+@@ -624,6 +685,7 @@ size_t load_filter( THIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std:
+     // load ibf_config from raptor params
+     ibf_config.window_size = window_size;
+     ibf_config.kmer_size   = shape.count();
++    ibf_config.max_fp      = fpr;
+ 
+     // Create map from paths
+     size_t binno{};
+@@ -645,6 +707,8 @@ size_t load_filter( THIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std:
+             }
+ 
+             bin_map.push_back( std::make_tuple( binno, f ) );
++            // same fpr for all
++            target_fpr[f] = fpr;
+         }
+         ++binno;
+     }
+@@ -652,7 +716,20 @@ size_t load_filter( THIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std:
+     return filter.user_bins.num_user_bins();
+ }
+ 
+-size_t load_filter( TIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std::string const& input_filter_file )
++inline double false_positive( uint64_t bin_size_bits, uint8_t hash_functions, uint64_t n_hashes )
++{
++    /*
++     * calculates the theoretical false positive of a bin (bf) based on parameters
++     */
++    return std::pow( 1 - std::exp( -hash_functions / ( bin_size_bits / static_cast< double >( n_hashes ) ) ),
++                     hash_functions );
++}
++
++size_t load_filter( TIBF&              filter,
++                    IBFConfig&         ibf_config,
++                    TBinMap&           bin_map,
++                    std::string const& input_filter_file,
++                    TTargetFpr&        target_fpr )
+ {
+     std::ifstream              is( input_filter_file, std::ios::binary );
+     cereal::BinaryInputArchive archive( is );
+@@ -665,6 +742,25 @@ size_t load_filter( TIBF& filter, IBFConfig& ibf_config, TBinMap& bin_map, std::
+     archive( hashes_count_std );
+     archive( bin_map );
+     archive( filter );
++
++
++    // generate fpr for each bin
++    for ( auto const& [target, count] : hashes_count_std )
++    {
++        // Use average number of hashes for each bin to calculate fp
++        uint64_t n_bins_target = std::ceil( count / static_cast< double >( ibf_config.max_hashes_bin ) );
++        // this can be off by a very small number (rounding ceil on multiple bins)
++        uint64_t n_hashes_bin = std::ceil( count / static_cast< double >( n_bins_target ) );
++
++        // false positive for the current target, considering split bins
++        target_fpr[target] =
++            1.0
++            - std::pow( 1.0 - false_positive( ibf_config.bin_size_bits, ibf_config.hash_functions, n_hashes_bin ),
++                        n_bins_target );
++        ;
++    }
++
++
+     return filter.bin_count();
+ }
+ 
+@@ -693,11 +789,12 @@ bool load_files( std::vector< Filter< TFilter > >& filters, std::vector< FilterC
+     size_t filter_cnt = 0;
+     for ( auto& filter_config : fconf )
+     {
+-        TTax      tax;
+-        IBFConfig ibf_config;
+-        TBinMap   bin_map;
+-        TFilter   filter;
+-        auto      bin_count = load_filter( filter, ibf_config, bin_map, filter_config.ibf_file );
++        TTax       tax;
++        IBFConfig  ibf_config;
++        TBinMap    bin_map;
++        TFilter    filter;
++        TTargetFpr target_fpr;
++        auto       bin_count = load_filter( filter, ibf_config, bin_map, filter_config.ibf_file, target_fpr );
+ 
+         // Parse vector with bin_map to the old map
+         TMap map;
+@@ -707,6 +804,7 @@ bool load_files( std::vector< Filter< TFilter > >& filters, std::vector< FilterC
+         }
+ 
+         filter_config.ibf_config = ibf_config;
++        filter_config.target_fpr = target_fpr;
+ 
+         if ( filter_config.tax_file != "" )
+             tax = load_tax( filter_config.tax_file );
+diff --git a/src/ganon-classify/include/ganon-classify/Config.hpp b/src/ganon-classify/include/ganon-classify/Config.hpp
+index a4ab2087..8ca33738 100644
+--- a/src/ganon-classify/include/ganon-classify/Config.hpp
++++ b/src/ganon-classify/include/ganon-classify/Config.hpp
+@@ -29,6 +29,7 @@ struct Config
+ 
+     std::vector< double > rel_cutoff{ 0.2 };
+     std::vector< double > rel_filter{ 0.0 };
++    std::vector< double > fpr_query{ 1.0 };
+ 
+     std::string output_prefix       = "";
+     bool        output_lca          = false;
+@@ -118,6 +119,21 @@ struct Config
+             return false;
+         }
+ 
++        valid_val = true;
++        for ( uint16_t i = 0; i < fpr_query.size(); ++i )
++        {
++            if ( fpr_query[i] < 0 || fpr_query[i] > 1 )
++            {
++                valid_val = false;
++                break;
++            }
++        }
++        if ( !valid_val )
++        {
++            std::cerr << "--fpr-query values should be set between 0 and 1 (1 to disable)" << std::endl;
++            return false;
++        }
++
+         if ( n_batches < 1 )
+             n_batches = 1;
+ 
+@@ -163,6 +179,19 @@ struct Config
+             return false;
+         }
+ 
++        if ( fpr_query.size() == 1 && unique_hierarchy > 1 )
++        {
++            for ( uint16_t b = 1; b < unique_hierarchy; ++b )
++            {
++                fpr_query.push_back( fpr_query[0] );
++            }
++        }
++        else if ( fpr_query.size() != unique_hierarchy )
++        {
++            std::cerr << "Please provide a single or one-per-hierarchy --fpr-query value[s]" << std::endl;
++            return false;
++        }
++
+         if ( tax.size() > 0 && ibf.size() != tax.size() )
+         {
+             std::cerr << "The number of files provided with --ibf and --tax should match" << std::endl;
+diff --git a/src/ganon/classify.py b/src/ganon/classify.py
+index f6556694..0c59c9df 100644
+--- a/src/ganon/classify.py
++++ b/src/ganon/classify.py
+@@ -35,6 +35,7 @@ def classify(cfg):
+                                    "--hierarchy-labels " + ",".join(cfg.hierarchy_labels) if cfg.hierarchy_labels else "",
+                                    "--rel-cutoff " + ",".join([str(rc) for rc in cfg.rel_cutoff]) if cfg.rel_cutoff else "",
+                                    "--rel-filter " + ",".join([str(rf) for rf in cfg.rel_filter]) if cfg.rel_filter else "",
++                                   "--fpr-query " + ",".join([str(fq) for fq in cfg.fpr_query]) if cfg.fpr_query else "",
+                                    "--output-prefix " + cfg.output_prefix if cfg.output_prefix else "",
+                                    "--skip-lca" if cfg.reassign and not cfg.output_lca else "",
+                                    "--output-lca" if cfg.output_lca else "",
+diff --git a/src/ganon/config.py b/src/ganon/config.py
+index c0c974ab..c7300a5d 100644
+--- a/src/ganon/config.py
++++ b/src/ganon/config.py
+@@ -132,6 +132,7 @@ def __init__(self, which: str=None, **kwargs):
+         classify_group_cutoff_filter = classify_parser.add_argument_group("cutoff/filter arguments")
+         classify_group_cutoff_filter.add_argument("-c", "--rel-cutoff",          type=int_or_float(minval=0, maxval=1), nargs="*", metavar="", default=[0.75],  help="Min. percentage of a read (set of minimizers) shared with the a reference necessary to consider a match. Generally used to cutoff low similarity matches. Single value or one per database (e.g. 0.7 1 0.25). 0 for no cutoff")
+         classify_group_cutoff_filter.add_argument("-e", "--rel-filter",          type=int_or_float(minval=0, maxval=1), nargs="*", metavar="", default=[0.0],   help="Additional relative percentage of minimizers (relative to the best match) to keep a match. Generally used to select best matches above cutoff. Single value or one per hierarchy (e.g. 0.1 0). 1 for no filter")
++        classify_group_cutoff_filter.add_argument("-f", "--fpr-query",           type=int_or_float(minval=0, maxval=1), nargs="*", metavar="", default=[1.0],   help="FPR. Single value or one per hierarchy (e.g. 0.1 0). 1 for no filter")
+ 
+         classify_group_output = classify_parser.add_argument_group("output arguments")
+         classify_group_output.add_argument("-o", "--output-prefix",       type=str,              metavar="", help="Output prefix for output (.rep) and report (.tre). Empty to output to STDOUT (only .rep)")
+diff --git a/src/ganon/reassign.py b/src/ganon/reassign.py
+index ba52a1ec..f65aa974 100644
+--- a/src/ganon/reassign.py
++++ b/src/ganon/reassign.py
+@@ -21,7 +21,7 @@ def reassign(cfg):
+     if check_file(rep_file):
+ 
+         print_log(".rep file found: " + rep_file, cfg.quiet)
+-        # look for hiearchies
++        # look for hierarchies
+         with open(rep_file) as rep:
+             for line in rep:
+                 if line[0] != "#":
+@@ -179,6 +179,7 @@ def get_top_match(matches, prob):
+     # set first match as target (also the case for no unique matches)
+     target = matches[0][0]
+     kcount = matches[0][1]
++
+     max_p = 0
+     for m, k in matches:
+         if prob[m] > max_p:
+diff --git a/tests/ganon-classify/GanonClassify.test.cpp b/tests/ganon-classify/GanonClassify.test.cpp
+index 3ea94373..7624e4a6 100644
+--- a/tests/ganon-classify/GanonClassify.test.cpp
++++ b/tests/ganon-classify/GanonClassify.test.cpp
+@@ -782,6 +782,42 @@ SCENARIO( "classifying reads with errors", "[ganon-classify][with-errors]" )
+         }
+     }
+ 
++    SECTION( "--rel-cutoff 0.2 --rel-filter 0.5 --fpr-query 1e-10" )
++    {
++        std::string prefix{ folder_prefix + "rel_cutoff_0.2_rel_filter_0.5_fpr_query_1e-10" };
++        auto        cfg  = config_classify::defaultConfig( prefix );
++        cfg.ibf          = { base_prefix + ".ibf" };
++        cfg.single_reads = { folder_prefix + "readF.fasta" };
++        cfg.rel_cutoff   = { 0.2 };
++        cfg.rel_filter   = { 0.5 };
++        cfg.fpr_query    = { 1e-10 };
++        REQUIRE( GanonClassify::run( cfg ) );
++        config_classify::Res res{ cfg };
++        config_classify::sanity_check( cfg, res );
++
++        REQUIRE( res.all["readF"].size() == 2 );
++        REQUIRE( res.all["readF"]["e0"] == 9 );
++        REQUIRE( res.all["readF"]["e1F_e2R"] == 5 );
++
++        SECTION( "--paired-reads" )
++        {
++            prefix            = prefix + "_paired";
++            cfg.output_prefix = prefix;
++            cfg.single_reads  = {};
++            cfg.paired_reads  = { folder_prefix + "readF.fasta", folder_prefix + "readR.fasta" };
++
++            REQUIRE( GanonClassify::run( cfg ) );
++            config_classify::Res res{ cfg };
++            config_classify::sanity_check( cfg, res );
++
++            REQUIRE( res.all["readF"].size() == 3 );
++            REQUIRE( res.all["readF"]["e0"] == 18 );
++            REQUIRE( res.all["readF"]["e1F"] == 14 );
++            REQUIRE( res.all["readF"]["e1F_e1R"] == 10 );
++        }
++    }
++
++
+     SECTION( "--rel-cutoff 0.6 --rel-filter 1 (OFF)" )
+     {
+         std::string prefix{ folder_prefix + "rel_cutoff_0.6_rel_filter_1" };
+@@ -889,6 +925,42 @@ SCENARIO( "classifying reads with errors", "[ganon-classify][with-errors]" )
+         }
+     }
+ 
++    SECTION( "--rel-cutoff 0 (OFF) --rel-filter 1 (OFF) --fpr-query 1e-10" )
++    {
++        std::string prefix{ folder_prefix + "rel_cutoff_1_rel_filter_1_fpr_query_1e-10" };
++        auto        cfg  = config_classify::defaultConfig( prefix );
++        cfg.ibf          = { base_prefix + ".ibf" };
++        cfg.single_reads = { folder_prefix + "readF.fasta" };
++        cfg.rel_cutoff   = { 0 };
++        cfg.rel_filter   = { 1 };
++        cfg.fpr_query    = { 1e-10 };
++
++        REQUIRE( GanonClassify::run( cfg ) );
++        config_classify::Res res{ cfg };
++        config_classify::sanity_check( cfg, res );
++
++        REQUIRE( res.all["readF"].size() == 2 );
++        REQUIRE( res.all["readF"]["e0"] == 9 );
++        REQUIRE( res.all["readF"]["e1F_e2R"] == 5 );
++
++        SECTION( "--paired-reads" )
++        {
++            prefix            = prefix + "_paired";
++            cfg.output_prefix = prefix;
++            cfg.single_reads  = {};
++            cfg.paired_reads  = { folder_prefix + "readF.fasta", folder_prefix + "readR.fasta" };
++
++            REQUIRE( GanonClassify::run( cfg ) );
++            config_classify::Res res{ cfg };
++            config_classify::sanity_check( cfg, res );
++
++            REQUIRE( res.all["readF"].size() == 3 );
++            REQUIRE( res.all["readF"]["e0"] == 18 );
++            REQUIRE( res.all["readF"]["e1F"] == 14 );
++            REQUIRE( res.all["readF"]["e1F_e1R"] == 10 );
++        }
++    }
++
+     SECTION( "--window-size" )
+     {
+         // build with --window-size

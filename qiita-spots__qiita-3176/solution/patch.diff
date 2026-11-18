@@ -1,0 +1,160 @@
+diff --git a/qiita_db/analysis.py b/qiita_db/analysis.py
+index 2f550632e..2d465b182 100644
+--- a/qiita_db/analysis.py
++++ b/qiita_db/analysis.py
+@@ -19,6 +19,7 @@
+ from itertools import product
+ from os.path import join, exists
+ from os import mkdir
++from collections import defaultdict
+ 
+ from biom import load_table
+ from biom.util import biom_open
+@@ -442,6 +443,37 @@ def mapping_file(self):
+         else:
+             return None
+ 
++    @property
++    def metadata_categories(self):
++        """Returns all metadata categories in the current analyses based
++           on the available studies
++
++        Returns
++        -------
++        dict of dict
++            a dict with study_id as the key & the values are another dict with
++            'sample' & 'prep' as keys and the metadata categories as values
++        """
++        ST = qdb.metadata_template.sample_template.SampleTemplate
++        PT = qdb.metadata_template.prep_template.PrepTemplate
++        with qdb.sql_connection.TRN:
++            sql = """SELECT DISTINCT study_id, artifact_id
++                     FROM qiita.analysis_sample
++                     LEFT JOIN qiita.study_artifact USING (artifact_id)
++                     WHERE analysis_id = %s"""
++            qdb.sql_connection.TRN.add(sql, [self._id])
++
++            metadata = defaultdict(dict)
++            for sid, aid in qdb.sql_connection.TRN.execute_fetchindex():
++                if sid not in metadata:
++                    metadata[sid]['sample'] = set(ST(sid).categories)
++                    metadata[sid]['prep'] = set()
++                for pt in qdb.artifact.Artifact(aid).prep_templates:
++                    metadata[sid]['prep'] = metadata[sid]['prep'] | set(
++                        PT(pt.id).categories)
++
++        return metadata
++
+     @property
+     def tgz(self):
+         """Returns the tgz file of the analysis
+@@ -795,7 +827,7 @@ def remove_samples(self, artifacts=None, samples=None):
+             qdb.sql_connection.TRN.add(sql, args, many=True)
+             qdb.sql_connection.TRN.execute()
+ 
+-    def build_files(self, merge_duplicated_sample_ids):
++    def build_files(self, merge_duplicated_sample_ids, categories=None):
+         """Builds biom and mapping files needed for analysis
+ 
+         Parameters
+@@ -804,6 +836,8 @@ def build_files(self, merge_duplicated_sample_ids):
+             If the duplicated sample ids in the selected studies should be
+             merged or prepended with the artifact ids. If false prepends
+             the artifact id
++        categories : set of str, optional
++            If not None, use _only_ these categories for the metaanalysis
+ 
+         Notes
+         -----
+@@ -858,7 +892,8 @@ def build_files(self, merge_duplicated_sample_ids):
+             # We need to negate merge_duplicated_sample_ids because in
+             # _build_mapping_file is acually rename: merge yes == rename no
+             rename_dup_samples = not merge_duplicated_sample_ids
+-            self._build_mapping_file(samples, rename_dup_samples)
++            self._build_mapping_file(
++                samples, rename_dup_samples, categories=categories)
+ 
+             if post_processing_cmds:
+                 biom_files = self._build_biom_tables(
+@@ -1034,7 +1069,8 @@ def _build_biom_tables(self,
+         # the user.
+         return biom_files
+ 
+-    def _build_mapping_file(self, samples, rename_dup_samples=False):
++    def _build_mapping_file(self, samples, rename_dup_samples=False,
++                            categories=None):
+         """Builds the combined mapping file for all samples
+            Code modified slightly from qiime.util.MetadataMap.__add__"""
+         with qdb.sql_connection.TRN:
+@@ -1045,9 +1081,14 @@ def _build_mapping_file(self, samples, rename_dup_samples=False):
+                 artifact = qdb.artifact.Artifact(aid)
+                 si = artifact.study.sample_template
+                 if si not in sample_infos:
+-                    sample_infos[si] = si.to_dataframe()
++                    si_df = si.to_dataframe()
++                    if categories is not None:
++                        si_df = si_df[categories & set(si_df.columns)]
++                    sample_infos[si] = si_df
+                 pt = artifact.prep_templates[0]
+                 pt_df = pt.to_dataframe()
++                if categories is not None:
++                    pt_df = pt_df[categories & set(pt_df.columns)]
+ 
+                 qm = pt_df.join(sample_infos[si], lsuffix="_prep")
+ 
+diff --git a/qiita_db/test/test_analysis.py b/qiita_db/test/test_analysis.py
+index 91e05fcf6..46a6d930b 100644
+--- a/qiita_db/test/test_analysis.py
++++ b/qiita_db/test/test_analysis.py
+@@ -298,6 +298,30 @@ def test_retrieve_mapping_file(self):
+             qdb.util.get_filepath_information(obs)['fullpath'], exp)
+         self.assertTrue(exists(exp))
+ 
++    def test_metadata_categories(self):
++        exp = {1: {
++            'sample': {
++                'env_package', 'water_content_soil', 'collection_timestamp',
++                'anonymized_name', 'sample_type', 'env_biome', 'host_taxid',
++                'ph', 'env_feature', 'temp', 'country', 'scientific_name',
++                'assigned_from_geo', 'physical_specimen_location',
++                'common_name', 'longitude', 'depth', 'season_environment',
++                'description', 'tot_org_carb', 'tot_nitro', 'dna_extracted',
++                'texture', 'samp_salinity', 'taxon_id', 'host_subject_id',
++                'description_duplicate', 'latitude',
++                'physical_specimen_remaining', 'altitude', 'elevation'},
++            'prep': {
++                'run_prefix', 'platform', 'study_center',
++                'library_construction_protocol', 'emp_status',
++                'target_subfragment', 'target_gene', 'center_project_name',
++                'illumina_technology', 'experiment_title', 'instrument_model',
++                'run_date', 'run_center', 'pcr_primers', 'sequencing_meth',
++                'experiment_center', 'experiment_design_description',
++                'barcode', 'samp_size', 'sample_center', 'primer',
++                'center_name'}}}
++        obs = self.analysis.metadata_categories
++        self.assertDictEqual(obs, exp)
++
+     def test_retrieve_tgz(self):
+         # generating here as the tgz is only generated once the analysis runs
+         # to completion (un)successfully
+@@ -395,6 +419,20 @@ def test_build_mapping_file(self):
+ 
+         assert_frame_equal(obs, exp, check_like=True)
+ 
++        # testing categories
++        analysis._build_mapping_file(
++            samples, categories=set(
++                ['env_package', 'experiment_design_description']))
++        obs = qdb.util.get_filepath_information(
++            analysis.mapping_file)['fullpath']
++        obs = qdb.metadata_template.util.load_template_to_dataframe(
++            obs, index='#SampleID').columns
++        exp = ['experiment_design_description', 'env_package',
++               'qiita_artifact_id', 'qiita_prep_deprecated',
++               'qiita_study_title', 'qiita_study_alias', 'qiita_owner',
++               'qiita_principal_investigator']
++        self.assertCountEqual(obs, exp)
++
+     def test_build_mapping_file_duplicated_samples_no_merge(self):
+         analysis = self._create_analyses_with_samples()
+         samples = {4: ['1.SKB8.640193', '1.SKD8.640184', '1.SKB7.640196'],

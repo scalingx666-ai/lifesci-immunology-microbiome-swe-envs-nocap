@@ -1,0 +1,1326 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 72dd01d1..71393fc4 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -84,6 +84,6 @@ Suggests:
+     rmarkdown
+ VignetteBuilder: knitr
+ Encoding: UTF-8
+-RoxygenNote: 7.2.0
++RoxygenNote: 7.2.1
+ LazyData: true
+ LazyDataCompression: xz
+diff --git a/NAMESPACE b/NAMESPACE
+index 930ad526..1db20f3b 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -208,6 +208,7 @@ importFrom(purrr,imap)
+ importFrom(purrr,map)
+ importFrom(purrr,map2)
+ importFrom(purrr,map2_chr)
++importFrom(purrr,map2_df)
+ importFrom(purrr,map2_lgl)
+ importFrom(purrr,map_chr)
+ importFrom(purrr,map_df)
+@@ -289,6 +290,7 @@ importFrom(tibble,tibble)
+ importFrom(tidyr,drop_na)
+ importFrom(tidyr,unite)
+ importFrom(tidyr,unnest)
++importFrom(tidyselect,any_of)
+ importFrom(tidyselect,starts_with)
+ importFrom(utils,capture.output)
+ importFrom(utils,packageVersion)
+diff --git a/R/align_lineage.R b/R/align_lineage.R
+index 854f7f2b..3d89590c 100644
+--- a/R/align_lineage.R
++++ b/R/align_lineage.R
+@@ -23,16 +23,14 @@
+ #'
+ #' @usage
+ #'
+-#' repAlignLineage(.data,
+-#' .min_lineage_sequences, .prepare_threads, .align_threads, .verbose_output, .nofail)
++#' repAlignLineage(.data, .min_lineage_sequences, .prepare_threads, .align_threads, .nofail)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame}, \link{data.table}
+ #' or a list of these objects.
+ #'
+ #' @param .min_lineage_sequences If number of sequences in the same clonal lineage and the same
+ #' cluster (not including germline) is lower than this threshold, this group of sequences
+-#' will not be aligned and will not be used in next steps of BCR pipeline
+-#' (will be saved in output table only if .verbose_output parameter is set to TRUE).
++#' will be filtered out from the dataframe; so only large enough lineages will be included.
+ #'
+ #' @param .prepare_threads Number of threads to prepare results table.
+ #' Please note that high number can cause heavy memory usage!
+@@ -43,11 +41,6 @@
+ #' must contain 'Cluster' column, which is added by seqCluster() function, and 'Germline.sequence'
+ #' column, which is added by repGermline() function.
+ #'
+-#' @param .verbose_output If TRUE, all output dataframe columns will be included (see documentation about this
+-#' function return), and unaligned clusters will be included in the output. Setting this to TRUE significantly
+-#' increases memory usage. If FALSE, only aligned clusters and columns required for repClonalFamily() and
+-#' repSomaticHypermutation() calculation will be included in the output.
+-#'
+ #' @param .nofail Will return NA instead of stopping if Clustal W is not installed.
+ #' Used to avoid raising errors in examples on computers where Clustal W is not installed.
+ #'
+@@ -57,21 +50,13 @@
+ #' The dataframe has these columns:
+ #' * Cluster: cluster name
+ #' * Germline: germline sequence
+-#' * V.germline.nt: germline V gene sequence
+-#' * J.germline.nt: germline J gene sequence
+-#' * CDR3.germline.length: length of CDR3 in germline
+-#' * Aligned (included if .verbose_output=TRUE): FALSE if this group of sequences was not aligned with lineage
+-#'   (.min_lineage_sequences is below the threshold); TRUE if it was aligned
+-#' * Alignment: DNAbin object with alignment or DNAbin object with unaligned sequences (if Aligned=FALSE)
+-#' * V.length: shortest length of V gene part outside of CDR3 region in this
+-#'   group of sequences; longer V genes (including germline) are trimmed to this length before alignment
+-#' * J.length: shortest length of J gene part outside of CDR3 region in this
+-#'   group of sequences; longer J genes (including germline) are trimmed to this length before alignment
++#' * Alignment: DNAbin object with alignment
+ #' * Sequences: nested dataframe containing all sequences for this combination
+ #'   of cluster and germline; it has columns
+-#'   Sequence, Clone.ID, Clones, CDR1.nt, CDR2.nt, CDR3.nt, FR1.nt, FR2.nt, FR3.nt, FR4.nt
+-#'   and, if .verbose_output=TRUE, also V.end, J.start, CDR3.start, CDR3.end;
+-#'   all values taken from the input dataframe
++#'   * Sequence, CDR1.nt, CDR2.nt, CDR3.nt, FR1.nt, FR2.nt, FR3.nt, FR4.nt, V.allele, J.allele,
++#'     V.aa, J.aa: all values taken from the input dataframe
++#'   * Clone.ID: taken from the input dataframe, or created (filled with row numbers) if missing
++#'   * Clones: taken from the input dataframe, or created (filled with '1' values) if missing
+ #'
+ #' @examples
+ #'
+@@ -87,7 +72,6 @@ repAlignLineage <- function(.data,
+                             .min_lineage_sequences = 3,
+                             .prepare_threads = 2,
+                             .align_threads = 4,
+-                            .verbose_output = FALSE,
+                             .nofail = FALSE) {
+   if (!require_system_package(c("clustalw", "clustalw2"), error_message = paste0(
+     "repAlignLineage requires Clustal W app to be installed!\n",
+@@ -96,27 +80,37 @@ repAlignLineage <- function(.data,
+   ), .nofail)) {
+     return(get_empty_object_with_class("step_failure_ignored"))
+   }
++  if (.min_lineage_sequences < 2) {
++    warning(
++      ".min_lineage_sequences is set to less than 2; ",
++      "results will not be valid to build trees with repClonalLineage()!"
++    )
++  }
+ 
+-  doParallel::registerDoParallel(cores = .prepare_threads)
++  parallel_prepare <- .prepare_threads > 1
++  if (parallel_prepare) {
++    doParallel::registerDoParallel(cores = .prepare_threads)
++  }
+   .data %<>%
+     apply_to_sample_or_list(
+       align_single_df,
+       .min_lineage_sequences = .min_lineage_sequences,
+-      .parallel_prepare = .prepare_threads > 1,
+-      .align_threads = .align_threads,
+-      .verbose_output = .verbose_output
++      .parallel_prepare = parallel_prepare,
++      .align_threads = .align_threads
+     )
+-  doParallel::stopImplicitCluster()
++  if (parallel_prepare) {
++    doParallel::stopImplicitCluster()
++  }
+   return(.data)
+ }
+ 
+ align_single_df <- function(data,
+                             .min_lineage_sequences,
+                             .parallel_prepare,
+-                            .align_threads,
+-                            .verbose_output) {
++                            .align_threads) {
+   for (required_column in c(
+-    "Cluster", "Germline.sequence", "V.germline.nt", "J.germline.nt", "CDR3.germline.length"
++    "Cluster", "Germline.sequence", "V.allele", "J.allele",
++    "FR1.nt", "CDR1.nt", "FR2.nt", "CDR2.nt", "FR3.nt", "CDR3.nt", "FR4.nt", "V.aa", "J.aa"
+   )) {
+     if (!(required_column %in% colnames(data))) {
+       stop(
+@@ -129,11 +123,11 @@ align_single_df <- function(data,
+   }
+ 
+   results <- data %>%
++    fill_missing_columns() %>%
+     plyr::dlply(
+       .variables = .(get("Cluster"), get("Germline.sequence")),
+       .fun = prepare_results_row,
+       .min_lineage_sequences = .min_lineage_sequences,
+-      .verbose_output = .verbose_output,
+       .parallel = .parallel_prepare
+     ) %>%
+     `[`(!is.na(.)) %>%
+@@ -143,112 +137,63 @@ align_single_df <- function(data,
+     stop("There are no lineages containing at least ", .min_lineage_sequences, " sequences!")
+   }
+ 
+-  # only required columns are passed to alignment function to reduce consumed memory
+-  if (.verbose_output) {
+-    alignments <- lapply(results, "[", c("Aligned", "Alignment"))
+-  } else {
+-    alignments <- lapply(results, "[", "Alignment")
+-  }
+-  alignments %<>% parallel::mclapply(
+-    align_sequences,
+-    .verbose_output = .verbose_output,
+-    mc.preschedule = TRUE,
+-    mc.cores = .align_threads
+-  )
++  # only Alignment column are passed to alignment function to reduce consumed memory
++  alignments <- lapply(results, "[", "Alignment") %>%
++    par_or_normal_lapply(mc.preschedule = TRUE, mc.cores = .align_threads, function(df_row) {
++      df_row[["Alignment"]] %<>% ape::clustal()
++    })
+ 
+   return(convert_results_to_df(results, alignments))
+ }
+ 
++# fill Clone.ID and Clones columns if they are missing
++fill_missing_columns <- function(data) {
++  if (!("Clone.ID" %in% colnames(data))) {
++    data[["Clone.ID"]] <- seq.int(nrow(data))
++  }
++  if (!("Clones" %in% colnames(data))) {
++    data[["Clones"]] <- as.integer(1)
++  }
++  return(data)
++}
++
+ # this function accepts dataframe subset containing rows only for current lineage
+ # and returns named list containing 1 row for results dataframe
+-prepare_results_row <- function(lineage_subset, .min_lineage_sequences, .verbose_output) {
+-  cluster_name <- lineage_subset[[1, "Cluster"]]
+-  germline_seq <- lineage_subset[[1, "Germline.sequence"]]
+-  germline_v <- lineage_subset[[1, "V.germline.nt"]]
+-  germline_j <- lineage_subset[[1, "J.germline.nt"]]
+-  germline_cdr3_len <- lineage_subset[[1, "CDR3.germline.length"]]
+-  aligned <- nrow(lineage_subset) >= .min_lineage_sequences
+-
+-  if (!aligned & !.verbose_output) {
++prepare_results_row <- function(lineage_subset, .min_lineage_sequences) {
++  if (nrow(lineage_subset) < .min_lineage_sequences) {
++    # NA rows will be filtered out
+     return(NA)
+   }
+ 
+-  lineage_subset[["V.lengths"]] <- v_len_outside_cdr3(
+-    lineage_subset[["V.end"]], lineage_subset[["CDR3.start"]]
+-  )
+-  lineage_subset[["J.lengths"]] <- j_len_outside_cdr3(
+-    lineage_subset[["Sequence"]], lineage_subset[["J.start"]], lineage_subset[["CDR3.end"]]
+-  )
++  cluster_name <- lineage_subset[[1, "Cluster"]]
++  germline_seq <- lineage_subset[[1, "Germline.sequence"]]
+ 
+   sequences_columns <- c(
+-    "Sequence", "Clone.ID", "Clones",
+-    "CDR1.nt", "CDR2.nt", "CDR3.nt", "FR1.nt", "FR2.nt", "FR3.nt", "FR4.nt"
++    "Sequence", "Clone.ID", "Clones", "V.allele", "J.allele",
++    "CDR1.nt", "CDR2.nt", "CDR3.nt", "FR1.nt", "FR2.nt", "FR3.nt", "FR4.nt", "V.aa", "J.aa"
+   )
+-  if (.verbose_output) {
+-    sequences_columns %<>% c("V.end", "J.start", "CDR3.start", "CDR3.end")
+-  }
++
+   sequences <- lineage_subset[sequences_columns]
+   sequences[["Clone.ID"]] %<>% as.integer()
+   sequences[["Clones"]] %<>% as.integer()
+ 
+-  germline_v_len <- str_length(germline_v)
+-  germline_j_len <- str_length(germline_j)
+-  v_min_len <- min(lineage_subset[["V.lengths"]], germline_v_len)
+-  j_min_len <- min(lineage_subset[["J.lengths"]], germline_j_len)
+-
+-  germline_trimmed <- trim_seq(germline_seq, germline_v_len, v_min_len, germline_j_len, j_min_len)
+-  clonotypes_trimmed <- trim_seq(
+-    lineage_subset[["Sequence"]],
+-    lineage_subset[["V.lengths"]],
+-    v_min_len,
+-    lineage_subset[["J.lengths"]],
+-    j_min_len
+-  )
+-
+   clonotypes_names <- sapply(lineage_subset[["Clone.ID"]], function(id) {
+     paste0("ID_", id)
+   })
+-  all_sequences_list <- c(list(germline_trimmed), as.list(clonotypes_trimmed))
++  all_sequences_list <- c(list(germline_seq), as.list(lineage_subset[["Sequence"]]))
+   names(all_sequences_list) <- c("Germline", clonotypes_names)
+   alignment <- convert_seq_list_to_dnabin(all_sequences_list)
+ 
+-  if (.verbose_output) {
+-    return(list(
+-      Cluster = cluster_name,
+-      Germline = germline_seq,
+-      V.germline.nt = germline_v,
+-      J.germline.nt = germline_j,
+-      CDR3.germline.length = germline_cdr3_len,
+-      Aligned = aligned,
+-      Alignment = alignment,
+-      V.length = v_min_len,
+-      J.length = j_min_len,
+-      Sequences = sequences
+-    ))
+-  } else {
+-    return(list(
+-      Cluster = cluster_name,
+-      Germline = germline_seq,
+-      V.germline.nt = germline_v,
+-      J.germline.nt = germline_j,
+-      CDR3.germline.length = germline_cdr3_len,
+-      Alignment = alignment,
+-      V.length = v_min_len,
+-      J.length = j_min_len,
+-      Sequences = sequences
+-    ))
+-  }
++  return(list(
++    Cluster = cluster_name,
++    Germline = germline_seq,
++    Alignment = alignment,
++    Sequences = sequences
++  ))
+ }
+ 
+-# trim V/J tails in sequence to the specified lenghts v_min, j_min
+-trim_seq <- function(seq, v_len, v_min, j_len, j_min) {
+-  str_sub(seq, v_len - v_min + 1, -(j_len - j_min + 1))
+-}
+-
+-convert_results_to_df <- function(nested_results_list, nested_alignments_list) {
+-  alignments <- nested_alignments_list %>%
+-    lapply(magrittr::extract2, "Alignment") %>%
+-    tibble(Alignment = .)
++convert_results_to_df <- function(nested_results_list, alignments_list) {
++  alignments <- tibble(Alignment = alignments_list)
+   sequences <- nested_results_list %>%
+     lapply(magrittr::extract2, "Sequences") %>%
+     tibble(Sequences = .)
+@@ -256,21 +201,5 @@ convert_results_to_df <- function(nested_results_list, nested_alignments_list) {
+     lapply(rlist::list.remove, c("Alignment", "Sequences")) %>%
+     purrr::map_dfr(~.) %>%
+     cbind(alignments, sequences)
+-  # fix column types after dataframe rebuilding
+-  for (column in c("CDR3.germline.length", "V.length", "J.length")) {
+-    df[[column]] %<>% as.integer()
+-  }
+   return(df)
+ }
+-
+-align_sequences <- function(df_row, .verbose_output) {
+-  if (.verbose_output) {
+-    aligned <- df_row[["Aligned"]]
+-  } else {
+-    aligned <- TRUE
+-  }
+-  if (aligned) {
+-    df_row[["Alignment"]] %<>% ape::clustal()
+-  }
+-  return(df_row)
+-}
+diff --git a/R/distance.R b/R/distance.R
+index 3fd2948c..45eddac5 100644
+--- a/R/distance.R
++++ b/R/distance.R
+@@ -13,7 +13,7 @@
+ #' @usage
+ #'
+ #' seqDist(.data, .col = 'CDR3.nt', .method = 'hamming',
+-#'  .group_by = c("V.first", "J.first"), .group_by_seqLength = TRUE, ...)
++#'  .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, .trim_genes = TRUE, ...)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame},
+ #' \link{data.table}, or a list of these objects.
+@@ -70,10 +70,15 @@
+ #' seqDist(immdata$data[1:2], .method = f, .group_by_seqLength = FALSE)
+ #' @export seqDist
+ 
+-seqDist <- function(.data, .col = "CDR3.nt", .method = "hamming", .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, trim_genes = TRUE, ...) {
++seqDist <- function(.data,
++                    .col = "CDR3.nt",
++                    .method = "hamming",
++                    .group_by = c("V.name", "J.name"),
++                    .group_by_seqLength = TRUE,
++                    .trim_genes = TRUE, ...) {
+   .validate_repertoires_data(.data)
+   gr_by_is_na <- all(is.na(.group_by))
+-  if (trim_genes) {
++  if (.trim_genes) {
+     for (colname in .group_by) {
+       .data <- add_column_with_first_gene(.data, colname)
+     }
+@@ -126,6 +131,6 @@ seqDist <- function(.data, .col = "CDR3.nt", .method = "hamming", .group_by = c(
+   attributes(result)[["col"]] <- .col
+   attributes(result)[["group_by"]] <- .group_by
+   attributes(result)[["group_by_length"]] <- .group_by_seqLength
+-  attributes(result)[["trimmed"]] <- trim_genes
++  attributes(result)[["trimmed"]] <- .trim_genes
+   return(result)
+ }
+diff --git a/R/germline.R b/R/germline.R
+index 13244fe3..8d21a700 100644
+--- a/R/germline.R
++++ b/R/germline.R
+@@ -8,6 +8,7 @@
+ #' @importFrom purrr imap map_dfr
+ #' @importFrom magrittr %>% %<>% extract2
+ #' @importFrom dplyr filter rowwise
++#' @importFrom tidyselect any_of
+ #' @importFrom parallel parApply detectCores makeCluster clusterExport stopCluster
+ #' @importFrom ape as.DNAbin clustal
+ #'
+@@ -21,8 +22,7 @@
+ #'
+ #' @usage
+ #'
+-#' repGermline(.data,
+-#' .species, .align_j_gene, .min_nuc_outside_cdr3, .threads)
++#' repGermline(.data, .species, .min_nuc_outside_cdr3, .threads)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame}, \link{data.table}
+ #' or a list of these objects.
+@@ -36,13 +36,6 @@
+ #' "OncorhynchusMykiss", "OrnithorhynchusAnatinus", "OryctolagusCuniculus", "RattusNorvegicus",
+ #' "SusScrofa".
+ #'
+-#' @param .align_j_gene MiXCR provides the number of J indels only for 1 allele of J gene
+-#' in the output file, and a germline can contain another allele. Therefore, calculation of
+-#' J gene start in reference based on numbers from input file can be sometimes incorrect.
+-#' As result, J gene in the germline will be trimmed in the start or will contain some
+-#' nucleotides from CDR3. Setting this parameter to TRUE enables precise alignment of J genes
+-#' to detect the correct starting point, but it significantly reduces performance.
+-#'
+ #' @param .min_nuc_outside_cdr3 This parameter sets how many nucleotides should have V or J chain
+ #' outside of CDR3 to be considered good for further alignment.
+ #'
+@@ -51,12 +44,10 @@
+ #' @return
+ #'
+ #' Data with added columns:
+-#' * V.first.allele, J.first.allele (first alleles of V and J genes),
+-#' * V.ref.nt, J.ref.nt (V and J reference sequences),
+-#' * V.germline.nt, J.germline.nt (V and J germline sequences; they are references with
+-#'   trimmed parts that are from CDR3),
+-#' * CDR3.germline.length (length of CDR3 in the germline),
+-#' * Germline.sequence (combined germline sequence)
++#' * Sequence (FR1+CDR1+FR2+CDR2+FR3+CDR3+FR4 in nucleotides; the column will be replaced if exists)
++#' * V.allele, J.allele (chosen alleles of V and J genes),
++#' * V.aa, J.aa (V and J sequences from original clonotype, outside CDR3, converted to amino acids)
++#' * Germline.sequence (combined germline nucleotide sequence)
+ #'
+ #' @examples
+ #'
+@@ -64,21 +55,12 @@
+ #'
+ #' bcrdata$data %>%
+ #'   top(5) %>%
+-#'   repGermline(.threads = 1)
++#'   repGermline()
+ #' @export repGermline
+ repGermline <- function(.data,
+                         .species = "HomoSapiens",
+-                        .align_j_gene = FALSE,
+                         .min_nuc_outside_cdr3 = 5,
+-                        .threads = parallel::detectCores()) {
+-  if (.align_j_gene) {
+-    require_system_package(c("clustalw", "clustalw2"), error_message = paste0(
+-      "repGermline with .align_j_gene = TRUE requires Clustal W app to be installed!\n",
+-      "Please download it from here: http://www.clustal.org/download/current/\n",
+-      "or install it with your system package manager (such as apt or dnf)."
+-    ))
+-  }
+-
++                        .threads = 1) {
+   # prepare reference sequences for all alleles
+   genesegments_env <- new.env()
+   data("genesegments", envir = genesegments_env)
+@@ -92,7 +74,6 @@ repGermline <- function(.data,
+       .with_names = TRUE,
+       reference = reference,
+       species = .species,
+-      align_j_gene = .align_j_gene,
+       min_nuc_outside_cdr3 = .min_nuc_outside_cdr3,
+       threads = .threads
+     )
+@@ -102,148 +83,154 @@ repGermline <- function(.data,
+ germline_single_df <- function(data,
+                                reference,
+                                species,
+-                               align_j_gene,
+                                min_nuc_outside_cdr3,
+                                threads,
+                                sample_name = NA) {
+   data %<>%
+-    validate_genes_edges(sample_name) %>%
+-    add_column_with_first_gene(
+-      "V.name",
+-      "V.first.allele",
+-      .with_allele = TRUE
+-    ) %>%
++    validate_mandatory_columns(sample_name) %>%
++    add_allele_column(reference[["allele_id"]], "V") %>%
+     merge_reference_sequences(reference, "V", species, sample_name) %>%
+-    add_column_with_first_gene(
+-      "J.name",
+-      "J.first.allele",
+-      .with_allele = TRUE
+-    ) %>%
++    add_allele_column(reference[["allele_id"]], "J") %>%
+     merge_reference_sequences(reference, "J", species, sample_name) %>%
+     validate_chains_length(min_nuc_outside_cdr3, sample_name) %>%
+-    calculate_germlines_parallel(align_j_gene, threads, sample_name) %>%
++    calculate_germlines_parallel(threads, sample_name) %>%
+     filter(!is.na(get("Germline.sequence")))
+   return(data)
+ }
+ 
+-calculate_germlines_parallel <- function(data, align_j_gene, threads, sample_name) {
+-  cluster <- makeCluster(threads)
+-  clusterExport(cluster, c("generate_germline_sequence", "align_and_find_j_start", "sample_name"),
+-    envir = environment()
+-  )
++calculate_germlines_parallel <- function(data, threads, sample_name) {
++  if (threads == 1) {
++    cluster <- NA
++  } else {
++    cluster <- makeCluster(threads)
++    clusterExport(cluster, c("generate_germline_sequence", "align_and_find_j_start", "sample_name"),
++      envir = environment()
++    )
++  }
+ 
+   # rowwise parallel calculation of new columns that are added to data
+-  data <- parApply(cluster, data, 1, function(row) {
+-    generate_germline_sequence(
+-      seq = row[["Sequence"]],
+-      v_ref = row[["V.ref.nt"]],
+-      j_ref = row[["J.ref.nt"]],
+-      cdr1_nt = row[["CDR1.nt"]],
+-      cdr2_nt = row[["CDR2.nt"]],
+-      fr1_nt = row[["FR1.nt"]],
+-      fr2_nt = row[["FR2.nt"]],
+-      fr3_nt = row[["FR3.nt"]],
+-      fr4_nt = row[["FR4.nt"]],
+-      cdr3_start = as.integer(row[["CDR3.start"]]),
+-      cdr3_end = as.integer(row[["CDR3.end"]]),
+-      j_start = as.integer(row[["J.start"]]),
+-      j3_del = as.integer(row[["J3.Deletions"]]),
+-      align_j_gene = align_j_gene,
+-      sample_name = sample_name
+-    )
++  data <- par_or_normal_apply(cluster, data, 1, function(row) {
++    calculate_new_columns(row, sample_name)
+   }) %>%
+     map_dfr(~.) %>%
+     germline_handle_warnings() %>%
+-    cbind(data, .)
++    merge_germline_results(data)
+ 
+-  stopCluster(cluster)
++  if (!has_no_data(cluster)) {
++    stopCluster(cluster)
++  }
+   return(data)
+ }
+ 
+-generate_germline_sequence <- function(seq, v_ref, j_ref, cdr1_nt, cdr2_nt,
+-                                       fr1_nt, fr2_nt, fr3_nt, fr4_nt,
+-                                       cdr3_start, cdr3_end, j_start, j3_del,
+-                                       align_j_gene, sample_name) {
++calculate_new_columns <- function(row, sample_name) {
++  v_ref <- row[["V.ref.nt"]]
++  j_ref <- row[["J.ref.nt"]]
++  cdr1_nt <- row[["CDR1.nt"]]
++  cdr2_nt <- row[["CDR2.nt"]]
++  cdr3_nt <- row[["CDR3.nt"]]
++  fr1_nt <- row[["FR1.nt"]]
++  fr2_nt <- row[["FR2.nt"]]
++  fr3_nt <- row[["FR3.nt"]]
++  fr4_nt <- row[["FR4.nt"]]
++
+   if (any(is.na(c(
+-    seq, v_ref, j_ref, cdr1_nt, cdr2_nt, fr1_nt, fr2_nt, fr3_nt, fr4_nt,
+-    cdr3_start, cdr3_end, j_start, j3_del
+-  ))) ||
+-    (seq == "")) {
++    v_ref, j_ref, cdr1_nt, cdr2_nt, fr1_nt, fr2_nt, fr3_nt, cdr3_nt, fr4_nt
++  )))) {
+     # warnings cannot be displayed from parApply; save them and display after finish
+     warn <- paste0(
+       "Some of mandatory fields in a row ",
+       optional_sample("from sample ", sample_name, " "),
+-      "contain unexpected NA or empty strings! Found values:\n",
+-      "Sequence = ",
+-      seq,
+-      ",\nV.ref.nt = ",
++      "contain unexpected NAs! Found values:\n",
++      "V.ref.nt = ",
+       v_ref,
+-      ",\nJ.ref.nt = ",
++      "\nJ.ref.nt = ",
+       j_ref,
+-      ",\nCDR1.nt = ",
++      "\nCDR1.nt = ",
+       cdr1_nt,
+-      ",\nCDR2.nt = ",
++      "\nCDR2.nt = ",
+       cdr2_nt,
+-      ",\nFR1.nt = ",
++      "\nCDR3.nt = ",
++      cdr3_nt,
++      "\nFR1.nt = ",
+       fr1_nt,
+-      ",\nFR2.nt = ",
++      "\nFR2.nt = ",
+       fr2_nt,
+-      ",\nFR3.nt = ",
++      "\nFR3.nt = ",
+       fr3_nt,
+-      ",\nFR4.nt = ",
++      "\nFR4.nt = ",
+       fr4_nt,
+-      ",\nCDR3.start = ",
+-      cdr3_start,
+-      ", CDR3.end = ",
+-      cdr3_end,
+-      ", J.start = ",
+-      j_start,
+-      ", J3.Deletions = ",
+-      j3_del,
+-      ".\nThe row will be dropped!"
++      "\nThe row will be dropped!"
+     )
+     return(list(
+-      V.germline.nt = NA,
+-      J.germline.nt = NA,
+-      CDR3.germline.length = NA,
++      Sequence = NA,
++      V.aa = NA,
++      J.aa = NA,
+       Germline.sequence = NA,
+       Warning = warn
+     ))
+   } else {
+-    v_end <- str_length(cdr1_nt) + str_length(cdr2_nt) +
+-      str_length(fr1_nt) + str_length(fr2_nt) + str_length(fr3_nt)
+-    cdr3_length <- cdr3_end - cdr3_start
++    seq <- paste0(fr1_nt, cdr1_nt, fr2_nt, cdr2_nt, fr3_nt, cdr3_nt, fr4_nt) %>% toupper()
++    cdr1_aa <- ifelse(has_no_data(row[["CDR1.aa"]]), bunch_translate(cdr1_nt), row[["CDR1.aa"]])
++    cdr2_aa <- ifelse(has_no_data(row[["CDR2.aa"]]), bunch_translate(cdr2_nt), row[["CDR2.aa"]])
++    fr1_aa <- ifelse(has_no_data(row[["FR1.aa"]]), bunch_translate(fr1_nt), row[["FR1.aa"]])
++    fr2_aa <- ifelse(has_no_data(row[["FR2.aa"]]), bunch_translate(fr2_nt), row[["FR2.aa"]])
++    fr3_aa <- ifelse(has_no_data(row[["FR3.aa"]]), bunch_translate(fr3_nt), row[["FR3.aa"]])
++    fr4_aa <- ifelse(has_no_data(row[["FR4.aa"]]), bunch_translate(fr4_nt), row[["FR4.aa"]])
++    v_aa <- paste0(fr1_aa, cdr1_aa, fr2_aa, cdr2_aa, fr3_aa)
++    j_aa <- fr4_aa
+ 
+     # trim intersection of V and CDR3 from reference V gene
+-    v_part <- str_sub(v_ref, 1, v_end)
++    v_length <- str_length(paste0(fr1_nt, cdr1_nt, fr2_nt, cdr2_nt, fr3_nt))
++    v_part <- str_sub(v_ref, 1, v_length)
+ 
+-    cdr3_part <- paste(rep("n", cdr3_length), collapse = "")
++    cdr3_part <- paste(rep("n", str_length(cdr3_nt)), collapse = "")
+ 
+     # trim intersection of J and CDR3 from reference J gene
+-    if (align_j_gene) {
+-      calculated_j_start <- align_and_find_j_start(j_ref, fr4_nt)
+-    } else {
+-      calculated_j_start <- max(0, cdr3_end - j_start - j3_del + 1)
+-    }
+-    j_part <- str_sub(j_ref, calculated_j_start)
++    j_length <- str_length(fr4_nt)
++    j_part <- str_sub(j_ref, str_length(j_ref) - j_length + 1, str_length(j_ref))
+ 
+     germline <- paste0(v_part, cdr3_part, j_part) %>%
+       toupper()
+ 
+     # return values for new calculated columns
+     return(list(
+-      V.germline.nt = v_part,
+-      J.germline.nt = j_part,
+-      CDR3.germline.length = cdr3_length,
++      Sequence = seq,
++      V.aa = v_aa,
++      J.aa = j_aa,
+       Germline.sequence = germline,
+       Warning = NA
+     ))
+   }
+ }
+ 
++add_allele_column <- function(.data, .reference_allele_ids, .gene) {
++  raw_genes_colname <- paste0(.gene, ".name")
++  target_colname <- paste0(.gene, ".allele")
++  if (validate_columns(.data, raw_genes_colname, target_colname)) {
++    .data[[target_colname]] <- .data[[raw_genes_colname]] %>% sapply(
++      function(genes_string) {
++        # first allele is substring until first ',' or '(' in string taken from column with gene names
++        first_allele <- strsplit(genes_string, ",|\\(")[[1]][1]
++        # MiXCR uses *00 for unknown alleles; drop it to find first matching allele in reference
++        name_to_search <- str_replace(first_allele, fixed("*00"), "")
++        first_matching_allele <- .reference_allele_ids[which(startsWith(
++          .reference_allele_ids,
++          name_to_search
++        ))][1]
++        if (has_no_data(first_matching_allele)) {
++          return(name_to_search)
++        } else {
++          return(first_matching_allele)
++        }
++      }
++    )
++  }
++  return(.data)
++}
++
+ merge_reference_sequences <- function(data, reference, chain_letter, species, sample_name) {
+   chain_seq_colname <- paste0(chain_letter, ".ref.nt")
+-  chain_allele_colname <- paste0(chain_letter, ".first.allele")
++  chain_allele_colname <- paste0(chain_letter, ".allele")
+   colnames(reference) <- c(chain_seq_colname, chain_allele_colname)
+ 
+   # check for alleles in data that don't exist in the reference
+@@ -252,7 +239,7 @@ merge_reference_sequences <- function(data, reference, chain_letter, species, sa
+   missing_alleles <- alleles_in_data[!(alleles_in_data %in% alleles_in_ref)]
+   if (length(missing_alleles) > 0) {
+     warning(
+-      "Alleles ",
++      "Genes or alleles ",
+       paste(missing_alleles, collapse = ", "),
+       " ",
+       optional_sample("from sample ", sample_name, " "),
+@@ -275,7 +262,7 @@ merge_reference_sequences <- function(data, reference, chain_letter, species, sa
+   return(data)
+ }
+ 
+-validate_genes_edges <- function(data, sample_name) {
++validate_mandatory_columns <- function(data, sample_name) {
+   if (nrow(data) == 0) {
+     stop(
+       "Sample ",
+@@ -283,7 +270,9 @@ validate_genes_edges <- function(data, sample_name) {
+       "dataframe is empty!"
+     )
+   }
+-  for (column in c("V.end", "J.start")) {
++  old_length <- nrow(data)
++  mandatory_columns <- c("FR1.nt", "CDR1.nt", "FR2.nt", "CDR2.nt", "FR3.nt", "CDR3.nt", "FR4.nt")
++  for (column in mandatory_columns) {
+     if (!(column %in% colnames(data))) {
+       stop(
+         "Missing mandatory ",
+@@ -295,16 +284,14 @@ validate_genes_edges <- function(data, sample_name) {
+     }
+     if (all(is.na(data[, column]))) {
+       stop(
+-        "No data in mandatory ",
+-        column,
+-        " column",
++        "Dropped all rows when filtering out NAs from mandatory columns ",
++        paste(mandatory_columns, collapse = ", "),
+         optional_sample(" in sample ", sample_name, ""),
+         "!"
+       )
+     }
++    data %<>% filter(!is.na(get(column)))
+   }
+-  old_length <- nrow(data)
+-  data %<>% filter(!is.na(get("V.end")) & !is.na(get("J.start")))
+   dropped_num <- old_length - nrow(data)
+   if (dropped_num > 0) {
+     warning(
+@@ -312,14 +299,9 @@ validate_genes_edges <- function(data, sample_name) {
+       " rows from ",
+       old_length,
+       optional_sample(" in sample ", sample_name, ""),
+-      " were dropped because of missing values in mandatory columns V.end and J.start!"
+-    )
+-  }
+-  if (nrow(data) == 0) {
+-    stop(
+-      "Sample ",
+-      optional_sample("", sample_name, " "),
+-      "dataframe is empty after dropping missing values!"
++      " were dropped because of missing values in mandatory columns ",
++      paste(mandatory_columns, collapse = ", "),
++      "!"
+     )
+   }
+   return(data)
+@@ -328,21 +310,14 @@ validate_genes_edges <- function(data, sample_name) {
+ validate_chains_length <- function(data, min_nuc_outside_cdr3, sample_name) {
+   old_length_v <- nrow(data)
+   data %<>% filter(
+-    v_len_outside_cdr3(
+-      get("V.end"),
+-      get("CDR3.start")
+-    ) >= min_nuc_outside_cdr3
++    str_length(get("FR1.nt")) + str_length(get("CDR1.nt")) + str_length(get("FR2.nt"))
++      + str_length(get("CDR2.nt")) + str_length(get("FR3.nt"))
++    >= min_nuc_outside_cdr3
+   )
+   dropped_v <- old_length_v - nrow(data)
+   old_length_j <- nrow(data)
+   if (nrow(data) > 0) {
+-    data %<>% filter(
+-      j_len_outside_cdr3(
+-        get("Sequence"),
+-        get("J.start"),
+-        get("CDR3.end")
+-      ) >= min_nuc_outside_cdr3
+-    )
++    data %<>% filter(str_length(get("FR4.nt")) >= min_nuc_outside_cdr3)
+   }
+   dropped_j <- old_length_j - nrow(data)
+ 
+@@ -373,39 +348,11 @@ validate_chains_length <- function(data, min_nuc_outside_cdr3, sample_name) {
+   return(data)
+ }
+ 
+-# align reference J gene and FR4 segment from clonotype to find start of J gene outside of CDR3
+-align_and_find_j_start <- function(j_ref, fr4_seq, max_len_diff = 10) {
+-  # max_len_diff is needed to prevent alignment of sequences that are very different in length;
+-  # we are only interested in the left side of alignment
+-  j_len <- str_length(j_ref)
+-  fr4_len <- str_length(fr4_seq)
+-  min_len <- min(j_len, fr4_len)
+-  max_len <- max(j_len, fr4_len)
+-  trim_len <- min(min_len + max_len_diff, max_len)
+-  j_trimmed <- str_sub(j_ref, 1, trim_len)
+-  fr4_trimmed <- str_sub(fr4_seq, 1, trim_len)
+-
+-  # alignment will contain vector of 2 aligned strings where deletions are "-" characters
+-  alignment <- list(J = j_trimmed, FR4 = fr4_trimmed) %>%
+-    lapply(
+-      function(sequence) {
+-        sequence %>%
+-          str_extract_all(boundary("character")) %>%
+-          unlist()
+-      }
+-    ) %>%
+-    ape::as.DNAbin() %>%
+-    ape::clustal() %>%
+-    as.character() %>%
+-    apply(1, paste, collapse = "") %>%
+-    lapply(toupper)
+-
+-  num_deletions <- str_length(stringr::str_extract(alignment[["FR4"]], pattern = "^(-+)"))
+-  if (is.na(num_deletions) | (str_length(alignment[["J"]]) <= num_deletions)) {
+-    return(1)
+-  } else {
+-    return(num_deletions + 1)
+-  }
++merge_germline_results <- function(new_columns, data) {
++  data %<>%
++    dplyr::select(-any_of(c("Sequence", "V.ref.nt", "J.ref.nt"))) %>%
++    cbind(new_columns)
++  return(data)
+ }
+ 
+ germline_handle_warnings <- function(df) {
+diff --git a/R/phylip.R b/R/phylip.R
+index bdd7c13b..7f63a0ac 100644
+--- a/R/phylip.R
++++ b/R/phylip.R
+@@ -23,8 +23,7 @@
+ #'
+ #' repClonalFamily(.data, .threads, .nofail)
+ #'
+-#' @param .data The data to be processed. Can be output of repAlignLineage() with normal
+-#' or verbose output; variants with one sample and list of samples are both supported.
++#' @param .data The data to be processed, output of repAlignLineage() function.
+ #'
+ #' @param .threads Number of threads to use.
+ #'
+@@ -36,16 +35,10 @@
+ #' Dataframe or list of dataframes (if input is a list with multiple samples).
+ #' The dataframe has these columns:
+ #' * Cluster: cluster name
+-#' * Germline.Input: germline sequence, like it was in the input; not trimmed and not aligned
+-#' * V.germline.nt: input germline V gene sequence
+-#' * J.germline.nt: input germline J gene sequence
+-#' * CDR3.germline.length: length of CDR3 in input germline
+-#' * V.length: length of V gene after trimming on repAlignLineage() step
+-#' * J.length: length of j gene after trimming on repAlignLineage() step
++#' * Germline.Input: germline sequence, like it was in the input; not aligned
+ #' * Germline.Output: germline sequence, parsed from PHYLIP dnapars function output;
+ #'   it contains difference of germline from the common ancestor; "." characters mean
+-#'   matching letters. It's usually shorter than Germline.Input, because germline and
+-#'   clonotype sequences were trimmed to the same length before alignment.
++#'   matching letters
+ #' * Common.Ancestor: common ancestor sequence, parsed from PHYLIP dnapars function output
+ #' * Trunk.Length: mean trunk length, representing the distance between the most recent
+ #'   common ancestor and germline sequence as a measure of the maturity of a lineage
+@@ -87,10 +80,7 @@ repClonalFamily <- function(.data, .threads = parallel::detectCores(), .nofail =
+ }
+ 
+ process_dataframe <- function(df, .threads, sample_name = NA) {
+-  required_columns <- c(
+-    "Cluster", "Germline", "V.germline.nt", "J.germline.nt", "CDR3.germline.length",
+-    "V.length", "J.length", "Alignment", "Sequences"
+-  )
++  required_columns <- c("Cluster", "Germline", "Alignment", "Sequences")
+   for (column in required_columns) {
+     if (!(column %in% colnames(df))) {
+       stop(
+@@ -103,10 +93,6 @@ process_dataframe <- function(df, .threads, sample_name = NA) {
+     }
+   }
+ 
+-  if ("Aligned" %in% colnames(df)) {
+-    df %<>% filter(get("Aligned"))
+-  }
+-
+   if (nrow(df) == 0) {
+     stop(
+       "repClonalFamily: input dataframe ",
+@@ -118,7 +104,7 @@ process_dataframe <- function(df, .threads, sample_name = NA) {
+   df <- df[required_columns]
+   clusters_list <- split(df, seq(nrow(df)))
+ 
+-  results <- parallel::mclapply(
++  results <- par_or_normal_lapply(
+     clusters_list,
+     process_cluster,
+     mc.preschedule = FALSE,
+@@ -129,18 +115,11 @@ process_dataframe <- function(df, .threads, sample_name = NA) {
+ }
+ 
+ process_cluster <- function(cluster_row) {
+-  # alignment and sequences should be extracted from 1-element lists because of these columns format
++  # alignment, sequences and aa_frame_starts should be extracted from 1-element lists
++  # because of these columns format
+   alignment <- cluster_row[["Alignment"]][[1]]
+   sequences <- cluster_row[["Sequences"]][[1]]
+   cluster_name <- cluster_row[["Cluster"]]
+-  cdr3_germline_length <- cluster_row[["CDR3.germline.length"]]
+-  v_trimmed_length <- cluster_row[["V.length"]]
+-  j_trimmed_length <- cluster_row[["J.length"]]
+-
+-  # positions of starting nucleotide for translation of sequences to amino acids
+-  v_full_length <- str_length(cluster_row[["V.germline.nt"]])
+-  v_aa_frame_start <- (v_full_length - v_trimmed_length) %% 3 + 1
+-  j_aa_frame_start <- (v_full_length + cdr3_germline_length) %% 3 + 1
+ 
+   temp_dir <- file.path(tempdir(check = TRUE), uuid::UUIDgenerate(use.time = FALSE))
+   dir.create(temp_dir)
+@@ -265,47 +244,51 @@ process_cluster <- function(cluster_row) {
+   germline <- tree_stats[which(tree_stats["Type"] == "Germline"), ][1, "Sequence"]
+   common_ancestor <- tree_stats[which(tree_stats["Type"] == "CommonAncestor"), ][1, "Sequence"]
+ 
+-  # calculate distances of all sequences from germline
+-  germline_v <- str_sub(germline, 1, v_trimmed_length)
+-  germline_j <- str_sub(germline, -j_trimmed_length)
+-  germline_nt_chars <- strsplit(paste0(germline_v, germline_j), "")[[1]]
++  # calculate distances of all sequences from their ancestors
++  v_nt_length <- str_length(paste0(
++    sequences[[1, "FR1.nt"]], sequences[[1, "CDR1.nt"]], sequences[[1, "FR2.nt"]],
++    sequences[[1, "CDR2.nt"]], sequences[[1, "FR3.nt"]]
++  ))
++  j_nt_length <- str_length(sequences[[1, "FR4.nt"]])
++  v_aa_length <- str_length(sequences[[1, "V.aa"]])
++  j_aa_length <- str_length(sequences[[1, "J.aa"]])
+ 
+-  germline_v_aa <- bunch_translate(substring(germline_v, v_aa_frame_start),
+-    .two.way = FALSE, .ignore.n = TRUE
+-  )
+-  germline_j_aa <- bunch_translate(substring(germline_j, j_aa_frame_start),
+-    .two.way = FALSE, .ignore.n = TRUE
+-  )
+-  germline_aa_chars <- strsplit(paste0(germline_v_aa, germline_j_aa), "")[[1]]
+   for (row in seq_len(nrow(tree_stats))) {
+-    if (tree_stats[row, "Type"] != "Germline") {
++    if (!has_no_data(tree_stats[row, "Ancestor"])) {
+       seq <- tree_stats[row, "Sequence"]
+-      seq_v <- str_sub(seq, 1, v_trimmed_length)
+-      seq_j <- str_sub(seq, -j_trimmed_length)
++      ancestor_name <- tree_stats[row, "Ancestor"]
++      ancestor <- tree_stats[which(tree_stats["Name"] == ancestor_name), ][1, "Sequence"]
++      seq_v <- str_sub(seq, 1, v_nt_length)
++      seq_j <- str_sub(seq, -j_nt_length)
++      ancestor_v <- str_sub(ancestor, 1, v_nt_length)
++      ancestor_j <- str_sub(ancestor, -j_nt_length)
+       seq_nt_chars <- strsplit(paste0(seq_v, seq_j), "")[[1]]
+-      if (length(germline_nt_chars) != length(seq_nt_chars)) {
++      ancestor_nt_chars <- strsplit(paste0(ancestor_v, ancestor_j), "")[[1]]
++      if (length(seq_nt_chars) != length(ancestor_nt_chars)) {
+         warning(
+-          "Germline and sequence lengths are different; ",
++          "Sequence and ancestor lengths are different; ",
+           "something is wrong in repClonalFamily calculation!\n",
+-          "germline_nt_chars = ", germline_nt_chars, "\nseq_nt_chars = ", seq_nt_chars
++          "seq_nt_chars = ", seq_nt_chars, "\nancestor_nt_chars = ", ancestor_nt_chars
+         )
+       }
+-      tree_stats[row, "DistanceNT"] <- sum(germline_nt_chars != seq_nt_chars)
+-      seq_v_aa <- bunch_translate(substring(seq_v, v_aa_frame_start),
+-        .two.way = FALSE, .ignore.n = TRUE
+-      )
+-      seq_j_aa <- bunch_translate(substring(seq_j, j_aa_frame_start),
+-        .two.way = FALSE, .ignore.n = TRUE
+-      )
++      tree_stats[row, "DistanceNT"] <- sum(seq_nt_chars != ancestor_nt_chars)
++
++      seq_aa <- bunch_translate(seq, .two.way = FALSE, .ignore.n = TRUE)
++      ancestor_aa <- bunch_translate(ancestor, .two.way = FALSE, .ignore.n = TRUE)
++      seq_v_aa <- str_sub(seq_aa, 1, v_aa_length)
++      seq_j_aa <- str_sub(seq_aa, -j_aa_length)
++      ancestor_v_aa <- str_sub(ancestor_aa, 1, v_aa_length)
++      ancestor_j_aa <- str_sub(ancestor_aa, -j_aa_length)
+       seq_aa_chars <- strsplit(paste0(seq_v_aa, seq_j_aa), "")[[1]]
+-      if (length(germline_aa_chars) != length(seq_aa_chars)) {
++      ancestor_aa_chars <- strsplit(paste0(ancestor_v_aa, ancestor_j_aa), "")[[1]]
++      if (length(seq_aa_chars) != length(ancestor_aa_chars)) {
+         warning(
+-          "Germline and sequence lengths are different; ",
++          "Sequence and ancestor lengths are different; ",
+           "something is wrong in repClonalFamily calculation!\n",
+-          "germline_aa_chars = ", germline_aa_chars, "\nseq_aa_chars = ", seq_aa_chars
++          "seq_aa_chars = ", seq_aa_chars, "\nancestor_aa_chars = ", ancestor_aa_chars
+         )
+       }
+-      tree_stats[row, "DistanceAA"] <- sum(germline_aa_chars != seq_aa_chars)
++      tree_stats[row, "DistanceAA"] <- sum(seq_aa_chars != ancestor_aa_chars)
+     }
+   }
+ 
+@@ -321,11 +304,6 @@ process_cluster <- function(cluster_row) {
+   return(list(
+     Cluster = cluster_name,
+     Germline.Input = cluster_row[["Germline"]],
+-    V.germline.nt = cluster_row[["V.germline.nt"]],
+-    J.germline.nt = cluster_row[["J.germline.nt"]],
+-    CDR3.germline.length = cdr3_germline_length,
+-    V.length = v_trimmed_length,
+-    J.length = j_trimmed_length,
+     Germline.Output = germline,
+     Common.Ancestor = common_ancestor,
+     Trunk.Length = trunk_length,
+@@ -350,9 +328,7 @@ convert_nested_to_df <- function(nested_results_list) {
+     purrr::map_dfr(~.) %>%
+     cbind(tree, tree_stats, sequences)
+   # fix column types after dataframe rebuilding
+-  for (column in c("CDR3.germline.length", "V.length", "J.length", "Trunk.Length")) {
+-    df[[column]] %<>% as.integer()
+-  }
++  df[["Trunk.Length"]] %<>% as.integer()
+   df %<>% add_class("clonal_family_df")
+   return(df)
+ }
+diff --git a/R/somatic_hypermutation.R b/R/somatic_hypermutation.R
+index 6c840669..8d6bed7b 100644
+--- a/R/somatic_hypermutation.R
++++ b/R/somatic_hypermutation.R
+@@ -64,13 +64,18 @@ repSomaticHypermutation <- function(.data, .threads = parallel::detectCores(), .
+     return(get_empty_object_with_class("step_failure_ignored"))
+   }
+ 
+-  doParallel::registerDoParallel(cores = .threads)
++  parallel <- .threads > 1
++  if (parallel) {
++    doParallel::registerDoParallel(cores = .threads)
++  }
+   results <- .data %>% apply_to_sample_or_list(
+     shm_process_dataframe,
+-    .parallel = .threads > 1,
++    .parallel = parallel,
+     .validate = FALSE
+   )
+-  doParallel::stopImplicitCluster()
++  if (parallel) {
++    doParallel::stopImplicitCluster()
++  }
+   return(results)
+ }
+ 
+@@ -84,8 +89,7 @@ shm_process_dataframe <- function(df, .parallel) {
+   )
+   # fix column types after dataframe rebuilding
+   for (column in c(
+-    "Clone.ID", "Clones", "CDR3.germline.length", "V.length", "J.length", "Trunk.Length",
+-    "Substitutions", "Insertions", "Deletions", "Mutations"
++    "Clone.ID", "Clones", "Trunk.Length", "Substitutions", "Insertions", "Deletions", "Mutations"
+   )) {
+     df[[column]] %<>% as.integer()
+   }
+@@ -93,12 +97,13 @@ shm_process_dataframe <- function(df, .parallel) {
+ }
+ 
+ shm_process_clonotype_row <- function(row) {
+-  v_gene_germline <- row[["V.germline.nt"]]
+-  j_gene_germline <- row[["J.germline.nt"]]
+   v_gene_clonotype <- paste0(
+     row[["FR1.nt"]], row[["CDR1.nt"]], row[["FR2.nt"]], row[["CDR2.nt"]], row[["FR3.nt"]]
+   )
+   j_gene_clonotype <- row[["FR4.nt"]]
++  germline <- row[["Germline.Input"]]
++  v_gene_germline <- str_sub(germline, 1, str_length(v_gene_clonotype))
++  j_gene_germline <- str_sub(germline, -str_length(j_gene_clonotype))
+ 
+   alignments <- list(
+     V = list(v_gene_germline, v_gene_clonotype),
+diff --git a/R/tools.R b/R/tools.R
+index a539f6ad..5bf9e8d3 100644
+--- a/R/tools.R
++++ b/R/tools.R
+@@ -251,7 +251,6 @@ translate_bunch <- bunch_translate
+ 
+ 
+ check_group_names <- function(.meta, .by) {
+-  names_to_check <- c()
+   if (is.null(.by)) {
+     names_to_check <- .by
+   } else {
+@@ -304,7 +303,6 @@ process_metadata_arguments <- function(.data, .by, .meta = NA, .data.sample.col
+   if (!is.na(.by)[1]) {
+     if (!is.na(.meta)[1]) {
+       data_groups <- group_from_metadata(.by, .meta)
+-      # group_name = .by
+       group_name <- paste0(.by, collapse = "; ")
+       is_grouped <- TRUE
+       data_group_names <- .meta[[.meta.sample.col]]
+@@ -330,7 +328,6 @@ process_metadata_arguments <- function(.data, .by, .meta = NA, .data.sample.col
+   }
+   names(data_groups) <- data_group_names
+   group_vec <- data_groups[.data[[.data.sample.col]]]
+-  # group_column = stringr::str_sort(data_groups[.data[[.data.sample.col]]], numeric = TRUE)
+   group_vec_sorted <- stringr::str_sort(group_vec, numeric = TRUE)
+   group_column <- factor(group_vec, levels = unique(group_vec_sorted))
+ 
+@@ -490,7 +487,7 @@ as_numeric_or_fail <- function(.string) {
+ }
+ 
+ has_no_data <- function(.data) {
+-  any(sapply(list(NA, NULL, NaN), identical, .data))
++  any(sapply(list(NA, NULL, NaN), identical, .data)) | all(is.na(.data))
+ }
+ 
+ # apply function to .data if it's a single sample or to each sample if .data is a list of samples
+@@ -573,6 +570,7 @@ add_column_without_alleles <- function(.data, .original_colname, .target_colname
+   return(.data)
+ }
+ 
++# if .target_colname is not set, it will overwrite the original column
+ add_column_with_first_gene <- function(.data, .original_colname, .target_colname = NA) {
+   .data %<>% apply_to_sample_or_list(.validate = FALSE, .function = function(df) {
+     if (validate_columns(df, .original_colname, .target_colname)) {
+@@ -618,16 +616,6 @@ require_system_package <- function(executable_names,
+   return(TRUE)
+ }
+ 
+-# calculate V gene part length outside of CDR3; works with vectors acquired from dataframe columns
+-v_len_outside_cdr3 <- function(v_end, cdr3_start) {
+-  pmin(v_end, as.numeric(cdr3_start))
+-}
+-
+-# calculate J gene part length outside of CDR3; works with vectors acquired from dataframe columns
+-j_len_outside_cdr3 <- function(seq, j_start, cdr3_end) {
+-  stringr::str_length(seq) - pmax(j_start, as.numeric(cdr3_end))
+-}
+-
+ convert_seq_list_to_dnabin <- function(seq_list) {
+   dnabin <- seq_list %>%
+     lapply(
+@@ -656,3 +644,21 @@ quiet <- function(procedure, capture_output = FALSE) {
+       suppressWarnings()
+   }
+ }
++
++# call normal or parallel apply, depending on existence of parallelization cluster
++par_or_normal_apply <- function(cluster, ...) {
++  if (has_no_data(cluster)) {
++    return(apply(...))
++  } else {
++    return(parApply(cluster, ...))
++  }
++}
++
++# call normal or parallel lapply, depending on mc.cores
++par_or_normal_lapply <- function(mc.preschedule, mc.cores, ...) {
++  if (mc.cores == 1) {
++    return(lapply(...))
++  } else {
++    return(mclapply(..., mc.preschedule = mc.preschedule, mc.cores = mc.cores))
++  }
++}
+diff --git a/man/repAlignLineage.Rd b/man/repAlignLineage.Rd
+index 2b39ba64..577ab94a 100644
+--- a/man/repAlignLineage.Rd
++++ b/man/repAlignLineage.Rd
+@@ -4,8 +4,7 @@
+ \alias{repAlignLineage}
+ \title{Aligns all sequences incliding germline within each clonal lineage within each cluster}
+ \usage{
+-repAlignLineage(.data,
+-.min_lineage_sequences, .prepare_threads, .align_threads, .verbose_output, .nofail)
++repAlignLineage(.data, .min_lineage_sequences, .prepare_threads, .align_threads, .nofail)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame}, \link{data.table}
+@@ -13,8 +12,7 @@ or a list of these objects.}
+ 
+ \item{.min_lineage_sequences}{If number of sequences in the same clonal lineage and the same
+ cluster (not including germline) is lower than this threshold, this group of sequences
+-will not be aligned and will not be used in next steps of BCR pipeline
+-(will be saved in output table only if .verbose_output parameter is set to TRUE).}
++will be filtered out from the dataframe; so only large enough lineages will be included.}
+ 
+ \item{.prepare_threads}{Number of threads to prepare results table.
+ Please note that high number can cause heavy memory usage!}
+@@ -25,11 +23,6 @@ It must have columns in the immunarch compatible format \link{immunarch_data_for
+ must contain 'Cluster' column, which is added by seqCluster() function, and 'Germline.sequence'
+ column, which is added by repGermline() function.}
+ 
+-\item{.verbose_output}{If TRUE, all output dataframe columns will be included (see documentation about this
+-function return), and unaligned clusters will be included in the output. Setting this to TRUE significantly
+-increases memory usage. If FALSE, only aligned clusters and columns required for repClonalFamily() and
+-repSomaticHypermutation() calculation will be included in the output.}
+-
+ \item{.nofail}{Will return NA instead of stopping if Clustal W is not installed.
+ Used to avoid raising errors in examples on computers where Clustal W is not installed.}
+ }
+@@ -38,21 +31,13 @@ Dataframe or list of dataframes (if input is a list with multiple samples).
+ The dataframe has these columns:
+ * Cluster: cluster name
+ * Germline: germline sequence
+-* V.germline.nt: germline V gene sequence
+-* J.germline.nt: germline J gene sequence
+-* CDR3.germline.length: length of CDR3 in germline
+-* Aligned (included if .verbose_output=TRUE): FALSE if this group of sequences was not aligned with lineage
+-  (.min_lineage_sequences is below the threshold); TRUE if it was aligned
+-* Alignment: DNAbin object with alignment or DNAbin object with unaligned sequences (if Aligned=FALSE)
+-* V.length: shortest length of V gene part outside of CDR3 region in this
+-  group of sequences; longer V genes (including germline) are trimmed to this length before alignment
+-* J.length: shortest length of J gene part outside of CDR3 region in this
+-  group of sequences; longer J genes (including germline) are trimmed to this length before alignment
++* Alignment: DNAbin object with alignment
+ * Sequences: nested dataframe containing all sequences for this combination
+   of cluster and germline; it has columns
+-  Sequence, Clone.ID, Clones, CDR1.nt, CDR2.nt, CDR3.nt, FR1.nt, FR2.nt, FR3.nt, FR4.nt
+-  and, if .verbose_output=TRUE, also V.end, J.start, CDR3.start, CDR3.end;
+-  all values taken from the input dataframe
++  * Sequence, CDR1.nt, CDR2.nt, CDR3.nt, FR1.nt, FR2.nt, FR3.nt, FR4.nt, V.allele, J.allele,
++    V.aa, J.aa: all values taken from the input dataframe
++  * Clone.ID: taken from the input dataframe, or created (filled with row numbers) if missing
++  * Clones: taken from the input dataframe, or created (filled with '1' values) if missing
+ }
+ \description{
+ This function aligns all sequences (incliding germline) that belong to one clonal
+diff --git a/man/repClonalFamily.Rd b/man/repClonalFamily.Rd
+index 3e769db3..5bf5099e 100644
+--- a/man/repClonalFamily.Rd
++++ b/man/repClonalFamily.Rd
+@@ -7,8 +7,7 @@
+ repClonalFamily(.data, .threads, .nofail)
+ }
+ \arguments{
+-\item{.data}{The data to be processed. Can be output of repAlignLineage() with normal
+-or verbose output; variants with one sample and list of samples are both supported.}
++\item{.data}{The data to be processed, output of repAlignLineage() function.}
+ 
+ \item{.threads}{Number of threads to use.}
+ 
+@@ -19,16 +18,10 @@ Used to avoid raising errors in examples on computers where PHYLIP is not instal
+ Dataframe or list of dataframes (if input is a list with multiple samples).
+ The dataframe has these columns:
+ * Cluster: cluster name
+-* Germline.Input: germline sequence, like it was in the input; not trimmed and not aligned
+-* V.germline.nt: input germline V gene sequence
+-* J.germline.nt: input germline J gene sequence
+-* CDR3.germline.length: length of CDR3 in input germline
+-* V.length: length of V gene after trimming on repAlignLineage() step
+-* J.length: length of j gene after trimming on repAlignLineage() step
++* Germline.Input: germline sequence, like it was in the input; not aligned
+ * Germline.Output: germline sequence, parsed from PHYLIP dnapars function output;
+   it contains difference of germline from the common ancestor; "." characters mean
+-  matching letters. It's usually shorter than Germline.Input, because germline and
+-  clonotype sequences were trimmed to the same length before alignment.
++  matching letters
+ * Common.Ancestor: common ancestor sequence, parsed from PHYLIP dnapars function output
+ * Trunk.Length: mean trunk length, representing the distance between the most recent
+   common ancestor and germline sequence as a measure of the maturity of a lineage
+diff --git a/man/repGermline.Rd b/man/repGermline.Rd
+index 244bf5c7..c3acad2e 100644
+--- a/man/repGermline.Rd
++++ b/man/repGermline.Rd
+@@ -4,8 +4,7 @@
+ \alias{repGermline}
+ \title{Creates germlines for clonal lineages}
+ \usage{
+-repGermline(.data,
+-.species, .align_j_gene, .min_nuc_outside_cdr3, .threads)
++repGermline(.data, .species, .min_nuc_outside_cdr3, .threads)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame}, \link{data.table}
+@@ -20,13 +19,6 @@ It must have columns in the immunarch compatible format \link{immunarch_data_for
+ "OncorhynchusMykiss", "OrnithorhynchusAnatinus", "OryctolagusCuniculus", "RattusNorvegicus",
+ "SusScrofa".}
+ 
+-\item{.align_j_gene}{MiXCR provides the number of J indels only for 1 allele of J gene
+-in the output file, and a germline can contain another allele. Therefore, calculation of
+-J gene start in reference based on numbers from input file can be sometimes incorrect.
+-As result, J gene in the germline will be trimmed in the start or will contain some
+-nucleotides from CDR3. Setting this parameter to TRUE enables precise alignment of J genes
+-to detect the correct starting point, but it significantly reduces performance.}
+-
+ \item{.min_nuc_outside_cdr3}{This parameter sets how many nucleotides should have V or J chain
+ outside of CDR3 to be considered good for further alignment.}
+ 
+@@ -34,12 +26,10 @@ outside of CDR3 to be considered good for further alignment.}
+ }
+ \value{
+ Data with added columns:
+-* V.first.allele, J.first.allele (first alleles of V and J genes),
+-* V.ref.nt, J.ref.nt (V and J reference sequences),
+-* V.germline.nt, J.germline.nt (V and J germline sequences; they are references with
+-  trimmed parts that are from CDR3),
+-* CDR3.germline.length (length of CDR3 in the germline),
+-* Germline.sequence (combined germline sequence)
++* Sequence (FR1+CDR1+FR2+CDR2+FR3+CDR3+FR4 in nucleotides; the column will be replaced if exists)
++* V.allele, J.allele (chosen alleles of V and J genes),
++* V.aa, J.aa (V and J sequences from original clonotype, outside CDR3, converted to amino acids)
++* Germline.sequence (combined germline nucleotide sequence)
+ }
+ \description{
+ This function creates germlines for clonal lineages. B cell clonal lineage
+@@ -56,6 +46,6 @@ data(bcrdata)
+ 
+ bcrdata$data \%>\%
+   top(5) \%>\%
+-  repGermline(.threads = 1)
++  repGermline()
+ }
+ \concept{germline}
+diff --git a/man/seqDist.Rd b/man/seqDist.Rd
+index d8923737..6ae7762c 100644
+--- a/man/seqDist.Rd
++++ b/man/seqDist.Rd
+@@ -5,7 +5,7 @@
+ \title{Function for computing distance for sequences}
+ \usage{
+ seqDist(.data, .col = 'CDR3.nt', .method = 'hamming',
+- .group_by = c("V.first", "J.first"), .group_by_seqLength = TRUE, ...)
++ .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, .trim_genes = TRUE, ...)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame},
+@@ -21,6 +21,8 @@ Every object must have columns in the immunarch compatible format \link{immunarc
+ 
+ \item{.group_by_seqLength}{If TRUE  - adds grouping by sequence length of .col argument}
+ 
++\item{.trim_genes}{If TRUE   - use only general gene values (e.g. "IGHV1-18") of .group_by columns for clustering; if FALSE - can cause very small clusters in case of high resolution genotyping}
++
+ \item{...}{Extra arguments for user-defined function.
+ 
+ The default value is \code{'hamming'} for Hamming distance which counts the number of character substitutions that turns b into a.

@@ -1,0 +1,684 @@
+diff --git a/metagraph/docs/source/quick_start.rst b/metagraph/docs/source/quick_start.rst
+index 9c0df2cfb2..8a3ff04132 100644
+--- a/metagraph/docs/source/quick_start.rst
++++ b/metagraph/docs/source/quick_start.rst
+@@ -955,6 +955,49 @@ fingerprint.
+ The ID is deterministic public metadata. Treat it as an identifier, never as a credential.
+ It is an output field. Existing request selectors keep their documented names and syntax.
+ 
++.. _search_cut_statements:
++
++Search result limits and pair identity
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++For each query sequence, ``POST /search`` returns ``results`` and a ``cuts`` array in match-count,
++presence-signature, k-mer-count and coordinate modes. Label-only and abundance-sum modes omit
++``cuts``. Each cut describes one configured pair, including a pair with no matching labels.
++
++.. code-block:: json
++
++    {"cuts": [{
++      "graph": "shared", "pair_id": "n1-4018747a-c7fb-5096-8c3f-67a85618f56d",
++      "index_fp": null, "matched": 3, "returned": 1, "complete": false,
++      "nth_score": 9, "tied": 3, "tied_returned": 1
++    }]}
++
++.. list-table::
++   :header-rows: 1
++
++   * - Field
++     - Meaning
++   * - ``matched``
++     - Labels passing the query filters before the ``top_labels`` limit.
++   * - ``returned``
++     - Labels kept by that limit for this pair.
++   * - ``complete``
++     - Whether ``returned`` equals ``matched``.
++   * - ``nth_score``
++     - The last kept label's matching k-mer count when the limit drops labels and keeps at least one. Otherwise ``null``.
++   * - ``tied``
++     - Labels with that matching k-mer count before the limit, or zero when ``nth_score`` is ``null``.
++   * - ``tied_returned``
++     - Labels with that count kept by the limit, or zero when ``nth_score`` is ``null``.
++
++Ties use the matching k-mer count only. A k-mer-count response does not certify median-abundance
++ordering or ties. ``complete`` refers to this pair's label limit only.
++
++On a server with a list of graphs, each result row and cut also carries ``graph`` and ``pair_id``.
++Use both fields to associate rows with their cut. The :ref:`opaque pair ID <configured_pair_id>`
++distinguishes pairs sharing a graph name. On a single-index server, rows omit these pair tags,
++and cuts carry ``null`` for them.
++
+ Using Python API
+ ^^^^^^^^^^^^^^^^
+ See :ref:`api`
+diff --git a/metagraph/integration_tests/test_traverse.py b/metagraph/integration_tests/test_traverse.py
+index 087e63f3ea..10d7ddd1e2 100644
+--- a/metagraph/integration_tests/test_traverse.py
++++ b/metagraph/integration_tests/test_traverse.py
+@@ -293,6 +293,15 @@ def test_traverse_opaque_pair_ids_match_python(self):
+         self.assertEqual(2, len(walks))
+         self._assert_opaque_pair_ids(walks)
+ 
++    def test_search_opaque_pair_ids_match_python(self):
++        response = self._post('search', {'FASTA': '>q\n' + self.X, 'top_labels': 10,
++                                         'discovery_fraction': 1})
++        self.assertEqual(200, response.status_code, response.text)
++        searched = response.json()[0]
++        self.assertEqual(2, len(searched['results']))
++        self.assertEqual(2, len(searched['cuts']))
++        self._assert_opaque_pair_ids(searched['results'] + searched['cuts'])
++
+     def test_selected_graphs(self):
+         seeds = [{'sequence': self.X}]
+         walks = self._traverse({'seeds': seeds, 'graphs': ['two']})['results'][0]['walks']
+diff --git a/metagraph/src/cli/query.cpp b/metagraph/src/cli/query.cpp
+index c7331a1d6c..3fe529508e 100644
+--- a/metagraph/src/cli/query.cpp
++++ b/metagraph/src/cli/query.cpp
+@@ -300,6 +300,19 @@ Json::Value SeqSearchResult::to_json(bool verbose_output, size_t k) const {
+         }
+     }
+ 
++    if (cut_) {
++        Json::Value cut(Json::objectValue);
++        for (const char *tag : {"graph", "pair_id", "index_fp"})
++            cut[tag] = Json::nullValue;
++        cut["matched"] = Json::UInt64(cut_->matched);
++        cut["returned"] = Json::UInt64(cut_->returned);
++        cut["complete"] = cut_->returned == cut_->matched;
++        cut["nth_score"] = cut_->nth_score ? Json::Value(Json::UInt64(*cut_->nth_score)) : Json::nullValue;
++        cut["tied"] = Json::UInt64(cut_->tied);
++        cut["tied_returned"] = Json::UInt64(cut_->tied_returned);
++        root["cuts"] = Json::Value(Json::arrayValue);
++        root["cuts"].append(std::move(cut));
++    }
+     return root;
+ }
+ 
+@@ -390,6 +403,7 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+                               const graph::AnnotatedDBG &anno_graph) {
+     // Perform a different action depending on the type (specified by config flags)
+     SeqSearchResult::result_type result;
++    graph::SearchCut cut;
+ 
+     switch (query_mode) {
+         case SIGNATURE: {
+@@ -397,7 +411,7 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+             result = anno_graph.get_top_label_signatures(sequence.sequence,
+                                                          num_top_labels,
+                                                          discovery_fraction,
+-                                                         presence_fraction);
++                                                         presence_fraction, nullptr, true, &cut);
+             break;
+         }
+         case COORDS: {
+@@ -405,7 +419,7 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+             result = anno_graph.get_kmer_coordinates(sequence.sequence,
+                                                      num_top_labels,
+                                                      discovery_fraction,
+-                                                     presence_fraction);
++                                                     presence_fraction, &cut);
+             break;
+         }
+         case COUNTS: {
+@@ -413,7 +427,7 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+             result = anno_graph.get_kmer_counts(sequence.sequence,
+                                                 num_top_labels,
+                                                 discovery_fraction,
+-                                                presence_fraction);
++                                                presence_fraction, &cut);
+             break;
+         }
+         case MATCHES: {
+@@ -422,7 +436,7 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+                                                num_top_labels,
+                                                discovery_fraction,
+                                                presence_fraction,
+-                                               false);
++                                               false, &cut);
+             break;
+         }
+         case COUNTS_SUM: {
+@@ -444,7 +458,9 @@ SeqSearchResult execute_query(QuerySequence&& sequence,
+     }
+ 
+     // Create seq search instance and move sequence into it
+-    return SeqSearchResult(std::move(sequence), std::move(result));
++    return SeqSearchResult(std::move(sequence), std::move(result), {},
++                           query_mode == LABELS || query_mode == COUNTS_SUM
++                               ? std::nullopt : std::optional<graph::SearchCut>(cut));
+ }
+ 
+ void call_suffix_match_sequences(const DBGSuccinct &dbg_succ,
+diff --git a/metagraph/src/cli/query.hpp b/metagraph/src/cli/query.hpp
+index 82762494de..499fbd244e 100644
+--- a/metagraph/src/cli/query.hpp
++++ b/metagraph/src/cli/query.hpp
+@@ -127,10 +127,11 @@ class SeqSearchResult {
+      */
+     SeqSearchResult(QuerySequence&& sequence,
+                     result_type&& result,
+-                    std::optional<Alignment>&& alignment = {})
++                    std::optional<Alignment>&& alignment = {},
++                    std::optional<graph::SearchCut> cut = {})
+           : sequence_(std::move(sequence)),
+             alignment_(std::move(alignment)),
+-            result_(std::move(result)) {}
++            cut_(cut), result_(std::move(result)) {}
+ 
+     /** Const reference getters */
+     const QuerySequence& get_sequence() const { return sequence_; }
+@@ -167,6 +168,7 @@ class SeqSearchResult {
+   private:
+     QuerySequence sequence_;             // query sequence this result represents
+     std::optional<Alignment> alignment_; // optional wrapper for alignment struct
++    std::optional<graph::SearchCut> cut_;
+     result_type result_;                 // result vector of labels and additional info
+ };
+ 
+diff --git a/metagraph/src/cli/server.cpp b/metagraph/src/cli/server.cpp
+index a9d9fdedb5..38fe685910 100644
+--- a/metagraph/src/cli/server.cpp
++++ b/metagraph/src/cli/server.cpp
+@@ -443,7 +443,7 @@ int run_server(Config *config) {
+                         futures.reserve(num_queries);
+                         for (const auto &name : graphs_to_query) {
+                             for (const auto &[graph_fname, anno_fname] : indexes[name]) {
+-                                futures.push_back(graphs_pool.enqueue([&,config,graph_fname=graph_fname,anno_fname=anno_fname]() {
++                                futures.push_back(graphs_pool.enqueue([&,config,name=name,graph_fname=graph_fname,anno_fname=anno_fname]() {
+                                     logger->trace("Request {}: Started querying graph {}. In total graphs being queried at the moment: {}",
+                                                   request_id, graph_fname, graphs_being_queried.fetch_add(1) + 1);
+                                     size_t index_size_reserved = 0;
+@@ -492,7 +492,19 @@ int run_server(Config *config) {
+                                             index = graphs_cache.at({ graph_fname, anno_fname }).get();
+                                         }
+ 
++                                        const auto &pair_id = pair_ids.at({ name, graph_fname, anno_fname });
+                                         auto json = process_search_request(search_request, *index);
++                                        for (auto &sequence : json) {
++                                            // Pair identity must accompany both the rows and their cut.
++                                            for (const char *field : {"results", "cuts"}) {
++                                                if (!sequence.isMember(field))
++                                                    continue;
++                                                for (auto &value : sequence[field]) {
++                                                    value["graph"] = name;
++                                                    value["pair_id"] = pair_id;
++                                                }
++                                            }
++                                        }
+                                         logger->trace("Request {}: {} graph {} {} in {} sec",
+                                                       request_id, in_ram ? "Loaded and searched" : "Searched",
+                                                       graph_fname, anno_fname, timer.elapsed());
+@@ -513,6 +525,9 @@ int run_server(Config *config) {
+                                                 for (auto&& value : json[i]["results"]) {
+                                                     result[i]["results"].append(std::move(value));
+                                                 }
++                                                for (auto&& value : json[i]["cuts"]) {
++                                                    result[i]["cuts"].append(std::move(value));
++                                                }
+                                             }
+                                         }
+                                     } catch (...) {
+diff --git a/metagraph/src/graph/annotated_dbg.cpp b/metagraph/src/graph/annotated_dbg.cpp
+index b913c5605e..e35ad9e5ce 100644
+--- a/metagraph/src/graph/annotated_dbg.cpp
++++ b/metagraph/src/graph/annotated_dbg.cpp
+@@ -304,30 +304,12 @@ AnnotatedSequenceGraph::get_labels(node_index index) const {
+     return annotator_->get_labels(graph_to_anno_index(index));
+ }
+ 
+-// Container `code_counts` must have pairs (index, count)
+-template <class Container>
+-void top_n_sorted(Container& code_counts, size_t num_top_labels) {
+-    assert(num_top_labels <= code_counts.size());
+-    auto comp = [](const auto &x, const auto &y) {
+-        return std::make_pair(y.second, x.first)
+-              < std::make_pair(x.second, y.first);
+-    };
+-    std::nth_element(code_counts.begin(),
+-                     code_counts.begin() + num_top_labels,
+-                     code_counts.end(),
+-                     comp);
+-    // leave only the first |num_top_labels| top labels
+-    code_counts.resize(num_top_labels);
+-    // sort the top labels by counts
+-    std::sort(code_counts.begin(), code_counts.end(), comp);
+-}
+ 
+ template <class Container>
+ std::vector<StringCountPair> filter_and_decode(Container&& code_counts,
+                                                const annot::LabelEncoder<> &label_encoder,
+-                                               size_t num_top_labels) {
+-    if (code_counts.size() > num_top_labels)
+-        top_n_sorted(code_counts, num_top_labels);
++                                               size_t num_top_labels, SearchCut *cut = nullptr) {
++    top_n_sorted(code_counts, num_top_labels, cut);
+ 
+     // TODO: remove this step? (return (code, count) pairs and defer label decoding to the caller)
+     std::vector<StringCountPair> label_counts;
+@@ -344,7 +326,9 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
+                              size_t num_top_labels,
+                              double discovery_fraction,
+                              double presence_fraction,
+-                             bool with_kmer_counts) const {
++                             bool with_kmer_counts, SearchCut *cut) const {
++    if (cut)
++        *cut = {};
+     assert(discovery_fraction >= 0.);
+     assert(discovery_fraction <= 1.);
+     assert(presence_fraction >= 0.);
+@@ -357,7 +341,7 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
+     if (coord_to_header_) {
+         auto counts = get_header_results<size_t>(sequence, num_top_labels,
+                                                 discovery_fraction, presence_fraction,
+-                                                with_kmer_counts);
++                                                with_kmer_counts, nullptr, cut);
+         std::vector<StringCountPair> result;
+         result.reserve(counts.size());
+         for (auto &[label, matches, count] : counts)
+@@ -388,11 +372,11 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
+     if (with_kmer_counts) {
+         result = filter_and_decode(dynamic_cast<const IntMatrix &>(annotator_->get_matrix())
+                                         .sum_row_values(index_counts.values_container(), min_count),
+-                                   annotator_->get_label_encoder(), num_top_labels);
++                                   annotator_->get_label_encoder(), num_top_labels, cut);
+     } else {
+         result = filter_and_decode(annotator_->get_matrix()
+                                         .sum_rows(index_counts.values_container(), min_count),
+-                                   annotator_->get_label_encoder(), num_top_labels);
++                                   annotator_->get_label_encoder(), num_top_labels, cut);
+     }
+ 
+     assert(with_kmer_counts || std::all_of(result.begin(), result.end(),
+@@ -697,7 +681,7 @@ class RecordFold {
+ 
+     // The records matched by at least |min_count| rows: all of them in the order of
+     // their first match, or the |num_top| with the most matches, sorted
+-    HeaderCounts select(size_t min_count, size_t num_top, size_t *num_passed = nullptr) const {
++    HeaderCounts select(size_t min_count, size_t num_top, size_t *num_passed = nullptr, SearchCut *cut = nullptr) const {
+         HeaderCounts counts;
+         for (const Record &record : records_) {
+             if (record.count >= min_count)
+@@ -705,8 +689,7 @@ class RecordFold {
+         }
+         if (num_passed)
+             *num_passed = counts.size();
+-        if (counts.size() > num_top)
+-            top_n_sorted(counts, num_top);
++        top_n_sorted(counts, num_top, cut);
+         return counts;
+     }
+ 
+@@ -920,7 +903,7 @@ Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
+                             size_t num_top_labels,
+                             const std::vector<size_t> &kmer_positions,
+                             size_t num_kmers,
+-                            size_t *num_passed = nullptr) {
++                            size_t *num_passed = nullptr, SearchCut *cut = nullptr) {
+     static_assert(utils::is_one_of_v<Result,
+                     std::vector<std::tuple<Label, size_t, PresenceRuns>>,
+                     std::vector<std::tuple<Label, size_t, CountRuns>>,
+@@ -938,8 +921,7 @@ Result filter_and_aggregate(const RowEnumerator &enumerate_rows,
+ 
+     if (num_passed)
+         *num_passed = counts.size();
+-    if (counts.size() > num_top_labels)
+-        top_n_sorted(counts, num_top_labels);
++    top_n_sorted(counts, num_top_labels, cut);
+ 
+     if (counts.empty())
+         return {};
+@@ -1002,7 +984,7 @@ template <class Values>
+ std::vector<std::tuple<Label, size_t, Values>>
+ AnnotatedDBG::get_header_results(std::string_view sequence, size_t num_top_labels,
+                                  double discovery_fraction, double presence_fraction,
+-                                 bool with_kmer_counts, size_t *num_passed) const {
++                                 bool with_kmer_counts, size_t *num_passed, SearchCut *cut) const {
+     static_assert(utils::is_one_of_v<Values, size_t, CountRuns, PresenceRuns>);
+     const size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
+     // The rows to decode and the query position of each. Without per-position values,
+@@ -1052,7 +1034,7 @@ AnnotatedDBG::get_header_results(std::string_view sequence, size_t num_top_label
+         call_row_tuples(*matrix, rows, [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+             fold.add_row(row, 0, weights[i]);
+         });
+-        const auto counts = fold.select(min_count, num_top_labels, num_passed);
++        const auto counts = fold.select(min_count, num_top_labels, num_passed, cut);
+         std::vector<std::tuple<Label, size_t, Values>> result;
+         result.reserve(counts.size());
+         for (const auto &[h, count] : counts) {
+@@ -1074,7 +1056,7 @@ AnnotatedDBG::get_header_results(std::string_view sequence, size_t num_top_label
+         call_row_tuples(*matrix, q.distinct, [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+             fold.add_row(row, q.first_position[i], q.weight[i], q.weight[i] == 1);
+         });
+-        const auto counts = fold.select(min_count, num_top_labels, num_passed);
++        const auto counts = fold.select(min_count, num_top_labels, num_passed, cut);
+ 
+         read_again_if_dropped(*matrix, q, counts, &fold);
+         // the values of the returned records at the repeated rows
+@@ -1144,7 +1126,9 @@ std::vector<std::tuple<std::string, size_t, CountRuns>>
+ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
+                               size_t num_top_labels,
+                               double discovery_fraction,
+-                              double presence_fraction) const {
++                              double presence_fraction, SearchCut *cut) const {
++    if (cut)
++        *cut = {};
+     assert(discovery_fraction >= 0.);
+     assert(discovery_fraction <= 1.);
+     assert(presence_fraction >= 0.);
+@@ -1156,7 +1140,7 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
+ 
+     if (coord_to_header_) {
+         return get_header_results<CountRuns>(sequence, num_top_labels,
+-                                             discovery_fraction, presence_fraction);
++                                             discovery_fraction, presence_fraction, false, nullptr, cut);
+     }
+ 
+     size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
+@@ -1177,7 +1161,7 @@ AnnotatedDBG::get_kmer_counts(std::string_view sequence,
+ 
+     auto get_results = [&](const auto &enumerate_rows) {
+         auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, CountRuns>>>(
+-            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++            enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers, nullptr, cut);
+         assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
+         return results;
+     };
+@@ -1204,7 +1188,9 @@ std::vector<std::tuple<Label, size_t, PositionCoords, size_t>>
+ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+                                    size_t num_top_labels,
+                                    double discovery_fraction,
+-                                   double presence_fraction) const {
++                                   double presence_fraction, SearchCut *cut) const {
++    if (cut)
++        *cut = {};
+     assert(discovery_fraction >= 0.);
+     assert(discovery_fraction <= 1.);
+     assert(presence_fraction >= 0.);
+@@ -1257,7 +1243,7 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+                         [&](size_t i, const MultiIntMatrix::RowTuples &row) {
+             fold.add_row(row, q.first_position[i], q.weight[i], q.weight[i] == 1);
+         });
+-        const auto counts = fold.select(min_count, num_top_labels);
++        const auto counts = fold.select(min_count, num_top_labels, nullptr, cut);
+ 
+         read_again_if_dropped(*tuple_matrix, q, counts, &fold);
+         // (position, coordinate) of each returned record at the repeated rows
+@@ -1307,7 +1293,7 @@ AnnotatedDBG::get_kmer_coordinates(std::string_view sequence,
+     };
+ 
+     auto results = filter_and_aggregate<std::vector<std::tuple<Label, size_t, PositionCoords>>>(
+-        call_rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers);
++        call_rows_tuples, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers, nullptr, cut);
+     assert(same_results(results, get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction)));
+ 
+     // Without a CoordToHeader mapping, the label refers to a whole annotation
+@@ -1327,7 +1313,9 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+                                        double discovery_fraction,
+                                        double presence_fraction,
+                                        size_t *num_passed,
+-                                       bool header_labels) const {
++                                       bool header_labels, SearchCut *cut) const {
++    if (cut)
++        *cut = {};
+     assert(discovery_fraction >= 0.);
+     assert(discovery_fraction <= 1.);
+     assert(presence_fraction >= 0.);
+@@ -1345,7 +1333,7 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+     // the shortcut ranks with get_top_labels, which reports no count and ranks headers when
+     // a CoordToHeader mapping is loaded
+     if (discovery_fraction == 1. && !num_passed && (header_labels || !coord_to_header_)) {
+-        auto label_counts = get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction);
++        auto label_counts = get_top_labels(sequence, num_top_labels, discovery_fraction, presence_fraction, false, cut);
+         std::vector<std::tuple<Label, size_t, PresenceRuns>> presence_vectors;
+         presence_vectors.reserve(label_counts.size());
+         // every position marked: one run
+@@ -1361,7 +1349,7 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+     if (coord_to_header_ && header_labels) {
+         return get_header_results<PresenceRuns>(sequence, num_top_labels,
+                                                 discovery_fraction, presence_fraction,
+-                                                false, num_passed);
++                                                false, num_passed, cut);
+     }
+ 
+     // kmers in the graph and their positions in the query sequence
+@@ -1378,7 +1366,7 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+     auto get_results = [&](const auto &enumerate_rows) {
+         auto results = filter_and_aggregate<std::vector<std::tuple<std::string, size_t, PresenceRuns>>>(
+             enumerate_rows, annotator_->get_label_encoder(), min_count, num_top_labels, kmer_positions, num_kmers,
+-            num_passed);
++            num_passed, cut);
+         // get_top_labels ranks headers when a CoordToHeader mapping is loaded
+         assert(coord_to_header_ || same_results(results, get_top_labels(sequence, num_top_labels,
+                                                                          discovery_fraction, presence_fraction)));
+diff --git a/metagraph/src/graph/annotated_dbg.hpp b/metagraph/src/graph/annotated_dbg.hpp
+index f609f9c109..d0af7bea46 100644
+--- a/metagraph/src/graph/annotated_dbg.hpp
++++ b/metagraph/src/graph/annotated_dbg.hpp
+@@ -10,6 +10,7 @@
+ #include "representation/base/sequence_graph.hpp"
+ #include "annotation/representation/base/annotation.hpp"
+ #include "position_values.hpp"
++#include "search_cut.hpp"
+ #include "annotation/coord_to_header.hpp"
+ 
+ 
+@@ -114,7 +115,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+                    size_t num_top_labels,
+                    double discovery_fraction = 0.0,
+                    double presence_fraction = 0.0,
+-                   bool with_kmer_counts = false) const;
++                   bool with_kmer_counts = false, SearchCut *cut = nullptr) const;
+ 
+     // The per-position queries below hold each label's values only at the positions
+     // it matches (PresenceRuns, CountRuns, PositionCoords), so their memory grows with
+@@ -125,7 +126,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+     get_kmer_counts(std::string_view sequence,
+                     size_t num_top_labels,
+                     double discovery_fraction,
+-                    double presence_fraction) const;
++                    double presence_fraction, SearchCut *cut = nullptr) const;
+ 
+     // returns tuples (label, num_kmer_matches, kmer_coordinates, num_kmers_in_target).
+     // num_kmers_in_target is 0 when no CoordToHeader mapping is loaded (the
+@@ -135,7 +136,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+     get_kmer_coordinates(std::string_view sequence,
+                          size_t num_top_labels,
+                          double discovery_fraction,
+-                         double presence_fraction) const;
++                         double presence_fraction, SearchCut *cut = nullptr) const;
+ 
+     // With |num_passed|, also report how many labels passed the thresholds, before the cut
+     // to |num_top_labels|. With |header_labels| false, rank annotation columns even when a
+@@ -146,14 +147,15 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+                              double discovery_fraction = 0.0,
+                              double presence_fraction = 0.0,
+                              size_t *num_passed = nullptr,
+-                             bool header_labels = true) const;
++                             bool header_labels = true, SearchCut *cut = nullptr) const;
+ 
+   private:
+     template <class Values>
+     std::vector<std::tuple<Label, size_t, Values>>
+     get_header_results(std::string_view sequence, size_t num_top_labels,
+                        double discovery_fraction, double presence_fraction,
+-                       bool with_kmer_counts = false, size_t *num_passed = nullptr) const;
++                       bool with_kmer_counts = false, size_t *num_passed = nullptr,
++                       SearchCut *cut = nullptr) const;
+ 
+     DeBruijnGraph &dbg_;
+     std::unique_ptr<annot::CoordToHeader> coord_to_header_;
+diff --git a/metagraph/src/graph/search_cut.hpp b/metagraph/src/graph/search_cut.hpp
+new file mode 100644
+index 0000000000..06e4cfd277
+--- /dev/null
++++ b/metagraph/src/graph/search_cut.hpp
+@@ -0,0 +1,55 @@
++#ifndef __SEARCH_CUT_HPP__
++#define __SEARCH_CUT_HPP__
++
++#include <algorithm>
++#include <cstddef>
++#include <optional>
++#include <utility>
++
++namespace mtg::graph {
++
++// Facts about the count-ranked cut, before per-position values are materialized.
++// A tie is on count only. This does not certify a median-abundance ordering.
++struct SearchCut {
++    size_t matched = 0;
++    size_t returned = 0;
++    std::optional<size_t> nth_score;
++    size_t tied = 0;
++    size_t tied_returned = 0;
++};
++
++// Container `code_counts` must have pairs (index, count)
++template <class Container>
++void top_n_sorted(Container& code_counts, size_t num_top_labels, SearchCut *cut = nullptr) {
++    if (cut) {
++        *cut = {};
++        cut->matched = code_counts.size();
++        cut->returned = std::min(num_top_labels, code_counts.size());
++    }
++    if (code_counts.size() <= num_top_labels)
++        return;
++    auto comp = [](const auto &x, const auto &y) {
++        return std::make_pair(y.second, x.first)
++              < std::make_pair(x.second, y.first);
++    };
++    std::nth_element(code_counts.begin(),
++                     code_counts.begin() + num_top_labels,
++                     code_counts.end(),
++                     comp);
++    if (cut && num_top_labels) {
++        auto end = code_counts.begin() + num_top_labels;
++        const size_t nth = std::min_element(code_counts.begin(), end,
++            [](const auto &a, const auto &b) { return a.second < b.second; })->second;
++        cut->nth_score = nth;
++        auto tied = [nth](const auto &value) { return value.second == nth; };
++        cut->tied_returned = std::count_if(code_counts.begin(), end, tied);
++        cut->tied = cut->tied_returned + std::count_if(end, code_counts.end(), tied);
++    }
++    // leave only the first |num_top_labels| top labels
++    code_counts.resize(num_top_labels);
++    // sort the top labels by counts
++    std::sort(code_counts.begin(), code_counts.end(), comp);
++}
++
++} // namespace mtg::graph
++#endif
+diff --git a/metagraph/tests/cli/test_search_cut_json.cpp b/metagraph/tests/cli/test_search_cut_json.cpp
+new file mode 100644
+index 0000000000..602493dbaa
+--- /dev/null
++++ b/metagraph/tests/cli/test_search_cut_json.cpp
+@@ -0,0 +1,37 @@
++#include <gtest/gtest.h>
++#include "cli/query.hpp"
++
++namespace {
++using mtg::cli::SeqSearchResult;
++
++TEST(SearchCutJson, ReportsCountTieWithoutClaimingMedianOrder) {
++    mtg::graph::SearchCut cut{3, 1, 7, 2, 1};
++    SeqSearchResult::result_type rows = SeqSearchResult::LabelCountVec{{"sample", 7}};
++    SeqSearchResult result({0, "q", "ACGT"}, std::move(rows), {}, cut);
++    auto json = result.to_json(false, 3);
++    EXPECT_EQ(1u, json["results"].size());
++    const auto &entry = json["cuts"][0];
++    EXPECT_EQ(3u, entry["matched"].asUInt64());
++    EXPECT_EQ(1u, entry["returned"].asUInt64());
++    EXPECT_FALSE(entry["complete"].asBool());
++    EXPECT_EQ(7u, entry["nth_score"].asUInt64());
++    EXPECT_EQ(2u, entry["tied"].asUInt64());
++    EXPECT_EQ(1u, entry["tied_returned"].asUInt64());
++    EXPECT_FALSE(entry.isMember("nth_median"));
++    EXPECT_TRUE(entry["graph"].isNull());
++    EXPECT_TRUE(entry["pair_id"].isNull());
++    EXPECT_FALSE(entry.isMember("graph_path"));
++    EXPECT_FALSE(entry.isMember("annotation_path"));
++}
++
++TEST(SearchCutJson, CompleteEmptyAndUnrecordedDiffer) {
++    SeqSearchResult::result_type rows = SeqSearchResult::LabelCountVec{};
++    SeqSearchResult recorded({0, "q", "ACGT"}, std::move(rows), {}, mtg::graph::SearchCut{});
++    auto json = recorded.to_json(false, 3);
++    EXPECT_TRUE(json["cuts"][0]["complete"].asBool());
++    EXPECT_TRUE(json["cuts"][0]["nth_score"].isNull());
++    SeqSearchResult::result_type old_rows = SeqSearchResult::LabelCountVec{};
++    SeqSearchResult legacy({0, "q", "ACGT"}, std::move(old_rows));
++    EXPECT_FALSE(legacy.to_json(false, 3).isMember("cuts"));
++}
++} // namespace
+diff --git a/metagraph/tests/graph/test_search_cut.cpp b/metagraph/tests/graph/test_search_cut.cpp
+new file mode 100644
+index 0000000000..9254f1ea50
+--- /dev/null
++++ b/metagraph/tests/graph/test_search_cut.cpp
+@@ -0,0 +1,63 @@
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <random>
++#include <vector>
++
++#include "graph/search_cut.hpp"
++
++namespace {
++using Rows = std::vector<std::pair<size_t, size_t>>;
++
++TEST(SearchCut, PreservesExistingSelectionAndCountsTies) {
++    std::mt19937 random(31979);
++    for (size_t size = 0; size < 80; ++size) {
++        Rows input;
++        for (size_t i = 0; i < size; ++i)
++            input.emplace_back(i, 1 + random() % 9);
++        std::shuffle(input.begin(), input.end(), random);
++        for (size_t limit = 0; limit <= size + 1; ++limit) {
++            auto expected = input;
++            auto rank = [](const auto &a, const auto &b) {
++                return std::make_pair(b.second, a.first) < std::make_pair(a.second, b.first);
++            };
++            if (size > limit) {
++                std::nth_element(expected.begin(), expected.begin() + limit, expected.end(), rank);
++                expected.resize(limit);
++                std::sort(expected.begin(), expected.end(), rank);
++            }
++            auto actual = input;
++            mtg::graph::SearchCut cut;
++            mtg::graph::top_n_sorted(actual, limit, &cut);
++            ASSERT_EQ(expected, actual);
++            ASSERT_EQ(size, cut.matched);
++            ASSERT_EQ(std::min(limit, size), cut.returned);
++            if (size <= limit || limit == 0) {
++                EXPECT_FALSE(cut.nth_score);
++                EXPECT_EQ(0u, cut.tied);
++                EXPECT_EQ(0u, cut.tied_returned);
++            } else {
++                const auto score = expected.back().second;
++                EXPECT_EQ(score, *cut.nth_score);
++                auto tied = [score](auto row) { return row.second == score; };
++                EXPECT_EQ(size_t(std::count_if(input.begin(), input.end(), tied)), cut.tied);
++                EXPECT_EQ(size_t(std::count_if(actual.begin(), actual.end(), tied)), cut.tied_returned);
++            }
++        }
++    }
++}
++
++TEST(SearchCut, HeaderIdentityPairsAndReusedOutput) {
++    std::vector<std::pair<std::pair<size_t, size_t>, size_t>> rows{
++        {{1, 9}, 5}, {{0, 7}, 5}, {{0, 2}, 5}, {{3, 0}, 4}};
++    mtg::graph::SearchCut cut;
++    mtg::graph::top_n_sorted(rows, 2, &cut);
++    EXPECT_EQ(std::make_pair(size_t(0), size_t(2)), rows.front().first);
++    EXPECT_EQ(3u, cut.tied);
++    EXPECT_EQ(2u, cut.tied_returned);
++    rows.clear();
++    mtg::graph::top_n_sorted(rows, 2, &cut);
++    EXPECT_EQ(0u, cut.matched);
++    EXPECT_FALSE(cut.nth_score);
++}
++} // namespace

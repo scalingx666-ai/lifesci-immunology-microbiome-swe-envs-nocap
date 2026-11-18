@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** KGML subchain deduplication fix
+
+## Description
+
+In walking KEGG pathways using KGML files, the walker can find both consumption chains *from* compounds and production chains *to* compounds in the pathway at the same time (`compound_fate = 'both'`). A route through the pathway consisting entirely of reversible reactions yields four chains: consumption chains in the forward and reverse directions, and production chains in the forward and reverse directions. All consumption and production chains are stored together as `terminal_chains`. The walker algorithm finds "candidate" terminal chains before confirming they are terminal chains to report, filtering out candidate chains that are subchains of the last stored terminal chain. Subchains generated in the course of the walker's operations are expected to be shorter than the longer terminal chain -- the same chain shouldn't be generated twice. However, when both consumption and production chains are sought, instead of one or the other, a consumption chain consisting only of reversible reactions taken in reverse looks like the equivalent production chain taken in the forward direction, and the consumption chain in the forward direction looks like the equivalent production chain in reverse, when comparing the two based on their ordered lists of compounds and reactions: this causes the walker to erroneously raise an `AssertionError` mistakenly identifying the full-length reversed chain as a subchain of unexpected equal length. The fix is to distinguish consumption chains (`is_consumed = True`) from production chains (`is_consumed = False`), only comparing consumption chains or production chains in subchain deduplication.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `05b26e60ef58`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

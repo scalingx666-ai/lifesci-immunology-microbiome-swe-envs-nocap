@@ -1,0 +1,403 @@
+diff --git a/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+index 0feb2a5da..10ddeea28 100644
+--- a/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
++++ b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+@@ -1,10 +1,11 @@
+ import os
+ from pathlib import Path
+ import zipfile
++import hashlib
+ from io import BytesIO
+ 
+ from tornado.gen import coroutine
+-from tornado.web import HTTPError, RequestHandler
++from tornado.web import HTTPError, RequestHandler, MissingArgumentError
+ 
+ from qiita_core.qiita_settings import qiita_config
+ from qiita_core.util import execute_as_transaction, is_test_environment
+@@ -200,60 +201,157 @@ class PushFileToCentralHandler(RequestHandler):
+     @coroutine
+     @execute_as_transaction
+     def post(self):
+-        if not self.request.files:
+-            raise HTTPError(400, reason='No files to upload defined!')
+-
++        """
++        Transfers (chunked) file content to Qiita main.
++
++        The content of one file is chunked and transferred in parts to Qiita
++        main. This function receives the chunkes, combined chunks into one file
++        and stores it at the provided filepath - within BASE_DATA_DIR.
++        Should is_directory be true, this function assumes the transferred
++        content is a zipped archive and attempts to decompress it.
++        Chunks must be numbered (starting with 1) and total number of expected
++        chunks must be provided to calculate end of transfer.
++
++        Expected arguments
++        ------------------
++        data: target_filepath : str
++            Mandatory.
++            Filepath in Qiita main, where transferred data shall be stored.
++        data: total_chunks : int
++            Mandatory.
++            Total number of content chunks to be expected for file transfer.
++        data: current_chunk : int
++            Current index (first is 1) of data chunk for file to be transferred.
++            Mandatory.
++        data: is_directory : bool
++            Optional, defaults to "false".
++            "false" if a single file is transferred, "true" if the transferred
++            file is a ZIP archive that shall be extracted after transfer.
++        files : multipart/form-data
++            Mandatory.
++            Only "body" of first element of object "file" is considered as
++            data chunk of the file to be transferred.
++        """
++        try:
++            data_chunk = self.request.files["file"][0]["body"]
++        except (KeyError, IndexError):
++            raise HTTPError(
++                400,
++                reason=("No files to upload defined! Ensure your POST request "
++                        "contains e.g. {'file': ('dummy', b\"data\", "
++                        "'application/octet-stream)}."))
++
++        try:
++            filepath = self.get_argument('target_filepath')
++        except MissingArgumentError:
++            raise HTTPError(
++                400,
++                reason=('No target_filepath defined! You need to provide a '
++                        'filepath in Qiita main, where the transferred file '
++                        'should be stored.'))
++
++        try:
++            current_chunk = int(self.get_body_argument('current_chunk'))
++        except MissingArgumentError:
++            raise HTTPError(
++                400,
++                reason=('No current_chunk argument provided. Should be 1 for '
++                        'small files but > 1 for larger files, which needs to '
++                        'be transferred in multiple chunks.'))
++
++        try:
++            total_chunks = int(self.get_body_argument('total_chunks'))
++        except MissingArgumentError:
++            raise HTTPError(
++                400,
++                reason=('No total_chunks argument provided. Should be 1 for '
++                        'small files, but without knowing the total expected '
++                        'number of chunks, we cannot combine larger chunked '
++                        'files.'))
++
++        # differentiate between regular files and whole directories,
++        # which must be zipped AND the client must provide the
++        # is_directory='true' body argument.
++        sent_directory = self.get_body_argument(
++            'is_directory', "false") == "true"
++
++        # Compute the actual target filepath
+         # canonic version of base_data_dir
+         basedatadir = os.path.abspath(qiita_config.base_data_dir)
+-        stored_files = []
+-        stored_directories = []
+-
+-        for filespath, filelist in self.request.files.items():
+-            if filespath.startswith(basedatadir):
+-                filespath = filespath[len(basedatadir):]
+-
+-            for file in filelist:
+-                # differentiate between regular files and whole directories,
+-                # which must be zipped AND the client must provide the
+-                # is_directory='true' body argument.
+-                sent_directory = self.get_body_argument(
+-                    'is_directory', "false") == "true"
+-
+-                filepath = os.path.join(filespath, file['filename'])
+-                # remove leading /
+-                if filepath.startswith(os.sep):
+-                    filepath = filepath[len(os.sep):]
+-                filepath = os.path.abspath(os.path.join(basedatadir, filepath))
+-
++        # chop BASE_DATA_DIR if provided by user of the function
++        if filepath.startswith(basedatadir):
++            filepath = filepath[len(basedatadir):]
++        # remove leading /
++        if filepath.startswith(os.sep):
++            filepath = filepath[len(os.sep):]
++        filepath = os.path.abspath(os.path.join(basedatadir, filepath))
++
++        # prevent overwriting existing files, except in test mode
++        if os.path.exists(filepath) and (not is_test_environment()):
++            raise HTTPError(403, reason=(
++                "The requested %s is already "
++                "present in Qiita's BASE_DATA_DIR!" %
++                ('directory' if sent_directory else 'file')))
++        # create parent directory if necessary
++        os.makedirs(os.path.dirname(filepath), exist_ok=True)
++
++        # The file is probably chunked. In order to avoid storing an
++        # incomplete file at the target filepath, we store a growing
++        # temporary file until current_chunk == total_chunks and only then
++        # move a compose file to the given location. To do so in parallel
++        # for multiple files, we need to uniquely identify the tmp files,
++        # which we do here by hashing the target filepath
++        resumable_identifier = hashlib.md5(filepath.encode()).hexdigest()
++        # We need to use a temporary directory that is shared between all qiita
++        # central nodes.
++        tmp_dirname = os.path.join(basedatadir, 'tmp_chunked_https_transfer')
++        # To avoid overpopulating a single directory with too many files, we
++        # dynamically create sub-directories consisting of the first to
++        # characters of the resumable_identifier
++        tmp_dirname = os.path.join(tmp_dirname, resumable_identifier[:2])
++        # ensure that the directory exists
++        os.makedirs(tmp_dirname, exist_ok=True)
++
++        tmp_filename = os.path.join(tmp_dirname, resumable_identifier)
++
++        # store each chunk to a temporary file
++        with open(tmp_filename + ('.%i' % current_chunk), "wb") as tmp_file:
++            tmp_file.write(bytes(data_chunk))
++
++        # last chunk, we can attempt to reconstruct the chunked file
++        if current_chunk == total_chunks:
++            # check that all chunks are present, we do NOT test if individual
++            # chunks might be corrupted
++            if all([os.path.exists(tmp_filename + ('.%i' % i))
++                    for i in range(1, total_chunks + 1)]):
++                # create the target file from individual chunks
++                # if a directory is transferred, combine one zip file in the
++                # temporary directory instead of the requested target directory
++                target_fp = filepath
+                 if sent_directory:
+-                    # if a whole directory was send, we want to store it at
+-                    # the given dirname of the filepath
+-                    filepath = os.path.dirname(filepath)
+-
+-                # prevent overwriting existing files, except in test mode
+-                if os.path.exists(filepath) and (not is_test_environment()):
+-                    raise HTTPError(403, reason=(
+-                        "The requested %s is already "
+-                        "present in Qiita's BASE_DATA_DIR!" %
+-                        ('directory' if sent_directory else 'file')))
+-
+-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
++                    target_fp = os.path.join(tmp_dirname,
++                                             resumable_identifier + '.zip')
++                with open(target_fp, 'wb') as targetfile:
++                    for i in range(1, total_chunks + 1):
++                        with open(tmp_filename + ('.%i' % i), 'rb') as f:
++                            targetfile.write(f.read())
++                        os.remove(tmp_filename + ('.%i' % i))
+                 if sent_directory:
+-                    with zipfile.ZipFile(BytesIO(file['body'])) as zf:
++                    with zipfile.ZipFile(target_fp, "r") as zf:
+                         zf.extractall(filepath)
+-                        stored_directories.append(filepath)
+-                else:
+-                    with open(filepath, "wb") as f:
+-                        f.write(file['body'])
+-                        stored_files.append(filepath)
+-
+-        for (_type, objs) in [('files', stored_files),
+-                              ('directories', stored_directories)]:
+-            if len(objs) > 0:
++                    os.remove(target_fp)
++
++                # reporting
+                 self.write(
+-                    "Stored %i %s into BASE_DATA_DIR of Qiita:\n%s\n" % (
+-                        len(objs),
+-                        _type,
+-                        '\n'.join(map(lambda x: ' - %s' % x, objs))))
++                    "Stored 1 %s into BASE_DATA_DIR of Qiita:\n - %s\n" % (
++                        'file' if (not sent_directory) else 'directory',
++                        filepath))
++            else:
++                raise HTTPError(
++                    400, reason=(
++                        ("Not all %s chunks for file %s have been "
++                         "transferred yet") % (
++                             total_chunks,
++                             self.get_body_argument('target_filepath'))))
+ 
+         self.finish()
+\ No newline at end of file
+diff --git a/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+index c301c9954..f90cca0d6 100644
+--- a/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
++++ b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+@@ -1,8 +1,9 @@
+ import filecmp
+ from os import remove, makedirs
+-from os.path import exists, basename, join, isdir, splitext
++from os.path import exists, basename, join, isdir, splitext, abspath
+ from unittest import main
+ from shutil import rmtree, make_archive
++import hashlib
+ 
+ import qiita_db as qdb
+ from qiita_db.handlers.tests.oauthbase import OauthTestingBase
+@@ -110,42 +111,119 @@ def test_post(self):
+ 
+         # test raise error if no file is given
+         obs = self.post_authed(self.endpoint)
+-        self.assertEqual(obs.reason, "No files to upload defined!")
++        self.assertIn("No files to upload defined!", obs.reason)
+ 
+         # test correct mechanism
+         with open(fp_source, 'rb') as fh:
+-            obs = self.post_authed(self.endpoint, files={'bar/': fh})
+-            self.assertIn('Stored 1 files into BASE_DATA_DIR of Qiita',
++            content = fh.read()
++            files = {'file': ("dummy", content, "text/plain")}
++            obs = self.post_authed(self.endpoint, files=files)
++            self.assertIn('No target_filepath defined!', obs.reason)
++
++            data = {'target_filepath': fp_target}
++            obs = self.post_authed(self.endpoint, files=files, data=data)
++            self.assertIn('No current_chunk argument provided', obs.reason)
++
++            data['current_chunk'] = 1
++            obs = self.post_authed(self.endpoint, files=files, data=data)
++            self.assertIn('No total_chunks argument provided', obs.reason)
++
++            data['total_chunks'] = 1
++            obs = self.post_authed(self.endpoint, files=files, data=data)
++            self.assertIn('Stored 1 file into BASE_DATA_DIR of Qiita',
+                           str(obs.content))
+             self.assertTrue(filecmp.cmp(fp_source, fp_target, shallow=False))
+ 
+         # check if error is raised, if file already exists
+-        with open(fp_source, 'rb') as fh:
+-            # we need to let qiita thinks for this test, to NOT be in test mode
+-            with TRN:
+-                TRN.add("UPDATE settings SET test = False")
+-                TRN.execute()
+-            obs = self.post_authed(self.endpoint, files={'bar/': fh})
+-            # reset test mode to true
+-            with TRN:
+-                TRN.add("UPDATE settings SET test = True")
+-                TRN.execute()
+-            self.assertIn("already present in Qiita's BASE_DATA_DIR!",
+-                          obs.reason)
+-
+-        # test transfer of multiple files
+-        if exists(fp_target):
+-            remove(fp_target)
+-        with open(fp_source, 'rb') as fh1:
+-            with open(fp_source2, 'rb') as fh2:
+-                obs = self.post_authed(
+-                    self.endpoint, files={'bar/': fh1, 'barr/': fh2})
+-                self.assertIn('Stored 2 files into BASE_DATA_DIR of Qiita',
+-                              str(obs.content))
+-                self.assertTrue(filecmp.cmp(fp_source, fp_target,
+-                                            shallow=False))
+-                self.assertTrue(filecmp.cmp(fp_source2, fp_target2,
+-                                            shallow=False))
++        # we need to let qiita thinks for this test, to NOT be in test mode
++        with TRN:
++            TRN.add("UPDATE settings SET test = False")
++            TRN.execute()
++        obs = self.post_authed(self.endpoint, files=files, data=data)
++        # reset test mode to true
++        with TRN:
++            TRN.add("UPDATE settings SET test = True")
++            TRN.execute()
++        self.assertIn("already present in Qiita's BASE_DATA_DIR!",
++                        obs.reason)
++
++    def test_chuncked_transfer(self):
++        long_content = (b"This is a very long file content, "
++                        b"that needs to be chunked :-)")
++        chunk_size = 25
++        chunks = {c+1: long_content[i:i+chunk_size]
++                  for c, i
++                  in enumerate(range(0, len(long_content), chunk_size))}
++
++        # transfer all but second chunk
++        fp_target = self.base_data_dir + '/chunked.txt'
++        self._clean_up_files.append(fp_target)
++        data = {'target_filepath': fp_target,
++                'total_chunks': len(chunks)}
++        resumable_identifier = hashlib.md5(
++            abspath(fp_target).encode()).hexdigest()
++        for i, content in chunks.items():
++            self._clean_up_files.append(resumable_identifier + ('%i' % i))
++            if i == 2:
++                continue
++            data['current_chunk'] = i
++            obs = self.post_authed(
++                self.endpoint,
++                files={'file': ("dummy", content, "text/plain")},
++                data=data)
++            # test that chunk 1 transferred OK, chunk 3 also BUT file
++            # could not yet be reconstructed as chunk 2 is missing
++            if i < len(chunks):
++                self.assertEqual(obs.status_code, 200)
++            else:
++                self.assertIn(
++                    ("Not all %i chunks for file %s have been "
++                     "transferred yet") % (len(chunks), fp_target),
++                     obs.reason)
++            # also test presense of chunk
++            tmp_dirname = join(
++                self.base_data_dir,
++                'tmp_chunked_https_transfer',
++                resumable_identifier[:2])
++            self.assertTrue(exists(join(
++                tmp_dirname, resumable_identifier + '.%i' % i)))
++
++        # transfer missing chunk
++        data['current_chunk'] = 2
++        obs = self.post_authed(
++            self.endpoint,
++            files={'file': ("dummy", chunks[data['current_chunk']],
++                            "text/plain")},
++            data=data)
++        self.assertEqual(obs.status_code, 200)
++        self.assertTrue(exists(join(
++                tmp_dirname,
++                resumable_identifier + '.%i' % data['current_chunk'])))
++
++        # all chunks have been transferred, but file has not been reconstructed
++        # as last expected chunk needs to be re-transferred to trigger this
++        data['current_chunk'] = 3
++        obs = self.post_authed(
++            self.endpoint,
++            files={'file': ("dummy", chunks[data['current_chunk']],
++                            "text/plain")},
++            data=data)
++        self.assertEqual(obs.status_code, 200)
++
++        # test existance of transferred and reconstructred file
++        self.assertTrue(exists(fp_target))
++        self.assertIn(b'Stored 1 file into BASE_DATA_DIR of Qiita',
++                      obs.content)
++
++        # test that tmp files have been removed
++        self.assertTrue(all([not exists(join(
++                tmp_dirname,
++                resumable_identifier + '.%i' % i)) for i in chunks.keys()]))
++
++        # test file content
++        with open(fp_target, 'r') as f:
++            filecontent = f.read()
++            self.assertEqual(long_content.decode("utf-8"), filecontent)
+ 
+     def _create_test_dir(self, prefix=None):
+         """Creates a test directory with files and subdirs."""
+@@ -191,8 +269,11 @@ def _send_dir(self, fp_zipped='tmp_senddir.zip'):
+         with open(fp_zipped, 'rb') as fh:
+             obs = self.post_authed(
+                 self.endpoint,
+-                data={'is_directory': 'true'},
+-                files={dir: fh})
++                data={'is_directory': 'true',
++                      'target_filepath': dir,
++                      'current_chunk': 1,
++                      'total_chunks': 1},
++                files={'file': ("dummy", fh.read(), "text/plain")})
+ 
+         return obs
+ 

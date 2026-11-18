@@ -1,0 +1,780 @@
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index 3e846411..1e3732f3 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -248,13 +248,13 @@ workflows:
+   build_and_test:
+     jobs:
+       - build_and_dryrun
+-      - sra_init:
+-          requires:
+-            - build_and_dryrun
+       - genome_quantify:
+           requires:
+             - build_and_dryrun
+             
++      # - sra_init:
++      #     requires:
++      #       - build_and_dryrun
+       # - get_example_data
+       # - getenvs:
+       #     requires:
+diff --git a/atlas/template_config.yaml b/atlas/template_config.yaml
+index 478366e4..999c024d 100644
+--- a/atlas/template_config.yaml
++++ b/atlas/template_config.yaml
+@@ -198,8 +198,8 @@ annotations:
+   - genes
+   - kegg_modules
+   - dram
+-#  - checkm_taxonomy
+-#  - checkm_tree
++
++
+ 
+ gene_annotations:
+   - eggNOG
+diff --git a/atlas/workflow/Snakefile b/atlas/workflow/Snakefile
+index 6fc963b7..ffd2b1ca 100644
+--- a/atlas/workflow/Snakefile
++++ b/atlas/workflow/Snakefile
+@@ -78,17 +78,6 @@ def io_params_for_tadpole(io, key="in"):
+     return flag
+ 
+ 
+-def input_paired_only(files):
+-    """
+-    return only paired interleaved or not
+-    """
+-
+-    if not PAIRED_END:
+-        raise IOError("Ask for paired end samples if not paired end workflow")
+-
+-    return files[: min(len(files), 2)]
+-
+-
+ def input_params_for_bbwrap(input):
+ 
+     if len(input) == 3:
+@@ -199,25 +188,35 @@ def get_files_from_sampleTable(sample, Headers):
+     return list(files)
+ 
+ 
+-def get_quality_controlled_reads(wildcards):
+-    """Gets quality controlled reads for two cases. When preprocessed with
+-    ATLAS, returns R1, R2 and se fastq files or just se. When preprocessed
+-    externaly and run ATLAS workflow assembly, we expect R1, R2 or se.
++def get_quality_controlled_reads(wildcards, include_se=False):
+     """
++    Gets quality controlled reads.
++    R1 and R1 or se are returned as a dict.
++
++    if the files are not in the sample tible impute default path produced with atlas.
++    set
++
++    """
++
++    Fractions = MULTIFILE_FRACTIONS
+ 
+     if config.get("interleaved_fastqs", False) and SKIP_QC:
+-        QC_Headers = ["Reads_QC_se"]
+-    else:
+-        QC_Headers = ["Reads_QC_" + f for f in MULTIFILE_FRACTIONS]
++        Fractions = ["se"]
++
++    elif not include_se:
++        # get only R1 and R2 or se
++        Fractions = Fractions[: min(len(Fractions), 2)]
+ 
+     try:
++        QC_Headers = ["Reads_QC_" + f for f in Fractions]
+         return get_files_from_sampleTable(wildcards.sample, QC_Headers)
++
+     except FileNotInSampleTableException:
+ 
+         # return files as named by atlas pipeline
+         return expand(
+             "{sample}/sequence_quality_control/{sample}_QC_{fraction}.fastq.gz",
+-            fraction=MULTIFILE_FRACTIONS,
++            fraction=Fractions,
+             sample=wildcards.sample,
+         )
+ 
+@@ -233,6 +232,7 @@ include: "rules/gtdbtk.smk"
+ include: "rules/cobinning.smk"
+ include: "rules/dram.smk"
+ include: "rules/strains.smk"
++include: "rules/bbsplit.smk"
+ 
+ 
+ CONDAENV = "envs"  # overwrite definition in download.smk
+@@ -325,10 +325,10 @@ def get_genome_annotations():
+ 
+ rule genomes:
+     input:
+-        "genomes/genomes",
+-        "genomes/counts/median_coverage_genomes.tsv",
+-        "genomes/counts/raw_counts_genomes.tsv",
++        "genomes/counts/median_coverage_genomes.parquet",
++        expand("genomes/counts/counts_{scope}.parquet", scope=["scaf", "ref"]),
+         "genomes/clustering/allbins2genome.tsv",
++        "genomes/counts/mapping_rate.tsv",
+         *get_genome_annotations(),
+         "finished_binning",
+     output:
+@@ -337,8 +337,8 @@ rule genomes:
+ 
+ rule quantify_genomes:
+     input:
+-        "genomes/counts/median_coverage_genomes.tsv",
+-        "genomes/counts/raw_counts_genomes.tsv",
++        "genomes/counts/median_coverage_genomes.parquet",
++        expand("genomes/counts/counts_{scope}.parquet", scope=["scaf", "ref"]),
+ 
+ 
+ rule binning:
+diff --git a/atlas/workflow/envs/dram.yaml b/atlas/workflow/envs/dram.yaml
+index d13ca92c..61013f7f 100644
+--- a/atlas/workflow/envs/dram.yaml
++++ b/atlas/workflow/envs/dram.yaml
+@@ -4,4 +4,5 @@ channels:
+   - defaults
+ dependencies:
+   - dram=1.3
++  - python-dateutil
+   - scipy <1.9 # # https://github.com/biocore/scikit-bio/issues/1818
+diff --git a/atlas/workflow/rules/bbsplit.smk b/atlas/workflow/rules/bbsplit.smk
+new file mode 100644
+index 00000000..17e42cc1
+--- /dev/null
++++ b/atlas/workflow/rules/bbsplit.smk
+@@ -0,0 +1,141 @@
++
++
++
++rule bbsplit_index:
++    input:
++        genome_dir,
++    output:
++        directory("ref/genome/5"),
++        directory("ref/index/5"),
++    params:
++        path=lambda wc, output: os.path.dirname(output[0]),
++    threads: config["threads"]
++    resources:
++        mem_mb=config["mem"] * 1000,
++        java_mem=int(config["mem"] * JAVA_MEM_FRACTION),
++        time_min=60 * config["runtime"]["long"],
++    log:
++        "logs/genomes/mapping/build_bbmap_index.log",
++    benchmark:
++        "logs/benchmark/genomes/bbsplit_index.log"
++    conda:
++        "../envs/required_packages.yaml"
++    shell:
++        " bbsplit.sh ref={input[0]} "
++        " build=5 "
++        " threads={threads} "
++        " log={log} "
++        " -Xmx{resources.java_mem}G "
++        " 2> {log} "
++
++
++rule bbsplit:
++    input:
++        reads=get_quality_controlled_reads,
++        refdir=rules.bbsplit_index.output,
++    output:
++        scafstats=temp("genomes/alignments/scafstats/{sample}.tsv.gz"),
++        refstats=temp("genomes/alignments/refstats/{sample}.tsv.gz"),
++        covstats="genomes/alignments/coverage/{sample}.tsv.gz",
++        bincov=temp("genomes/alignments/coverage_binned/{sample}.tsv.gz"),
++    params:
++        reads=lambda wc, input: io_params_for_tadpole(input.reads, "in"),
++        ambiguous="all",
++        ambiguous2="best",
++        minid=config["contig_min_id"],
++        # unmapped=lambda wc, output: io_params_for_tadpole(output.unmapped, "outu"),
++    shadow:
++        "shallow"
++    log:
++        "logs/genomes/bbsplit/{sample}.log",
++    benchmark:
++        "logs/benchmark/genomes/bbsplit/{sample}.txt"
++    threads: config["threads"]
++    conda:
++        "../envs/required_packages.yaml"
++    resources:
++        mem_mb=1000 * config["mem"],
++        java_mem=int(config["mem"] * JAVA_MEM_FRACTION),
++        time_min=config["runtime"]["default"] * 60,
++        time=config["runtime"]["default"],
++    shell:
++        " bbsplit.sh "
++        " {params.reads} "
++        " build=5 "
++        " threads={threads} "
++        " ambiguous={params.ambiguous} "
++        " ambiguous2={params.ambiguous2} "
++        " minid={params.minid} "
++        " scafstats={output.scafstats} "
++        " refstats={output.refstats} "
++        " covstats={output.covstats} "
++        " bincov={output.bincov} "
++        " 2> {log} "
++
++
++localrules:
++    count_mapped_reads,
++
++
++rule count_mapped_reads:
++    input:
++        logfile=expand("logs/genomes/bbsplit/{sample}.log", sample=SAMPLES),
++        out_check=expand(rules.bbsplit.output.covstats, sample=SAMPLES),
++    output:
++        "genomes/counts/mapping_rate.tsv",
++    run:
++        import pandas as pd
++        from utils.parsers_bbmap import parse_bbmap_log_file
++
++        D = pd.DataFrame(index=SAMPLES, columns=["reads_used", "reads_mapped"])
++        for i, sample in enumerate(SAMPLES):
++            D.loc[sample] = parse_bbmap_log_file(input[i])
++
++        D["mapping_rate"] = D.iloc[:, 1] / D.iloc[:, 0]
++        D.to_csv(output[0], sep="\t")
++
++
++rule combine_bined_coverages_MAGs:
++    input:
++        binned_coverage_files=expand(
++            "genomes/alignments/coverage_binned/{sample}.tsv.gz", sample=SAMPLES
++        ),
++    params:
++        samples=SAMPLES,
++    output:
++        binned_cov="genomes/counts/binned_coverage.parquet",
++        median_abund="genomes/counts/median_coverage_genomes.parquet",
++    log:
++        "logs/genomes/counts/combine_binned_coverages_MAGs.log",
++    threads: 1
++    resources:
++        mem_mb=1000 * config["simplejob_mem"],
++        time_min=config["runtime"]["simplejob"] * 60,
++    script:
++        "../scripts/combine_coverage_MAGs.py"
++
++
++rule merge_counts:
++    input:
++        expand("genomes/alignments/{{scope}}stats/{sample}.tsv.gz", sample=SAMPLES),
++    output:
++        counts="genomes/counts/counts_{scope}.parquet",
++    threads: 1
++    run:
++        import pandas as pd
++        import gc
++
++        samples = SAMPLES
++
++        Reads = {}
++        for i in range(len(input)):
++            df = pd.read_csv(input[i], index_col=0, sep="\t")
++            Reads[samples[i]] = pd.to_numeric(df.unambiguousReads)
++            del df
++            gc.collect()
++
++
++        Reads = pd.concat(Reads, axis=1, sort=False).fillna(0).T
++        gc.collect()
++
++        Reads.reset_index().to_parquet(output.counts)
+diff --git a/atlas/workflow/rules/cobinning.smk b/atlas/workflow/rules/cobinning.smk
+index 4ff08704..da6a133a 100644
+--- a/atlas/workflow/rules/cobinning.smk
++++ b/atlas/workflow/rules/cobinning.smk
+@@ -101,7 +101,7 @@ rule samtools_dict:
+ 
+ rule minimap:
+     input:
+-        fq=lambda wildcards: input_paired_only(get_quality_controlled_reads(wildcards)),
++        fq=get_quality_controlled_reads,
+         mmi="Cobinning/combined_contigs.mmi",
+         dict="Cobinning/combined_contigs.dict",
+     output:
+diff --git a/atlas/workflow/rules/genecatalog.smk b/atlas/workflow/rules/genecatalog.smk
+index 860e6bd8..e68edc8e 100644
+--- a/atlas/workflow/rules/genecatalog.smk
++++ b/atlas/workflow/rules/genecatalog.smk
+@@ -210,7 +210,7 @@ rule rename_gene_catalog:
+ 
+ rule align_reads_to_Genecatalog:
+     input:
+-        reads=get_quality_controlled_reads,
++        reads=lambda wc: get_quality_controlled_reads(wc, include_se=True),
+         fasta="Genecatalog/gene_catalog.fna",
+     output:
+         sam=temp("Genecatalog/alignments/{sample}.sam"),
+diff --git a/atlas/workflow/rules/genomes.smk b/atlas/workflow/rules/genomes.smk
+index aea0d38e..efdc911e 100644
+--- a/atlas/workflow/rules/genomes.smk
++++ b/atlas/workflow/rules/genomes.smk
+@@ -293,135 +293,6 @@ rule run_all_checkm_lineage_wf:
+         """
+ 
+ 
+-### Quantification
+-
+-
+-rule build_db_genomes:
+-    input:
+-        genome_dir,
+-    output:
+-        index="ref/genome/3/summary.txt",
+-        fasta=temp("genomes/all_contigs.fasta"),
+-    threads: config.get("threads", 6)
+-    resources:
+-        mem=config["mem"],
+-        java_mem=int(config["mem"] * JAVA_MEM_FRACTION),
+-    log:
+-        "logs/genomes/mapping/build_bbmap_index.log",
+-    shell:
+-        """
+-        cat {input}/*.fasta > {output.fasta} 2> {log}
+-        bbmap.sh build=3 -Xmx{resources.java_mem}G ref={output.fasta} threads={threads} local=f 2>> {log}
+-
+-        """
+-
+-
+-# generalized rule so that reads from any "sample" can be aligned to contigs from "sample_contigs"
+-rule align_reads_to_MAGs:
+-    input:
+-        reads=get_quality_controlled_reads,
+-        ref=rules.build_db_genomes.output.index,
+-    output:
+-        sam=temp("genomes/alignments/{sample}.sam"),
+-        unmapped=expand(
+-            "genomes/alignments/unmapped/{{sample}}_{fraction}.fastq.gz",
+-            fraction=MULTIFILE_FRACTIONS,
+-        ),
+-    params:
+-        input=lambda wc, input: input_params_for_bbwrap(input.reads),
+-        unmapped=lambda wc, output: io_params_for_tadpole(output.unmapped, "outu"),
+-        maxsites=config.get("maximum_counted_map_sites", MAXIMUM_COUNTED_MAP_SITES),
+-        max_distance_between_pairs=config.get(
+-            "contig_max_distance_between_pairs", CONTIG_MAX_DISTANCE_BETWEEN_PAIRS
+-        ),
+-        paired_only=(
+-            "t"
+-            if config.get("contig_map_paired_only", CONTIG_MAP_PAIRED_ONLY)
+-            else "f"
+-        ),
+-        ambiguous="all" if CONTIG_COUNT_MULTI_MAPPED_READS else "best",
+-        min_id=config.get("contig_min_id", CONTIG_MIN_ID),
+-        maxindel=100,  # default 16000 good for genome deletions but not necessarily for alignment to contigs
+-    shadow:
+-        "shallow"
+-    log:
+-        "logs/genomes/mapping/map_{sample}.log",
+-    conda:
+-        "%s/required_packages.yaml" % CONDAENV
+-    threads: config.get("threads", 1)
+-    resources:
+-        mem=config["mem"],
+-        java_mem=int(config["mem"] * JAVA_MEM_FRACTION),
+-    shell:
+-        """
+-        bbwrap.sh \
+-        build=3 \
+-        {params.input} \
+-        trimreaddescriptions=t \
+-        outm={output.sam} \
+-        {params.unmapped} \
+-        threads={threads} \
+-        pairlen={params.max_distance_between_pairs} \
+-        pairedonly={params.paired_only} \
+-        minid={params.min_id} \
+-        mdtag=t \
+-        xstag=fs \
+-        nmtag=t \
+-        sam=1.3 \
+-        ambiguous={params.ambiguous} \
+-        secondary=t \
+-        saa=f \
+-        maxsites={params.maxsites} \
+-        -Xmx{resources.java_mem}G \
+-        2> {log}
+-        """
+-
+-
+-rule pileup_MAGs:
+-    input:
+-        sam="genomes/alignments/{sample}.sam",
+-    output:
+-        # basecov=temp("genomes/alignments/{sample}_base_coverage.txt.gz"),
+-        # covhist=temp("genomes/alignments/{sample}_coverage_histogram.txt"),
+-        covstats=temp("genomes/alignments/{sample}_coverage.txt"),
+-        bincov=temp("genomes/alignments/{sample}_coverage_binned.txt"),
+-    log:
+-        "logs/genomes/alignments/pilup_{sample}.log",
+-    conda:
+-        "%s/required_packages.yaml" % CONDAENV
+-    threads: config.get("threads", 1)
+-    resources:
+-        mem=config["mem"],
+-        java_mem=int(config["mem"] * JAVA_MEM_FRACTION),
+-    shell:
+-        """pileup.sh in={input.sam} \
+-        threads={threads} \
+-        -Xmx{resources.java_mem}G \
+-        covstats={output.covstats} \
+-        concise=t \
+-        bincov={output.bincov} 2> {log}"""
+-
+-
+-rule combine_coverages_MAGs:
+-    input:
+-        covstats=expand("genomes/alignments/{sample}_coverage.txt", sample=SAMPLES),
+-        binned_coverage_files=expand(
+-            "genomes/alignments/{sample}_coverage_binned.txt", sample=SAMPLES
+-        ),
+-        contig2genome="genomes/clustering/contig2genome.tsv",
+-    params:
+-        samples=SAMPLES,
+-    output:
+-        counts="genomes/counts/raw_counts_genomes.tsv",
+-        binned_cov="genomes/counts/binned_coverage.tsv.gz",
+-        median_abund="genomes/counts/median_coverage_genomes.tsv",
+-    log:
+-        "logs/genomes/counts/combine_coverages_MAGs.log",
+-    threads: 1
+-    script:
+-        "../scripts/combine_coverage_MAGs.py"
+-
+-
+ # rule predict_genes_genomes:
+ #     input:
+ #         dir= genomes_dir
+diff --git a/atlas/workflow/rules/gtdbtk.smk b/atlas/workflow/rules/gtdbtk.smk
+index 48813d7d..476e1f17 100644
+--- a/atlas/workflow/rules/gtdbtk.smk
++++ b/atlas/workflow/rules/gtdbtk.smk
+@@ -81,16 +81,9 @@ rule combine_taxonomy:
+         "../scripts/combine_taxonomy.py"
+ 
+ 
+-msa_paths = {
+-    "checkm": "genomes/checkm/storage/tree/concatenated.fasta",
+-    "gtdbtk.bac120": f"{gtdb_dir}/align/gtdbtk.bac120.user_msa.fasta",
+-    "gtdbtk.ar122": f"{gtdb_dir}/align/gtdbtk.ar122.user_msa.fasta",
+-}
+-
+-
+ rule fasttree:
+     input:
+-        lambda wildcards: msa_paths[wildcards.msa],
++        f"{gtdb_dir}/align/{{msa}}.user_msa.fasta.gz"
+     output:
+         temp("genomes/tree/{msa}.unrooted.nwk"),
+     log:
+@@ -100,7 +93,8 @@ rule fasttree:
+         "%s/tree.yaml" % CONDAENV
+     shell:
+         "export OMP_NUM_THREADS={threads}; "
+-        "FastTree -log {log} {input} > {output} "
++        "gunzip -c {input} | "
++        " FastTree > {output} 2> {log} "
+ 
+ 
+ localrules:
+@@ -129,7 +123,7 @@ rule root_tree:
+ def all_gtdb_trees_input(wildcards):
+     dir = checkpoints.align.get().output[0]
+ 
+-    domains = glob_wildcards(f"{dir}/gtdbtk.{{domain}}.user_msa.fasta").domain
++    domains = glob_wildcards(f"{dir}/gtdbtk.{{domain}}.user_msa.fasta.gz").domain
+ 
+     return expand("genomes/tree/gtdbtk.{domain}.nwk", domain=domains)
+ 
+diff --git a/atlas/workflow/rules/qc.smk b/atlas/workflow/rules/qc.smk
+index cc6f2e5d..78cbce1a 100644
+--- a/atlas/workflow/rules/qc.smk
++++ b/atlas/workflow/rules/qc.smk
+@@ -35,17 +35,6 @@ def get_ribosomal_rna_input(wildcards):
+         return {"clean_reads": clean_reads}
+ 
+ 
+-# def get_finalize_qc_input(wildcards):
+-#     inputs = get_quality_controlled_reads(wildcards)
+-#     try:
+-#         # FIXME: 'decontaminated_seqs': ['{sample}/sequence_quality_control/contaminants/PhiX_R1.fastq.gz'...
+-#         # inputs["decontaminated_seqs"] = rules.decontamination.output.contaminants
+-#         inputs["decontaminated_stats"] = "{sample}/sequence_quality_control/{sample}_decontamination_reference_stats.txt".format(sample=wildcards.sample)
+-#     except AttributeError:
+-#         pass
+-#     return inputs
+-
+-
+ if SKIP_QC:
+     PROCESSED_STEPS = ["QC"]
+ 
+@@ -158,20 +147,20 @@ rule get_read_stats:
+             tmp_file = os.path.join(subfolder, "read_stats.tmp")
+             shell(
+                 """
+-                                                                                                mkdir -p {subfolder} 2> {log}
+-
+-                                                                                                reformat.sh {params_in} \
+-                                                                                                bhist={subfolder}/base_hist.txt \
+-                                                                                                qhist={subfolder}/quality_by_pos.txt \
+-                                                                                                lhist={subfolder}/readlength.txt \
+-                                                                                                gchist={subfolder}/gc_hist.txt \
+-                                                                                                gcbins=auto \
+-                                                                                                bqhist={subfolder}/boxplot_quality.txt \
+-                                                                                                threads={threads} \
+-                                                                                                overwrite=true \
+-                                                                                                -Xmx{mem}G \
+-                                                                                                2> >(tee -a {log} {tmp_file} )
+-                                                                                                """.format(
++                    mkdir -p {subfolder} 2> {log}
++
++                    reformat.sh {params_in} \
++                    bhist={subfolder}/base_hist.txt \
++                    qhist={subfolder}/quality_by_pos.txt \
++                    lhist={subfolder}/readlength.txt \
++                    gchist={subfolder}/gc_hist.txt \
++                    gcbins=auto \
++                    bqhist={subfolder}/boxplot_quality.txt \
++                    threads={threads} \
++                    overwrite=true \
++                    -Xmx{mem}G \
++                    2> >(tee -a {log} {tmp_file} )
++                """.format(
+                     subfolder=subfolder,
+                     params_in=params_in,
+                     log=log,
+@@ -577,7 +566,7 @@ if PAIRED_END:
+ 
+     rule calculate_insert_size:
+         input:
+-            lambda wildcards: input_paired_only(get_quality_controlled_reads(wildcards)),
++            get_quality_controlled_reads,
+         output:
+             ihist=(
+                 "{sample}/sequence_quality_control/read_stats/QC_insert_size_hist.txt"
+diff --git a/atlas/workflow/scripts/combine_coverage_MAGs.py b/atlas/workflow/scripts/combine_coverage_MAGs.py
+index 7897cf0e..42e6d9df 100644
+--- a/atlas/workflow/scripts/combine_coverage_MAGs.py
++++ b/atlas/workflow/scripts/combine_coverage_MAGs.py
+@@ -30,25 +30,8 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ 
+ import pandas as pd
+ import os
+-from utils.parsers_bbmap import read_coverage_binned, combine_coverages
+-
+-
+-contig2genome = pd.read_csv(
+-    snakemake.input.contig2genome, header=None, index_col=0, sep="\t"
+-).iloc[:, 0]
+-
+-
+-# sum counts
+-
+-combined_cov, Counts_contigs = combine_coverages(
+-    snakemake.input.covstats, snakemake.params.samples
+-)
+-
+-
+-Counts_genome = Counts_contigs.groupby(contig2genome, axis=1).sum().T
+-Counts_genome.index.name = "Sample"
+-Counts_genome.to_csv(snakemake.output.counts, sep="\t")
+-
++from utils.parsers_bbmap import read_bbsplit_bincov
++import gc
+ 
+ # Binned coverage
+ 
+@@ -56,19 +39,23 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ for i, cov_file in enumerate(snakemake.input.binned_coverage_files):
+ 
+     sample = snakemake.params.samples[i]
++    logging.info(f"Reading bincov_file for sample {sample}")
+ 
+-    binCov[sample] = read_coverage_binned(cov_file)
++    binCov[sample] = read_bbsplit_bincov(cov_file)
+ 
+ binCov = pd.DataFrame.from_dict(binCov)
+-binCov.to_csv(snakemake.output.binned_cov, sep="\t", compression="gzip")
++
++gc.collect()
++logging.info(f"Saving combined binCov to {snakemake.output.binned_cov}")
++binCov.reset_index().to_parquet(snakemake.output.binned_cov)
+ 
+ 
+ # Median coverage
++logging.info("Calculate median coverage")
++Median_abund = binCov.groupby(level=0).median().T
++del binCov
++Median_abund.reset_index().to_parquet(snakemake.output.median_abund)
+ 
+-Median_abund = (
+-    binCov.groupby(contig2genome.loc[binCov.index.get_level_values(0)].values)
+-    .median()
+-    .T
+-)
+ 
+-Median_abund.to_csv(snakemake.output.median_abund, sep="\t")
++del Median_abund
++gc.collect()
+diff --git a/atlas/workflow/scripts/rename_genomes.py b/atlas/workflow/scripts/rename_genomes.py
+index 42b22c95..a4e41260 100644
+--- a/atlas/workflow/scripts/rename_genomes.py
++++ b/atlas/workflow/scripts/rename_genomes.py
+@@ -1,5 +1,7 @@
+ #! /usr/bin/env python
+ 
++from atlas import utils
++import pandas as pd
+ 
+ import sys, os
+ import logging, traceback
+@@ -11,6 +13,8 @@
+     datefmt="%Y-%m-%d %H:%M:%S",
+ )
+ 
++    file_name = f"{input_folder}/{{binid}}.fasta"
++    (bin_ids,) = glob_wildcards(file_name)
+ 
+ def handle_exception(exc_type, exc_value, exc_traceback):
+     if issubclass(exc_type, KeyboardInterrupt):
+@@ -30,6 +34,7 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ # Install exception handler
+ sys.excepthook = handle_exception
+ 
++            old2new_mapping_file.write(f"{binid}\t{new_name}\n")
+ 
+ from snakemake.io import glob_wildcards
+ 
+@@ -42,12 +47,12 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ # path/to/rep.fasta path/to/bin.fasta
+ 
+ mapping = pd.read_csv(
+-    snakemake.input.mapping_file, sep="\t", usecols=[0,1], header=None
++    snakemake.input.mapping_file, sep="\t", usecols=[0, 1], header=None
+ )
+-mapping.columns = ["Rep_path","Bin_path"]
++mapping.columns = ["Rep_path", "Bin_path"]
+ 
+ # go from path to id
+-mapping[[ "Representative","Bin"]] = mapping.applymap(
++mapping[["Representative", "Bin"]] = mapping.applymap(
+     lambda x: os.path.basename(x).replace(".fasta", "")
+ )
+ mapping.set_index("Bin", inplace=True)
+diff --git a/atlas/workflow/scripts/root_tree.py b/atlas/workflow/scripts/root_tree.py
+index 535ee28c..b644b4d4 100644
+--- a/atlas/workflow/scripts/root_tree.py
++++ b/atlas/workflow/scripts/root_tree.py
+@@ -1,11 +1,55 @@
+-import sys
++#! /usr/bin/env python
++
++from atlas import utils
++import pandas as pd
++
++import sys, os
++import logging, traceback
++
++logging.basicConfig(
++    filename=snakemake.log[0],
++    level=logging.INFO,
++    format="%(asctime)s %(message)s",
++    datefmt="%Y-%m-%d %H:%M:%S",
++)
++
++    file_name = f"{input_folder}/{{binid}}.fasta"
++    (bin_ids,) = glob_wildcards(file_name)
++
++def handle_exception(exc_type, exc_value, exc_traceback):
++    if issubclass(exc_type, KeyboardInterrupt):
++        sys.__excepthook__(exc_type, exc_value, exc_traceback)
++        return
++
++    logging.error(
++        "".join(
++            [
++                "Uncaught exception: ",
++                *traceback.format_exception(exc_type, exc_value, exc_traceback),
++            ]
++        )
++    )
++
++
++# Install exception handler
++sys.excepthook = handle_exception
++
++# start
+ import ete3
+ 
+-with open(snakemake.log[0], "w") as log:
+-    sys.stderr = sys.stdout = log
++T = ete3.Tree(snakemake.input.tree, quoted_node_names=True, format=1)
++
++try:
++
+ 
+-    T = ete3.Tree(snakemake.input.tree, quoted_node_names=True, format=1)
+     T.unroot()
+     if len(T) > 2:
+         T.set_outgroup(T.get_midpoint_outgroup())
+-    T.write(outfile=snakemake.output.tree)
++
++except Exception as e: 
++    logging.error('Failed to root tree, keep unrooted. Reason was:\n\n'+str(e))
++
++
++
++
++T.write(outfile=snakemake.output.tree)
+diff --git a/atlas/workflow/scripts/utils/parsers_bbmap.py b/atlas/workflow/scripts/utils/parsers_bbmap.py
+index 9333ccf8..7d3930f3 100644
+--- a/atlas/workflow/scripts/utils/parsers_bbmap.py
++++ b/atlas/workflow/scripts/utils/parsers_bbmap.py
+@@ -106,6 +106,36 @@ def combine_coverages(coverage_files, sample_names, coverage_measure="Median_fol
+     return combined_cov, combined_N_reads
+ 
+ 
++def read_bbsplit_bincov(bbsplit_bincov_file):
++    """
++    #Mean   1.545
++    #STDev  29.298
++    #RefName        Cov     Pos     RunningPos
++    MAG20067$ERR675668_24   0.00    1000    0
++    MAG20067$ERR675668_24   0.00    2000    1000
++
++    """
++    binCov = pd.read_csv(
++        bbsplit_bincov_file,
++        sep="\t",
++        skiprows=2,
++        index_col=[0, 2],  # Ref$Contig and Position
++        usecols=[0, 1, 2],
++    )
++
++    binCov = pd.to_numeric(binCov.squeeze(), downcast="integer")
++
++    # split first index `genome$contig` in two
++    index = pd.Series(binCov.index.levels[0], index=binCov.index.levels[0])
++    splitted = index.str.split("$", expand=True)
++    splitted.columns = ["Genome", "Contig"]
++    new_index = splitted.loc[binCov.index.get_level_values(0)]
++    new_index["Position"] = binCov.index.get_level_values(1).values
++    binCov.index = pd.MultiIndex.from_frame(new_index)
++
++    return binCov
++
++
+ def parse_bbmap_log_file(log_file):
+     """
+     parses a bbmap log file (paired, single end or both (bbrwap))

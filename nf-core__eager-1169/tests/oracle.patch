@@ -1,0 +1,295 @@
+diff --git a/conf/test_microbial.config b/conf/test_microbial.config
+index a2da85cd..821726e6 100644
+--- a/conf/test_microbial.config
++++ b/conf/test_microbial.config
+@@ -44,6 +44,7 @@ params {
+ 
+     // BAM filtering
+     deduplication_tool                    = "dedup"
++    deduplication_skipregionsplit               = true
+     run_bamfiltering                      = true
+     bamfiltering_minreadlength            = 30
+     bamfiltering_mappingquality           = 37
+diff --git a/nextflow.config b/nextflow.config
+index 91203cb8..cecfa245 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -199,6 +199,7 @@ params {
+ 
+     // Deduplication options
+     skip_deduplication                                               = false
++    deduplication_skipregionsplit                                    = false
+     deduplication_tool                                               = 'markduplicates'
+ 
+     // Qualimap
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index a72b94ef..da9dd432 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -1002,6 +1002,12 @@
+                     "description": "Specify to skip the removal of PCR duplicates.",
+                     "fa_icon": "fas fa-forward"
+                 },
++                "deduplication_skipregionsplit": {
++                    "type": "boolean",
++                    "description": "Specify to run deduplicaiton without splitting bams by contig (default behavior).",
++                    "fa_icon": "fas fa-forward",
++                    "help_text": "Run deduplication steps bam-by-bam rather than contig-by-contig for each bam file. This reduces the total number of jobs submitted to a cluster, but increases the computational runtime. If you use a shared cluster with limited resources, running many low-resource jobs can slow down the overall runtime of eager due to scheduling constraints.\nAlso applicable for poor-quality reference genomes."
++                },
+                 "deduplication_tool": {
+                     "type": "string",
+                     "default": "markduplicates",
+diff --git a/subworkflows/local/deduplicate.nf b/subworkflows/local/deduplicate.nf
+index c2c94a88..3bca8f14 100644
+--- a/subworkflows/local/deduplicate.nf
++++ b/subworkflows/local/deduplicate.nf
+@@ -29,39 +29,49 @@ workflow DEDUPLICATE {
+         addNewMetaFromAttributes( it, "id" , "reference" , false )
+     }
+ 
+-    // Create genomic regions file for splitting the bam before deduplication
+-    BUILD_INTERVALS( fasta_fai )
+-    ch_versions      = ch_versions.mix( BUILD_INTERVALS.out.versions.first() )
++    if ( params.deduplication_skipregionsplit ) {
+ 
+-    // Prep regions for combining
+-    ch_intervals_for_join = BUILD_INTERVALS.out.bed
+-    .map {
+-        // Replace meta with new meta that contains the meta.id value in the meta.reference attribute only
+-        addNewMetaFromAttributes( it, "id" , "reference" , true )
+-    }
++        // No splitting of .bam files by contig, deduplicate all in one
++        input_for_deduplication = ch_bam_bai
+ 
+-    // Ensure input bam matches the regions file
+-    ch_bam_for_split = ch_bam_bai
+-        .map {
+-            // Prepend a new meta that contains the meta.reference value as the new_meta.reference attribute
+-            addNewMetaFromAttributes( it, "reference" , "reference" , false )
+-        }
+-        .combine(
+-            by: 0,
+-            ch_intervals_for_join
+-        )
++    } else {
++
++        // Create genomic regions file for splitting the bam before deduplication
++        BUILD_INTERVALS( fasta_fai )
++        ch_versions      = ch_versions.mix( BUILD_INTERVALS.out.versions.first() )
++
++        // Prep regions for combining
++        ch_intervals_for_join = BUILD_INTERVALS.out.bed
+         .map {
+-            ignore_me, meta, bam, bai, regions ->
+-            [ meta, bam, bai, regions ]
++            // Replace meta with new meta that contains the meta.id value in the meta.reference attribute only
++            addNewMetaFromAttributes( it, "id" , "reference" , true )
+         }
+ 
+-    //Split input bam by region
+-    BAM_SPLIT_BY_REGION( ch_bam_for_split )
+-    ch_versions   = ch_versions.mix( BAM_SPLIT_BY_REGION.out.versions )
++        // Ensure input bam matches the regions file
++        ch_bam_for_split = ch_bam_bai
++            .map {
++                // Prepend a new meta that contains the meta.reference value as the new_meta.reference attribute
++                addNewMetaFromAttributes( it, "reference" , "reference" , false )
++            }
++            .combine(
++                by: 0,
++                ch_intervals_for_join
++            )
++            .map {
++                ignore_me, meta, bam, bai, regions ->
++                [ meta, bam, bai, regions ]
++            }
++
++        //Split input bam by region
++        BAM_SPLIT_BY_REGION( ch_bam_for_split )
++        input_for_deduplication = BAM_SPLIT_BY_REGION.out.bam_bai
++        ch_versions   = ch_versions.mix( BAM_SPLIT_BY_REGION.out.versions )
++
++    }
+ 
+     if ( params.deduplication_tool == 'markduplicates' ) {
+ 
+-        ch_markduplicates_input = BAM_SPLIT_BY_REGION.out.bam_bai
++        ch_markduplicates_input = input_for_deduplication
+             .map {
+                 // Prepend a new meta that contains the meta.reference value as the new_meta.reference attribute
+                 addNewMetaFromAttributes( it, "reference" , "reference" , false )
+@@ -83,63 +93,75 @@ workflow DEDUPLICATE {
+                 ch_markduplicates_input.fasta,
+                 ch_markduplicates_input.fasta_fai
+             )
+-            ch_versions             = ch_versions.mix( PICARD_MARKDUPLICATES.out.versions.first() )
++            ch_versions     = ch_versions.mix( PICARD_MARKDUPLICATES.out.versions.first() )
+ 
+-            ch_dedupped_region_bam  = PICARD_MARKDUPLICATES.out.bam
++            ch_dedupped_bam = PICARD_MARKDUPLICATES.out.bam
+ 
+     } else if ( params.deduplication_tool == "dedup" ) {
+-        ch_dedup_input = BAM_SPLIT_BY_REGION.out.bam_bai
++        ch_dedup_input = input_for_deduplication
+             .map {
+                 meta, bam, bai ->
+                 [ meta, bam ]
+             }
+ 
+         DEDUP( ch_dedup_input )
+-        ch_versions            = ch_versions.mix( DEDUP.out.versions.first() )
++        ch_versions     = ch_versions.mix( DEDUP.out.versions.first() )
+ 
+-        ch_dedupped_region_bam = DEDUP.out.bam
++        ch_dedupped_bam = DEDUP.out.bam
+     }
+ 
+-    ch_input_for_samtools_merge = ch_dedupped_region_bam
+-        .map {
+-            meta, bam ->
+-            meta2 = meta.clone().findAll{ it.key != 'genomic_region' }
+-            [ meta2, bam ]
+-        }
+-        .groupTuple()
+-        .map {
+-            // Prepend a new meta that contains the meta.reference value as the new_meta.reference attribute
+-            addNewMetaFromAttributes( it, "reference" , "reference" , false )
+-        }
+-        .combine(
+-            by:0,
+-            ch_refs
++    if ( params.deduplication_skipregionsplit ) {
++
++        // Bams were never split by region, so bypass of re-merging
++        ch_input_for_samtools_sort_dedupped = ch_dedupped_bam
++
++    } else {
++
++        // Re-merging of bams-by-contig must take place after deduplciation
++        ch_input_for_samtools_merge = ch_dedupped_bam
++            .map {
++                meta, bam ->
++                meta2 = meta.clone().findAll{ it.key != 'genomic_region' }
++                [ meta2, bam ]
++            }
++            .groupTuple()
++            .map {
++                // Prepend a new meta that contains the meta.reference value as the new_meta.reference attribute
++                addNewMetaFromAttributes( it, "reference" , "reference" , false )
++            }
++            .combine(
++                by:0,
++                ch_refs
++            )
++            .multiMap{
++                // bam here is a list of bams
++                ignore_me, meta, bam, meta2, fasta, fasta_fai ->
++                bam:        [ meta, bam ]
++                fasta:      [ meta2, fasta ]
++                fasta_fai:  [ meta2, fasta_fai ]
++            }
++
++        // Merge the bams for each region into one bam
++        SAMTOOLS_MERGE_DEDUPPED(
++            ch_input_for_samtools_merge.bam,
++            ch_input_for_samtools_merge.fasta,
++            ch_input_for_samtools_merge.fasta_fai
+         )
+-        .multiMap{
+-            // bam here is a list of bams
+-            ignore_me, meta, bam, meta2, fasta, fasta_fai ->
+-            bam:        [ meta, bam ]
+-            fasta:      [ meta2, fasta ]
+-            fasta_fai:  [ meta2, fasta_fai ]
+-        }
++        ch_versions                         = ch_versions.mix( SAMTOOLS_MERGE_DEDUPPED.out.versions )
+ 
+-    // Merge the bams for each region into one bam
+-    SAMTOOLS_MERGE_DEDUPPED(
+-        ch_input_for_samtools_merge.bam,
+-        ch_input_for_samtools_merge.fasta,
+-        ch_input_for_samtools_merge.fasta_fai
+-    )
+-    ch_versions   = ch_versions.mix( SAMTOOLS_MERGE_DEDUPPED.out.versions )
++        ch_input_for_samtools_sort_dedupped = SAMTOOLS_MERGE_DEDUPPED.out.bam
++
++    }
+ 
+ 
+     // Sort the merged bam and index
+-    SAMTOOLS_SORT_DEDUPPED ( SAMTOOLS_MERGE_DEDUPPED.out.bam )
++    SAMTOOLS_SORT_DEDUPPED ( ch_input_for_samtools_sort_dedupped )
+     ch_versions   = ch_versions.mix( SAMTOOLS_SORT_DEDUPPED.out.versions )
+     ch_dedup_bam  = SAMTOOLS_SORT_DEDUPPED.out.bam
+ 
+     SAMTOOLS_INDEX_DEDUPPED ( ch_dedup_bam )
+     ch_versions   = ch_versions.mix( SAMTOOLS_INDEX_DEDUPPED.out.versions )
+-    ch_dedup_bai  =  params.fasta_largeref ? SAMTOOLS_INDEX_DEDUPPED.out.csi : SAMTOOLS_INDEX_DEDUPPED.out.bai
++    ch_dedup_bai  = params.fasta_largeref ? SAMTOOLS_INDEX_DEDUPPED.out.csi : SAMTOOLS_INDEX_DEDUPPED.out.bai
+ 
+     // Finally run flagstat on the dedupped bam
+     ch_input_for_samtools_flagstat = ch_dedup_bam.join( ch_dedup_bai )
+@@ -147,6 +169,7 @@ workflow DEDUPLICATE {
+     SAMTOOLS_FLAGSTAT_DEDUPPED(
+         ch_input_for_samtools_flagstat
+     )
++
+     ch_versions       = ch_versions.mix( SAMTOOLS_FLAGSTAT_DEDUPPED.out.versions )
+     ch_multiqc_files  = ch_multiqc_files.mix( SAMTOOLS_FLAGSTAT_DEDUPPED.out.flagstat )
+     ch_dedup_flagstat = SAMTOOLS_FLAGSTAT_DEDUPPED.out.flagstat
+diff --git a/tests/test_microbial.nf.test.snap b/tests/test_microbial.nf.test.snap
+index a756f2c8..bdb71a82 100644
+--- a/tests/test_microbial.nf.test.snap
++++ b/tests/test_microbial.nf.test.snap
+@@ -636,9 +636,6 @@
+                 "BEDTOOLS_COVERAGE_DEPTH": {
+                     "bedtools": "2.31.1)"
+                 },
+-                "BUILD_INTERVALS": {
+-                    "gawk": "5.1.0"
+-                },
+                 "BWA_ALN": {
+                     "bwa": "0.7.18-r1243-dirty"
+                 },
+@@ -697,9 +694,6 @@
+                 "SAMTOOLS_FLAGSTAT_MERGED_LIBRARIES": {
+                     "samtools": 1.18
+                 },
+-                "SAMTOOLS_INDEX": {
+-                    "samtools": 1.18
+-                },
+                 "SAMTOOLS_INDEX_DEDUPPED": {
+                     "samtools": 1.18
+                 },
+@@ -712,9 +706,6 @@
+                 "SAMTOOLS_LENGTH_FILTER_INDEX": {
+                     "samtools": 1.18
+                 },
+-                "SAMTOOLS_MERGE_DEDUPPED": {
+-                    "samtools": 1.18
+-                },
+                 "SAMTOOLS_MERGE_LIBRARIES": {
+                     "samtools": 1.18
+                 },
+@@ -724,9 +715,6 @@
+                 "SAMTOOLS_SORT_MERGED_LIBRARIES": {
+                     "samtools": 1.18
+                 },
+-                "SAMTOOLS_VIEW": {
+-                    "samtools": 1.18
+-                },
+                 "SAMTOOLS_VIEW_BAM_FILTERING": {
+                     "samtools": 1.18
+                 },
+@@ -740,9 +728,9 @@
+         ],
+         "meta": {
+             "nf-test": "0.9.3",
+-            "nextflow": "25.04.8"
++            "nextflow": "25.10.3"
+         },
+-        "timestamp": "2025-11-07T11:08:47.368306"
++        "timestamp": "2026-02-13T09:52:11.74559929"
+     },
+     "authentication": {
+         "content": [

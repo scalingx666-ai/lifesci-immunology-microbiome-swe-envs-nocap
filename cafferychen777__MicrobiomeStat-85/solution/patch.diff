@@ -1,0 +1,438 @@
+diff --git a/R/generate_alpha_per_time_test_long.R b/R/generate_alpha_per_time_test_long.R
+index 1aac8e6..7b7a1e4 100644
+--- a/R/generate_alpha_per_time_test_long.R
++++ b/R/generate_alpha_per_time_test_long.R
+@@ -144,6 +144,20 @@ generate_alpha_per_time_test_long <- function(data.obj,
+       subset_data.obj <- subset_inputs$data.obj
+       subset_alpha.obj <- subset_inputs$alpha.obj
+ 
++      # Pin the group reference level to the global one so the within-timepoint
++      # lm uses the same baseline that mStat_restructure_group_term_results
++      # applies as the label. Without this, lm falls back to the first level
++      # present in the subset, which can differ from `reference_level` when a
++      # timepoint is missing the global reference group, mislabelling the
++      # contrast. Only relevel when the reference level is actually present.
++      if (!is.null(reference_level) &&
++          reference_level %in% as.character(subset_data.obj$meta.dat[[group.var]])) {
++        subset_data.obj$meta.dat[[group.var]] <- stats::relevel(
++          factor(subset_data.obj$meta.dat[[group.var]]),
++          ref = reference_level
++        )
++      }
++
+       subset_meta_tab <- mStat_prepare_alpha_meta_tab(
+         data.obj = subset_data.obj,
+         vars = c(group.var, time.var, adj.vars)
+diff --git a/R/generate_alpha_volatility_test_long.R b/R/generate_alpha_volatility_test_long.R
+index 60993fb..abc3f65 100644
+--- a/R/generate_alpha_volatility_test_long.R
++++ b/R/generate_alpha_volatility_test_long.R
+@@ -112,6 +112,19 @@ generate_alpha_volatility_test_long <- function(data.obj,
+         dplyr::select(all_of(adj.vars)) %>%
+         dplyr::mutate(dplyr::across(where(is.character) & !is.factor, factor))
+ 
++      # Guard against missing covariate values. model.matrix() / lm() drop NA rows
++      # by default, which would make the residual vector shorter than alpha_df and
++      # misalign (or error on) the assignment back into alpha_df[[index]], silently
++      # corrupting the per-subject volatility computed below. This mirrors the
++      # explicit check in mStat_calculate_adjusted_alpha_diversity().
++      if (anyNA(data_subset)) {
++        stop(
++          "Adjustment variables contain missing values. Please remove or impute ",
++          "missing covariates before adjusting alpha diversity.",
++          call. = FALSE
++        )
++      }
++
+       factor_terms <- names(data_subset)[vapply(data_subset, is.factor, logical(1))]
+       contrasts_arg <- if (length(factor_terms) > 0) {
+         lapply(data_subset[factor_terms], stats::contrasts, contrasts = FALSE)
+@@ -170,7 +183,10 @@ generate_alpha_volatility_test_long <- function(data.obj,
+ 
+     valid_terms <- mStat_resolve_variable_terms(
+       data = test_df,
+-      terms = c(group.var, adj.vars)
++      # group.var is placed last so that the sequential (Type-I) anova() F-test
++      # for the group term equals SS(group | adj.vars), i.e. the covariate-adjusted
++      # omnibus test. There is no interaction here, so this matches Type-II/III.
++      terms = c(adj.vars, group.var)
+     )
+ 
+     model_formula <- mStat_build_formula(
+diff --git a/R/generate_beta_test_single.R b/R/generate_beta_test_single.R
+index 12b78de..0fea333 100644
+--- a/R/generate_beta_test_single.R
++++ b/R/generate_beta_test_single.R
+@@ -113,6 +113,21 @@ generate_beta_test_single <- function(data.obj,
+   # This step ensures we have the necessary distance matrices for the analysis
+   if (!is.null(time.var) && !is.null(t.level)) {
+     data.obj <- mStat_subset_by_meta_values(data.obj, time.var, t.level)
++  } else if (!is.null(time.var) && is.null(t.level) &&
++             length(unique(data.obj$meta.dat[[time.var]])) > 1) {
++    # PERMANOVA permutes samples as exchangeable units. Pooling multiple
++    # timepoints without scoping to one (t.level = NULL) treats repeated
++    # measurements of the same subject as independent observations, which
++    # violates exchangeability and inflates the Type-I error rate. Warn rather
++    # than silently returning an anti-conservative test.
++    warning(
++      "time.var '", time.var, "' has multiple levels but t.level is NULL: ",
++      "PERMANOVA will pool all timepoints and treat repeated measures as ",
++      "independent, which inflates the Type-I error rate. Specify t.level to ",
++      "restrict the test to a single timepoint, or supply cross-sectional ",
++      "(one-row-per-subject) data.",
++      call. = FALSE
++    )
+   }
+ 
+   if (is.null(dist.obj)) {
+@@ -121,18 +136,39 @@ generate_beta_test_single <- function(data.obj,
+   } else {
+     # If distance object is provided, use it but ensure it matches the current data
+     message("Using provided dist.obj...")
+-    dist.obj <- mStat_subset_dist(dist.obj, rownames(data.obj$meta.dat))
+     # Check if all requested distances are available before filtering
+     available_dists <- names(dist.obj)
+     missing_dists <- setdiff(dist.name, available_dists)
+     if (length(missing_dists) > 0) {
+-      stop(paste("The following distances are not available in dist.obj:", 
++      stop(paste("The following distances are not available in dist.obj:",
+                  paste(missing_dists, collapse = ", ")))
+     }
+     # Filter dist.obj to only include the distances specified in dist.name
+     dist.obj <- dist.obj[dist.name]
+   }
+ 
++  # GUniFrac::PermanovaG2 / vegan::adonis2 pair each distance matrix with the
++  # `data` rows by POSITION, not by sample name, and silently mishandle NA
++  # predictors. Restrict the metadata and every distance matrix to the same
++  # complete-case samples, in a consistent order, so the F/R2/p-values are
++  # computed on correctly paired data regardless of the incoming meta.dat row
++  # order. (Previously only the provided-dist.obj branch realigned, so a freshly
++  # computed distance with an unsorted meta.dat could be silently misaligned.)
++  analysis_vars <- c(adj.vars, group.var)
++  analysis_vars <- analysis_vars[!is.na(analysis_vars) & nzchar(analysis_vars)]
++  keep_samples <- rownames(data.obj$meta.dat)
++  if (length(analysis_vars) > 0) {
++    complete_idx <- stats::complete.cases(
++      data.obj$meta.dat[, analysis_vars, drop = FALSE]
++    )
++    keep_samples <- keep_samples[complete_idx]
++  }
++  if (length(keep_samples) == 0) {
++    stop("No samples with complete data for the requested group/adjustment variables.", call. = FALSE)
++  }
++  data.obj$meta.dat <- data.obj$meta.dat[keep_samples, , drop = FALSE]
++  dist.obj <- mStat_subset_dist(dist.obj, keep_samples)
++
+   # Prepare for PERMANOVA analysis
+   message("Running PermanovaG2 for all distances...")
+ 
+diff --git a/R/generate_beta_volatility_test_long.R b/R/generate_beta_volatility_test_long.R
+index 5c7087d..2970cda 100644
+--- a/R/generate_beta_volatility_test_long.R
++++ b/R/generate_beta_volatility_test_long.R
+@@ -170,7 +170,9 @@ generate_beta_volatility_test_long <-
+       # Test the association between volatility and group variable using linear regression
+       valid_terms <- mStat_resolve_variable_terms(
+         data = test_df,
+-        terms = c(group.var, adj.vars)
++        # group.var last so the sequential (Type-I) anova() F-test for the group
++        # term equals SS(group | adj.vars), the covariate-adjusted omnibus test.
++        terms = c(adj.vars, group.var)
+       )
+       test_result <- lm(
+         mStat_build_formula(response = "volatility", terms = valid_terms),
+diff --git a/R/generate_taxa_change_test_pair.R b/R/generate_taxa_change_test_pair.R
+index 9ee79cb..74b6aac 100644
+--- a/R/generate_taxa_change_test_pair.R
++++ b/R/generate_taxa_change_test_pair.R
+@@ -198,13 +198,19 @@ generate_taxa_change_test_pair <-
+         message("Zero-handling: Per-taxon half-minimum pseudocount calculated across ALL samples and time points combined. ",
+                 "This ensures unbiased change calculations by using the same pseudocount at both time points.")
+ 
+-        # Apply winsorization to limit extreme values
+-        otu_tax_agg_filter[, -1] <- apply(otu_tax_agg_filter[, -1], 2, function(x) {
++        # Apply winsorization to limit extreme values.
++        # Winsorize each taxon (row) across samples so that outlier samples for a
++        # given taxon are capped; winsorizing across taxa within a sample (MARGIN = 2)
++        # would mix unrelated taxa and distort each sample's composition. This matches
++        # the per-taxon convention used by winsor_feature_table() and the per-taxon
++        # pseudocount imputation applied above. t() keeps the assignment orientation
++        # consistent with otu_tax_agg_filter[, -1] (taxa in rows, samples in columns).
++        otu_tax_agg_filter[, -1] <- t(apply(otu_tax_agg_filter[, -1], 1, function(x) {
+           qt <- quantile(x, probs = c((1 - winsor.qt) / 2, 1 - (1 - winsor.qt) / 2))
+           x[x < qt[1]] <- qt[1]
+           x[x > qt[2]] <- qt[2]
+           return(x)
+-        })
++        }))
+ 
+       }
+       # "other": no preprocessing — respect user's pre-processed data
+@@ -241,8 +247,15 @@ generate_taxa_change_test_pair <-
+         as.matrix()
+ 
+       # Prepare metadata for analysis
++      # Keep only subjects (columns) that have a complete set of change scores.
++      # value_diff_matrix is taxa (rows) x subjects (columns); selecting complete
++      # columns retains subjects with no missing change values. (na.omit() on a
++      # matrix drops rows, so the previous colnames(na.omit(...)) returned every
++      # subject whenever any taxon row was complete, and none when every taxon had
++      # an NA -- never the intended per-subject filter.)
++      complete_subjects <- colSums(is.na(value_diff_matrix)) == 0
+       aligned_subjects <- mStat_align_subject_metadata_to_matrix(
+-        value_matrix = value_diff_matrix[, colnames(na.omit(value_diff_matrix)), drop = FALSE],
++        value_matrix = value_diff_matrix[, complete_subjects, drop = FALSE],
+         meta_tab = meta_tab,
+         subject.var = subject.var,
+         keep_vars = c(group.var, adj.vars)
+diff --git a/R/generate_taxa_test_single.R b/R/generate_taxa_test_single.R
+index 27a75b1..f7e958c 100644
+--- a/R/generate_taxa_test_single.R
++++ b/R/generate_taxa_test_single.R
+@@ -107,7 +107,13 @@ perform_lm_analysis <- function(feature.dat,
+       df$reject <- df$padj <= alpha
+       df$baseMean <- NA  # Not applicable for linear models
+       df$stat <- df$log2FoldChange / df$lfcSE
+-      df$df <- nrow(meta.dat) - length(all.vars(as.formula(paste("~", formula)))) - 1
++      # Residual degrees of freedom must account for the design-matrix rank: a
++      # k-level factor contributes k - 1 columns, not 1. Counting variables with
++      # all.vars() overstates df for any multi-level factor predictor. Derive it
++      # from the actual model matrix instead. (The reported p-values come from
++      # lm's summary and were already correct; only this df column was wrong.)
++      df$df <- nrow(meta.dat) -
++        ncol(stats::model.matrix(stats::as.formula(paste("~", formula)), data = meta.dat))
+ 
+       # Set rownames
+       rownames(df) <- df$feature
+diff --git a/R/generate_taxa_volatility_test_long.R b/R/generate_taxa_volatility_test_long.R
+index 320663f..442aecd 100644
+--- a/R/generate_taxa_volatility_test_long.R
++++ b/R/generate_taxa_volatility_test_long.R
+@@ -193,7 +193,9 @@ generate_taxa_volatility_test_long <- function(data.obj,
+ 
+         valid_terms <- mStat_resolve_variable_terms(
+           data = test_df,
+-          terms = c(group.var, adj.vars)
++          # group.var last so the sequential (Type-I) anova() F-test for the group
++          # term equals SS(group | adj.vars), the covariate-adjusted omnibus test.
++          terms = c(adj.vars, group.var)
+         )
+ 
+         model_formula <- mStat_build_formula(
+diff --git a/R/linda.R b/R/linda.R
+index 6947527..52bc017 100644
+--- a/R/linda.R
++++ b/R/linda.R
+@@ -31,7 +31,7 @@
+ #' @param mean.abund.filter A real value; taxa with mean abundance less than mean.abund.filter are excluded. Default is 0 (no taxa will be excluded).
+ #' @param max.abund.filter A real value; taxa with max abundance less than max.abund.filter are excluded. Default is 0 (no taxa will be excluded).
+ #' @param is.winsor Boolean. If TRUE (default), the Winsorization process will be conducted for the feature table.
+-#' @param outlier.pct A real value between 0 and 1; Winsorization cutoff (percentile) for the feature table, e.g., 0.03. Default is NULL. If NULL, Winsorization process will not be conducted.
++#' @param outlier.pct A real value between 0 and 1; Winsorization cutoff (percentile) for the feature table, e.g., 0.03. Default is 0.03. If NULL, the Winsorization process will be skipped even when is.winsor is TRUE.
+ #' @param adaptive Boolean. Default is TRUE. If TRUE, the parameter imputation will be treated as FALSE no matter what it is actually set to be. Then the significant correlations between the sequencing depth and explanatory variables will be tested via the linear regression between the log of the sequencing depths and formula. If any p-value is smaller than or equal to corr.cut, the imputation approach will be used; otherwise, the pseudo-count approach will be used.
+ #' @param zero.handling Character. Specifies the method to handle zeros in the feature table. Options are "pseudo-count" or "imputation" (default is "pseudo-count"). If "imputation", zeros in the feature table will be imputed using the formula in the referenced paper. If "pseudo-count", a small constant (pseudo.cnt) will be added to each value in the feature table.
+ #' @param pseudo.cnt A positive real value. Default is 0.5. If zero.handling is set to "pseudo-count", this constant will be added to each value in the feature table.
+@@ -228,7 +228,7 @@ linda <- function(feature.dat, meta.dat, phyloseq.obj = NULL, formula, feature.d
+   Z[, ind] <- scale(Z[, ind])
+ 
+   # Apply Winsorization to handle outliers if specified
+-  if (is.winsor) {
++  if (is.winsor && !is.null(outlier.pct)) {
+     Y <- winsor_feature_table(Y, 1 - outlier.pct, feature.dat.type)
+   }
+ 
+@@ -274,12 +274,12 @@ linda <- function(feature.dat, meta.dat, phyloseq.obj = NULL, formula, feature.d
+           if (verbose) {
+             message("Imputation approach is used.")
+           }
+-          zero.handling <- "Imputation"
++          zero.handling <- "imputation"
+         } else {
+           if (verbose) {
+             message("Pseudo-count approach is used.")
+           }
+-          zero.handling <- "Pseudo-count"
++          zero.handling <- "pseudo-count"
+         }
+       }
+       if (zero.handling == "imputation") {
+diff --git a/R/linda2.R b/R/linda2.R
+index c8aa309..885b520 100644
+--- a/R/linda2.R
++++ b/R/linda2.R
+@@ -268,7 +268,7 @@ get_tree_smoothing_info <- function(phy.tree, tax.names,
+ #' @param mean.abund.filter A real value; taxa with mean abundance less than mean.abund.filter are excluded. Default is 0 (no taxa will be excluded).
+ #' @param max.abund.filter A real value; taxa with max abundance less than max.abund.filter are excluded. Default is 0 (no taxa will be excluded).
+ #' @param is.winsor Boolean. If TRUE (default), the Winsorization process will be conducted for the feature table.
+-#' @param outlier.pct A real value between 0 and 1; Winsorization cutoff (percentile) for the feature table, e.g., 0.03. Default is NULL. If NULL, Winsorization process will not be conducted.
++#' @param outlier.pct A real value between 0 and 1; Winsorization cutoff (percentile) for the feature table, e.g., 0.03. Default is 0.03. If NULL, the Winsorization process will be skipped even when is.winsor is TRUE.
+ #' @param adaptive Boolean. Default is TRUE. If TRUE, the parameter imputation will be treated as FALSE no matter what it is actually set to be. Then the significant correlations between the sequencing depth and explanatory variables will be tested via the linear regression between the log of the sequencing depths and formula. If any p-value is smaller than or equal to corr.cut, the imputation approach will be used; otherwise, the pseudo-count approach will be used.
+ #' @param zero.handling Character. Specifies the method to handle zeros in the feature table. Options are "pseudo-count" or "imputation" (default is "pseudo-count"). If "imputation", zeros in the feature table will be imputed using the formula in the referenced paper. If "pseudo-count", a small constant (pseudo.cnt) will be added to each value in the feature table.
+ #' @param pseudo.cnt A positive real value. Default is 0.5. If zero.handling is set to "pseudo-count", this constant will be added to each value in the feature table.
+@@ -656,7 +656,7 @@ linda2 <- function(feature.dat, meta.dat, phyloseq.obj = NULL, formula, feature.
+   Z[, ind] <- scale(Z[, ind])
+ 
+   # Apply Winsorization to handle outliers if specified
+-  if (is.winsor) {
++  if (is.winsor && !is.null(outlier.pct)) {
+     Y <- winsor_feature_table(Y, 1 - outlier.pct, feature.dat.type)
+   }
+ 
+@@ -712,12 +712,12 @@ linda2 <- function(feature.dat, meta.dat, phyloseq.obj = NULL, formula, feature.
+           if (verbose) {
+             message("Imputation approach is used.")
+           }
+-          zero.handling <- "Imputation"
++          zero.handling <- "imputation"
+         } else {
+           if (verbose) {
+             message("Pseudo-count approach is used.")
+           }
+-          zero.handling <- "Pseudo-count"
++          zero.handling <- "pseudo-count"
+         }
+       }
+       if (zero.handling == "imputation") {
+diff --git a/R/mStat_calculate_adjusted_distance.R b/R/mStat_calculate_adjusted_distance.R
+index fea763f..e6eb9c3 100644
+--- a/R/mStat_calculate_adjusted_distance.R
++++ b/R/mStat_calculate_adjusted_distance.R
+@@ -108,7 +108,6 @@ mStat_calculate_adjusted_distance <- function (data.obj,
+     }
+ 
+     mds_coordinates <- mds_coordinates[, positive_axes, drop = FALSE]
+-    axis_weights <- sqrt(mds_result$eig[seq_len(ncol(mds_result$points))][positive_axes])
+ 
+     res_matrix <- matrix(NA_real_, nrow = nrow(mds_coordinates), ncol = ncol(mds_coordinates))
+     rownames(res_matrix) <- rownames(mds_coordinates)
+@@ -124,8 +123,14 @@ mStat_calculate_adjusted_distance <- function (data.obj,
+       res_matrix[, i] <- stats::residuals(model_fit)
+     }
+ 
+-    weighted_coordinates <- sweep(res_matrix, 2, axis_weights, `*`)
+-    D.adj <- stats::dist(weighted_coordinates)
++    # stats::cmdscale() returns principal coordinates already scaled by sqrt(eig)
++    # (i.e. dist(points) reconstructs the original distance), so the residualized
++    # coordinates inherit that scaling. Re-multiplying by sqrt(eig) here would
++    # weight axis i by eig_i instead of sqrt(eig_i), squaring the eigenvalue
++    # weighting and over-emphasizing the leading axes. Taking dist() of the
++    # residuals directly correctly reduces to the original distance when the
++    # adjustment covariates explain nothing.
++    D.adj <- stats::dist(res_matrix)
+     mStat_attach_dist_metadata(D.adj, data.obj$meta.dat)
+   })
+ 
+diff --git a/R/mStat_calculate_alpha_diversity.R b/R/mStat_calculate_alpha_diversity.R
+index 50e06fc..d3e90d2 100644
+--- a/R/mStat_calculate_alpha_diversity.R
++++ b/R/mStat_calculate_alpha_diversity.R
+@@ -54,6 +54,22 @@ mStat_calculate_alpha_diversity <- function(x, alpha.name, tree = NULL) {
+     warning("It appears the data may not have been rarefied. Please verify.")
+   }
+ 
++  # Chao1 and ACE are richness estimators defined only for integer abundance
++  # counts: they are functions of the numbers of singletons/doubletons (and rare
++  # species). Applying them to normalized/relative-abundance data yields
++  # statistically meaningless estimates, so require integer counts here.
++  if (any(c("chao1", "ace") %in% alpha.name)) {
++    finite_x <- x[is.finite(x)]
++    if (length(finite_x) > 0 && !isTRUE(all.equal(finite_x, round(finite_x)))) {
++      stop(
++        "Chao1 and ACE require integer count data, but non-integer values were ",
++        "detected. These estimators are based on singleton/doubleton counts and ",
++        "are not defined for normalized or relative-abundance data. Provide raw ",
++        "counts, or remove 'chao1'/'ace' from alpha.name."
++      )
++    }
++  }
++
+   x_transpose <- t(x)
+ 
+   alpha.obj <- lapply(alpha.name, function(index) {
+diff --git a/R/mStat_convert_phyloseq_to_data_obj.R b/R/mStat_convert_phyloseq_to_data_obj.R
+index 96b304d..3f3eb7e 100644
+--- a/R/mStat_convert_phyloseq_to_data_obj.R
++++ b/R/mStat_convert_phyloseq_to_data_obj.R
+@@ -47,11 +47,11 @@ mStat_convert_phyloseq_to_data_obj <- function (phylo.obj) {
+ 
+     data.obj$feature.tab <- otu_matrix
+ 
+-    data.obj$feature.tab <- data.obj$feature.tab[rowSums(data.obj$feature.tab) > 0, ]
++    data.obj$feature.tab <- data.obj$feature.tab[rowSums(data.obj$feature.tab) > 0, , drop = FALSE]
+   }
+ 
+   if (!is.null(phylo.obj@sam_data)) {
+-    data.obj$meta.dat <- data.frame(phylo.obj@sam_data, stringsAsFactors = FALSE)
++    data.obj$meta.dat <- data.frame(phylo.obj@sam_data, stringsAsFactors = FALSE, check.names = FALSE)
+ 
+     if ("sample" %in% colnames(data.obj$meta.dat)) {
+       data.obj$meta.dat <- data.obj$meta.dat[, setdiff(colnames(data.obj$meta.dat), "sample"), drop = FALSE]
+diff --git a/R/mStat_normalize_data.R b/R/mStat_normalize_data.R
+index f41337d..6543071 100644
+--- a/R/mStat_normalize_data.R
++++ b/R/mStat_normalize_data.R
+@@ -141,6 +141,12 @@ mStat_compute_tmm_scale_factors <- function(otu_tab) {
+ #'     \item "DESeq": DESeq normalization
+ #'     \item "TMM": Trimmed Mean of M-values (requires edgeR)
+ #'   }
++#' @param depth Target rarefaction depth for the "Rarefy" and "Rarefy-TSS"
++#'   methods. If NULL (default), the smallest per-sample total count is used.
++#'   Ignored by the non-rarefaction methods.
++#' @param seed Integer seed used to make rarefaction subsampling reproducible
++#'   for the "Rarefy" and "Rarefy-TSS" methods. The global RNG state is restored
++#'   afterwards, so the caller's random stream is not affected. Default is 123.
+ #'
+ #' @return A list with normalized data object and scale factors.
+ #'
+@@ -184,7 +190,8 @@ mStat_compute_tmm_scale_factors <- function(otu_tab) {
+ mStat_normalize_data <-
+   function(data.obj,
+            method = c("Rarefy-TSS", "Rarefy", "TSS", "GMPR", "CSS", "DESeq", "TMM"),
+-           depth = NULL) {
++           depth = NULL,
++           seed = 123) {
+     # Validate input data structure
+     # Ensuring the input is a list is crucial for maintaining the expected data format
+     if (!is.list(data.obj)) {
+@@ -223,8 +230,13 @@ mStat_normalize_data <-
+       if (all(round(colSums(otu_tab), 5) == 1)) {
+         rarefied_otu_tab <- as.matrix(otu_tab)
+       } else {
+-        # Perform rarefaction using vegan package
+-        rarefied_otu_tab <- t(vegan::rrarefy(t(otu_tab), sample = depth))
++        # Perform rarefaction using vegan package. rrarefy() draws a random
++        # subsample, so wrap it in a local seed to make the result reproducible
++        # by default while leaving the caller's global RNG stream untouched.
++        rarefied_otu_tab <- mStat_with_local_seed(
++          seed,
++          t(vegan::rrarefy(t(otu_tab), sample = depth))
++        )
+       }
+ 
+       # Apply TSS normalization (convert to relative abundance) for Rarefy-TSS only
+diff --git a/man/mStat_normalize_data.Rd b/man/mStat_normalize_data.Rd
+index 31209e2..74298de 100644
+--- a/man/mStat_normalize_data.Rd
++++ b/man/mStat_normalize_data.Rd
+@@ -7,7 +7,8 @@
+ mStat_normalize_data(
+   data.obj,
+   method = c("Rarefy-TSS", "Rarefy", "TSS", "GMPR", "CSS", "DESeq", "TMM"),
+-  depth = NULL
++  depth = NULL,
++  seed = 123
+ )
+ }
+ \arguments{
+@@ -42,6 +43,10 @@ Data objects can be created using converters like
+ 
+ \item{depth}{Numeric value or NULL. Rarefaction depth for rarefaction
+ workflows. If NULL, uses the minimum sample depth.}
++
++\item{seed}{Integer seed used to make rarefaction subsampling reproducible
++for the "Rarefy" and "Rarefy-TSS" methods. The global RNG state is restored
++afterwards, so the caller's random stream is not affected. Default is 123.}
+ }
+ \value{
+ A list with normalized data object and scale factors.

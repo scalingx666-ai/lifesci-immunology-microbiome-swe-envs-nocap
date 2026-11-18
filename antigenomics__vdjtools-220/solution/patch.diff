@@ -1,0 +1,150 @@
+diff --git a/docs/features.rst b/docs/features.rst
+index 1d4cd809..e1c14058 100644
+--- a/docs/features.rst
++++ b/docs/features.rst
+@@ -231,3 +231,9 @@ The two configurations each support seven definitions: base plus the two motif
+ representations with three V-context choices. Every definition has a distinct
+ identity. Availability of fitted published variants is determined by the corpus
+ registry; an implemented feature definition does not imply a published rotation.
++
++Sample PCA application processes byte-bounded row blocks instead of converting
++the entire feature table to a dense array. ``TablePCA.transform(table, threads=0)``
++uses allocated BLAS cores; its default is serial, matching ``TablePCA.fit``.
++``vdjtools project-features --threads 0`` uses the allocation for fit and apply.
++The numerical phase restores the caller's native thread limits on exit.
+diff --git a/python/vdjtools/cli/__init__.py b/python/vdjtools/cli/__init__.py
+index f9a2292c..c38355b8 100644
+--- a/python/vdjtools/cli/__init__.py
++++ b/python/vdjtools/cli/__init__.py
+@@ -535,6 +535,7 @@ def project_features(
+     space: Optional[str] = typer.Option(None, help="Explicit shared feature-basis identity when absent from tables."),
+     components: int = typer.Option(256, min=1),
+     seed: int = typer.Option(0),
++    threads: int = typer.Option(0, min=0, help="PCA CPU budget; 0 uses the allocation."),
+     out: Optional[Path] = _OUT,
+ ) -> None:
+     """Fit/apply sample PCA for vsig, rsig or RFF tables, preserving IDs and channels."""
+@@ -555,8 +556,8 @@ def load(path):
+     cols = columns.read_text().splitlines() if columns else None
+     reducer = (TablePCA.load(rotation) if rotation else
+                TablePCA.fit(load(cohort) if cohort else data, columns=cols,
+-                            n_components=components,seed=seed))
+-    result = reducer.transform(data)
++                            n_components=components,seed=seed,threads=threads))
++    result = reducer.transform(data,threads=threads)
+     if fit:
+         reducer.save(fit)
+     _write(result,out)
+diff --git a/python/vdjtools/signature/corpus.py b/python/vdjtools/signature/corpus.py
+index e3f0ee22..4be92465 100644
+--- a/python/vdjtools/signature/corpus.py
++++ b/python/vdjtools/signature/corpus.py
+@@ -2144,7 +2144,7 @@ def fit(cls, table: pl.DataFrame, *, n_components: int = 256, seed: int = 0,
+         from vdjtools.cores import require_memory
+         require_memory(32 * table.height * len(cols) + 16 * min(table.height, len(cols))**2,
+                        'sample feature PCA fit')
+-        X = table.select(cols).to_numpy(order='c').copy()
++        X = table.select(cols).to_numpy(order='c', writable=True)
+         X[~np.isfinite(X)] = np.nan
+         fill = np.zeros(len(cols))
+         observed = np.isfinite(X).any(axis=0)
+@@ -2199,22 +2199,36 @@ def fit_features(cls, samples, *, vocab, feature_definition, n_components=256,
+             parameters = table_pca(raw, n_components, seed=seed)
+         return cls(columns, space, *parameters)
+ 
+-    def transform(self, table: pl.DataFrame) -> pl.DataFrame:
+-        """Apply this exact rotation; preserve sample IDs and metadata in input order."""
++    def transform(self, table: pl.DataFrame, *, threads: int = 1) -> pl.DataFrame:
++        """Project bounded row blocks; preserve sample IDs and metadata in input order.
++
++        ``threads`` budgets BLAS during application (1 serial, 0 allocated cores).
++        The selected input stays columnar; only a bounded block becomes dense.
++        """
+         if _space(table) != self.space:
+             raise ValueError('embedding space differs from the fitted rotation')
+         selected = set(self.columns)
+         if not selected.issubset(table.columns):
+             raise ValueError('embedding columns differ from the fitted rotation')
+-        from vdjtools.cores import require_memory
+-        require_memory(24 * table.height * len(self.columns)
+-                       + 8 * table.height * self.components.shape[0], 'sample feature PCA transform')
+-        X = table.select(self.columns).to_numpy(order='c')
+-        X = np.where(np.isfinite(X), X, self.fill)
+-        X -= self.mean
+-        X /= self.scale
+-        X -= self.center
+-        scores = X @ self.components.T
++        from vdjtools.cores import kernel_threads, numerical_kernels, require_memory
++        budget = kernel_threads(threads)
++        # Two dense blocks plus masks/scaling scratch fit in 32 MiB; output is N x rank.
++        rows = max(1, (32 * 1024**2) // (16 * len(self.columns)))
++        dtype = np.result_type(self.components.dtype, self.fill.dtype, np.float64)
++        require_memory(16 * min(rows, table.height) * len(self.columns)
++                       + dtype.itemsize * table.height * self.components.shape[0],
++                       'sample feature PCA transform')
++        scores = np.empty((table.height, self.components.shape[0]), dtype=dtype)
++        features = table.select(self.columns)
++        with numerical_kernels(budget):
++            for i, block in enumerate(features.iter_slices(rows)):
++                X = block.to_numpy(order='c', writable=True).astype(dtype, copy=False)
++                np.copyto(X, self.fill, where=~np.isfinite(X))
++                X -= self.mean
++                X /= self.scale
++                X -= self.center
++                start = i * rows
++                np.matmul(X, self.components.T, out=scores[start:start+block.height])
+         metadata = table.select([c for c in table.columns if c not in selected])
+         return metadata.hstack(pl.from_numpy(scores, schema=[f'pc{i}' for i in range(scores.shape[1])]))
+ 
+diff --git a/tests/python/test_projection.py b/tests/python/test_projection.py
+index b1403612..9d0d8bed 100644
+--- a/tests/python/test_projection.py
++++ b/tests/python/test_projection.py
+@@ -188,3 +188,47 @@ def checked(*args, **kwargs):
+                           loci=('TRB',), feature_definition=feature_definition('basic'),
+                           cstar_target=None, n_jobs=2, threads=2, n_components=2)
+     assert result.fits
++
++
++def test_table_projection_bounds_conversion_and_restores_threads(monkeypatch):
++    from threadpoolctl import threadpool_info, threadpool_limits
++    from vdjtools.cores import available_cores
++    rng = np.random.default_rng(13)
++    x = rng.normal(size=(1050, 2048))
++    x[3, 5] = np.nan
++    x[8, 9] = np.inf
++    columns = [f'phi:{i}' for i in range(x.shape[1])]
++    table = pl.from_numpy(x, schema=columns).with_columns(
++        pl.Series('sample_id', [str(i) for i in range(len(x))]),
++        pl.lit('fixed').alias('embedding_space'))
++    rotation = TablePCA(columns, 'fixed', np.zeros(x.shape[1]),
++                        rng.normal(size=x.shape[1]), np.ones(x.shape[1]),
++                        rng.normal(size=x.shape[1]), rng.normal(size=(4, x.shape[1])))
++    expected = (np.where(np.isfinite(x), x, rotation.fill)
++                - rotation.mean - rotation.center) @ rotation.components.T
++    original = pl.DataFrame.to_numpy
++    heights = []
++    def bounded(frame, *args, **kwargs):
++        if frame.width == len(columns):
++            heights.append(frame.height)
++            assert frame.height < table.height, 'full feature table materialized'
++        return original(frame, *args, **kwargs)
++    monkeypatch.setattr(pl.DataFrame, 'to_numpy', bounded)
++    with threadpool_limits(limits=1, user_api='blas'):
++        actual = rotation.transform(table, threads=min(2, available_cores()))
++        assert all(p['num_threads'] == 1 for p in threadpool_info() if p['user_api'] == 'blas')
++    with threadpool_limits(limits=1, user_api='blas'), monkeypatch.context() as patch:
++        def failed(*args, **kwargs):
++            raise RuntimeError('projection failed')
++        patch.setattr(np, 'matmul', failed)
++        with pytest.raises(RuntimeError, match='projection failed'):
++            rotation.transform(table, threads=min(2, available_cores()))
++        assert all(p['num_threads'] == 1 for p in threadpool_info() if p['user_api'] == 'blas')
++    assert len(heights) > 1
++    assert actual['sample_id'].equals(table['sample_id'])
++    np.testing.assert_allclose(actual.select('^pc.*$').to_numpy(), expected, rtol=0, atol=1e-10)
++    assert np.isnan(x[3, 5]) and np.isinf(x[8, 9])
++    with pytest.raises(ValueError, match='between'):
++        rotation.transform(table, threads=available_cores()+1)
++    with pytest.raises(ValueError, match='spaces'):
++        rotation.transform(table.head(0))

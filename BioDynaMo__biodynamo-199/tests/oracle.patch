@@ -1,0 +1,225 @@
+diff --git a/src/core/container/parallel_resize_vector.h b/src/core/container/parallel_resize_vector.h
+index 62d6bce45..a13865a6a 100644
+--- a/src/core/container/parallel_resize_vector.h
++++ b/src/core/container/parallel_resize_vector.h
+@@ -145,15 +145,20 @@ class ParallelResizeVector {
+   }
+ 
+   ParallelResizeVector& operator=(const ParallelResizeVector& other) {
+-    free(data_);
+-    data_ = nullptr;
++    if (&other == this) {
++      return *this;
++    }
++
++    clear();
++    // the following function call ensures that at least other.capacity_
++    // elements can be stored. If capacity_ > other.capacity_
++    // the container is NOT shrank.
+     reserve(other.capacity_);
+     size_ = other.size_;
+-    capacity_ = other.capacity_;
+ 
+ #pragma omp parallel for
+     for (std::size_t i = 0; i < size_; i++) {
+-      data_[i] = other.data_[i];
++      new (&(data_[i])) T(other.data_[i]);
+     }
+     return *this;
+   }
+diff --git a/src/core/diffusion/diffusion_grid.cc b/src/core/diffusion/diffusion_grid.cc
+index 61041b5c8..38ff9ea39 100644
+--- a/src/core/diffusion/diffusion_grid.cc
++++ b/src/core/diffusion/diffusion_grid.cc
+@@ -188,11 +188,14 @@ void DiffusionGrid::RunInitializers() {
+           double real_z = grid_dimensions_[0] + z * box_length_;
+           std::array<uint32_t, 3> box_coord = {x, y, z};
+           size_t idx = GetBoxIndex(box_coord);
+-          ChangeConcentrationBy(idx, initializers_[f](real_x, real_y, real_z));
++          double value = initializers_[f](real_x, real_y, real_z);
++          ChangeConcentrationBy(idx, value);
+         }
+       }
+     }
+   }
++  // Copy data to second array to ensure valid Dirichlet Boundary Conditions
++  c2_ = c1_;
+ 
+   // Clear the initializer to free up space
+   initializers_.clear();
+diff --git a/src/core/diffusion/diffusion_grid.h b/src/core/diffusion/diffusion_grid.h
+index 10d758919..7e0d8eafc 100644
+--- a/src/core/diffusion/diffusion_grid.h
++++ b/src/core/diffusion/diffusion_grid.h
+@@ -156,6 +156,7 @@ class DiffusionGrid {
+   friend class RungaKuttaGrid;
+   friend class EulerGrid;
+   friend class StencilGrid;
++  friend class TestGrid;  // class used for testing (e.g. initialization)
+ 
+   void ParametersCheck();
+ 
+diff --git a/test/unit/core/container/parallel_resize_vector_test.cc b/test/unit/core/container/parallel_resize_vector_test.cc
+index 9c8d8f1b9..da16b01a6 100644
+--- a/test/unit/core/container/parallel_resize_vector_test.cc
++++ b/test/unit/core/container/parallel_resize_vector_test.cc
+@@ -102,4 +102,48 @@ TEST(ParallelResizeVector, AssignmentOperator) {
+   }
+ }
+ 
++TEST(ParallelResizeVector, AssignmentOperator2) {
++  ParallelResizeVector<int> v;
++  EXPECT_EQ(0u, v.size());
++  EXPECT_EQ(0u, v.capacity());
++
++  v.resize(17576, 123);
++
++  ParallelResizeVector<int> copy{};
++  copy = v;
++
++  EXPECT_EQ(17576u, copy.size());
++  EXPECT_EQ(17576u, copy.capacity());
++
++  for (auto el : copy) {
++    EXPECT_EQ(123, el);
++  }
++
++  v.clear();
++  v.resize(10, 124);
++  copy = v;
++
++  EXPECT_EQ(10u, copy.size());
++
++  for (auto el : copy) {
++    EXPECT_EQ(124, el);
++  }
++}
++
++TEST(ParallelResizeVector, AssignmentOperator_Self) {
++  ParallelResizeVector<int> v;
++  EXPECT_EQ(0u, v.size());
++  EXPECT_EQ(0u, v.capacity());
++
++  v.resize(17576, 123);
++  v = v;
++
++  EXPECT_EQ(17576u, v.size());
++  EXPECT_EQ(17576u, v.capacity());
++
++  for (auto el : v) {
++    EXPECT_EQ(123, el);
++  }
++}
++
+ }  // namespace bdm
+diff --git a/test/unit/core/diffusion_init_test.cc b/test/unit/core/diffusion_init_test.cc
+index 02a108f03..a0f762a1e 100644
+--- a/test/unit/core/diffusion_init_test.cc
++++ b/test/unit/core/diffusion_init_test.cc
+@@ -12,6 +12,7 @@
+ //
+ // -----------------------------------------------------------------------------
+ 
++#include "diffusion_init_test.h"
+ #include "core/agent/cell.h"
+ #include "core/diffusion/diffusion_grid.h"
+ #include "core/environment/environment.h"
+@@ -88,4 +89,44 @@ TEST(DiffusionInitTest, GaussianBand) {
+               eps);
+ }
+ 
++// Both internal arrays (c1_ and c2_) need to be initialized to avoid unphysical
++// effects at the boundary after the first internal swap. See PR #199.
++TEST(DiffusionInitTest, InitBothArrays) {
++  auto set_param = [](auto* param) {
++    param->bound_space = Param::BoundSpaceMode::kClosed;
++    param->min_bound = 0;
++    param->max_bound = 250;
++  };
++  Simulation simulation(TEST_NAME, set_param);
++
++  auto* rm = simulation.GetResourceManager();
++  auto* param = simulation.GetParam();
++
++  // Create one cell at a random position
++  auto construct = [](const Double3& position) {
++    Cell* cell = new Cell(position);
++    cell->SetDiameter(10);
++    return cell;
++  };
++  ModelInitializer::CreateAgentsRandom(param->min_bound, param->max_bound, 1,
++                                       construct);
++
++  // Define the substances in our simulation
++  DiffusionGrid* d_grid = nullptr;
++  d_grid = new TestGrid(kSubstance, "Substance", 0.0, 0.0, 26);
++  rm->AddDiffusionGrid(d_grid);
++
++  // Initialize the substance according to a GaussianBand along the x-axis
++  auto SetValues = [&](double x, double y, double z) { return 0.5; };
++  ModelInitializer::InitializeSubstance(kSubstance, SetValues);
++
++  simulation.GetEnvironment()->Update();
++  simulation.GetScheduler()->Simulate(1);
++
++  // Test if all values in c1_ are 0.5 and if all values in c2_ are the same as
++  // in c1_.
++  auto* test_grid = bdm_static_cast<TestGrid*>(d_grid);
++  EXPECT_TRUE(test_grid->ComapareArrayWithValue(0.5));
++  EXPECT_TRUE(test_grid->CompareArrays());
++}
+ }  // namespace bdm
+diff --git a/test/unit/core/diffusion_init_test.h b/test/unit/core/diffusion_init_test.h
+new file mode 100644
+index 000000000..09f11cca8
+--- /dev/null
++++ b/test/unit/core/diffusion_init_test.h
+@@ -0,0 +1,48 @@
++#ifndef UNIT_CORE_DIFFUSION_INIT_TEST_H_
++#define UNIT_CORE_DIFFUSION_INIT_TEST_H_
++
++#include "core/diffusion/diffusion_grid.h"
++
++namespace bdm {
++
++// Test class for diffusion grid to
++class TestGrid : public DiffusionGrid {
++ public:
++  TestGrid() {}
++  TestGrid(int substance_id, std::string substance_name, double dc, double mu,
++           int resolution = 11)
++      : DiffusionGrid(substance_id, substance_name, dc, mu, resolution) {}
++
++  void DiffuseWithClosedEdge() override { return; };
++
++  void DiffuseWithOpenEdge() override { return; };
++
++  void Swap() { c1_.swap(c2_); }
++
++  // Check if the entries of c1_ and c2_ are equal for each position.
++  bool CompareArrays() {
++    for (size_t i = 0; i < c1_.size(); i++) {
++      if (c1_[i] != c2_[i]) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  // Compares all values of the array c1_ with a specific value.
++  bool ComapareArrayWithValue(double value) {
++    for (size_t i = 0; i < c1_.size(); i++) {
++      if (c1_[i] != value) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++ private:
++  BDM_CLASS_DEF_OVERRIDE(TestGrid, 1);
++};
++
++}  // namespace bdm
++
++#endif  // UNIT_CORE_DIFFUSION_INIT_TEST_H_

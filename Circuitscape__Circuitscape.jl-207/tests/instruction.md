@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Fix a bug where max curr was not being initialized properly
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `2fe4517f4e81`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

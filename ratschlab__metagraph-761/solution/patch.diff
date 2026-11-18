@@ -1,0 +1,84 @@
+diff --git a/metagraph/docs/source/traverse.rst b/metagraph/docs/source/traverse.rst
+index 2679c007a9..6ca44010c3 100644
+--- a/metagraph/docs/source/traverse.rst
++++ b/metagraph/docs/source/traverse.rst
+@@ -110,8 +110,9 @@ seed for another cause, its walk holds the ``error`` instead (``too_wide``, ``ti
+ ``ambiguous_header``).
+ 
+ The server refuses a named label that no selected graph has with HTTP 400. A malformed seed and
+-an ambiguous label fail the whole request, as on a single index. The time budget applies to each
+-walk. The graphs are walked in parallel.
++an ambiguous label fail the whole request, as on a single index. The graphs are walked in parallel.
++The walks of a request share its time: each walk gets the budget or the time left, whichever is
++less.
+ 
+ Terms
+ -----
+@@ -191,7 +192,7 @@ Interval
+      - How far each arm extends.
+      - 5000
+    * - ``bounds.time_budget_ms``
+-     - The time for one seed, at least 1. A request can take this time once per seed. The server lowers it to ``--traverse-max-time-ms``.
++     - The time for one seed, at least 1. A request can take this time once per seed. This holds on a server with a list of graphs too. A walk there gets the time that is left, which can be less than the budget. The server lowers it to ``--traverse-max-time-ms``.
+      - ``--traverse-max-time-ms``
+ 
+ How a walk proceeds
+diff --git a/metagraph/src/cli/traverse.cpp b/metagraph/src/cli/traverse.cpp
+index 03c24f5f3d..b7f8db2ffa 100644
+--- a/metagraph/src/cli/traverse.cpp
++++ b/metagraph/src/cli/traverse.cpp
+@@ -1,6 +1,7 @@
+ #include "traverse.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <exception>
+ #include <future>
+@@ -474,7 +475,12 @@ struct IndexWalks {
+     std::vector<bool> too_short;
+ };
+ 
+-IndexWalks walk_index(const TraverseRequest &req, const TraverseIndex &index) {
++using Clock = std::chrono::steady_clock;
++
++// The walks of all indexes share the request's time: each walk gets its seed's budget or the
++// time left before |deadline|, whichever is less
++IndexWalks walk_index(const TraverseRequest &req, const TraverseIndex &index,
++                      Clock::time_point deadline) {
+     const LabelOracle oracle(*index.anno_graph);
+     IndexWalks out;
+     for (const Seed &named : req.seeds) {
+@@ -495,7 +501,10 @@ IndexWalks walk_index(const TraverseRequest &req, const TraverseIndex &index) {
+         try {
+             // a malformed seed or an ambiguous label refuses the request
+             check_seed(oracle, seed);
+-            walk = seed_result_to_json(traverse_seed(oracle, seed, req.strategy));
++            Strategy strategy = req.strategy;
++            const std::chrono::duration<double, std::milli> left = deadline - Clock::now();
++            strategy.time_budget_ms = std::max(0.0, std::min(strategy.time_budget_ms, left.count()));
++            walk = seed_result_to_json(traverse_seed(oracle, seed, strategy));
+         } catch (const SeedNotInGraph &) {
+             continue;
+         } catch (const SeedDerivationError &e) {
+@@ -520,6 +529,11 @@ Json::Value process_traverse_request(const Json::Value &request,
+         fields.removeMember("graphs");
+     const TraverseRequest req = parse_traverse_request(fields, limits);
+ 
++    // a request takes its time budget at most once per seed, however many indexes walk it
++    // (capped at about 30 years, which Clock::duration holds)
++    const double request_ms = std::min(req.strategy.time_budget_ms * req.seeds.size(), 1e12);
++    const auto deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
++            std::chrono::duration<double, std::milli>(request_ms));
+     std::vector<IndexWalks> walked(indexes.size());
+     // the tasks refer to this frame: they are waited for before it is left, also on a throw
+     struct Pending {
+@@ -535,7 +549,7 @@ Json::Value process_traverse_request(const Json::Value &request,
+     for (size_t i = 0; i < indexes.size(); ++i) {
+         futures.push_back(pool.enqueue([&, i]() {
+             try {
+-                walked[i] = walk_index(req, indexes[i]);
++                walked[i] = walk_index(req, indexes[i], deadline);
+             } catch (...) {
+                 return std::current_exception();
+             }

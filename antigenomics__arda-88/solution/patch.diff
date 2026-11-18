@@ -1,0 +1,525 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b4317ed3..555849af 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,62 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.6.3
++
++### Fixed — the mmseqs auto-fetch could publish a half-written binary
++
++arda runs concurrently against one cache **by design** — a Nextflow process per sample, a SLURM
++array task per shard — and on a cold cache every one of them calls the fetch in the same moment.
++That path installed with `shutil.copy2` straight onto `bin/mmseqs`, which is this repo's
++signature bug in its purest form. Two silent failures:
++
++* `copy2` writes **in place**, so two processes doing it at once interleave their bytes and
++  produce a corrupt binary that nothing reported an error about;
++* `dest.exists()` — the gate deciding the work is already done — goes true on the **first byte**
++  `copy2` writes. A third process therefore finds an mmseqs, trusts it, and executes a truncated
++  file. The `chmod` came *after* the copy as well, leaving a second window in which the file
++  existed but was not executable.
++
++Now there is one downloader under `build_lock`, the binary is made executable while still under
++a private name, and a single `os.replace` publishes it. A rename is atomic within a filesystem,
++so `bin/mmseqs` only ever exists as a complete, executable binary — which is what makes
++`dest.exists()` a legitimate gate instead of a bug. (`os.replace` is a rename only within one
++filesystem, which is why 2.6.2's move of the staging directory next to the destination is a
++prerequisite, not a separate fix.)
++
++The two new tests were checked against the old implementation and **both fail there** — a
++concurrency test that passes on the broken code pins nothing. The decisive one interrupts the
++copy *after* it has written bytes, which is what a full disk, an OOM kill or a SLURM timeout
++does, and asserts no partial binary is left for the next process to run.
++
++The reference fetch (`_database_fetch`) and the new IgBLAST fetch already worked this way; this
++brings the third one into line.
++
++### Fixed — `pip install 'arda-mapper[mmseqs]'` was a hard failure
++
++The `mmseqs` extra depended on `arda-mmseqs`, a companion distribution that is built by CI but
++has never been uploaded to PyPI. An extra naming a package the index does not have does not
++degrade gracefully — it is a resolution error:
++
++```
++ERROR: No matching distribution found for arda-mmseqs<19,>=18; extra == "mmseqs"
++```
++
++And that exact command was what the README, the installation docs, and `mmseqs_binary()`'s own
++"binary not found" error all told you to run. The one actionable line in the error message was
++itself broken.
++
++`mmseqs` is now an empty alias, like `rnaseq` already was, so existing pins keep resolving.
++Nothing is lost: the bundled wheel was only ever a convenience over the runtime auto-fetch,
++which pulls the same static binary, is what a plain install already does, and needs the network
++exactly once — as `pip` itself just did. The four places that recommended the extra now describe
++auto-fetch, and the resolution test asserts the advice names a route that exists.
++
++There is no install-time alternative to look for: **a wheel has no post-install hook.** `pip`
++unpacks an archive and runs nothing, by design, so "download it during `pip install`" is not
++something a package can opt into. Fetching at first use is the standard answer to that
++constraint, and it is what arda already does.
++
+ ## 2.6.2
+ 
+ ### Fixed — auto-fetch staged its download in the system temp dir, and died on a cluster
+diff --git a/docs/conf.py b/docs/conf.py
+index ee054ced..befcc729 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -8,7 +8,7 @@
+ project = "arda"
+ author = "Mikhail Shugay"
+ copyright = "2026, Mikhail Shugay"
+-release = "2.6.2"
++release = "2.6.3"
+ 
+ extensions = [
+     "sphinx.ext.autodoc",
+diff --git a/docs/installation.rst b/docs/installation.rst
+index c9a6a2e7..3b689fab 100644
+--- a/docs/installation.rst
++++ b/docs/installation.rst
+@@ -30,13 +30,17 @@ What gets installed
+ MMseqs2 without conda
+ ---------------------
+ 
+-You do not have to install MMseqs2. Either of these works with nothing else set up::
++You do not have to install MMseqs2. This is enough::
+ 
+     pip install arda-mapper              # auto-fetches a static binary on first use
+-    pip install 'arda-mapper[mmseqs]'    # ships the binary in the wheel; no download at all
+ 
+-Resolution order: ``$ARDA_MMSEQS`` → the ``arda-mapper[mmseqs]`` wheel → ``<project>/bin/mmseqs``
+-→ ``mmseqs`` on ``PATH`` → auto-fetch.
++Resolution order: ``$ARDA_MMSEQS`` → an ``arda_mmseqs`` package if one is installed →
++``<project>/bin/mmseqs`` → ``mmseqs`` on ``PATH`` → auto-fetch.
++
++The ``[mmseqs]`` extra still resolves, but it installs nothing: the companion ``arda-mmseqs``
++distribution that used to bundle the binary is not published, and an extra naming a package PyPI
++does not have is a hard failure rather than a soft one. Auto-fetch pulls the same static
++binary.
+ 
+ **Candidates are version-matched, not merely found.** An mmseqs index is only reusable by the
+ release that compiled it, so an unrelated ``mmseqs`` on ``PATH`` makes arda discard the
+diff --git a/integrations/nextflow/arda/Dockerfile b/integrations/nextflow/arda/Dockerfile
+index a15316e5..a955688a 100644
+--- a/integrations/nextflow/arda/Dockerfile
++++ b/integrations/nextflow/arda/Dockerfile
+@@ -2,9 +2,9 @@
+ # Build and push to your own registry (e.g. the ISPRAS private registry), then point the module's
+ # `container` directive (or a withName override in your nextflow.config) at the pushed tag:
+ #
+-#   docker build -t arda-mapper:2.6.0 integrations/nextflow/arda
+-#   docker tag arda-mapper:2.6.0 <your-registry>/arda-mapper:2.6.0
+-#   docker push <your-registry>/arda-mapper:2.6.0
++#   docker build -t arda-mapper:2.6.2 integrations/nextflow/arda
++#   docker tag arda-mapper:2.6.2 <your-registry>/arda-mapper:2.6.2
++#   docker push <your-registry>/arda-mapper:2.6.2
+ #
+ FROM mambaorg/micromamba:1.5.8
+ COPY --chown=$MAMBA_USER:$MAMBA_USER environment.yml /tmp/environment.yml
+diff --git a/integrations/nextflow/arda/README.md b/integrations/nextflow/arda/README.md
+index 7e7bdcc2..27ecf94d 100644
+--- a/integrations/nextflow/arda/README.md
++++ b/integrations/nextflow/arda/README.md
+@@ -98,7 +98,7 @@ changes. Five edits, all mirroring how an existing tool is wired:
+    (copy any existing `skip_*`/`run_*` boolean entry as a template).
+ 
+ 5. **Container override** (only for `-profile docker/singularity/<your-profile>`): add
+-   `withName: 'ARDA' { container = '<your-registry>/arda-mapper:2.6.0' }` to your deployment config
++   `withName: 'ARDA' { container = '<your-registry>/arda-mapper:2.6.2' }` to your deployment config
+    (e.g. `conf/<profile>.config`), exactly as the other tools' images are pinned there.
+ 
+ Run with `--run_arda`:
+diff --git a/integrations/nextflow/arda/environment.yml b/integrations/nextflow/arda/environment.yml
+index 42834210..d52ea477 100644
+--- a/integrations/nextflow/arda/environment.yml
++++ b/integrations/nextflow/arda/environment.yml
+@@ -10,4 +10,4 @@ dependencies:
+   - pip
+   - pip:
+       # seqtree (needed by `arda rnaseq correct`) is a core dependency since 2.5.5 -- no extra.
+-      - arda-mapper==2.6.0
++      - arda-mapper==2.6.2
+diff --git a/integrations/nextflow/arda/main.nf b/integrations/nextflow/arda/main.nf
+index cc201bc4..59f8d4f6 100644
+--- a/integrations/nextflow/arda/main.nf
++++ b/integrations/nextflow/arda/main.nf
+@@ -15,7 +15,7 @@ process ARDA {
+     //   -profile docker   -> build the image from the Dockerfile beside this module and push it to
+     //                        your registry, then point `container` at it (or override in a config).
+     conda "${moduleDir}/environment.yml"
+-    container "arda-mapper:2.6.0"
++    container "arda-mapper:2.6.2"
+ 
+     input:
+     tuple val(meta), path(reads)
+diff --git a/pyproject.toml b/pyproject.toml
+index 772a4e47..71877972 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.6.2"
++version = "2.6.3"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+@@ -37,11 +37,16 @@ dev = ["ruff", "pytest", "pybind11"]
+ # Kept as an empty alias so existing `arda-mapper[rnaseq]` pins (the Nextflow module, collaborator
+ # instructions, older docs) keep resolving without a warning. seqtree is a core dependency now.
+ rnaseq = []
+-# Ship the aligner instead of downloading it on first use. Not a hard dependency: the plain
+-# install auto-fetches the same static binary. The pin is deliberately loose because it is not
+-# what keeps you safe -- `mmseqs.mmseqs_binary()` version-matches whatever it finds against the
+-# precompiled indexes in `database/`, so a stale bundle is rejected like any other candidate.
+-mmseqs = ["arda-mmseqs>=18,<19"]
++# An empty alias, like `rnaseq` above, and for a sharper reason: an extra naming a package PyPI
++# does not have is a hard resolution FAILURE, not a soft one. `arda-mmseqs` is built by
++# .github/workflows/publish-mmseqs.yml but has never been uploaded, so as a real dependency this
++# extra turned `pip install 'arda-mapper[mmseqs]'` -- which the README, the docs and
++# `mmseqs_binary()`'s own error message all recommend -- into `No matching distribution found`.
++#
++# Nothing is lost by emptying it. The bundled wheel was only ever a convenience over the runtime
++# auto-fetch, which pulls the same static binary and is what a plain install already does; both
++# need the network exactly once. Restore the pin when the distribution is actually published.
++mmseqs = []
+ # Tests only: OLGA's generative model supplies ground-truth V/J trims (and D spans) for
+ # `arda.cdr3fix`. Kept out of `test`/`dev` so the normal suite never imports it.
+ groundtruth = ["olga"]
+diff --git a/skills/arda/SKILL.md b/skills/arda/SKILL.md
+index d95d9a79..251fdab1 100644
+--- a/skills/arda/SKILL.md
++++ b/skills/arda/SKILL.md
+@@ -225,8 +225,8 @@ rest once, through the same function `arda rnaseq run` uses — so a sharded run
+ 
+ ## mmseqs: nothing to install, and nothing to pin
+ 
+-`pip install arda-mapper` auto-fetches a static binary on first use; `pip install
+-'arda-mapper[mmseqs]'` ships it in the wheel so there is no download at all. Candidates are
++`pip install arda-mapper` auto-fetches a static binary on first use — there is no extra to
++add, and the `[mmseqs]` extra installs nothing (see installation.rst). Candidates are
+ **version-matched** against the shipped indexes — an index is only reusable by the release that
+ built it, so an unrelated `mmseqs` on `PATH` would silently discard `database/`'s precompiled
+ DBs and rebuild a private cache. `$ARDA_MMSEQS` overrides everything and is not checked.
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index cf5f5570..f6743d5a 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.6.2"
++__version__ = "2.6.3"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/_mmseqs_fetch.py b/src/arda/_mmseqs_fetch.py
+index 2c333b5d..bc18c4b0 100644
+--- a/src/arda/_mmseqs_fetch.py
++++ b/src/arda/_mmseqs_fetch.py
+@@ -19,6 +19,8 @@
+ import urllib.request
+ from pathlib import Path
+ 
++from ._locking import build_lock
++
+ RELEASE_URL = "https://github.com/soedinglab/MMseqs2/releases/latest/download/{asset}"
+ 
+ # GitHub rejects the default Python-urllib User-Agent on some networks; mimic a
+@@ -68,40 +70,72 @@ def default_asset() -> str:
+ 
+ 
+ def fetch(bin_dir: Path, *, force: bool = False) -> Path:
+-    """Download + install the mmseqs binary into *bin_dir*; return its path."""
++    """Download + install the mmseqs binary into *bin_dir*; return its path.
++
++    Concurrency-safe, because arda runs concurrently against one cache by design -- a Nextflow
++    process per sample, a SLURM array task per shard -- and on a cold cache every one of them
++    calls this at the same moment.
++
++    It used to `shutil.copy2` straight onto ``bin/mmseqs``, which is this repo's signature bug in
++    its purest form. Two failures, both silent:
++
++    * copy2 writes **in place**, so two processes doing it at once interleave their bytes and the
++      result is a corrupt binary that nobody reported an error about;
++    * ``dest.exists()`` -- the gate that decides the work is already done -- becomes true on the
++      **first byte** copy2 writes. A third process therefore sees an mmseqs, returns it, and
++      executes a truncated file. (The chmod came after the copy too, so there was a second window
++      where the file existed but was not executable.)
++
++    Now: one downloader under the build lock, the binary made executable while still under a
++    private name, and a single ``os.replace`` to publish it. A rename is atomic within a
++    filesystem, so ``dest`` only ever exists as a complete, executable binary -- which is what
++    makes ``dest.exists()`` a legitimate gate rather than a bug.
++    """
+     bin_dir = Path(bin_dir)
+     bin_dir.mkdir(parents=True, exist_ok=True)
+     dest = bin_dir / "mmseqs"
+     if dest.exists() and not force:
+         return dest
+ 
+-    asset = default_asset()
+-    url = RELEASE_URL.format(asset=asset)
+-    print(f"[arda] fetching mmseqs: {url}", file=sys.stderr)
+-    # Scratch next to the destination, NOT in the system temp dir: on a cluster /tmp is routinely
+-    # a small node-local filesystem (aldan3's is 2.0 GB with 29 MB free) and this archive plus its
+-    # extraction does not fit. The IgBLAST fetch died there first, with ENOSPC.
+-    with tempfile.TemporaryDirectory(prefix=".arda_mmseqs_", dir=bin_dir) as td:
+-        tmp = Path(td)
+-        tarball = tmp / asset
+-        _download(url, tarball)
+-        with tarfile.open(tarball) as tf:
+-            tmp_resolved = tmp.resolve()
+-            for member in tf.getmembers():
+-                if member.issym() or member.islnk():
+-                    raise RuntimeError(
+-                        f"Refusing to extract link from MMseqs2 archive: {member.name}"
+-                    )
+-                member_path = (tmp / member.name).resolve()
+-                if not str(member_path).startswith(str(tmp_resolved) + os.sep):
+-                    raise RuntimeError(
+-                        f"Refusing to extract path outside temp dir: {member.name}"
+-                    )
+-            tf.extractall(tmp)
+-        extracted = next(tmp.rglob("bin/mmseqs"), None)  # static archives: mmseqs/bin/mmseqs
+-        if extracted is None:
+-            raise RuntimeError(f"Unexpected MMseqs2 archive layout in {asset}")
+-        shutil.copy2(extracted, dest)
+-        dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
++    # Under --force the work is ours by definition; otherwise whoever we queued behind may have
++    # finished it while we waited, and there is then nothing left to do.
++    done = (lambda: False) if force else dest.exists
++    with build_lock(bin_dir / ".mmseqs.lock", done=done) as ours:
++        if not ours:
++            return dest
++        asset = default_asset()
++        url = RELEASE_URL.format(asset=asset)
++        print(f"[arda] fetching mmseqs: {url}", file=sys.stderr)
++        # Scratch next to the destination, NOT in the system temp dir: on a cluster /tmp is
++        # routinely a small node-local filesystem (aldan3's is 2.0 GB with 29 MB free) and this
++        # archive plus its extraction does not fit. The IgBLAST fetch died there first, with
++        # ENOSPC. It also puts the staged binary on the same filesystem as `dest`, which is what
++        # makes the `os.replace` below a rename rather than a copy.
++        with tempfile.TemporaryDirectory(prefix=".arda_mmseqs_", dir=bin_dir) as td:
++            tmp = Path(td)
++            tarball = tmp / asset
++            _download(url, tarball)
++            with tarfile.open(tarball) as tf:
++                tmp_resolved = tmp.resolve()
++                for member in tf.getmembers():
++                    if member.issym() or member.islnk():
++                        raise RuntimeError(
++                            f"Refusing to extract link from MMseqs2 archive: {member.name}"
++                        )
++                    member_path = (tmp / member.name).resolve()
++                    if not str(member_path).startswith(str(tmp_resolved) + os.sep):
++                        raise RuntimeError(
++                            f"Refusing to extract path outside temp dir: {member.name}"
++                        )
++                tf.extractall(tmp)
++            extracted = next(tmp.rglob("bin/mmseqs"), None)  # static archives: mmseqs/bin/mmseqs
++            if extracted is None:
++                raise RuntimeError(f"Unexpected MMseqs2 archive layout in {asset}")
++            staged = tmp / "mmseqs.staged"
++            shutil.copy2(extracted, staged)
++            # Executable BEFORE it is published, never after: a rename cannot be observed
++            # half-done, but a chmod that follows the publish can.
++            staged.chmod(staged.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
++            os.replace(staged, dest)
+     print(f"[arda] installed mmseqs -> {dest}", file=sys.stderr)
+     return dest
+diff --git a/src/arda/mmseqs.py b/src/arda/mmseqs.py
+index 86c43722..18c304c2 100644
+--- a/src/arda/mmseqs.py
++++ b/src/arda/mmseqs.py
+@@ -12,7 +12,7 @@
+ rebuilds a private cache. If nothing matches, a known-good static binary is
+ auto-fetched into ``<project>/bin/mmseqs`` (one-time, transparent) unless
+ ``$ARDA_NO_AUTO_FETCH`` is set — so neither pip nor conda users need to install
+-mmseqs manually. ``pip install 'arda-mapper[mmseqs]'`` skips even that.
++mmseqs manually -- the binary is fetched on first use.
+ """
+ 
+ from __future__ import annotations
+@@ -167,16 +167,15 @@ def mmseqs_binary() -> str:
+         warnings.warn(
+             f"mmseqs {got} does not match the version the shipped indexes were built with "
+             f"({want}); the precompiled reference index will be ignored and a private cache "
+-            f"rebuilt on first use. Install a matching build "
+-            f"(pip install 'arda-mapper[mmseqs]') or set $ARDA_MMSEQS to silence this.",
++            f"rebuilt on first use. Let arda auto-fetch a matching build (unset "
++            f"$ARDA_NO_AUTO_FETCH) or set $ARDA_MMSEQS to silence this.",
+             RuntimeWarning, stacklevel=2,
+         )
+         return candidates[0]
+ 
+     raise MMseqsError(
+-        "mmseqs binary not found. Install it (pip install 'arda-mapper[mmseqs]', or "
+-        "conda install -c bioconda mmseqs2), set $ARDA_MMSEQS, or allow auto-fetch "
+-        "(unset $ARDA_NO_AUTO_FETCH)."
++        "mmseqs binary not found. Allow auto-fetch (unset $ARDA_NO_AUTO_FETCH), install it "
++        "(conda install -c bioconda mmseqs2), or set $ARDA_MMSEQS."
+     )
+ 
+ 
+diff --git a/tests/unit/test_mmseqs_fetch.py b/tests/unit/test_mmseqs_fetch.py
+index 8b28e764..6e184b86 100644
+--- a/tests/unit/test_mmseqs_fetch.py
++++ b/tests/unit/test_mmseqs_fetch.py
+@@ -1,5 +1,7 @@
+ """Unit tests for mmseqs binary discovery and static-binary auto-fetch (offline)."""
+ 
++from pathlib import Path
++
+ import pytest
+ 
+ from arda import _mmseqs_fetch, mmseqs
+@@ -56,3 +58,120 @@ def _boom(*a, **k):  # auto-fetch must NOT be attempted
+     with pytest.raises(mmseqs.MMseqsError, match="not found"):
+         mmseqs.mmseqs_binary()
+     mmseqs.mmseqs_binary.cache_clear()
++
++
++# --- concurrency ---------------------------------------------------------------------------
++#
++# arda runs concurrently against ONE cache by design (a Nextflow process per sample, a SLURM
++# array task per shard), and on a cold cache they all call `fetch` in the same instant. The old
++# implementation copied straight onto `bin/mmseqs`, so `dest.exists()` -- the gate saying the
++# work was done -- went true on the FIRST BYTE, and a concurrent reader could exec a truncated
++# binary. Nothing raised. These pin the properties that make that impossible.
++
++
++def _fake_archive(tmp: Path, payload: bytes = b"#!/bin/sh\ntrue\n") -> None:
++    """Stand in for `_download` + the real tarball: write an archive shaped like MMseqs2's."""
++    import tarfile
++
++    src = tmp / "mmseqs" / "bin"
++    src.mkdir(parents=True, exist_ok=True)
++    (src / "mmseqs").write_bytes(payload)
++    with tarfile.open(tmp / "asset.tar.gz", "w:gz") as tf:
++        tf.add(src / "mmseqs", arcname="mmseqs/bin/mmseqs")
++
++
++def _install_fakes(monkeypatch, payload=b"#!/bin/sh\ntrue\n"):
++    monkeypatch.setattr(_mmseqs_fetch, "default_asset", lambda: "asset.tar.gz")
++
++    def fake_download(url, dest, **kw):
++        _fake_archive(dest.parent, payload)
++
++    monkeypatch.setattr(_mmseqs_fetch, "_download", fake_download)
++
++
++def test_the_binary_is_published_by_rename_not_written_in_place(tmp_path, monkeypatch):
++    """`bin/mmseqs` must appear atomically, already executable.
++
++    Asserted via os.replace rather than by racing threads, because a race test that happens to
++    pass proves nothing. The invariant is structural: the only call that creates `dest` is a
++    rename, and the source was already chmod'ed.
++    """
++    import os
++    import stat as st
++
++    _install_fakes(monkeypatch)
++    seen = {}
++    real_replace = os.replace
++
++    def spy_replace(src, dst):
++        seen["src"], seen["dst"] = Path(src), Path(dst)
++        seen["mode_before_publish"] = Path(src).stat().st_mode
++        real_replace(src, dst)
++
++    monkeypatch.setattr(_mmseqs_fetch.os, "replace", spy_replace)
++    dest = _mmseqs_fetch.fetch(tmp_path / "bin")
++
++    assert seen["dst"] == dest, "dest must be created by the rename, not written in place"
++    assert seen["src"].parent.parent == dest.parent, "staging must share dest's filesystem"
++    assert seen["mode_before_publish"] & st.S_IXUSR, "must be executable BEFORE it is published"
++    assert dest.stat().st_mode & st.S_IXUSR
++
++
++def test_a_failed_download_leaves_no_binary_for_anyone_to_exec(tmp_path, monkeypatch):
++    """A crash mid-install must not leave a partial `bin/mmseqs` behind.
++
++    This is the failure that had no error attached to it: the next process would find the file,
++    treat its existence as "already installed", and run it.
++    """
++    monkeypatch.setattr(_mmseqs_fetch, "default_asset", lambda: "asset.tar.gz")
++
++    def dying_download(url, dest, **kw):
++        dest.write_bytes(b"partial")
++        raise RuntimeError("network died mid-download")
++
++    monkeypatch.setattr(_mmseqs_fetch, "_download", dying_download)
++    with pytest.raises(RuntimeError, match="network died"):
++        _mmseqs_fetch.fetch(tmp_path / "bin")
++    assert not (tmp_path / "bin" / "mmseqs").exists()
++    # and the lock is released, so the next process is not stuck behind a corpse
++    assert not (tmp_path / "bin" / ".mmseqs.lock").exists()
++
++
++def test_a_second_caller_does_not_download_again(tmp_path, monkeypatch):
++    """The lock's `done` check: whoever we queued behind already did the work."""
++    _install_fakes(monkeypatch)
++    dest = _mmseqs_fetch.fetch(tmp_path / "bin")
++    assert dest.exists()
++
++    def must_not_run(*a, **k):
++        raise AssertionError("re-downloaded an mmseqs that was already installed")
++
++    monkeypatch.setattr(_mmseqs_fetch, "_download", must_not_run)
++    assert _mmseqs_fetch.fetch(tmp_path / "bin") == dest
++
++
++def test_an_interrupted_copy_never_leaves_a_partial_binary_at_dest(tmp_path, monkeypatch):
++    """The actual old bug: copy2 wrote INTO `bin/mmseqs`, so a partial one stayed behind.
++
++    Distinct from the failed-download case, which the old code survived by accident (it died
++    before copying). Here the copy itself dies after writing bytes -- which is what a full disk,
++    an OOM kill or a SLURM timeout does -- and the old implementation left a truncated,
++    executable-looking `bin/mmseqs` that the next process would find, trust and run.
++    """
++    _install_fakes(monkeypatch)
++    real_copy2 = _mmseqs_fetch.shutil.copy2
++
++    def dying_copy2(src, dst, **kw):
++        Path(dst).write_bytes(b"#!/bin/sh\ntru")   # a plausible-looking truncation
++        raise OSError(28, "No space left on device")
++
++    monkeypatch.setattr(_mmseqs_fetch.shutil, "copy2", dying_copy2)
++    with pytest.raises(OSError, match="No space left"):
++        _mmseqs_fetch.fetch(tmp_path / "bin")
++    assert not (tmp_path / "bin" / "mmseqs").exists(), \
++        "a partial binary was published; the next process will exec it"
++
++    # And the cache is not poisoned: a later, healthy run still installs correctly.
++    monkeypatch.setattr(_mmseqs_fetch.shutil, "copy2", real_copy2)
++    dest = _mmseqs_fetch.fetch(tmp_path / "bin")
++    assert dest.exists() and dest.read_bytes() == b"#!/bin/sh\ntrue\n"
+diff --git a/tests/unit/test_mmseqs_resolution.py b/tests/unit/test_mmseqs_resolution.py
+index ec2a09ca..649e8020 100644
+--- a/tests/unit/test_mmseqs_resolution.py
++++ b/tests/unit/test_mmseqs_resolution.py
+@@ -175,8 +175,15 @@ def test_nothing_found_at_all_raises_with_actionable_advice(tmp_path, monkeypatc
+     monkeypatch.setattr(mmseqs.shutil, "which", lambda _n: None)
+     monkeypatch.setattr(mmseqs, "bin_dir", lambda: tmp_path / "nonexistent")
+ 
+-    with pytest.raises(mmseqs.MMseqsError, match=r"arda-mapper\[mmseqs\]"):
++    # The advice has to be advice that WORKS. It used to say `pip install 'arda-mapper[mmseqs]'`,
++    # and that extra pointed at a distribution never published to PyPI -- so the one actionable
++    # line in the error was itself a hard failure (`No matching distribution found`). Assert both
++    # halves: a route that exists, and not that one.
++    with pytest.raises(mmseqs.MMseqsError) as exc:
+         mmseqs.mmseqs_binary()
++    msg = str(exc.value)
++    assert "ARDA_NO_AUTO_FETCH" in msg and "$ARDA_MMSEQS" in msg
++    assert "arda-mapper[mmseqs]" not in msg
+ 
+ 
+ def test_committed_index_version_never_triggers_a_reference_download(monkeypatch):

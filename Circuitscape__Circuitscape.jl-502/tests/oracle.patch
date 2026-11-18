@@ -1,0 +1,903 @@
+diff --git a/src/config.jl b/src/config.jl
+index 9321220c..619fabe0 100644
+--- a/src/config.jl
++++ b/src/config.jl
+@@ -281,6 +281,26 @@ function _remove_policy_symbol(v::RemovePolicy)
+     v == rp_rmvall ? :rmvall : :keepall
+ end
+ 
++# Predicates on a CSConfig. These replace the RasterFlags / NetworkFlags /
++# OutputFlags structs that used to be rebuilt from cfg at every entry point:
++# with a single representation there is no second copy for an option to be
++# parsed into and then never read from.
++is_raster(cfg::CSConfig) = cfg.data_type == dt_raster
++is_network(cfg::CSConfig) = cfg.data_type == dt_network
++is_pairwise(cfg::CSConfig) = cfg.scenario == sc_pairwise
++is_advanced(cfg::CSConfig) = cfg.scenario == sc_advanced
++is_onetoall(cfg::CSConfig) = cfg.scenario == sc_onetoall
++is_alltoone(cfg::CSConfig) = cfg.scenario == sc_alltoone
++policy(cfg::CSConfig) = _remove_policy_symbol(cfg.remove_src_or_gnd)
++
++"""
++    CSConfig(cfg::CSConfig; field = value, ...)
++
++Copy of `cfg` with the given fields replaced.
++"""
++CSConfig(cfg::CSConfig; kwargs...) =
++    CSConfig(; (f => getfield(cfg, f) for f in fieldnames(CSConfig))..., kwargs...)
++
+ function Base.Dict{String,String}(cfg::CSConfig)
+     a = Dict{String,String}()
+     a["version"] = cfg.version
+diff --git a/src/core.jl b/src/core.jl
+index 4e4994f0..1b799dab 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -42,6 +42,11 @@ struct Output{T,V}
+     cum::Cumulative{T}
+ end
+ 
++# The pairwise kernel hands `write_cur_maps` / `write_volt_maps` an `Output`
++# per pair; the advanced kernel hands them the voltage vector itself.
++_voltages(output::Output) = output.voltages
++_voltages(voltages::AbstractVector) = voltages
++
+ struct Shortcut{T}
+     get_shortcut_resistances::Bool
+     voltmatrix::Matrix{T}
+@@ -70,8 +75,8 @@ Core kernel of Circuitscape - used to solve several pairs
+ Input:
+ * data::GraphProblem
+ """
+-function single_ground_all_pairs(prob::GraphProblem{T,V,W}, flags, cfg, log = true) where {T,V,W}
+-    solve(prob, prob.solver, flags, cfg, log)
++function single_ground_all_pairs(prob::GraphProblem{T,V,W}, cfg, log = true) where {T,V,W}
++    solve(prob, prob.solver, cfg, log)
+ end
+ 
+ function get_solver(cfg)
+@@ -145,14 +150,14 @@ function pair_jobs(csub::Vector{V}, comp, points, orig_pts, exclude, first_sourc
+ end
+ 
+ """
+-    solve(prob, solver, flags, cfg, log)
++    solve(prob, solver, cfg, log)
+ 
+ Pairwise driver shared by every solver. Enumerates the pairs per connected
+ component, hands them to `solve_pairs!` for the solver-specific linear
+ algebra, and stores resistances / postprocesses maps in `handle_pair`. Only
+ `prepare!` and `solve_pairs!` differ between the iterative and direct paths.
+ """
+-function solve(prob::GraphProblem{T,V}, solver::Solver, flags, cfg, log)::Matrix{T} where {T,V}
++function solve(prob::GraphProblem{T,V}, solver::Solver, cfg, log)::Matrix{T} where {T,V}
+ 
+     # Data
+     a = prob.G
+@@ -166,12 +171,11 @@ function solve(prob::GraphProblem{T,V}, solver::Solver, flags, cfg, log)::Matrix
+     cellmap = prob.cellmap
+     cum = prob.cum
+ 
+-    # Flags
+-    outputflags = flags.outputflags
+-    write_volt_maps = outputflags.write_volt_maps
+-    write_cur_maps = outputflags.write_cur_maps
+-    write_cum_cur_map_only = outputflags.write_cum_cur_map_only
+-    write_max_cur_maps = outputflags.write_max_cur_maps
++    # Output options
++    write_volt_maps = cfg.write_volt_maps
++    write_cur_maps = cfg.write_cur_maps
++    write_cum_cur_map_only = cfg.write_cum_cur_map_only
++    write_max_cur_maps = cfg.write_max_cur_maps
+ 
+     numpoints = size(points, 1)
+ 
+@@ -189,7 +193,7 @@ function solve(prob::GraphProblem{T,V}, solver::Solver, flags, cfg, log)::Matrix
+     comps = getindex.([a], cc, cc)
+ 
+     get_shortcut_resistances = false
+-    if flags.is_raster && !write_volt_maps && !write_cur_maps &&
++    if is_raster(cfg) && !write_volt_maps && !write_cur_maps &&
+             !write_cum_cur_map_only && !write_max_cur_maps &&
+             isempty(exclude)
+         get_shortcut_resistances = true
+@@ -237,7 +241,7 @@ function solve(prob::GraphProblem{T,V}, solver::Solver, flags, cfg, log)::Matrix
+                 resistances[c_j, c_i] = resistance
+                 output = Output(points, voltages, (orig_pts[c_i], orig_pts[c_j]),
+                                 (job.comp_i, job.comp_j), resistance, V(c_j), cum)
+-                postprocess(output, component_data, flags, shortcut, cfg)
++                postprocess(output, component_data, shortcut, cfg)
+             end
+         end
+ 
+@@ -574,7 +578,7 @@ function solve_linear_system(factor::SuiteSparse.CHOLMOD.Factor, matrix, rhs; to
+     refine_columns!(factor \ rhs, factor, matrix, rhs, tol, "CHOLMOD")
+ end
+ 
+-function postprocess(output, component_data, flags, shortcut, cfg)
++function postprocess(output, component_data, shortcut, cfg)
+ 
+ 
+     voltages = output.voltages
+@@ -594,13 +598,13 @@ function postprocess(output, component_data, flags, shortcut, cfg)
+ 
+     name = "_$(orig_pts[1])_$(orig_pts[2])"
+ 
+-    if flags.outputflags.write_volt_maps
+-        write_volt_maps(name, output, component_data, flags, cfg)
++    if cfg.write_volt_maps
++        write_volt_maps(name, output, component_data, cfg)
+     end
+ 
+     # TODO: Even though this function is called write_cur_maps
+-    # actually writing the calculated maps depends on some flags.
+-    write_cur_maps(name, output, component_data, [-9999.], flags, cfg)
++    # actually writing the calculated maps depends on some options.
++    write_cur_maps(name, output, component_data, [-9999.], cfg)
+     nothing
+ end
+ 
+diff --git a/src/network/advanced.jl b/src/network/advanced.jl
+index 668341be..b9bc454b 100644
+--- a/src/network/advanced.jl
++++ b/src/network/advanced.jl
+@@ -3,21 +3,17 @@ function network_advanced(T, V, cfg)::Matrix{T}
+     # Get data
+     data = get_network_data(T, V, cfg)
+ 
+-    # Get flags
+-    flags = get_network_flags(cfg)
+-
+     # Compute advanced data
+-    advanced_data = compute_advanced_data(data, flags, cfg)
++    advanced_data = compute_advanced_data(data, cfg)
+ 
+     # Send to main kernel
+-    v , _ = advanced_kernel(advanced_data, flags, cfg)
++    v , _ = advanced_kernel(advanced_data, cfg)
+ 
+     v
+ end
+ 
+ 
+-function compute_advanced_data(data::NetworkData{T,V}, 
+-                            flags, cfg)::AdvancedProblem{T,V} where {T,V}
++function compute_advanced_data(data::NetworkData{T,V}, cfg)::AdvancedProblem{T,V} where {T,V}
+ 
+     i,j,v = data.coords
+ 
+@@ -42,7 +38,7 @@ function compute_advanced_data(data::NetworkData{T,V},
+     solver = get_solver(cfg)
+ 
+     sources, grounds, finite_grounds = 
+-                get_sources_and_grounds(data, flags, G, nodemap)
++                get_sources_and_grounds(data, cfg, G, nodemap)
+ 
+     source_map = Matrix{eltype(A)}(undef,0,0)
+     AdvancedProblem(G, cc, nodemap, polymap, RasterMeta(), 
+diff --git a/src/network/pairwise.jl b/src/network/pairwise.jl
+index 978a344e..a7eea096 100644
+--- a/src/network/pairwise.jl
++++ b/src/network/pairwise.jl
+@@ -6,17 +6,14 @@ function network_pairwise(T, V, cfg)::Matrix{T}
+     # Get input
+     networkdata = get_network_data(T, V, cfg)
+ 
+-    # Get compute flags
+-    flags = get_network_flags(cfg)
+-
+-    # Compute graph data based on compute flags
++    # Compute graph data
+     graphdata = compute_graph_data(networkdata, cfg)
+ 
+     # Send to main kernel
+-    ret = single_ground_all_pairs(graphdata, flags, cfg)
++    ret = single_ground_all_pairs(graphdata, cfg)
+ 
+ 	# Write cum maps
+-	if flags.outputflags.write_cur_maps
++	if cfg.write_cur_maps
+ 		cum_node_curr = graphdata.cum.cum_node_curr
+ 		cum_branch_curr = graphdata.cum.cum_branch_curr
+ 		cum_node_curr = hcat(1:length(cum_node_curr), cum_node_curr)
+@@ -73,30 +70,3 @@ function compute_graph_data(data::NetworkData{T,V}, cfg)::GraphProblem{T,V} wher
+ 
+ end
+ 
+-function get_network_flags(cfg)
+-
+-    # Computation flags
+-    is_raster = false
+-    is_advanced = cfg.scenario == sc_advanced
+-    is_alltoone = false
+-    is_onetoall = false
+-    grnd_file_is_res = cfg.ground_file_is_resistances
+-    policy = _remove_policy_symbol(cfg.remove_src_or_gnd)
+-
+-    # Output flags
+-    o = get_output_flags(cfg)
+-
+-    NetworkFlags(is_raster, is_advanced, is_alltoone, is_onetoall,
+-                grnd_file_is_res, policy, o)
+-end
+-
+-struct NetworkFlags
+-    is_raster::Bool
+-    is_advanced::Bool
+-    is_alltoone::Bool
+-    is_onetoall::Bool
+-    grnd_file_is_res::Bool
+-    policy::Symbol
+-    outputflags::OutputFlags
+-end
+-
+diff --git a/src/out.jl b/src/out.jl
+index 84d08b47..f4247c4d 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -1,15 +1,3 @@
+-struct OutputFlags
+-    write_volt_maps::Bool
+-    write_cur_maps::Bool
+-    write_cum_cur_map_only::Bool
+-    write_max_cur_maps::Bool
+-    set_null_currents_to_nodata::Bool
+-    set_null_voltages_to_nodata::Bool
+-    compress_grids::Bool
+-    log_transform_maps::Bool
+-    set_focal_node_currents_to_zero::Bool
+-end
+-
+ function compute_3col(resistances::Matrix{T}) where {T}
+     fp = deleteat!(resistances[:,1], 1)
+     l = length(fp)
+@@ -27,26 +15,25 @@ function compute_3col(resistances::Matrix{T}) where {T}
+ end
+ 
+ 
+-function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
++function write_cur_maps(name, output, component_data, finitegrounds, cfg)
+ 
+     # Get desired data
+     G = component_data.matrix
+-    voltages = flags.is_advanced ? output : output.voltages
++    voltages = _voltages(output)
+     cc = component_data.cc
+     nodemap = component_data.local_nodemap
+     hbmeta = component_data.hbmeta
+     cellmap = component_data.cellmap
+ 
+-    # Flags
+-    log_transform = flags.outputflags.log_transform_maps
+-    set_null_currents_to_nodata =
+-        flags.outputflags.set_null_currents_to_nodata
+-    write_max_cur_maps = flags.outputflags.write_max_cur_maps
+-    write_cum_cur_map_only = flags.outputflags.write_cum_cur_map_only
++    # Output options
++    log_transform = cfg.log_transform_maps
++    set_null_currents_to_nodata = cfg.set_null_currents_to_nodata
++    write_max_cur_maps = cfg.write_max_cur_maps
++    write_cum_cur_map_only = cfg.write_cum_cur_map_only
+ 
+     node_currents, branch_currents = _create_current_maps(G, voltages, finitegrounds, cfg, nodemap = nodemap, hbmeta = hbmeta)
+ 
+-    if !flags.is_raster
++    if !is_raster(cfg)
+ 
+         # Branch currents
+         branch_currents_array = _convert_to_3col(branch_currents, cc)
+@@ -54,7 +41,7 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+         # Node currents
+         node_currents_array = _append_name_to_node_currents(node_currents, cc)
+ 
+-		if flags.is_advanced
++		if is_advanced(cfg)
+ 			write_currents(node_currents_array, branch_currents_array, name, cfg)
+ 			return nothing
+ 		end
+@@ -99,7 +86,7 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+         # being solved carry no current in this pair's map, so the cumulative
+         # map shows only current that flows *through* a focal region when
+         # other pairs are active (Dickson et al. 2013).
+-        if flags.outputflags.set_focal_node_currents_to_zero
++        if cfg.set_focal_node_currents_to_zero
+             zero_focal_cells!(cmap, nodemap, output.comp_idx)
+         end
+ 
+@@ -118,7 +105,7 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+         end
+ 
+         # Write current maps
+-        !write_cum_cur_map_only && flags.outputflags.write_cur_maps && 
++        !write_cum_cur_map_only && cfg.write_cur_maps && 
+                         write_grid(cmap, name, cfg, hbmeta)
+ 
+ 		return nothing
+@@ -405,11 +392,11 @@ function write_grid(cmap, name, cfg, hbmeta, cellmap;
+                  file_format)
+ end
+ 
+-function write_volt_maps(name, output, component_data, flags, cfg)
++function write_volt_maps(name, output, component_data, cfg)
+ 
+-    voltages = flags.is_advanced ? output : output.voltages
++    voltages = _voltages(output)
+ 
+-    if !flags.is_raster
++    if !is_raster(cfg)
+ 
+         cc = component_data.cc
+         write_voltages(cfg.output_file, name, voltages, cc)
+@@ -421,7 +408,7 @@ function write_volt_maps(name, output, component_data, flags, cfg)
+         cc = component_data.cc
+         hbmeta = component_data.hbmeta
+         nodemap = component_data.local_nodemap
+-        set_null_voltages_to_nodata = flags.outputflags.set_null_voltages_to_nodata
++        set_null_voltages_to_nodata = cfg.set_null_voltages_to_nodata
+ 
+         vm = _create_voltage_map(voltages, nodemap, hbmeta)
+         write_grid(vm, name, cfg, hbmeta, component_data.cellmap, voltage = true,
+@@ -484,15 +471,15 @@ function save_resistances(r, cfg)
+     end
+ end
+ 
+-function write_cum_maps(cum, cellmap::Matrix{T}, cfg, hbmeta, write_max, write_cum) where T
++function write_cum_maps(cum, cellmap::Matrix{T}, cfg, hbmeta) where T
+ 
+-    if write_cum || cfg.write_cur_maps
++    if cfg.write_cum_cur_map_only || cfg.write_cur_maps
+         cum_curr = cum.cum_curr
+         postprocess_cum_curmap!(cum_curr)
+         write_grid(cum_curr, "", cfg, hbmeta, cum = true)
+     end
+ 
+-    if write_max
++    if cfg.write_max_cur_maps
+         max_curr = cum.max_curr
+         postprocess_cum_curmap!(max_curr)
+         write_grid(max_curr, "", cfg, hbmeta, max = true)
+diff --git a/src/raster/advanced.jl b/src/raster/advanced.jl
+index 984fefae..cc561778 100644
+--- a/src/raster/advanced.jl
++++ b/src/raster/advanced.jl
+@@ -19,22 +19,17 @@ function raster_advanced(T, V, cfg)::Matrix{T}
+     # Load raster data
+     rasterdata = load_raster_data(T, V, cfg)
+ 
+-    # Get flags
+-    flags = get_raster_flags(cfg)
+-
+-
+     # Generate advanced
+-    advanced_data = compute_advanced_data(rasterdata, flags, cfg)
++    advanced_data = compute_advanced_data(rasterdata, cfg)
+ 
+     # Send to main kernel
+-    v, _ = advanced_kernel(advanced_data, flags, cfg)
++    v, _ = advanced_kernel(advanced_data, cfg)
+ 
+     v
+ end
+ 
+ 
+-function compute_advanced_data(data::RasterData{T,V},
+-                        flags,cfg)::AdvancedProblem{T,V} where {T,V}
++function compute_advanced_data(data::RasterData{T,V}, cfg)::AdvancedProblem{T,V} where {T,V}
+ 
+     # Data
+     cellmap = data.cellmap
+@@ -45,10 +40,9 @@ function compute_advanced_data(data::RasterData{T,V},
+     source_map = data.source_map
+ 
+ 
+-    # Flags
+-    avg_res = flags.avg_res
+-    four_neighbors = flags.four_neighbors
+-    policy = flags.policy
++    # Options
++    avg_res = cfg.connect_using_avg_resistances
++    four_neighbors = cfg.connect_four_neighbors_only
+ 
+     # Nodemap and graph construction
+     nodemap = construct_node_map(cellmap, polymap)
+@@ -60,7 +54,7 @@ function compute_advanced_data(data::RasterData{T,V},
+ 
+     # Advanced mode specific stuff
+     sources, grounds, finitegrounds =
+-            get_sources_and_grounds(data, flags, G, nodemap)
++            get_sources_and_grounds(data, cfg, G, nodemap)
+ 
+     solver = get_solver(cfg)
+ 
+@@ -70,27 +64,26 @@ function compute_advanced_data(data::RasterData{T,V},
+ 
+ end
+ 
+-function get_sources_and_grounds(data, flags, G, nodemap)
++function get_sources_and_grounds(data, cfg, G, nodemap)
+ 
+     # Data
+     source_map = data.source_map
+     ground_map = data.ground_map
+ 
+-    _get_sources_and_grounds(source_map, ground_map, flags, G, nodemap)
++    _get_sources_and_grounds(source_map, ground_map, cfg, G, nodemap)
+ end
+ 
+ function _get_sources_and_grounds(source_map, ground_map,
+-                                  flags, G, nodemap::Matrix{V}, override_policy = :none) where V
+-    # Flags
+-    is_raster = flags.is_raster
+-    grnd_file_is_res = flags.grnd_file_is_res
+-    policy = override_policy == :none ? flags.policy : override_policy
++                                  cfg, G, nodemap::Matrix{V}, override_policy = :none) where V
++    # Options
++    grnd_file_is_res = cfg.ground_file_is_resistances
++    conflict_policy = override_policy == :none ? policy(cfg) : override_policy
+ 
+     # Initialize sources and grounds
+     sources = zeros(eltype(G), size(G, 1))
+     grounds = zeros(eltype(G), size(G, 1))
+ 
+-    if is_raster
++    if is_raster(cfg)
+         (i1, j1, v1) = begin _I = findall(!iszero, source_map); getindex.(_I, 1), getindex.(_I, 2), source_map[_I] end
+         (i2, j2, v2) = begin _I = findall(!iszero, ground_map); getindex.(_I, 1), getindex.(_I, 2), ground_map[_I] end
+         for i = 1:size(i1, 1)
+@@ -113,7 +106,7 @@ function _get_sources_and_grounds(source_map, ground_map,
+         grounds[V.(ground_map[:,1])] = ground_map[:,2]
+     end
+     sources, grounds, finitegrounds =
+-        resolve_conflicts(sources, grounds, policy)
++        resolve_conflicts(sources, grounds, conflict_policy)
+ end
+ 
+ function resolve_conflicts(sources::Vector{T},
+@@ -148,7 +141,7 @@ function resolve_conflicts(sources::Vector{T},
+     sources, grounds, finitegrounds
+ end
+ 
+-function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix{T},Matrix{T}} where {T,V,S}
++function advanced_kernel(prob::AdvancedProblem{T,V,S}, cfg)::Tuple{Matrix{T},Matrix{T}} where {T,V,S}
+ 
+     # Data
+     G = prob.G
+@@ -165,13 +158,13 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+     cellmap = prob.cellmap
+ 
+ 
+-    # Flags
+-    is_raster = flags.is_raster
+-    is_alltoone = flags.is_alltoone
+-    is_onetoall = flags.is_onetoall
+-    write_v_maps = flags.outputflags.write_volt_maps
+-    write_c_maps = flags.outputflags.write_cur_maps
+-    write_cum_cur_map_only = flags.outputflags.write_cum_cur_map_only
++    # Options
++    raster = is_raster(cfg)
++    alltoone = is_alltoone(cfg)
++    onetoall = is_onetoall(cfg)
++    write_v_maps = cfg.write_volt_maps
++    write_c_maps = cfg.write_cur_maps
++    write_cum_cur_map_only = cfg.write_cum_cur_map_only
+ 
+     volt = zeros(eltype(G), size(nodemap))
+     ind = findall(x->x!=0,nodemap)
+@@ -207,11 +200,11 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+         solver_called = true
+ 
+         if write_v_maps
+-			is_raster ? accum_voltages!(outvolt, voltages[c], local_nodemap, hbmeta) :
++			raster ? accum_voltages!(outvolt, voltages[c], local_nodemap, hbmeta) :
+ 				accum_voltages!(outvolt, voltages, local_nodemap, hbmeta)
+         end
+         if write_c_maps
+-			is_raster ? accum_currents!(outcurr, voltages[c], cfg, a_local, voltages[c], f_local, local_nodemap, hbmeta) :
++			raster ? accum_currents!(outcurr, voltages[c], cfg, a_local, voltages[c], f_local, local_nodemap, hbmeta) :
+ 				accum_currents!(outcurr, voltages, cfg, G, voltages, finitegrounds, local_nodemap, hbmeta)
+         end
+ 
+@@ -222,8 +215,8 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+ 
+     name = src == 0 ? "" : "_$(V(src))"
+     if write_v_maps
+-        if !is_raster
+-            write_volt_maps(name, voltages, FullGraph(G, cellmap), flags, cfg)
++        if !raster
++            write_volt_maps(name, voltages, FullGraph(G, cellmap), cfg)
+         else
+             write_grid(outvolt, name, cfg, hbmeta, cellmap, voltage = true)
+         end
+@@ -231,21 +224,20 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+ 
+     # Issue 342: in one-to-all / all-to-one every focal node is active on each
+     # solve (one as source, the rest as grounds), so all of them are zeroed.
+-    if is_raster && (is_onetoall || is_alltoone) &&
+-            flags.outputflags.set_focal_node_currents_to_zero
++    if raster && (onetoall || alltoone) && cfg.set_focal_node_currents_to_zero
+         active = V[n for n in eachindex(sources) if sources[n] != 0 || grounds[n] != 0]
+         zero_focal_cells!(outcurr, nodemap, Set(active))
+     end
+ 
+     if write_c_maps || write_cum_cur_map_only
+-        if !is_raster
+-            write_cur_maps(name, voltages, FullGraph(G, cellmap), finitegrounds, flags, cfg)
++        if !raster
++            write_cur_maps(name, voltages, FullGraph(G, cellmap), finitegrounds, cfg)
+         else
+             write_grid(outcurr, name, cfg, hbmeta, cellmap)
+         end
+     end
+ 
+-    if !is_raster
++    if !raster
+         v = [collect(1:size(G, 1))  voltages]
+         return v, outcurr
+     end
+@@ -257,7 +249,7 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+         return ret, outcurr
+     end
+ 
+-    if is_onetoall
++    if onetoall
+         idx = findall(x->x!=0,source_map)
+         val = volt[idx] ./ source_map[idx]
+         if val[1] ≈ 0
+@@ -269,7 +261,7 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+             ret[:,1] = val
+             return ret, outcurr
+         end
+-    elseif is_alltoone
++    elseif alltoone
+         ret = Matrix{T}(undef,1,1)
+         ret[1] = 0
+         return ret, outcurr
+diff --git a/src/raster/onetoall.jl b/src/raster/onetoall.jl
+index 749da6ee..97ec782e 100644
+--- a/src/raster/onetoall.jl
++++ b/src/raster/onetoall.jl
+@@ -3,14 +3,11 @@ function raster_one_to_all(T, V, cfg)::Matrix{T}
+     # Load the data
+     rasterdata = load_raster_data(T, V, cfg)
+ 
+-    # Get flags
+-    flags = get_raster_flags(cfg)
+-
+     # Send to main kernel
+-    onetoall_kernel(rasterdata, flags, cfg)
++    onetoall_kernel(rasterdata, cfg)
+ end
+ 
+-function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,V}
++function onetoall_kernel(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+ 
+     # Data
+     strengths = data.strengths
+@@ -21,13 +18,13 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+     hbmeta = data.hbmeta
+     source_map = data.source_map
+ 
+-    # Flags
++    # Options
+     use_variable_strengths = !isempty(strengths)
+     use_included_pairs = !isempty(included_pairs)
+     mode = included_pairs.mode == :include ? 0 : 1
+-    one_to_all = flags.is_onetoall
+-    avg_res = flags.avg_res
+-    four_neighbors = flags.four_neighbors
++    one_to_all = is_onetoall(cfg)
++    avg_res = cfg.connect_using_avg_resistances
++    four_neighbors = cfg.connect_four_neighbors_only
+ 
+     if use_included_pairs
+         prune_points!(points_rc, included_pairs.point_ids)
+@@ -58,7 +55,7 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+     # ground_map = Matrix{eltype(a)}(0, 0)
+     s = zeros(eltype(a), size(point_map))
+     z = deepcopy(s)
+-    cum = initialize_cum_maps(gmap, flags.outputflags.write_max_cur_maps)
++    cum = initialize_cum_maps(gmap, cfg.write_max_cur_maps)
+ 
+     point_ids = included_pairs.point_ids
+     res = zeros(eltype(a), size(points_unique, 1))
+@@ -126,7 +123,7 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+         policy = one_to_all ? :rmvgnd : :rmvsrc
+         sources, grounds, finite_grounds =
+                     _get_sources_and_grounds(source_map, ground_map,
+-                            flags, G, nodemap, policy)
++                            cfg, G, nodemap, policy)
+ 
+ 
+         solver = get_solver(cfg)
+@@ -136,11 +133,7 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+                         check_node, n, gmap, solver)
+ 
+ 
+-        if one_to_all
+-            v, curr = advanced_kernel(advanced_data, flags, cfg)
+-        else
+-            v, curr = advanced_kernel(advanced_data, flags, cfg)
+-        end
++        v, curr = advanced_kernel(advanced_data, cfg)
+         res[i] = v[1]
+ 
+         return curr
+@@ -158,13 +151,11 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+     for curr in results
+         curr === nothing && continue
+         cum.cum_curr .+= curr
+-        flags.outputflags.write_max_cur_maps && (cum.max_curr .= max.(cum.max_curr, curr))
++        cfg.write_max_cur_maps && (cum.max_curr .= max.(cum.max_curr, curr))
+     end
+ 
+-    if flags.outputflags.write_cur_maps || flags.outputflags.write_cum_cur_map_only
+-        write_cum_maps(cum, gmap, cfg, hbmeta,
+-                       flags.outputflags.write_max_cur_maps,
+-                       flags.outputflags.write_cum_cur_map_only)
++    if cfg.write_cur_maps || cfg.write_cum_cur_map_only
++        write_cum_maps(cum, gmap, cfg, hbmeta)
+     end
+ 
+     hcat(points_unique, res)
+diff --git a/src/raster/pairwise.jl b/src/raster/pairwise.jl
+index 1a1d9c4c..3c45a998 100644
+--- a/src/raster/pairwise.jl
++++ b/src/raster/pairwise.jl
+@@ -1,77 +1,32 @@
+-struct RasterFlags
+-    is_raster::Bool
+-    is_pairwise::Bool
+-    is_advanced::Bool
+-    is_onetoall::Bool
+-    is_alltoone::Bool
+-    grnd_file_is_res::Bool
+-    policy::Symbol
+-    four_neighbors::Bool
+-    avg_res::Bool
+-    outputflags::OutputFlags
+-end
+-
+ function raster_pairwise(T, V, cfg)::Matrix{T}
+ 
+     # Get input
+     rasterdata = @timeit CSTIMER[] "load raster data" load_raster_data(T, V, cfg)
+ 
+-    # Get compute flags
+-    flags = get_raster_flags(cfg)
+-
+     pt_file_contains_polygons = length(rasterdata.points_rc[1]) !=
+                                 length(unique(rasterdata.points_rc[3]))
+ 
+     if pt_file_contains_polygons
+-        _pt_file_polygons_path(rasterdata, flags, cfg)
++        _pt_file_polygons_path(rasterdata, cfg)
+     else
+-        _pt_file_no_polygons_path(rasterdata, flags, cfg)
++        _pt_file_no_polygons_path(rasterdata, cfg)
+     end
+ end
+ 
+-function get_raster_flags(cfg)
+-
+-    # Computation flags
+-    is_raster = true
+-    is_pairwise = cfg.scenario == sc_pairwise
+-    is_advanced = cfg.scenario == sc_advanced
+-    is_onetoall = cfg.scenario == sc_onetoall
+-    is_alltoone = cfg.scenario == sc_alltoone
+-    four_neighbors = cfg.connect_four_neighbors_only
+-    avg_res = cfg.connect_using_avg_resistances
+-    ground_file_is_resistances = cfg.ground_file_is_resistances
+-    policy = _remove_policy_symbol(cfg.remove_src_or_gnd)
+-
+-    # Output Flags
+-    o = get_output_flags(cfg)
+-
+-    RasterFlags(is_raster, is_pairwise, is_advanced,
+-                is_onetoall, is_alltoone,
+-                ground_file_is_resistances, policy,
+-                four_neighbors, avg_res, o)
+-end
++function _pt_file_no_polygons_path(rasterdata::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+ 
++    graphdata = @timeit CSTIMER[] "construct graph" compute_graph_data_no_polygons(rasterdata, cfg)
++    r = @timeit CSTIMER[] "solve pairwise resistances" single_ground_all_pairs(graphdata, cfg)
+ 
+-function _pt_file_no_polygons_path(rasterdata::RasterData{T,V}, 
+-
+-                    flags, cfg)::Matrix{T} where {T,V}
+-
+-    graphdata = @timeit CSTIMER[] "construct graph" compute_graph_data_no_polygons(rasterdata, flags, cfg)
+-    r = @timeit CSTIMER[] "solve pairwise resistances" single_ground_all_pairs(graphdata, flags, cfg)
+-
+-    if flags.outputflags.write_cur_maps || flags.outputflags.write_cum_cur_map_only
+-        @timeit CSTIMER[] "write cumulative current maps" write_cum_maps(graphdata.cum, rasterdata.cellmap, cfg, rasterdata.hbmeta,
+-                        flags.outputflags.write_max_cur_maps,
+-                        flags.outputflags.write_cum_cur_map_only)
++    if cfg.write_cur_maps || cfg.write_cum_cur_map_only
++        @timeit CSTIMER[] "write cumulative current maps" write_cum_maps(graphdata.cum, rasterdata.cellmap, cfg, rasterdata.hbmeta)
+     end
+ 
+     r
+ end
+ 
+ 
+-function _pt_file_polygons_path(rasterdata::RasterData{T,V}, 
+-
+-                        flags, cfg)::Matrix{T} where {T,V}
++function _pt_file_polygons_path(rasterdata::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+ 
+     # get unique list of points
+     # for every point pair do
+@@ -86,14 +41,12 @@ function _pt_file_polygons_path(rasterdata::RasterData{T,V},
+     gmap = rasterdata.cellmap
+     polymap = rasterdata.polymap
+     points_rc = rasterdata.points_rc
+-    avg_res = flags.avg_res
+-    four_neighbors = flags.four_neighbors
+ 	included_pairs = rasterdata.included_pairs
+ 	exclude_pairs = isempty(included_pairs) ? Vector{Tuple{V,V}}() : 
+ 						generate_exclude_pairs(points_rc, included_pairs)
+ 
+     # Cumulative maps
+-    cum = initialize_cum_maps(gmap, flags.outputflags.write_max_cur_maps)
++    cum = initialize_cum_maps(gmap, cfg.write_max_cur_maps)
+ 
+     pts = unique(points_rc[3])
+     resistances = -1 * ones(length(pts), length(pts))
+@@ -105,8 +58,8 @@ function _pt_file_polygons_path(rasterdata::RasterData{T,V},
+     for (k, (i, j)) in enumerate(pairs)
+         pt1, pt2 = pts[i], pts[j]
+         @info("Solving pair $k of $n")
+-        graphdata = compute_graph_data_polygons(rasterdata, flags, pt1, pt2, cum, cfg)
+-        pairwise_resistance = single_ground_all_pairs(graphdata, flags, cfg, false)
++        graphdata = compute_graph_data_polygons(rasterdata, pt1, pt2, cum, cfg)
++        pairwise_resistance = single_ground_all_pairs(graphdata, cfg, false)
+         resistances[i,j] = resistances[j,i] = pairwise_resistance[2,3]
+     end
+     for i = 1:size(pts, 1)
+@@ -115,10 +68,8 @@ function _pt_file_polygons_path(rasterdata::RasterData{T,V},
+     P = [0, pts...]
+     r = hcat(P, vcat(pts', resistances))
+ 
+-    if flags.outputflags.write_cur_maps || flags.outputflags.write_cum_cur_map_only
+-        write_cum_maps(cum, gmap, cfg, rasterdata.hbmeta,
+-                       flags.outputflags.write_max_cur_maps,
+-                       flags.outputflags.write_cum_cur_map_only)
++    if cfg.write_cur_maps || cfg.write_cum_cur_map_only
++        write_cum_maps(cum, gmap, cfg, rasterdata.hbmeta)
+     end
+ 
+     # save resistances
+@@ -142,8 +93,8 @@ function pairs_to_solve(pts, exclude_pairs)
+ end
+ 
+ 
+-function compute_graph_data_polygons(rasterdata::RasterData{T,V}, 
+-                            flags, pt1, pt2, cum, cfg)::GraphProblem{T,V} where {T,V}
++function compute_graph_data_polygons(rasterdata::RasterData{T,V},
++                            pt1, pt2, cum, cfg)::GraphProblem{T,V} where {T,V}
+ 
+ 
+     # Data
+@@ -152,9 +103,9 @@ function compute_graph_data_polygons(rasterdata::RasterData{T,V},
+     points_rc = rasterdata.points_rc
+     hbmeta = rasterdata.hbmeta
+ 
+-    # Flags
+-    avg_res = flags.avg_res
+-    four_neighbors = flags.four_neighbors
++    # Options
++    avg_res = cfg.connect_using_avg_resistances
++    four_neighbors = cfg.connect_four_neighbors_only
+ 
+     # Construct new polymap
+     newpoly = create_new_polymap(gmap, polymap, points_rc, pt1, pt2)
+@@ -186,8 +137,7 @@ function compute_graph_data_polygons(rasterdata::RasterData{T,V},
+             exclude_pairs, nodemap, newpoly, hbmeta, gmap, cum, solver)
+ end
+ 
+-function compute_graph_data_no_polygons(data::RasterData{T,V}, 
+-                    flags, cfg)::GraphProblem{T,V} where {T,V}
++function compute_graph_data_no_polygons(data::RasterData{T,V}, cfg)::GraphProblem{T,V} where {T,V}
+ 
+ 
+     # Data
+@@ -197,10 +147,10 @@ function compute_graph_data_no_polygons(data::RasterData{T,V},
+     included_pairs = data.included_pairs
+     hbmeta = data.hbmeta
+ 
+-    # Flags
+-    avg_res = flags.avg_res
+-    four_neighbors = flags.four_neighbors
+-    write_max_cur_maps = flags.outputflags.write_max_cur_maps
++    # Options
++    avg_res = cfg.connect_using_avg_resistances
++    four_neighbors = cfg.connect_four_neighbors_only
++    write_max_cur_maps = cfg.write_max_cur_maps
+ 
+     # Nodemap and graph construction
+     nodemap = construct_node_map(cellmap, polymap)
+diff --git a/src/utils.jl b/src/utils.jl
+index 21999ac3..aaa43aa4 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -70,15 +70,6 @@ function _construct_local_nodemap(local_nodemap, polymap, idx)
+ end
+ 
+ 
+-function get_output_flags(cfg)
+-    OutputFlags(cfg.write_volt_maps, cfg.write_cur_maps,
+-                cfg.write_cum_cur_map_only, cfg.write_max_cur_maps,
+-                cfg.set_null_currents_to_nodata, cfg.set_null_voltages_to_nodata,
+-                cfg.compress_grids, cfg.log_transform_maps,
+-                cfg.set_focal_node_currents_to_zero)
+-end
+-
+-
+ # Reads the directory with the current maps
+ # and accumulates all current maps
+ function accumulate_current_maps(path, f)
+@@ -231,20 +222,26 @@ function compute_omniscape_current(
+                             included_pairs,
+                             hbmeta)
+ 
+-    # Generate advanced data
+-    o = OutputFlags(
+-        false, false, false, false,
+-        false, false, false, false, false
+-    )
+-
+-    cfg = CSConfig(cs_cfg)
+-
+-    flags = RasterFlags(
+-        true, false, true, false, false, false, Symbol("rmvsrc"),
+-        cfg.connect_four_neighbors_only, false, o
+-    )
+-
+-    data = compute_advanced_data(rasterdata, flags, cfg)
++    # Omniscape drives a raster advanced-mode solve on in-memory arrays with
++    # the sources removed at conflicts and no maps written; only the solver
++    # settings and connect_four_neighbors_only are taken from the caller.
++    cfg = CSConfig(CSConfig(cs_cfg);
++                   data_type = dt_raster,
++                   scenario = sc_advanced,
++                   ground_file_is_resistances = false,
++                   remove_src_or_gnd = rp_rmvsrc,
++                   connect_using_avg_resistances = false,
++                   write_volt_maps = false,
++                   write_cur_maps = false,
++                   write_cum_cur_map_only = false,
++                   write_max_cur_maps = false,
++                   set_null_currents_to_nodata = false,
++                   set_null_voltages_to_nodata = false,
++                   set_focal_node_currents_to_zero = false,
++                   compress_grids = false,
++                   log_transform_maps = false)
++
++    data = compute_advanced_data(rasterdata, cfg)
+ 
+     G = data.G
+     nodemap = data.nodemap
+diff --git a/test/internal.jl b/test/internal.jl
+index 2bc9b9fb..fe7ff504 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -281,6 +281,18 @@ end
+     # Unknown keys are ignored (with a warning), not fatal
+     d = copy(good); d["max_parallel"] = "4"
+     @test Circuitscape.CSConfig(d) isa Circuitscape.CSConfig
++
++    # CSConfig is the only representation past parsing: predicates read it
++    # directly and a copy-with constructor replaces selected fields.
++    cfg = Circuitscape.CSConfig(good)
++    @test Circuitscape.is_raster(cfg) && Circuitscape.is_pairwise(cfg)
++    @test !Circuitscape.is_advanced(cfg) && !Circuitscape.is_onetoall(cfg)
++    @test Circuitscape.policy(cfg) == :keepall
++    cfg2 = Circuitscape.CSConfig(cfg; scenario = Circuitscape.sc_advanced,
++                                 remove_src_or_gnd = Circuitscape.rp_rmvsrc)
++    @test Circuitscape.is_advanced(cfg2) && Circuitscape.policy(cfg2) == :rmvsrc
++    @test cfg2.habitat_file == cfg.habitat_file && cfg2.output_file == cfg.output_file
++    @test Dict{String,String}(cfg2)["scenario"] == "advanced"
+ end
+ 
+ # Issue 342: set_focal_node_currents_to_zero

@@ -1,0 +1,866 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 3fded815..54f3eb61 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -6,6 +6,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🚀 Features
+ 
++* {func}`ep.get.obs_df <ehrapy.get.obs_df>` and the functions that read variables through it, the survival and regression models, the causal estimators, {func}`ep.pl.scatter <ehrapy.plot.scatter>`, {func}`ep.pl.catplot <ehrapy.plot.catplot>` and {func}`ep.pl.ols <ehrapy.plot.ols>`, take variables of longitudinal 3D data at their first non-missing value, the baseline, or at another statistic over time passed to `obs_df` as `statistic` ([#1164](https://github.com/theislab/ehrapy/pull/1164)) @Zethson
++
++  The survival models derive the duration and event from an `event_col` that is a longitudinal variable, so that `ep.tl.kaplan_meier(edata, event_col="SepsisLabel")` estimates the time to sepsis on PhysioNet 2019.
++  The event is whether the variable is ever 1, at the time of its first 1 in `edata.tem["interval_start_offset"]`, and observations without one are censored at their last non-missing value.
++  The fitted models hold the derived durations and events as `durations` and `event_observed`.
+ * {func}`ep.tl.kaplan_meier <ehrapy.tools.kaplan_meier>` estimates the cumulative incidence of an `event_of_interest` with the Aalen-Johansen estimator when the event column holds competing events, {func}`ep.tl.nelson_aalen <ehrapy.tools.nelson_aalen>` its cause-specific cumulative hazard, and {func}`ep.pl.kaplan_meier <ehrapy.plot.kaplan_meier>` plots the cumulative incidence ([#1155](https://github.com/theislab/ehrapy/pull/1155)) @Zethson
+ 
+   Without `event_of_interest`, the univariate survival models raise an error for event columns with more than one event type instead of silently treating every event type as the same event.
+diff --git a/ehrapy/get/_get.py b/ehrapy/get/_get.py
+index e4a638a0..d060922a 100644
+--- a/ehrapy/get/_get.py
++++ b/ehrapy/get/_get.py
+@@ -2,35 +2,39 @@
+ 
+ from typing import TYPE_CHECKING
+ 
++from ehrdata import EHRData
+ from scanpy.get import obs_df as scanpy_obs_df
+ from scanpy.get import rank_genes_groups_df
+ from scanpy.get import var_df as scanpy_var_df
+ 
+-from ehrapy._compat import _as_scanpy_input, function_2D_only
++from ehrapy._compat import _as_scanpy_input, _materialize, function_2D_only
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Collection, Iterable
+ 
+     import pandas as pd
+-    from ehrdata import EHRData
++
++    from ehrapy.preprocessing._summarize_measurements import Statistic
+ 
+ 
+-@function_2D_only(var_keys=("keys",))
+ def obs_df(
+     edata: EHRData,
+     *,
+     keys: Collection[str] = (),
+     obsm_keys: Iterable[tuple[str, int]] = (),
+     layer: str | None = None,
++    statistic: Statistic = "first",
+ ) -> pd.DataFrame:
+     """Return values for observations in edata.
+ 
+     Args:
+         edata: Central data object.
+         keys: Keys from either `.var_names` or `.obs.columns`.
+-            Keys from `.var_names` require `.X` or `layer` to be 2D, whereas `.obs` columns can be read from 3D data.
+         obsm_keys: Tuples of `(key from obsm, column index of obsm[key])`.
+         layer: Layer of `edata` to use as feature values.
++        statistic: Statistic over time that gives one value per observation for variables of 3D data, as in :func:`~ehrapy.preprocessing.summarize_measurements`.
++            The default `"first"` is the first non-missing value, the baseline.
++            To take the values at one timepoint, select it first, such as `edata[:, :, [6]]`.
+ 
+     Returns:
+         A DataFrame with `edata.obs_names` as index, and values specified by `keys` and `obsm_keys`.
+@@ -40,10 +44,36 @@ def obs_df(
+         >>> import ehrapy as ep
+         >>> edata = ed.dt.mimic_2()
+         >>> ages = ep.get.obs_df(edata, keys=["age"])
++
++        Mean of longitudinal variables over time:
++
++        >>> edata = ed.dt.ehrdata_blobs(n_variables=3, base_timepoints=5)
++        >>> means = ep.get.obs_df(edata, keys=["feature_0", "cluster"], statistic="mean")
+     """
++    edata, layer = _over_time(edata, keys, layer=layer, statistic=statistic)
+     return scanpy_obs_df(adata=_as_scanpy_input(edata), keys=keys, obsm_keys=obsm_keys, layer=layer)
+ 
+ 
++def _over_time(
++    edata: EHRData,
++    keys: Iterable[str | None],
++    *,
++    layer: str | None,
++    statistic: Statistic = "first",
++) -> tuple[EHRData, str | None]:
++    """`edata` with the variables among `keys` reduced to `statistic` over time if they are 3D, and the layer to read them from."""
++    X = edata.X if layer is None else edata.layers[layer]
++    selected = edata.var_names.isin([key for key in keys if key is not None])
++    if getattr(X, "ndim", 2) != 3 or not selected.any():
++        return edata, layer
++    from ehrapy.preprocessing._summarize_measurements import _aggregate_time
++
++    (values,) = _materialize(_aggregate_time(X[:, selected], statistic))
++    reduced = EHRData(values, obs=edata.obs, var=edata.var[selected], obsm=edata.obsm, obsp=edata.obsp)
++    reduced.uns = edata.uns
++    return reduced, None
++
++
+ @function_2D_only()
+ def var_df(
+     edata: EHRData,
+diff --git a/ehrapy/ml/_features.py b/ehrapy/ml/_features.py
+index a7e4bd64..6d187267 100644
+--- a/ehrapy/ml/_features.py
++++ b/ehrapy/ml/_features.py
+@@ -8,7 +8,7 @@
+ from fast_array_utils.conv import to_dense
+ 
+ from ehrapy._compat import _like_obs
+-from ehrapy.preprocessing._summarize_measurements import summarize_measurements
++from ehrapy.preprocessing._summarize_measurements import _tem_times, summarize_measurements
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+@@ -102,15 +102,7 @@ def _with_covariates(values: Array, covariates: pd.DataFrame) -> Array:
+ def _times(edata: EHRData, task: Task, layer: str | None, time_key: str) -> np.ndarray:
+     """Time of every timepoint of the observation window from `edata.tem[time_key]`, or its position if `tem` has no such column."""
+     X = edata.X if layer is None else edata.layers[layer]
+-    window = task._window(X.shape[2])
+-    if time_key not in edata.tem:
+-        return np.arange(X.shape[2], dtype=np.float64)[window]
+-    times = edata.tem[time_key].iloc[window]
+-    if pd.api.types.is_numeric_dtype(times):
+-        return times.to_numpy(np.float64)
+-    if pd.api.types.is_datetime64_any_dtype(times):
+-        times = times - times.iloc[0]
+-    return pd.to_timedelta(times).dt.total_seconds().to_numpy()
++    return _tem_times(edata, time_key)[task._window(X.shape[2])]
+ 
+ 
+ def _covariates(edata: EHRData, obs_keys: Sequence[str], columns: Sequence[str] | None) -> pd.DataFrame:
+diff --git a/ehrapy/plot/_catplot.py b/ehrapy/plot/_catplot.py
+index df39ff4e..e01eb63c 100644
+--- a/ehrapy/plot/_catplot.py
++++ b/ehrapy/plot/_catplot.py
+@@ -4,6 +4,8 @@
+ 
+ import seaborn as sns
+ 
++from ehrapy.get import obs_df
++
+ if TYPE_CHECKING:
+     from ehrdata import EHRData
+     from seaborn.axisgrid import FacetGrid
+@@ -23,7 +25,7 @@ def catplot(
+     Wrapper around `seaborn.catplot <https://seaborn.pydata.org/generated/seaborn.catplot.html>`_. Typically used to show
+     the behaviour of one numerical variable with respect to one or several categorical variables.
+ 
+-    Considers edata.obs only.
++    Columns of `edata.obs` and variables can be plotted, with variables of 3D data at their first non-missing value, see :func:`~ehrapy.get.obs_df`.
+ 
+     Args:
+         edata: Central data object.
+@@ -53,4 +55,6 @@ def catplot(
+ 
+         .. image:: /_static/docstring_previews/catplot.png
+     """
+-    return sns.catplot(data=edata.obs, x=x, y=y, hue=hue, kind=kind, **kwargs)
++    var_names = [key for key in (x, y, hue) if key in edata.var_names and key not in edata.obs]
++    data = edata.obs.join(obs_df(edata, keys=var_names)) if var_names else edata.obs
++    return sns.catplot(data=data, x=x, y=y, hue=hue, kind=kind, **kwargs)
+diff --git a/ehrapy/plot/_scanpy_pl_api.py b/ehrapy/plot/_scanpy_pl_api.py
+index 47e25e69..fd170c37 100644
+--- a/ehrapy/plot/_scanpy_pl_api.py
++++ b/ehrapy/plot/_scanpy_pl_api.py
+@@ -13,6 +13,7 @@
+ 
+ from ehrapy._compat import _as_scanpy_input, _materialize, _raise_if_3D, function_2D_only
+ from ehrapy._utils_doc import _doc_params, doc_plot_params
++from ehrapy.get._get import _over_time
+ 
+ if TYPE_CHECKING:
+     from pathlib import Path
+@@ -38,7 +39,6 @@
+ _ValuesToPlot = Literal["scores", "logfoldchanges", "pvals", "pvals_adj", "log10_pvals", "log10_pvals_adj"]
+ 
+ 
+-@function_2D_only(var_keys=("x", "y", "color"))
+ @_doc_params(**doc_plot_params)
+ def scatter(
+     edata: EHRData,
+@@ -71,6 +71,7 @@ def scatter(
+     """Scatter plot along observations or variables axes.
+ 
+     Color the plot using annotations of observations (`.obs`), variables (`.var`) or features (`.var_names`).
++    Variables of 3D data are plotted with their first non-missing value, see :func:`~ehrapy.get.obs_df`.
+ 
+     Args:
+         edata: Central data object.
+@@ -114,6 +115,9 @@ def scatter(
+     Preview:
+         .. image:: /_static/docstring_previews/scatter.png
+     """
++    if layers is None or isinstance(layers, str):
++        colors = [color] if isinstance(color, str) else list(color or ())
++        edata, layers = _over_time(edata, [x, y, *colors], layer=layers)
+     scatter_partial = partial(
+         sc.pl.scatter,
+         x=x,
+diff --git a/ehrapy/preprocessing/_summarize_measurements.py b/ehrapy/preprocessing/_summarize_measurements.py
+index c392cd39..40e0edc5 100644
+--- a/ehrapy/preprocessing/_summarize_measurements.py
++++ b/ehrapy/preprocessing/_summarize_measurements.py
+@@ -197,3 +197,16 @@ def _aggregate_time(X: Array, statistic: str) -> Array:
+             first_valid = xp.argmax(xp.astype(valid, xp.int8), axis=2, keepdims=True)
+             return xp.sum(xp.where(xp.arange(X.shape[2]) == first_valid, X, 0), axis=2)
+     raise ValueError(f"Unknown statistic: {statistic}")
++
++
++def _tem_times(edata: EHRData, time_key: str) -> np.ndarray:
++    """Time of every timepoint since the first one from `edata.tem[time_key]`, as numbers, time differences in seconds or dates, or its position if `tem` has no such column."""
++    if time_key not in edata.tem:
++        return np.arange(edata.n_t, dtype=np.float64)
++    times = edata.tem[time_key]
++    if pd.api.types.is_numeric_dtype(times):
++        times = times.to_numpy(np.float64)
++        return times - times[0]
++    if pd.api.types.is_datetime64_any_dtype(times):
++        times = times - times.iloc[0]
++    return pd.to_timedelta(times).dt.total_seconds().to_numpy()
+diff --git a/ehrapy/tools/_survival_analysis.py b/ehrapy/tools/_survival_analysis.py
+index 95aa414c..9ec9ec2b 100644
+--- a/ehrapy/tools/_survival_analysis.py
++++ b/ehrapy/tools/_survival_analysis.py
+@@ -23,24 +23,64 @@
+ from scipy import stats
+ from statsmodels.genmod.generalized_linear_model import GLMResultsWrapper  # noqa
+ 
++from ehrapy._compat import _materialize
+ from ehrapy.get import obs_df
++from ehrapy.preprocessing._summarize_measurements import _tem_times
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Iterable, Mapping, Sequence
+ 
+     from ehrdata import EHRData
+ 
++    from ehrapy._compat import Array
++
+ 
+ def _model_frame(edata: EHRData, keys: Iterable[str | None], *, layer: str | None, dropna: bool = True) -> pd.DataFrame:
+     """Values of the obs columns and variables a model uses, without the observations that miss any of them."""
+     keys = list(dict.fromkeys(key for key in keys if key is not None))
+     frame = obs_df(edata, keys=keys, layer=layer).infer_objects()
+-    if dropna:
+-        complete = frame.notna().all(axis=1)
+-        if n_dropped := int((~complete).sum()):
+-            logger.info(f"Dropped {n_dropped} of {len(frame)} observations with missing values in {keys}.")
+-        frame = frame[complete]
+-    return frame
++    return _drop_incomplete(frame) if dropna else frame
++
++
++def _drop_incomplete(frame: pd.DataFrame) -> pd.DataFrame:
++    complete = frame.notna().all(axis=1)
++    if n_dropped := int((~complete).sum()):
++        logger.info(f"Dropped {n_dropped} of {len(frame)} observations with missing values in {list(frame.columns)}.")
++    return frame[complete]
++
++
++def _survival_frame(
++    edata: EHRData, duration_col: str | None, event_col: str | None, keys: Iterable[str | None], *, layer: str | None
++) -> tuple[pd.DataFrame, str]:
++    """Model frame of a survival model and its duration column, which is derived along with the event if `event_col` is a variable of 3D data."""
++    X = edata.X if layer is None else edata.layers[layer]
++    if event_col is None or getattr(X, "ndim", 2) != 3 or event_col not in edata.var_names:
++        if duration_col is None:
++            raise ValueError("Pass a `duration_col`, or an `event_col` that is a variable of 3D data.")
++        return _model_frame(edata, [duration_col, event_col, *keys], layer=layer), duration_col
++    if duration_col is not None:
++        raise ValueError(f"The durations are derived from the 3D variable {event_col!r}, pass no `duration_col`.")
++    duration_col = f"{event_col}_duration"
++    events = pd.DataFrame(
++        _time_to_event(X[:, edata.var_names.get_loc(event_col)], _tem_times(edata, "interval_start_offset"), event_col),
++        index=edata.obs_names,
++        columns=[duration_col, event_col],
++    )
++    covariates = _model_frame(edata, [key for key in keys if key != event_col], layer=layer, dropna=False)
++    return _drop_incomplete(pd.concat([events, covariates], axis=1)), duration_col
++
++
++def _time_to_event(values: Array, times: np.ndarray, name: str) -> np.ndarray:
++    """Time of the first 1 of every row and 1, or the time of its last non-missing value and 0 if it has no 1."""
++    (values,) = _materialize(values)
++    observed = ~np.isnan(values)
++    if not np.isin(values[observed], [0, 1]).all():
++        raise ValueError(f"The longitudinal event {name!r} must be 1 at the timepoints with the event and 0 otherwise.")
++    occurred = values == 1
++    happened = occurred.any(axis=1)
++    last = values.shape[1] - 1 - observed[:, ::-1].argmax(axis=1)
++    durations = np.where(happened, times[occurred.argmax(axis=1)], times[last])
++    return np.where(observed.any(axis=1)[:, None], np.column_stack([durations, happened]), np.nan)
+ 
+ 
+ def _formula_variables(formula: str | None) -> list[str]:
+@@ -174,7 +214,7 @@ def glm(
+ 
+ def kaplan_meier(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None = None,
+     *,
+     event_col: str | None = None,
+     key_added: str = "kaplan_meier",
+@@ -203,9 +243,12 @@ def kaplan_meier(
+     Args:
+         edata: Central data object.
+         duration_col: Column in `edata.obs` or variable with the subjects' lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         timeline: Return the best estimate at the values in timelines (positively increasing)
+         entry_col: Column in `edata.obs` or variable with the relative time when a subject entered the study.
+@@ -360,7 +403,7 @@ def anova_glm(
+ 
+ def cox_ph(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None = None,
+     *,
+     event_col: str | None = None,
+     key_added: str = "cox_ph",
+@@ -396,9 +439,12 @@ def cox_ph(
+     Args:
+         edata: Central data object.
+         duration_col: Column in `edata.obs` or variable with the subjects' lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         alpha: The alpha value in the confidence intervals.
+         label: The name of the column of the estimate.
+@@ -447,11 +493,11 @@ def cox_ph(
+         ... )
+     """
+     strata_cols = [strata] if isinstance(strata, str) else list(strata or [])
+-    df = _model_frame(
++    df, duration_col = _survival_frame(
+         edata,
++        duration_col,
++        event_col,
+         [
+-            duration_col,
+-            event_col,
+             entry_col,
+             weights_col,
+             cluster_col,
+@@ -513,7 +559,7 @@ def cox_ph(
+ 
+ def weibull_aft(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None,
+     event_col: str,
+     *,
+     key_added: str = "weibull_aft",
+@@ -546,9 +592,12 @@ def weibull_aft(
+     Args:
+         edata: Central data object.
+         duration_col: Name of the column in the data objects that contains the subjects’ lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         alpha: The alpha value in the confidence intervals.
+         fit_intercept: Whether to fit an intercept term in the model.
+@@ -587,9 +636,11 @@ def weibull_aft(
+         >>> aft.print_summary()
+     """
+     ancillary_cols = _formula_variables(ancillary) if isinstance(ancillary, str) else []
+-    df = _model_frame(
++    df, duration_col = _survival_frame(
+         edata,
+-        [duration_col, event_col, entry_col, weights_col, *_covariates(edata, covariates, formula), *ancillary_cols],
++        duration_col,
++        event_col,
++        [entry_col, weights_col, *_covariates(edata, covariates, formula), *ancillary_cols],
+         layer=layer,
+     )
+     df = _shift_zero_durations(df, duration_col)
+@@ -624,7 +675,7 @@ def weibull_aft(
+ 
+ def log_logistic_aft(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None = None,
+     *,
+     event_col: str | None = None,
+     key_added: str = "log_logistic_aft",
+@@ -656,9 +707,12 @@ def log_logistic_aft(
+     Args:
+         edata: Central data object.
+         duration_col: Name of the column in the data objects that contains the subjects' lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         alpha: The alpha value in the confidence intervals.
+         fit_intercept: Whether to fit an intercept term in the model.
+@@ -696,9 +750,11 @@ def log_logistic_aft(
+         >>> llf = ep.tl.log_logistic_aft(edata, duration_col="mort_day_censored", event_col="censor_flg")
+     """
+     ancillary_cols = _formula_variables(ancillary) if isinstance(ancillary, str) else []
+-    df = _model_frame(
++    df, duration_col = _survival_frame(
+         edata,
+-        [duration_col, event_col, entry_col, weights_col, *_covariates(edata, covariates, formula), *ancillary_cols],
++        duration_col,
++        event_col,
++        [entry_col, weights_col, *_covariates(edata, covariates, formula), *ancillary_cols],
+         layer=layer,
+     )
+     df = _shift_zero_durations(df, duration_col)
+@@ -733,7 +789,7 @@ def log_logistic_aft(
+ 
+ def _univariate_model(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None,
+     event_col: str,
+     model_class,
+     key_added: str,
+@@ -751,7 +807,7 @@ def _univariate_model(
+     random_state: int = 0,
+ ):
+     """Convenience function for univariate models."""
+-    df = _model_frame(edata, [duration_col, event_col, entry_col, weights_col], layer=layer)
++    df, duration_col = _survival_frame(edata, duration_col, event_col, [entry_col, weights_col], layer=layer)
+     if not accept_zero_duration:
+         df = _shift_zero_durations(df, duration_col)
+ 
+@@ -799,7 +855,7 @@ def _univariate_model(
+ 
+ def nelson_aalen(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None = None,
+     *,
+     event_col: str | None = None,
+     key_added: str = "nelson_aalen",
+@@ -825,9 +881,12 @@ def nelson_aalen(
+     Args:
+         edata: Central data object.
+         duration_col: Column in `edata.obs` or variable with the subjects' lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         timeline: Return the best estimate at the values in timelines (positively increasing)
+         entry_col: Column in `edata.obs` or variable with the relative time when a subject entered the study.
+@@ -878,7 +937,7 @@ def nelson_aalen(
+ 
+ def weibull(
+     edata: EHRData,
+-    duration_col: str,
++    duration_col: str | None,
+     event_col: str,
+     *,
+     key_added: str = "weibull",
+@@ -905,9 +964,12 @@ def weibull(
+     Args:
+         edata: Central data object.
+         duration_col: Name of the column in the data objects that contains the subjects’ lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: Column in `edata.obs` or variable that specifies whether the event has been observed, or censored.
+             Column values are `True` if the event was observed, `False` if the event was lost (right-censored).
+             If left `None`, all individuals are assumed to be uncensored.
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         key_added: The key to use for the `.uns` slot in the data object.
+         timeline: Return the best estimate at the values in timelines (positively increasing)
+         entry_col: Column in `edata.obs` or variable with the relative time when a subject entered the study.
+@@ -954,7 +1016,7 @@ def cox_ph_adjusted_curves(
+     edata: EHRData,
+     cph: CoxPHFitter,
+     strata: str,
+-    duration_col: str,
++    duration_col: str | None,
+     event_col: str,
+     *,
+     method: Literal["average", "conditional"] = "average",
+@@ -980,8 +1042,11 @@ def cox_ph_adjusted_curves(
+         strata: Name of the column to stratify by.
+             Must be present in the data and should not be included in the Cox model formula.
+         duration_col: The name of the column that contains the subjects' lifetimes.
++            `None` if `event_col` is a variable of 3D data, from which the durations are derived.
+         event_col: The name of the column that specifies whether the event has been observed or censored.
+             Column values are True if the event was observed, False if the event was lost (right-censored).
++            If it is a variable of 3D data that is 1 at the timepoints with the event and 0 otherwise, the event is whether it is ever 1 and the duration the time of its first 1, or of its last non-missing value for censored observations.
++            Times count from the first timepoint, in `edata.tem['interval_start_offset']` if present, with time differences in seconds, or as positions otherwise.
+         method: The method used to compute adjusted survival curves. Options are:
+             * `'average'` one population-averaged curve per group, no rebalancing.
+             * `'conditional'` one curve per group for a synthetic reference patient with cohort-average covariates, varying only the strata variable.
+@@ -1019,7 +1084,9 @@ def cox_ph_adjusted_curves(
+     edata = edata.copy() if copy else edata
+     strata_cols = [cph.strata] if isinstance(cph.strata, str) else list(cph.strata or [])
+     cph_covariates = _formula_variables(cph.formula) if cph.formula else list(cph.params_.index)
+-    df = _model_frame(edata, [duration_col, event_col, strata, *strata_cols, *cph_covariates], layer=layer)
++    df, duration_col = _survival_frame(
++        edata, duration_col, event_col, [strata, *strata_cols, *cph_covariates], layer=layer
++    )
+ 
+     t_max = df[duration_col].max()
+     _times = times if times is not None else np.linspace(0, t_max, 100)
+diff --git a/tests/get/test_get.py b/tests/get/test_get.py
+index f08f4201..bab69d1d 100644
+--- a/tests/get/test_get.py
++++ b/tests/get/test_get.py
+@@ -1,3 +1,4 @@
++import dask.array as da
+ import ehrdata as ed
+ import numpy as np
+ import pandas as pd
+@@ -40,9 +41,43 @@ def test_obs_df_3d_obs_keys(edata_blobs_timeseries_small):
+     pd.testing.assert_series_equal(df["cluster"], edata_blobs_timeseries_small.obs["cluster"])
+ 
+ 
+-def test_obs_df_var_df_3d_var_keys_raise(edata_blobs_timeseries_small):
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        ep.get.obs_df(edata_blobs_timeseries_small, keys=["cluster", "feature_0"], layer=DEFAULT_TEM_LAYER_NAME)
++@pytest.mark.parametrize("statistic", ["first", "last", "mean", "max", "slope"])
++def test_obs_df_3d_var_keys(edata_blobs_timeseries_small, statistic):
++    edata = edata_blobs_timeseries_small
++    edata.layers[DEFAULT_TEM_LAYER_NAME][0, 1, :3] = np.nan
++    summary = ep.pp.summarize_measurements(
++        edata, layer=DEFAULT_TEM_LAYER_NAME, var_names=["feature_1", "feature_0"], statistics=[statistic]
++    )
++
++    df = ep.get.obs_df(
++        edata, keys=["cluster", "feature_1", "feature_0"], layer=DEFAULT_TEM_LAYER_NAME, statistic=statistic
++    )
++
++    assert df.columns.tolist() == ["cluster", "feature_1", "feature_0"]
++    pd.testing.assert_series_equal(df["cluster"], edata.obs["cluster"])
++    np.testing.assert_array_equal(df[["feature_1", "feature_0"]].to_numpy(), summary.X)
++
++
++def test_obs_df_3d_timepoint(edata_blobs_timeseries_small):
++    edata = edata_blobs_timeseries_small
++
++    df = ep.get.obs_df(edata[:, :, [4]], keys=["feature_2"], layer=DEFAULT_TEM_LAYER_NAME)
++
++    np.testing.assert_array_equal(df["feature_2"], edata.layers[DEFAULT_TEM_LAYER_NAME][:, 2, 4])
++
++
++def test_obs_df_3d_dask(edata_blobs_timeseries_small):
++    edata = edata_blobs_timeseries_small
++    expected = ep.get.obs_df(edata, keys=["feature_0", "cluster"], layer=DEFAULT_TEM_LAYER_NAME, statistic="mean")
++    edata.layers[DEFAULT_TEM_LAYER_NAME] = da.from_array(edata.layers[DEFAULT_TEM_LAYER_NAME], chunks=(5, -1, -1))
++
++    with forbid_dask_compute(allowed=1):
++        result = ep.get.obs_df(edata, keys=["feature_0", "cluster"], layer=DEFAULT_TEM_LAYER_NAME, statistic="mean")
++
++    pd.testing.assert_frame_equal(result, expected)
++
++
++def test_var_df_3d_raises(edata_blobs_timeseries_small):
+     with pytest.raises(ValueError, match="only supports 2D data"):
+         ep.get.var_df(edata_blobs_timeseries_small, keys=["0"], layer=DEFAULT_TEM_LAYER_NAME)
+ 
+diff --git a/tests/plot/test_catplot.py b/tests/plot/test_catplot.py
+index 4a0f2b02..304e93b3 100644
+--- a/tests/plot/test_catplot.py
++++ b/tests/plot/test_catplot.py
+@@ -1,5 +1,7 @@
+ from pathlib import Path
+ 
++import numpy as np
++
+ import ehrapy as ep
+ 
+ CURRENT_DIR = Path(__file__).parent
+@@ -14,3 +16,10 @@ def test_catplot_vanilla(edata_mini, check_same_image):
+         base_path=f"{_TEST_IMAGE_PATH}/catplot_vanilla",
+         tol=2e-1,
+     )
++
++
++def test_catplot_variables_3D(edata_blobs_3d):
++    grid = ep.pl.catplot(edata_blobs_3d, x="cluster", y="feature_0", kind="box")
++
++    np.testing.assert_array_equal(grid.data["feature_0"], edata_blobs_3d.X[:, 0, 0])
++    np.testing.assert_array_equal(grid.data["cluster"], edata_blobs_3d.obs["cluster"])
+diff --git a/tests/plot/test_scanpy_pl_api.py b/tests/plot/test_scanpy_pl_api.py
+index a9a84433..76117933 100644
+--- a/tests/plot/test_scanpy_pl_api.py
++++ b/tests/plot/test_scanpy_pl_api.py
+@@ -32,9 +32,15 @@ def test_scatter_plot(mimic_2, check_same_image):
+ 
+ 
+ def test_scatter_plot_3D(edata_blob_small):
+-    ep.pl.scatter(edata_blob_small, x="feature_1", y="feature_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
+-        ep.pl.scatter(edata_blob_small, layers=DEFAULT_TEM_LAYER_NAME, x="feature_1", y="feature_2")
++    expected = ep.pl.scatter(edata_blob_small, x="feature_1", y="feature_2", color="feature_3", show=False)
++
++    ax = ep.pl.scatter(
++        edata_blob_small, layers=DEFAULT_TEM_LAYER_NAME, x="feature_1", y="feature_2", color="feature_3", show=False
++    )
++
++    np.testing.assert_array_equal(ax.collections[0].get_offsets(), expected.collections[0].get_offsets())
++    np.testing.assert_array_equal(ax.collections[0].get_array(), expected.collections[0].get_array())
++    plt.close("all")
+ 
+ 
+ def test_heatmap_plot(edata_mini, check_same_image):
+@@ -799,19 +805,17 @@ def test_embedding_plots_3D(plotter, edata_embedded, clean_up_plots):
+         plot(edata_embedded, color=["group", "feature_0"], show=False, **kwargs)
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("plotter", "obs_kwargs", "var_kwargs"),
+-    [
+-        ("violin", {"keys": "age"}, {"keys": ["age", "feature_0"]}),
+-        ("scatter", {"x": "age", "y": "y"}, {"x": "age", "y": "y", "color": "feature_0"}),
+-    ],
+-)
+-def test_obs_plots_3D(plotter, obs_kwargs, var_kwargs, edata_blobs_3d, clean_up_plots):
+-    plot = getattr(ep.pl, plotter)
+-
+-    plot(edata_blobs_3d, show=False, **obs_kwargs)
++def test_violin_obs_3D(edata_blobs_3d, clean_up_plots):
++    ep.pl.violin(edata_blobs_3d, keys="age", show=False)
+     with pytest.raises(ValueError, match="only supports 2D data"):
+-        plot(edata_blobs_3d, show=False, **var_kwargs)
++        ep.pl.violin(edata_blobs_3d, keys=["age", "feature_0"], show=False)
++
++
++def test_scatter_obs_3D(edata_blobs_3d, clean_up_plots):
++    ax = ep.pl.scatter(edata_blobs_3d, x="age", y="feature_0", color="feature_1", show=False)
++
++    points = np.column_stack([edata_blobs_3d.obs["age"], edata_blobs_3d.X[:, 0, 0]])
++    np.testing.assert_array_equal(np.sort(ax.collections[0].get_offsets(), axis=0), np.sort(points, axis=0))
+ 
+ 
+ def test_dendrogram_3D(edata_blobs_3d, clean_up_plots):
+diff --git a/tests/plot/test_survival_analysis.py b/tests/plot/test_survival_analysis.py
+index f5cf4306..0211c816 100644
+--- a/tests/plot/test_survival_analysis.py
++++ b/tests/plot/test_survival_analysis.py
+@@ -125,17 +125,23 @@ def test_ols_array_types(array_type, rng: np.random.Generator):
+     pd.testing.assert_frame_equal(plot.data, expected.data)
+ 
+ 
+-def test_ols_3d_raises(edata_blobs_timeseries_small: EHRData):
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        ep.pl.ols(edata_blobs_timeseries_small, x="feature_0", y="feature_1", layer=DEFAULT_TEM_LAYER_NAME)
++def test_ols_3D(edata_blobs_timeseries_small: EHRData):
++    first = ep.pp.summarize_measurements(
++        edata_blobs_timeseries_small,
++        layer=DEFAULT_TEM_LAYER_NAME,
++        var_names=["feature_0", "feature_1"],
++        statistics=["first"],
++    )
++
++    plot = ep.pl.ols(edata_blobs_timeseries_small, x="feature_0", y="feature_1", layer=DEFAULT_TEM_LAYER_NAME)
++
++    np.testing.assert_array_equal(plot.data["feature_0"], first.X[:, 0])
+ 
+ 
+ def test_ols_obs_columns_on_3D_data(edata_blobs_3d: EHRData):
+     plot = ep.pl.ols(edata_blobs_3d, x="age", y="y")
+ 
+     np.testing.assert_array_equal(plot.data["age"], edata_blobs_3d.obs["age"])
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        ep.pl.ols(edata_blobs_3d, x="age", y="feature_0")
+ 
+ 
+ def test_cox_ph_adjusted_curves(mimic_2_adjusted_sa):
+diff --git a/tests/tools/causal/test_causal.py b/tests/tools/causal/test_causal.py
+index 2d05d0ec..2220443d 100644
+--- a/tests/tools/causal/test_causal.py
++++ b/tests/tools/causal/test_causal.py
+@@ -224,27 +224,37 @@ def test_causal_array_types(array_type, estimator, kwargs):
+         (ep.tl.positivity_check, {}),
+     ],
+ )
+-def test_causal_obs_columns_on_3D_data(edata_blobs_3d, estimator, kwargs):
+-    estimator(edata_blobs_3d, treatment="treated", covariates=["age"], **kwargs)
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        estimator(edata_blobs_3d, treatment="treated", covariates=["age", "feature_0"], **kwargs)
++def test_causal_variables_on_3D_data(edata_blobs_3d, estimator, kwargs):
++    baseline = ed.EHRData(
++        X=ep.get.obs_df(edata_blobs_3d, keys=list(edata_blobs_3d.var_names)).to_numpy(),
++        obs=edata_blobs_3d.obs,
++        var=edata_blobs_3d.var,
++    )
++    kwargs = {"treatment": "treated", "covariates": ["age", "feature_0"], **kwargs}
++    expected = estimator(baseline, **kwargs)
++
++    result = estimator(edata_blobs_3d, **kwargs)
++
++    if isinstance(expected, pd.DataFrame):
++        pd.testing.assert_frame_equal(result, expected)
++    elif isinstance(expected, dict):
++        np.testing.assert_allclose(result["propensity_scores"], expected["propensity_scores"])
++    else:
++        assert result.value == pytest.approx(expected.value)
+ 
+ 
+ class TestGuards:
+-    def test_rejects_3d_layer(self):
++    def test_3d_layer_at_first_timepoint(self):
+         from ehrdata.core.constants import DEFAULT_TEM_LAYER_NAME
+ 
+         edata = _synth_dataset()
+-        edata.layers[DEFAULT_TEM_LAYER_NAME] = np.stack([edata.X, edata.X], axis=2)
+-        with pytest.raises(ValueError, match=r"only supports 2D data"):
+-            ep.tl.iptw(
+-                edata,
+-                treatment="tx",
+-                outcome="y",
+-                covariates=["age", "sex", "bmi"],
+-                layer=DEFAULT_TEM_LAYER_NAME,
+-                n_bootstrap=0,
+-            )
++        kwargs = {"treatment": "tx", "outcome": "y", "covariates": ["age", "sex", "bmi"], "n_bootstrap": 0}
++        expected = ep.tl.iptw(edata, **kwargs)
++        edata.layers[DEFAULT_TEM_LAYER_NAME] = np.stack([edata.X, np.full_like(edata.X, np.nan), edata.X + 1], axis=2)
++
++        result = ep.tl.iptw(edata, layer=DEFAULT_TEM_LAYER_NAME, **kwargs)
++
++        assert result.value == pytest.approx(expected.value)
+ 
+     def test_rejects_non_binary_treatment(self):
+         edata = _synth_dataset()
+diff --git a/tests/tools/test_sa.py b/tests/tools/test_sa.py
+index 87586b3d..1bdf5323 100644
+--- a/tests/tools/test_sa.py
++++ b/tests/tools/test_sa.py
+@@ -39,9 +39,13 @@ def test_ols(mimic_2, layer):
+ def test_ols_3D(edata_blob_small):
+     formula = "feature_1 ~ feature_2"
+     var_names = ["feature_1", "feature_2"]
+-    ep.tl.ols(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer="layer_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
+-        ep.tl.ols(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer=DEFAULT_TEM_LAYER_NAME)
++    expected = ep.tl.ols(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer="layer_2").fit()
++
++    result = ep.tl.ols(
++        edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer=DEFAULT_TEM_LAYER_NAME
++    ).fit()
++
++    pd.testing.assert_series_equal(result.params, expected.params)
+ 
+ 
+ @pytest.mark.parametrize("layer", [None, "layer_2"])
+@@ -67,9 +71,13 @@ def test_glm(mimic_2, layer):
+ def test_glm_3D(edata_blob_small):
+     formula = "feature_1 ~ feature_2"
+     var_names = ["feature_1", "feature_2"]
+-    ep.tl.glm(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer="layer_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
+-        ep.tl.glm(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer=DEFAULT_TEM_LAYER_NAME)
++    expected = ep.tl.glm(edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer="layer_2").fit()
++
++    result = ep.tl.glm(
++        edata_blob_small, var_names=var_names, formula=formula, missing="drop", layer=DEFAULT_TEM_LAYER_NAME
++    ).fit()
++
++    pd.testing.assert_series_equal(result.params, expected.params)
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -179,7 +187,7 @@ def test_survival_models_3D(sa_function, sa_class, edata_blob_small):
+     edata_blob_small.layers["layer_2"] = edata_blob_small.X.copy()
+ 
+     sa_function(edata_blob_small, duration_col=duration_col, event_col=event_col, layer="layer_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
++    with pytest.raises(ValueError, match=r"pass no `duration_col`"):
+         sa_function(edata_blob_small, duration_col=duration_col, event_col=event_col, layer=DEFAULT_TEM_LAYER_NAME)
+ 
+ 
+@@ -419,3 +427,76 @@ def test_cox_ph_adjusted_curves_array_types(array_type, rng):
+             result.uns["cox_ph_adjusted_curves"][group]["survival"],
+             expected.uns["cox_ph_adjusted_curves"][group]["survival"],
+         )
++
++
++@pytest.fixture
++def longitudinal_events() -> ed.EHRData:
++    nan = np.nan
++    event = [[1, 1, 1, 1], [0, 0, 1, 0], [0, 0, 0, nan], [nan, nan, nan, nan], [0, nan, 0, 0], [0, 1, 1, nan]]
++    hr = np.arange(24, dtype=float).reshape(6, 4)
++    obs = pd.DataFrame({"group": list("ababab"), "age": [50.0, 61, 72, 43, 54, 65]}, index=list("pqrstu"))
++    tem = pd.DataFrame(
++        {"interval_start_offset": pd.to_timedelta([0, 1, 2, 4], unit="h")}, index=[str(t) for t in range(4)]
++    )
++    return ed.EHRData(
++        X=np.stack([np.array(event, dtype=float), hr], axis=1),
++        obs=obs,
++        var=pd.DataFrame(index=["event", "hr"]),
++        tem=tem,
++    )
++
++
++@pytest.mark.parametrize(
++    ("time_key", "durations"),
++    [("interval_start_offset", [0, 7200, 7200, 14400, 3600]), ("unknown", [0, 2, 2, 3, 1])],
++)
++def test_survival_from_longitudinal_event(longitudinal_events, time_key, durations):
++    if time_key == "unknown":
++        longitudinal_events.tem = longitudinal_events.tem.rename(columns={"interval_start_offset": time_key})
++
++    kmf = ep.tl.kaplan_meier(longitudinal_events, event_col="event")
++
++    np.testing.assert_array_equal(kmf.durations, durations)
++    np.testing.assert_array_equal(kmf.event_observed, [1, 1, 0, 0, 1])
++
++
++@pytest.mark.parametrize(
++    ("sa_function", "lifelines_class"),
++    [(ep.tl.kaplan_meier, KaplanMeierFitter), (ep.tl.nelson_aalen, NelsonAalenFitter)],
++)
++def test_survival_curves_from_longitudinal_event(longitudinal_events, sa_function, lifelines_class):
++    durations = pd.Series([0.0, 2, 2, 3, 1], index=list("pqrtu"))
++    expected = lifelines_class().fit(durations, event_observed=pd.Series([1, 1, 0, 0, 1], index=durations.index))
++    longitudinal_events.tem = longitudinal_events.tem.drop(columns="interval_start_offset")
++
++    model = sa_function(longitudinal_events, event_col="event")
++
++    pd.testing.assert_frame_equal(model.event_table, expected.event_table)
++
++
++def test_cox_ph_from_longitudinal_event(longitudinal_events):
++    longitudinal_events.tem = longitudinal_events.tem.drop(columns="interval_start_offset")
++    frame = pd.DataFrame(
++        {
++            "duration": [0.0, 2, 2, 3, 1],
++            "event": [1, 1, 0, 0, 2],
++            "hr": [0.0, 4, 8, 16, 20],
++            "age": [50.0, 61, 72, 54, 65],
++        },
++        index=list("pqrtu"),
++    )
++    expected = CoxPHFitter(penalizer=0.1).fit(frame, duration_col="duration", event_col="event")
++
++    cph = ep.tl.cox_ph(longitudinal_events, event_col="event", covariates=["hr", "age"], penalizer=0.1)
++
++    np.testing.assert_allclose(cph.params_, expected.params_)
++
++
++def test_survival_needs_duration_col(longitudinal_events):
++    with pytest.raises(ValueError, match="Pass a `duration_col`"):
++        ep.tl.kaplan_meier(longitudinal_events, event_col="age")
++
++
++def test_survival_needs_binary_longitudinal_event(longitudinal_events):
++    with pytest.raises(ValueError, match="must be 1 at the timepoints with the event"):
++        ep.tl.kaplan_meier(longitudinal_events, event_col="hr")

@@ -1,0 +1,1166 @@
+diff --git a/README.md b/README.md
+index c4e9a50a..0b0283cf 100644
+--- a/README.md
++++ b/README.md
+@@ -195,10 +195,14 @@ If alignments already exist, TaxTriage can start from them. Pre-aligned samples
+ stage — compression, trimming, QC plots, host depletion, subsampling, classification and reference
+ downloading — and go straight to coverage statistics, scoring (`match_paths.py`) and the report.
+ 
+-Because no classifier runs to select references, the reference the file was aligned against must be
+-supplied with `--reference_fasta`. It provides both the accession → taxid map (`match_paths.py -m`)
+-and the sourmash/ANI comparison (`match_paths.py -f`), so reference names in the BAM header must
+-match the accessions in that FASTA.
++Because no classifier runs to select references, supply the reference the file was aligned against
++with `--reference_fasta`. It provides both the accession → taxid map (`match_paths.py -m`) and the
++sourmash/ANI comparison (`match_paths.py -f`), so reference names in the BAM header must match the
++accessions in that FASTA.
++
++If `--reference_fasta` is omitted, the reference sequence is reconstructed from the alignment itself
++with `samtools consensus` and used in its place — see [Consensus-derived
++references](#consensus-derived-references) below for the trade-offs.
+ 
+ ```bash
+ nextflow run https://github.com/jhuapl-bio/taxtriage \
+@@ -233,6 +237,32 @@ nextflow run https://github.com/jhuapl-bio/taxtriage \
+   `--microbert`, `--novelty`, `--generate_iss`, `--generate_nanosim`, `--reference_assembly`,
+   `--get_variants`) are disabled with a warning on a BAM-only run.
+ 
++### Consensus-derived references
++
++A BAM header records reference names and lengths but no bases. `match_paths.py` already falls back to
++the header for reference _lengths_, but sourmash sketching, the shared-window conflict report and the
++ANI matrix all need sequence. When no `--reference_fasta` is given, TaxTriage therefore calls a
++per-reference consensus straight off the alignment (`samtools consensus -a`, N-padded so consensus
++coordinates still match the original reference) and treats the result exactly like a user-supplied
++FASTA: fuzzy-matched against the assembly summary for the accession → taxid map, and passed to
++`match_paths.py -f` for sketching.
++
++Two limitations are inherent to this and are printed as a warning at run time:
++
++- **Coverage-limited.** Only positions with aligned reads are recovered; ANI and containment are
++  effectively computed over the covered fraction of each reference. References recovering fewer than
++  `--consensus_min_bases` (default 500) non-N bases are dropped rather than contributing empty
++  sketches.
++- **Multimapping bias.** A read placed on several references contributes to the consensus of each,
++  so related organisms look more similar than their true genomes are, which makes conflict-driven
++  read removal more aggressive.
++
++Supply `--reference_fasta` whenever the true reference is available. Related options:
++`--bam_consensus true|false` (force on / opt out), `--consensus_min_depth`, `--consensus_min_bases`,
++`--consensus_min_mapq`, `--consensus_mode simple|bayesian`. With `--bam_consensus false` and no
++reference, the run proceeds without sketch-based conflict analysis — pair it with
++`--minhash_weight 0` so the TASS weights rebalance.
++
+ ## Offline and reproducible operation
+ 
+ Clone the repository when local modifications, pinned code, or offline execution are required:
+@@ -265,6 +295,8 @@ nextflow drop -f https://github.com/jhuapl-bio/taxtriage
+ 10. Optional assembly, protein annotation, novelty detection, and simulation analysis.
+ 11. MultiQC, static outputs, and the interactive Organism Discovery Report.
+ 
++Pre-aligned (BAM/CRAM) samples enter at stage 7; stages 1–6 and 10 are skipped for them.
++
+ Detailed descriptions are available in [Pipeline Modules](https://github.com/jhuapl-bio/taxtriage/wiki/Pipeline-Modules).
+ 
+ ## Important outputs
+diff --git a/bin/append_taxid.py b/bin/append_taxid.py
+index 78c3092e..5c95f477 100755
+--- a/bin/append_taxid.py
++++ b/bin/append_taxid.py
+@@ -23,9 +23,9 @@
+ try:
+     # Shared stdlib-only helper (bin/ncbi_taxid.py). Available alongside this
+     # script in the staged bin/ directory at runtime.
+-    from ncbi_taxid import fetch_taxid
++    from ncbi_taxid import fetch_taxids
+ except Exception:  # noqa: BLE001 - keep working even if helper is unavailable
+-    fetch_taxid = None
++    fetch_taxids = None
+ 
+ def parse_args(argv=None):
+     """Define and immediately parse command line arguments."""
+@@ -97,6 +97,18 @@ def parse_args(argv=None):
+         default=None,
+         help="Optional NCBI API key for E-utilities querying.",
+     )
++    parser.add_argument(
++        "--ncbi-batch-size",
++        dest="ncbi_batch_size",
++        metavar="N",
++        type=int,
++        required=False,
++        default=100,
++        help=(
++            "Number of accessions resolved per E-utilities request pair during "
++            "the NCBI backup lookup. Lower this if NCBI returns HTTP 429."
++        ),
++    )
+     parser.add_argument(
+         "--custom-map",
+         dest="custom_map",
+@@ -230,7 +242,7 @@ def _is_missing(value):
+     return mapped_df
+ 
+ 
+-def backfill_missing_taxids(mapped_df, email=None, api_key=None):
++def backfill_missing_taxids(mapped_df, email=None, api_key=None, batch_size=None):
+     """Fill empty Mapped_Value taxids by querying NCBI per accession.
+ 
+     Accessions that were not present in any assembly summary (e.g. a local
+@@ -238,7 +250,7 @@ def backfill_missing_taxids(mapped_df, email=None, api_key=None):
+     Mapped_Value blank. Query NCBI directly by the nuccore accession (the 'Acc'
+     column) to recover the taxid so it can be passed downstream in the map file.
+     """
+-    if fetch_taxid is None:
++    if fetch_taxids is None:
+         print("NCBI backup requested but ncbi_taxid helper is unavailable; skipping.")
+         return mapped_df
+ 
+@@ -253,16 +265,27 @@ def _is_missing(value):
+     if n_missing == 0:
+         return mapped_df
+ 
+-    print(f"Attempting NCBI taxid backup lookup for {n_missing} unmapped accession(s)...")
+-    cache = {}
++    # Collect the unique accessions first and resolve them in batched, rate
++    # limited requests rather than two E-utilities calls per row.
++    wanted = []
++    for idx in mapped_df.index[missing_mask]:
++        acc = str(mapped_df.at[idx, "Acc"]).strip()
++        if acc and acc.lower() != "nan":
++            wanted.append(acc)
++    unique_acc = list(dict.fromkeys(wanted))
++
++    print(
++        f"Attempting NCBI taxid backup lookup for {n_missing} unmapped accession(s) "
++        f"({len(unique_acc)} unique)..."
++    )
++    cache = fetch_taxids(
++        unique_acc, email=email, api_key=api_key, batch_size=batch_size
++    )
++
+     resolved = 0
+     for idx in mapped_df.index[missing_mask]:
+         acc = str(mapped_df.at[idx, "Acc"]).strip()
+-        if not acc or acc.lower() == "nan":
+-            continue
+-        if acc not in cache:
+-            cache[acc] = fetch_taxid(acc, email=email, api_key=api_key)
+-        taxid = cache[acc]
++        taxid = cache.get(acc)
+         if taxid:
+             mapped_df.at[idx, "Mapped_Value"] = taxid
+             resolved += 1
+@@ -280,7 +303,12 @@ def main(argv=None):
+     if args.custom_map:
+         mapped_df = apply_custom_map(mapped_df, args.custom_map)
+     if args.ncbi_backup:
+-        mapped_df = backfill_missing_taxids(mapped_df, email=args.email, api_key=args.api_key)
++        mapped_df = backfill_missing_taxids(
++            mapped_df,
++            email=args.email,
++            api_key=args.api_key,
++            batch_size=args.ncbi_batch_size,
++        )
+     # Write the output to the specified file
+     if args.output:
+         mapped_df[['Acc', 'Assembly',  'Organism_Name', 'Description', 'Mapped_Value']].to_csv(args.output, sep='\t', index=False)
+diff --git a/bin/ncbi_taxid.py b/bin/ncbi_taxid.py
+index b8820a1c..103bf059 100644
+--- a/bin/ncbi_taxid.py
++++ b/bin/ncbi_taxid.py
+@@ -28,14 +28,28 @@
+ """
+ 
+ import json
++import os
++import random
+ import ssl
+ import sys
++import threading
+ import time
++import urllib.error
+ import urllib.parse
+ import urllib.request
+ 
+ EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+ 
++# NCBI E-utilities allows 3 requests/second without an API key and 10/second
++# with one. Stay comfortably under those ceilings - the published limit is
++# enforced per-IP and bursts get answered with HTTP 429.
++RATE_NO_KEY = float(os.environ.get("NCBI_RATE_NO_KEY", "2.0"))
++RATE_WITH_KEY = float(os.environ.get("NCBI_RATE_WITH_KEY", "7.0"))
++
++# Accessions resolved per esearch/esummary pair. Batching is the single biggest
++# win: 200 accessions cost 2 requests instead of 400.
++BATCH_SIZE = int(os.environ.get("NCBI_BATCH_SIZE", "100"))
++
+ # NCBI hosts a valid certificate, but several pipeline containers ship outdated
+ # CA bundles; fall back to an unverified context so the backup lookup still
+ # succeeds rather than hard-failing the whole run.
+@@ -44,74 +58,218 @@
+ _CTX.verify_mode = ssl.CERT_NONE
+ 
+ 
+-def _get(url, timeout=30):
+-    req = urllib.request.Request(url, headers={"User-Agent": "taxtriage-ncbi-backup"})
+-    with urllib.request.urlopen(req, context=_CTX, timeout=timeout) as resp:
+-        return resp.read().decode("utf-8", errors="replace")
++class _RateLimiter:
++    """Process-wide minimum-interval throttle shared by every request."""
+ 
++    def __init__(self, rate_per_sec):
++        self._lock = threading.Lock()
++        self._interval = 1.0 / rate_per_sec if rate_per_sec > 0 else 0.0
++        self._next_allowed = 0.0
++        # Extra delay imposed after a 429, decayed on success.
++        self._penalty = 0.0
+ 
+-def fetch_taxid(accession, email=None, api_key=None, retries=3, timeout=30, pause=0.4):
+-    """Return the taxid (as a string) for a nuccore accession, or None.
++    def set_rate(self, rate_per_sec):
++        with self._lock:
++            self._interval = 1.0 / rate_per_sec if rate_per_sec > 0 else 0.0
++
++    def wait(self):
++        while True:
++            with self._lock:
++                now = time.monotonic()
++                if now >= self._next_allowed:
++                    self._next_allowed = now + self._interval + self._penalty
++                    return
++                sleep_for = self._next_allowed - now
++            time.sleep(sleep_for)
++
++    def penalize(self):
++        """Back off globally after a 429 so sibling calls slow down too."""
++        with self._lock:
++            self._penalty = min(5.0, (self._penalty * 2) if self._penalty else 0.5)
++
++    def relax(self):
++        with self._lock:
++            if self._penalty:
++                self._penalty = max(0.0, self._penalty / 2.0)
++
++
++_LIMITER = _RateLimiter(RATE_NO_KEY)
++
++
++def configure_rate(api_key=None, rate_per_sec=None):
++    """Set the shared request rate. Called once before a batch of lookups."""
++    if rate_per_sec is None:
++        rate_per_sec = RATE_WITH_KEY if api_key else RATE_NO_KEY
++    _LIMITER.set_rate(rate_per_sec)
++
++
++def _get(url, timeout=30, retries=6):
++    """Rate-limited GET with exponential backoff that honours HTTP 429."""
++    last_err = None
++    for attempt in range(retries):
++        _LIMITER.wait()
++        try:
++            req = urllib.request.Request(
++                url, headers={"User-Agent": "taxtriage-ncbi-backup"}
++            )
++            with urllib.request.urlopen(req, context=_CTX, timeout=timeout) as resp:
++                body = resp.read().decode("utf-8", errors="replace")
++            _LIMITER.relax()
++            return body
++        except urllib.error.HTTPError as err:
++            last_err = err
++            if err.code in (429, 500, 502, 503, 504):
++                if err.code == 429:
++                    _LIMITER.penalize()
++                retry_after = err.headers.get("Retry-After") if err.headers else None
++                try:
++                    delay = float(retry_after)
++                except (TypeError, ValueError):
++                    delay = (2.0 ** attempt) + random.uniform(0, 0.5)
++                time.sleep(min(delay, 60.0))
++                continue
++            raise
++        except Exception as err:  # noqa: BLE001 - transient network issues
++            last_err = err
++            time.sleep(min((2.0 ** attempt) + random.uniform(0, 0.5), 60.0))
++    raise last_err
+ 
+-    Resolves the accession to an internal UID with esearch, then reads the
+-    taxid from esummary. Network/parse failures are swallowed and return None
+-    so callers can degrade gracefully (the taxid is simply left blank).
+-    """
+-    accession = (accession or "").strip()
+-    if not accession:
+-        return None
+ 
++def _common_params(email, api_key):
+     common = {"db": "nuccore"}
+     if email:
+         common["email"] = email
++        common["tool"] = "taxtriage"
+     if api_key:
+         common["api_key"] = api_key
++    return common
+ 
+-    last_err = None
+-    for attempt in range(retries):
++
++def _esearch_uids(accessions, common, timeout):
++    """Resolve a list of accessions to UIDs in one esearch call."""
++    term = " OR ".join("{}[ACCN]".format(a) for a in accessions)
++    params = dict(common)
++    params.update({"term": term, "retmode": "json", "retmax": str(len(accessions) * 2)})
++    url = EUTILS_BASE + "esearch.fcgi"
++    # Terms get long fast; POST avoids URL length limits.
++    data = urllib.parse.urlencode(params).encode("utf-8")
++    for attempt in range(6):
++        _LIMITER.wait()
++        try:
++            req = urllib.request.Request(
++                url, data=data, headers={"User-Agent": "taxtriage-ncbi-backup"}
++            )
++            with urllib.request.urlopen(req, context=_CTX, timeout=timeout) as resp:
++                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
++            _LIMITER.relax()
++            return payload.get("esearchresult", {}).get("idlist", [])
++        except urllib.error.HTTPError as err:
++            if err.code in (429, 500, 502, 503, 504):
++                if err.code == 429:
++                    _LIMITER.penalize()
++                retry_after = err.headers.get("Retry-After") if err.headers else None
++                try:
++                    delay = float(retry_after)
++                except (TypeError, ValueError):
++                    delay = (2.0 ** attempt) + random.uniform(0, 0.5)
++                time.sleep(min(delay, 60.0))
++                continue
++            raise
++        except Exception:  # noqa: BLE001
++            time.sleep(min((2.0 ** attempt) + random.uniform(0, 0.5), 60.0))
++    return []
++
++
++def _esummary_taxids(uids, common, timeout):
++    """Return {accession(-version and bare): taxid} for a list of UIDs."""
++    params = dict(common)
++    params.update({"id": ",".join(uids), "retmode": "json"})
++    url = EUTILS_BASE + "esummary.fcgi?" + urllib.parse.urlencode(params)
++    summary = json.loads(_get(url, timeout=timeout))
++    result = summary.get("result", {})
++    out = {}
++    for uid in result.get("uids", uids):
++        record = result.get(uid, {})
++        taxid = record.get("taxid")
++        if taxid in (None, "", 0, "0"):
++            continue
++        taxid = str(taxid)
++        for key in (record.get("accessionversion"), record.get("caption")):
++            if key:
++                out[str(key)] = taxid
++                out[str(key).split(".")[0]] = taxid
++    return out
++
++
++def fetch_taxids(accessions, email=None, api_key=None, timeout=30, batch_size=None):
++    """Return {accession: taxid or None} for many accessions, batched.
++
++    Requests are throttled process-wide and retried with exponential backoff on
++    HTTP 429, so large unmapped-accession lists no longer trip NCBI's rate
++    limit. Failures degrade to None rather than aborting the run.
++    """
++    accessions = [str(a).strip() for a in accessions if a and str(a).strip()]
++    accessions = list(dict.fromkeys(accessions))
++    results = {a: None for a in accessions}
++    if not accessions:
++        return results
++
++    api_key = api_key or os.environ.get("NCBI_API_KEY") or None
++    configure_rate(api_key)
++    common = _common_params(email, api_key)
++    size = batch_size or BATCH_SIZE
++
++    for start in range(0, len(accessions), size):
++        chunk = accessions[start:start + size]
+         try:
+-            # 1) accession -> internal UID
+-            search_params = dict(common)
+-            search_params.update({"term": accession, "retmode": "json"})
+-            search_url = EUTILS_BASE + "esearch.fcgi?" + urllib.parse.urlencode(search_params)
+-            search = json.loads(_get(search_url, timeout=timeout))
+-            idlist = search.get("esearchresult", {}).get("idlist", [])
+-            if not idlist:
+-                return None
+-            uid = idlist[0]
+-
+-            time.sleep(pause)
+-
+-            # 2) UID -> taxid via document summary
+-            summ_params = dict(common)
+-            summ_params.update({"id": uid, "retmode": "json"})
+-            summ_url = EUTILS_BASE + "esummary.fcgi?" + urllib.parse.urlencode(summ_params)
+-            summary = json.loads(_get(summ_url, timeout=timeout))
+-            record = summary.get("result", {}).get(uid, {})
+-            taxid = record.get("taxid")
+-            if taxid in (None, "", 0, "0"):
+-                return None
+-            return str(taxid)
++            uids = _esearch_uids(chunk, common, timeout)
++            if not uids:
++                continue
++            lookup = _esummary_taxids(uids, common, timeout)
+         except Exception as err:  # noqa: BLE001 - degrade gracefully
+-            last_err = err
+-            time.sleep(pause * (attempt + 1))
+-    if last_err is not None:
+-        sys.stderr.write(
+-            "NCBI taxid backup lookup failed for {}: {}\n".format(accession, last_err)
+-        )
+-    return None
++            sys.stderr.write(
++                "NCBI taxid backup lookup failed for batch of {} starting at {}: {}\n".format(
++                    len(chunk), chunk[0], err
++                )
++            )
++            continue
++        for acc in chunk:
++            taxid = lookup.get(acc) or lookup.get(acc.split(".")[0])
++            if taxid:
++                results[acc] = taxid
++    return results
++
++
++def fetch_taxid(accession, email=None, api_key=None, retries=6, timeout=30, pause=None):
++    """Return the taxid (as a string) for a single nuccore accession, or None.
++
++    Thin wrapper over :func:`fetch_taxids` kept for backwards compatibility;
++    `retries` and `pause` are accepted but handled by the shared limiter.
++    """
++    accession = (accession or "").strip()
++    if not accession:
++        return None
++    return fetch_taxids([accession], email=email, api_key=api_key, timeout=timeout).get(
++        accession
++    )
+ 
+ 
+ if __name__ == "__main__":
+-    # Simple CLI: ncbi_taxid.py ACCESSION [EMAIL]
+-    if len(sys.argv) < 2:
+-        sys.stderr.write("Usage: ncbi_taxid.py ACCESSION [EMAIL]\n")
++    # Simple CLI: ncbi_taxid.py ACCESSION [ACCESSION ...] [--email EMAIL]
++    argv = sys.argv[1:]
++    mail = None
++    if "--email" in argv:
++        i = argv.index("--email")
++        mail = argv[i + 1] if len(argv) > i + 1 else None
++        del argv[i:i + 2]
++    if not argv:
++        sys.stderr.write("Usage: ncbi_taxid.py ACCESSION [ACCESSION ...] [--email EMAIL]\n")
+         sys.exit(2)
+-    acc = sys.argv[1]
+-    mail = sys.argv[2] if len(sys.argv) > 2 else None
+-    result = fetch_taxid(acc, email=mail)
+-    if result:
+-        print(result)
+-    else:
++    found = fetch_taxids(argv, email=mail)
++    missing = [a for a, t in found.items() if not t]
++    for acc in argv:
++        if found.get(acc):
++            print("{}\t{}".format(acc, found[acc]) if len(argv) > 1 else found[acc])
++    for acc in missing:
+         sys.stderr.write("No taxid found for {}\n".format(acc))
+-        sys.exit(1)
++    sys.exit(1 if len(missing) == len(argv) else 0)
+diff --git a/conf/modules.config b/conf/modules.config
+index d4931b1c..0a811d99 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -376,6 +376,12 @@ process {
+         publishDir = [path:{ "${params.outdir}/alignment" }, mode:'copy', saveAs:{ filename -> filename.equals('versions.yml') ? null : filename }]
+ 
+     }
++    withName: BAM_CONSENSUS {
++        publishDir = [path:{ "${params.outdir}/references" }, mode:'copy', saveAs:{ filename -> filename.equals('versions.yml') ? null : filename }]
++    }
++    withName: MAP_SAMPLE_FASTA_TO_ASSEMBLY {
++        errorStrategy = 'ignore'
++    }
+     withName: PREPARE_BAM {
+         publishDir = [path:{ "${params.outdir}/alignment" }, mode:'copy', saveAs:{ filename -> filename.equals('versions.yml') || filename.endsWith('.readcount.txt') ? null : filename }]
+     }
+diff --git a/modules/local/bam_consensus.nf b/modules/local/bam_consensus.nf
+new file mode 100644
+index 00000000..8f751705
+--- /dev/null
++++ b/modules/local/bam_consensus.nf
+@@ -0,0 +1,131 @@
++// ##############################################################################################
++// # Copyright 2022 The Johns Hopkins University Applied Physics Laboratory LLC
++// # All rights reserved.
++// # Permission is hereby granted, free of charge, to any person obtaining a copy of this
++// # software and associated documentation files (the "Software"), to deal in the Software
++// # without restriction, including without limitation the rights to use, copy, modify,
++// # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
++// # permit persons to whom the Software is furnished to do so.
++// #
++// # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
++// # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
++// # PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// # LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++// # TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
++// # OR OTHER DEALINGS IN THE SOFTWARE.
++// #
++
++//
++// Reconstruct reference sequence from a pre-aligned BAM when the user did not
++// supply --reference_fasta.
++//
++// match_paths.py can already fall back to the BAM header for reference LENGTHS,
++// but every sketching step (sourmash region signatures, the shared-window
++// conflict report, and the taxid-level ANI matrix) needs actual bases.  This
++// module calls a per-reference consensus straight from the alignment so those
++// steps have sequence to work with.
++//
++// CAVEATS (documented in the README as well):
++//   * only positions covered by reads are recovered; everything else is N, so
++//     ANI/containment is computed over the covered fraction of each reference.
++//   * multi-mapping reads contribute to the consensus of EVERY reference they
++//     were placed on, which inflates the apparent similarity between related
++//     organisms and therefore makes conflict-driven read removal more
++//     aggressive than it would be against true reference genomes.
++// Supplying --reference_fasta is always preferable when it is available.
++//
++process BAM_CONSENSUS {
++    tag "$meta.id"
++    label 'process_medium'
++
++    conda (params.enable_conda ? "bioconda::samtools=1.19.2" : null)
++    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
++        'https://depot.galaxyproject.org/singularity/samtools:1.19.2--h50ea8bc_0' :
++        'biocontainers/samtools:1.19.2--h50ea8bc_0' }"
++
++    input:
++    tuple val(meta), path(bam), path(csi)
++
++    output:
++    tuple val(meta), path("*.consensus.fasta"), emit: fasta
++    tuple val(meta), path("*.consensus_stats.tsv"), emit: stats
++    path "versions.yml"                           , emit: versions
++
++    when:
++    task.ext.when == null || task.ext.when
++
++    script:
++    def args      = task.ext.args ?: ''
++    def prefix    = task.ext.prefix ?: "${meta.id}"
++    def min_depth = params.consensus_min_depth ?: 1
++    def min_bases = params.consensus_min_bases ?: 500
++    def min_mq    = params.consensus_min_mapq != null ? " --min-MQ ${params.consensus_min_mapq} " : ""
++    def mode      = params.consensus_mode ?: 'simple'
++
++    """
++    set -euo pipefail
++
++    # `-a` keeps every reference at full length with uncovered positions as N so
++    # consensus coordinates stay identical to the original reference — the
++    # shared-window sketching in conflict_regions.py slides fixed windows along
++    # these sequences and would otherwise compare mismatched coordinates.
++    samtools consensus \\
++        -@ ${task.cpus} \\
++        -m ${mode} \\
++        -a \\
++        -d ${min_depth} \\
++        ${min_mq} \\
++        -f fasta \\
++        --show-ins no \\
++        --show-del yes \\
++        $args \\
++        ${bam} \\
++        > raw_consensus.fasta
++
++    # Drop references whose consensus is (almost) all N — i.e. references present
++    # in the BAM header that no read actually supports.  Keeping them would add
++    # empty sketches and drag every ANI comparison toward zero.
++    awk -v minb=${min_bases} '
++        function flush_rec() {
++            if (hdr != "" && nonN >= minb) { print hdr; print seq }
++            if (hdr != "") { printf "%s\\t%d\\t%d\\n", substr(hdr, 2), len, nonN >> statsf }
++        }
++        /^>/ {
++            flush_rec()
++            hdr = \$0; seq = ""; nonN = 0; len = 0; next
++        }
++        {
++            seq = seq \$0
++            len += length(\$0)
++            t = \$0
++            gsub(/[Nn]/, "", t)
++            nonN += length(t)
++        }
++        END { flush_rec() }
++    ' statsf="${prefix}.consensus_stats.tsv" raw_consensus.fasta > ${prefix}.consensus.fasta
++
++    # Always emit the files even when nothing passed the filter, so downstream
++    # channel joins do not silently drop the sample.
++    touch ${prefix}.consensus.fasta ${prefix}.consensus_stats.tsv
++
++    n_refs=\$(grep -c '^>' ${prefix}.consensus.fasta || true)
++    echo "Recovered consensus for \${n_refs} reference(s) from ${bam} (min depth ${min_depth}, min ${min_bases} non-N bases)"
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//' )
++    END_VERSIONS
++    """
++
++    stub:
++    def prefix = task.ext.prefix ?: "${meta.id}"
++    """
++    touch ${prefix}.consensus.fasta
++    touch ${prefix}.consensus_stats.tsv
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        samtools: \$(echo \$(samtools --version 2>&1) | sed 's/^.*samtools //; s/Using.*\$//' )
++    END_VERSIONS
++    """
++}
+diff --git a/modules/local/environment.yml b/modules/local/environment.yml
+new file mode 100644
+index 00000000..046005a0
+--- /dev/null
++++ b/modules/local/environment.yml
+@@ -0,0 +1,6 @@
++channels:
++  - conda-forge
++  - bioconda
++  - defaults
++dependencies:
++  - bioconda::samtools=1.19.2
+diff --git a/modules/local/map_taxid_assembly.nf b/modules/local/map_taxid_assembly.nf
+index b643e18b..71d0ed67 100644
+--- a/modules/local/map_taxid_assembly.nf
++++ b/modules/local/map_taxid_assembly.nf
+@@ -2,6 +2,15 @@ process MAP_TAXID_ASSEMBLY {
+     label 'process_medium'
+     tag "$meta.id"
+ 
++    // The NCBI backup lookup hits E-utilities, which rate limits per IP
++    // (3 req/s without an API key, 10 with). Serialise the tasks so parallel
++    // samples don't collectively blow past the limit and get HTTP 429s.
++    maxForks (params.ncbi_api_key ? 3 : 1)
++
++    // Rate limiting is transient - give the task a couple of chances.
++    errorStrategy { task.attempt <= 2 ? 'retry' : 'finish' }
++    maxRetries 2
++
+     conda (params.enable_conda ? "bioconda::pysam" : null)
+     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+         'library://bmerritt1762/jhuaplbio/reportlab-pdf:4.0.7' :
+@@ -20,14 +29,16 @@ process MAP_TAXID_ASSEMBLY {
+ 
+     script:
+     def email          = params.email ? " -e ${params.email}" : ""
++    def api_key        = params.ncbi_api_key ? " --api-key ${params.ncbi_api_key}" : ""
+     def custom_map_arg = custom_map.name != "NO_FILE" ? " --custom-map ${custom_map}" : ""
+ 
+     """
+ 
+    append_taxid.py \\
++        --ncbi-batch-size ${params.ncbi_batch_size} \\
+         -i $gcfmapping \\
+         -r $assembly \\
+-        --ncbi-backup${email}${custom_map_arg} \\
++        --ncbi-backup${email}${api_key}${custom_map_arg} \\
+         -o ${meta.id}.merged.taxid.tsv
+ 
+ 
+diff --git a/nextflow.config b/nextflow.config
+index d7170717..1f8c21d1 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -52,12 +52,25 @@ params {
+     // ── Pre-aligned input ────────────────────────────────────────────────────
+     // Single BAM/CRAM/SAM shortcut (the samplesheet equivalent is a `bam` column).
+     // Pre-aligned samples skip QC, trimming, host removal, classification and
+-    // reference downloading; --reference_fasta (the reference the BAM was aligned
+-    // against) is REQUIRED so match_paths.py can build the accession->taxid map
+-    // and the ANI comparison.
++    // reference downloading.  Supply --reference_fasta (the reference the BAM was
++    // aligned against) so match_paths.py can build the accession->taxid map and the
++    // ANI comparison; without it the sequence is recovered from the alignment via
++    // BAM_CONSENSUS (see bam_consensus below).
+     bam = null
+     bam_minmapq = null       // optional MAPQ filter applied to pre-aligned input (default: take the BAM as given)
+     cram_reference = null    // reference FASTA used to decode CRAM input, if different from --reference_fasta
++    // Reference-sequence recovery for pre-aligned input.  A BAM header holds
++    // reference names and lengths but no bases, so with no --reference_fasta the
++    // sequence is called off the alignment (samtools consensus) to feed sourmash
++    // sketching, the shared-window conflict report and the ANI matrix.
++    //   null  = auto: on when a BAM sample has no --reference_fasta / --get_pathogens
++    //   true  = always derive consensus (even alongside a supplied reference)
++    //   false = never; run without the minhash/conflict component instead
++    bam_consensus        = null
++    consensus_min_depth  = 1      // samtools consensus -d: min read depth to call a base
++    consensus_min_bases  = 500    // drop consensus records with fewer non-N bases than this
++    consensus_min_mapq   = null   // samtools consensus --min-MQ
++    consensus_mode       = 'simple'  // samtools consensus -m: simple or bayesian
+     platform = null
+     trim = false
+     sample = null
+@@ -250,6 +263,11 @@ params {
+     publish_dir_mode = 'copy'
+     email = null
+     email_on_fail = null
++    // NCBI E-utilities backup taxid lookup (MAP_TAXID_ASSEMBLY). An API key
++    // raises the per-IP limit from 3 to 10 requests/second and lets more tasks
++    // run in parallel. Lower ncbi_batch_size if NCBI still returns HTTP 429.
++    ncbi_api_key = null
++    ncbi_batch_size = 100
+     plaintext_email = false
+     monochrome_logs = false
+     help = false
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 7a885140..84cec869 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -73,7 +73,7 @@
+                     "format": "file-path",
+                     "pattern": "^\\S+\\.(bam|cram|sam)$",
+                     "errorMessage": "File must be a pre-aligned .bam, .cram or .sam file.",
+-                    "description": "Path to a pre-aligned BAM/CRAM/SAM file. Skips QC, trimming, host removal, classification and reference downloading. Requires --reference_fasta (the reference the file was aligned against). The samplesheet equivalent is a 'bam' column.",
++                    "description": "Path to a pre-aligned BAM/CRAM/SAM file. Skips QC, trimming, host removal, classification and reference downloading. Supply --reference_fasta (the reference the file was aligned against); without it the reference sequence is recovered from the alignment via samtools consensus (see --bam_consensus). The samplesheet equivalent is a 'bam' column.",
+                     "fa_icon": "fas fa-align-left"
+                 },
+                 "cram_reference": {
+@@ -87,6 +87,35 @@
+                     "description": "Optional MAPQ filter applied to pre-aligned (--bam / bam column) input. By default the alignment is taken as given.",
+                     "fa_icon": "fas fa-filter"
+                 },
++                "bam_consensus": {
++                    "type": "boolean",
++                    "description": "Recover reference sequence from a pre-aligned BAM with samtools consensus when no --reference_fasta is given, so sourmash sketching, the shared-window conflict report and the ANI matrix have bases to work with. Auto-enabled for BAM input without a reference; set false to run without the minhash/conflict component instead. Consensus covers only positions with aligned reads and is inflated by multi-mapping reads, so a real reference is always preferable.",
++                    "fa_icon": "fas fa-dna"
++                },
++                "consensus_min_depth": {
++                    "type": "number",
++                    "default": 1,
++                    "description": "Minimum read depth for samtools consensus to call a base (-d) when deriving reference sequence from a BAM.",
++                    "fa_icon": "fas fa-layer-group"
++                },
++                "consensus_min_bases": {
++                    "type": "number",
++                    "default": 500,
++                    "description": "Drop consensus records with fewer than this many non-N bases; prevents barely-covered references from adding empty sketches that drag every ANI comparison toward zero.",
++                    "fa_icon": "fas fa-ruler-horizontal"
++                },
++                "consensus_min_mapq": {
++                    "type": "number",
++                    "description": "Exclude reads below this mapping quality when calling consensus from a BAM (samtools consensus --min-MQ).",
++                    "fa_icon": "fas fa-filter"
++                },
++                "consensus_mode": {
++                    "type": "string",
++                    "default": "simple",
++                    "enum": ["simple", "bayesian"],
++                    "description": "samtools consensus calling mode (-m) used for BAM-derived reference sequence.",
++                    "fa_icon": "fas fa-sliders-h"
++                },
+                 "sample": {
+                     "type": "string",
+                     "description": "Sample name.  If left blank it retrieves the basename of the fastq_1 file",
+@@ -844,6 +873,19 @@
+                     "description": "only email if set to true",
+                     "fa_icon": "fas fa-envelope"
+                 },
++                "ncbi_api_key": {
++                    "type": "string",
++                    "description": "NCBI API key for the E-utilities taxid backup lookup.",
++                    "fa_icon": "fas fa-key",
++                    "help_text": "Raises the NCBI rate limit from 3 to 10 requests/second per IP and lets MAP_TAXID_ASSEMBLY run more tasks in parallel. Get one from https://www.ncbi.nlm.nih.gov/account/settings/."
++                },
++                "ncbi_batch_size": {
++                    "type": "integer",
++                    "default": 100,
++                    "description": "Accessions resolved per NCBI E-utilities request pair.",
++                    "fa_icon": "fas fa-layer-group",
++                    "help_text": "MAP_TAXID_ASSEMBLY resolves unmapped accessions in batches instead of one request pair per accession. Lower this if NCBI still returns HTTP 429 Too Many Requests."
++                },
+                 "plaintext_email": {
+                     "type": "boolean",
+                     "description": "Send email in plaintext",
+diff --git a/subworkflows/local/bam_input.nf b/subworkflows/local/bam_input.nf
+index 5cf5af68..5d0ace46 100644
+--- a/subworkflows/local/bam_input.nf
++++ b/subworkflows/local/bam_input.nf
+@@ -1,11 +1,12 @@
+ //
+-// Pre-aligned (BAM/CRAM/SAM) input path.
++// Stage 2 of the pre-aligned (BAM/CRAM/SAM) input path.
+ //
+ // Samples that arrive as alignments skip everything upstream of ALIGNMENT — no
+ // compression, trimming, QC plots, host removal, classifier or reference
+-// download.  This subworkflow simply normalises the alignment file and produces
+-// the exact channel shapes ALIGNMENT emits, so REPORT can consume both kinds of
+-// sample without knowing which is which.
++// download.  BAM_PREP has already normalised and indexed the alignment (and, if
++// no reference FASTA was given, recovered consensus sequence from it); this
++// subworkflow derives the coverage products in the exact channel shapes
++// ALIGNMENT emits, so REPORT consumes both kinds of sample identically.
+ //
+ // ##############################################################################################
+ // # Copyright 2022 The Johns Hopkins University Applied Physics Laboratory LLC
+@@ -24,33 +25,18 @@
+ // # OR OTHER DEALINGS IN THE SOFTWARE.
+ // #
+ 
+-include { PREPARE_BAM } from '../../modules/local/prepare_bam'
+ include { SAMTOOLS_COVERAGE as SAMTOOLS_COVERAGE_BAM } from '../../modules/nf-core/samtools/coverage/main'
+ include { SAMTOOLS_HIST_COVERAGE as SAMTOOLS_HIST_COVERAGE_BAM } from '../../modules/local/samtools_hist_coverage.nf'
+ include { BEDTOOLS_GENOMECOVERAGE as BEDTOOLS_GENOMECOVERAGE_BAM } from '../../modules/local/bedtools_genomcov'
+ 
+ workflow BAM_INPUT {
+     take:
+-    ch_alignments      // [ meta, bamfile ]
++    ch_bams            // [ meta, bam, csi ] prepared alignments (from BAM_PREP)
+     ch_mapping         // [ meta, merged accession->taxid map ] (from REFERENCE_PREP)
+-    ch_cram_reference  // path: reference FASTA used for CRAM decoding, or NO_FILE
+ 
+     main:
+     ch_versions = Channel.empty()
+ 
+-    PREPARE_BAM(
+-        ch_alignments,
+-        ch_cram_reference
+-    )
+-    ch_versions = ch_versions.mix(PREPARE_BAM.out.versions)
+-
+-    // [meta, bam, csi] — same shape as ALIGNMENT.out.bams.
+-    // NOTE: meta is deliberately left untouched here.  It is the join key for
+-    // every downstream channel (mapping, fastas, kraken placeholder …), so the
+-    // primary-read count is folded into meta.read_count only once all of those
+-    // meta-keyed joins are done — see `counts` below and its use in taxtriage.nf.
+-    ch_bams = PREPARE_BAM.out.bam
+-
+     SAMTOOLS_COVERAGE_BAM(
+         ch_bams
+     )
+@@ -81,9 +67,7 @@ workflow BAM_INPUT {
+     }
+ 
+     emit:
+-        bams      = ch_bams                 // [meta, bam, csi]
+         stats     = ch_stats                // [meta, coverage.txt]
+         bedgraphs = ch_bedgraphs            // [meta, bedgraph | NO_FILE_bedgraph]
+-        counts    = PREPARE_BAM.out.count   // [meta, readcount.txt] -> meta.read_count downstream
+         versions  = ch_versions
+ }
+diff --git a/subworkflows/local/bam_prep.nf b/subworkflows/local/bam_prep.nf
+new file mode 100644
+index 00000000..70fe0245
+--- /dev/null
++++ b/subworkflows/local/bam_prep.nf
+@@ -0,0 +1,71 @@
++//
++// Stage 1 of the pre-aligned (BAM/CRAM/SAM) input path.
++//
++// Runs BEFORE REFERENCE_PREP because its consensus output feeds into it: when no
++// --reference_fasta is supplied, the reference sequence is reconstructed from the
++// alignment itself and then fuzzy-matched to the assembly summary exactly like a
++// user-supplied FASTA would be.  Coverage products are computed afterwards in
++// BAM_INPUT, which needs the map REFERENCE_PREP produces — hence the split.
++//
++// ##############################################################################################
++// # Copyright 2022 The Johns Hopkins University Applied Physics Laboratory LLC
++// # All rights reserved.
++// # Permission is hereby granted, free of charge, to any person obtaining a copy of this
++// # software and associated documentation files (the "Software"), to deal in the Software
++// # without restriction, including without limitation the rights to use, copy, modify,
++// # merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
++// # permit persons to whom the Software is furnished to do so.
++// #
++// # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
++// # INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
++// # PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// # LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
++// # TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
++// # OR OTHER DEALINGS IN THE SOFTWARE.
++// #
++
++include { PREPARE_BAM } from '../../modules/local/prepare_bam'
++include { BAM_CONSENSUS } from '../../modules/local/bam_consensus'
++
++workflow BAM_PREP {
++    take:
++    ch_alignments      // [ meta, alignment file ]
++    ch_cram_reference  // path: reference FASTA used for CRAM decoding, or NO_FILE
++    val_consensus      // boolean: reconstruct reference sequence from the BAM
++
++    main:
++    ch_versions = Channel.empty()
++
++    PREPARE_BAM(
++        ch_alignments,
++        ch_cram_reference
++    )
++    ch_versions = ch_versions.mix(PREPARE_BAM.out.versions)
++
++    // [meta, bam, csi] — same shape as ALIGNMENT.out.bams.
++    // NOTE: meta is deliberately left untouched here.  It is the join key for
++    // every downstream channel (mapping, fastas, kraken placeholder …), so the
++    // primary-read count is folded into meta.read_count only once all of those
++    // meta-keyed joins are done — see `counts` and its use in taxtriage.nf.
++    ch_bams = PREPARE_BAM.out.bam
++
++    // ── Reference sequence recovery ────────────────────────────────────────
++    // Only when the user gave us no reference to compare against.  match_paths.py
++    // can read reference LENGTHS from the BAM header on its own, but sourmash
++    // sketching, the shared-window conflict report and the ANI matrix all need
++    // bases, so we call them off the alignment.  Empty results (no reference
++    // recovered enough sequence) are dropped rather than passed on as an empty
++    // FASTA that every sketch step would silently skip.
++    ch_consensus = Channel.empty()
++    if (val_consensus) {
++        BAM_CONSENSUS(ch_bams)
++        ch_versions = ch_versions.mix(BAM_CONSENSUS.out.versions)
++        ch_consensus = BAM_CONSENSUS.out.fasta.filter { meta, fasta -> fasta.size() > 0 }
++    }
++
++    emit:
++        bams      = ch_bams                  // [meta, bam, csi]
++        counts    = PREPARE_BAM.out.count    // [meta, readcount.txt]
++        consensus = ch_consensus             // [meta, consensus.fasta] (empty unless recovering)
++        versions  = ch_versions
++}
+diff --git a/subworkflows/local/reference_prep.nf b/subworkflows/local/reference_prep.nf
+index d57e4be2..e9135889 100644
+--- a/subworkflows/local/reference_prep.nf
++++ b/subworkflows/local/reference_prep.nf
+@@ -2,6 +2,7 @@
+ include { MAKE_FILE } from '../../modules/local/make_file'
+ include { DOWNLOAD_ASSEMBLY } from '../../modules/local/download_assembly'
+ include { MAP_LOCAL_ASSEMBLY_TO_FASTA } from '../../modules/local/map_assembly_to_fasta'
++include { MAP_LOCAL_ASSEMBLY_TO_FASTA as MAP_SAMPLE_FASTA_TO_ASSEMBLY } from '../../modules/local/map_assembly_to_fasta'
+ include { MAP_TAXID_ASSEMBLY } from '../../modules/local/map_taxid_assembly'
+ include { FEATURES_DOWNLOAD } from '../../modules/local/download_features'
+ include { FEATURES_TO_BED } from '../../modules/local/convert_features_to_bed'
+@@ -17,6 +18,7 @@ workflow  REFERENCE_PREP {
+     ch_reference_fasta
+     ch_assembly_txt
+     ch_pathogens_file
++    ch_sample_fastas   // [meta, fasta] per-sample reference sequence (BAM consensus); may be empty
+ 
+     main:
+     ch_versions = Channel.empty()
+@@ -69,7 +71,10 @@ workflow  REFERENCE_PREP {
+                     return [ [id: basename],  fasta]
+                 },
+                 ch_assembly_txt,
+-                ch_pathogens_file
++                // .first() -> value channel, so the pathogens file is broadcast to
++                // EVERY fasta.  As a plain queue of one item it would be consumed by
++                // the first task, leaving the remaining reference FASTAs unmapped.
++                ch_pathogens_file.first()
+             )
+             // add ch_reference_fasta to all ch_fastas
+             // add ch_reference_fasta to all ch_fastas
+@@ -144,6 +149,43 @@ workflow  REFERENCE_PREP {
+                 [meta, fastas, listmaps, listids]
+             }.set{ ch_mapped_assemblies }
+         }
++
++        ////////////////////////////////////////////////////////////////////////////////////////
++        // PER-SAMPLE REFERENCE SEQUENCE (BAM consensus)
++        // Pre-aligned samples run without --reference_fasta recover their reference
++        // sequence from the alignment itself (BAM_CONSENSUS).  That FASTA is treated
++        // exactly like a user-supplied local reference: fuzzy-matched against the
++        // assembly summary to build the accession->taxid map match_paths.py needs for
++        // -m, and added to the sample's FASTA list so -f (sourmash / ANI) has bases.
++        // The difference is that it is PER SAMPLE, so it is joined by meta rather
++        // than broadcast to every sample.
++        ////////////////////////////////////////////////////////////////////////////////////////
++        MAP_SAMPLE_FASTA_TO_ASSEMBLY(
++            ch_sample_fastas,
++            ch_assembly_txt,
++            ch_pathogens_file.first()
++        )
++        ch_versions = ch_versions.mix(MAP_SAMPLE_FASTA_TO_ASSEMBLY.out.versions)
++
++        ch_fastas = ch_fastas
++            .join(ch_sample_fastas, remainder: true)
++            .filter { it[0] != null && it[1] != null }
++            .map { meta, fastas, sample_fasta ->
++                if (sample_fasta) { fastas.add(sample_fasta) }
++                [meta, fastas]
++            }
++
++        ch_mapped_assemblies = ch_mapped_assemblies
++            .join(ch_sample_fastas, remainder: true)
++            .join(MAP_SAMPLE_FASTA_TO_ASSEMBLY.out.map, remainder: true)
++            .join(MAP_SAMPLE_FASTA_TO_ASSEMBLY.out.accessions, remainder: true)
++            .filter { it[0] != null && it[1] != null }
++            .map { meta, fastas, listmaps, listids, sample_fasta, mapfile, accessions ->
++                if (sample_fasta) { fastas.add([sample_fasta]) }
++                if (mapfile)      { listmaps.add(mapfile) }
++                if (accessions)   { listids.add(accessions) }
++                [meta, fastas, listmaps, listids]
++            }
+     }
+     // get the size of the ch_reports_to_download
+     // if the size is greater than 0, then download the reports
+diff --git a/workflows/taxtriage.nf b/workflows/taxtriage.nf
+index f406f489..f8f960cf 100644
+--- a/workflows/taxtriage.nf
++++ b/workflows/taxtriage.nf
+@@ -37,6 +37,7 @@
+ //
+ include { INPUT_CHECK } from '../subworkflows/local/input_check'
+ include { ALIGNMENT } from '../subworkflows/local/alignment'
++include { BAM_PREP } from '../subworkflows/local/bam_prep'
+ include { BAM_INPUT } from '../subworkflows/local/bam_input'
+ include { REPORT } from '../subworkflows/local/report'
+ include { HOST_REMOVAL } from '../subworkflows/local/host_removal'
+@@ -197,13 +198,34 @@ workflow TAXTRIAGE {
+     def has_bam_samples = params.bam ? true : bam_scan.any
+     def bam_only_run    = params.bam ? true : bam_scan.all
+ 
++    // ── Reference sequence for pre-aligned samples ──────────────────────────────
++    // match_paths.py needs the reference(s) the BAM was aligned against: the FASTA
++    // for sourmash / shared-window / ANI comparison and the derived accession->taxid
++    // map for -m.  A BAM header carries reference NAMES and LENGTHS but no bases, so
++    // when no reference is supplied we reconstruct one by calling consensus off the
++    // alignment itself (BAM_CONSENSUS).  --bam_consensus false opts out and instead
++    // runs without the minhash / conflict component.
++    def bam_consensus_mode = false
+     if (has_bam_samples) {
+-        // match_paths.py needs the reference(s) the BAM was aligned against: the FASTA
+-        // for sourmash/ANI comparison and the derived accession->taxid map for -m.
++        def consensus_opt_out = (params.bam_consensus != null && !params.bam_consensus)
+         if (!params.reference_fasta && !params.get_pathogens) {
+-            exit 1, "ERROR: pre-aligned (BAM) input requires the reference the BAM was aligned " +
+-                    "against. Pass --reference_fasta <fasta|dir> (or --get_pathogens) so the " +
+-                    "accession->taxid map and ANI comparison can be built."
++            if (consensus_opt_out) {
++                println 'WARNING: pre-aligned input without --reference_fasta and --bam_consensus false: ' +
++                        'no reference sequence is available, so sourmash/ANI comparison and conflict-based ' +
++                        'read removal are disabled. Set --minhash_weight 0 to rebalance the TASS weights.'
++            } else {
++                bam_consensus_mode = true
++                println 'NOTE: pre-aligned input without --reference_fasta -> reconstructing reference ' +
++                        'sequence from the alignment (samtools consensus).'
++                println 'WARNING: consensus-derived references only cover positions with aligned reads, and ' +
++                        'multi-mapping reads contribute to every reference they were placed on, which ' +
++                        'overstates similarity between related organisms and makes conflict-driven read ' +
++                        'removal more aggressive. Pass --reference_fasta whenever the true reference is available.'
++            }
++        } else if (params.bam_consensus) {
++            bam_consensus_mode = true
++            println 'NOTE: --bam_consensus set explicitly; consensus sequence will be derived from the ' +
++                    'alignment in addition to the supplied reference.'
+         }
+     }
+ 
+@@ -252,7 +274,9 @@ workflow TAXTRIAGE {
+         exit 1, "If --skip_kraken2 is false, you must provide --db or --download_db"
+     }
+ 
+-    if (params.skip_kraken2 && !params.reference_fasta && !params.get_pathogens && !params.organisms && !params.organisms_file) {
++    // Pre-aligned samples are exempt: the references are already fixed by the BAM,
++    // and their sequence comes either from --reference_fasta or from BAM_CONSENSUS.
++    if (params.skip_kraken2 && !has_bam_samples && !params.reference_fasta && !params.get_pathogens && !params.organisms && !params.organisms_file) {
+         exit 1, "If you are skipping kraken2, you must provide a reference fasta, --get_pathogens to pull the pathogens file, organisms, or organisms_file"
+     }
+ 
+@@ -457,6 +481,9 @@ workflow TAXTRIAGE {
+     }
+     if (!ch_assembly_txt) {
+         GET_ASSEMBLIES()
++        // GET_ASSEMBLIES takes no input, so it runs once and its outputs are VALUE
++        // channels — already broadcast to every consumer (the per-fasta and
++        // per-sample mapping processes each get their own copy).
+         GET_ASSEMBLIES.out.assembly.map {  record -> record }.set { ch_assembly_txt }
+     }
+ 
+@@ -872,17 +899,34 @@ workflow TAXTRIAGE {
+     ch_organisms_to_download = CLASSIFIER.out.ch_organisms_to_download
+     ch_multiqc_files = ch_multiqc_files.mix(ch_krakenreport.collect { it[1] }.ifEmpty([]))
+ 
++    ////////////////////////////// PRE-ALIGNED (BAM) SAMPLES: PREP /////////////////////////////////
++    // Normalise the supplied alignment (convert / sort / index) and, when no
++    // reference FASTA was given, recover reference sequence from the alignment so
++    // the sketching + ANI steps have bases to work with.  Runs BEFORE
++    // REFERENCE_PREP because that consensus is mapped to taxids there.
++    ch_cram_reference = params.cram_reference
++        ? Channel.value(file(params.cram_reference, checkIfExists: true))
++        : Channel.value(ch_empty_file)
++
++    BAM_PREP(
++        ch_bam_inputs,
++        ch_cram_reference,
++        bam_consensus_mode
++    )
++    ch_versions = ch_versions.mix(BAM_PREP.out.versions)
++
+     ///////////////////////////RUN REFERENCE pull or processing/////////////////////////////////////////////////////////////////////
+-    // Pre-aligned samples enter with an EMPTY organism list: they still need the
+-    // local --reference_fasta mapped (accession -> taxid) for match_paths.py's -m
+-    // and ANI comparison, but nothing is ever downloaded on their behalf
+-    // (REFERENCE_PREP filters meta.is_bam out of DOWNLOAD_ASSEMBLY).
++    // Pre-aligned samples enter with an EMPTY organism list: they still need their
++    // reference mapped (accession -> taxid) for match_paths.py's -m and ANI
++    // comparison, but nothing is ever downloaded on their behalf (REFERENCE_PREP
++    // filters meta.is_bam out of DOWNLOAD_ASSEMBLY).  The per-sample FASTA channel
++    // carries the BAM consensus when --reference_fasta was not supplied.
+     REFERENCE_PREP(
+         ch_organisms_to_download.mix(ch_bam_inputs.map { meta, bam -> [meta, []] }),
+         ch_reference_fasta,
+         ch_assembly_txt,
+-        ch_pathogens
+-
++        ch_pathogens,
++        BAM_PREP.out.consensus
+     )
+     ////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+@@ -897,18 +941,12 @@ workflow TAXTRIAGE {
+     ch_assembly_analysis = Channel.empty()
+     ch_fastas = Channel.empty()
+ 
+-    ////////////////////////////// PRE-ALIGNED (BAM) SAMPLES ///////////////////////////////////////
+-    // Normalise the supplied alignment (sort/convert/index) and derive the same
+-    // coverage products ALIGNMENT emits, so REPORT consumes both paths identically.
+-    // No aligner, no assembly download, no QC.
+-    ch_cram_reference = params.cram_reference
+-        ? Channel.value(file(params.cram_reference, checkIfExists: true))
+-        : Channel.value(ch_empty_file)
+-
++    ////////////////////////////// PRE-ALIGNED (BAM) SAMPLES: COVERAGE /////////////////////////////
++    // Derive the same coverage products ALIGNMENT emits, so REPORT consumes both
++    // paths identically.  No aligner, no assembly download, no QC.
+     BAM_INPUT(
+-        ch_bam_inputs,
+-        ch_mapped_assemblies,
+-        ch_cram_reference
++        BAM_PREP.out.bams,
++        ch_mapped_assemblies
+     )
+     ch_versions = ch_versions.mix(BAM_INPUT.out.versions)
+ 
+@@ -1000,7 +1038,7 @@ workflow TAXTRIAGE {
+         ch_covfiles = ALIGNMENT.out.stats.mix(BAM_INPUT.out.stats)
+         ch_alignment_stats = ch_covfiles
+         ch_bedgraphs = ALIGNMENT.out.bedgraphs.mix(BAM_INPUT.out.bedgraphs)
+-        ch_report_bams = ALIGNMENT.out.bams.mix(BAM_INPUT.out.bams)
++        ch_report_bams = ALIGNMENT.out.bams.mix(BAM_PREP.out.bams)
+         ch_versions = ch_versions.mix(ALIGNMENT.out.versions)
+         ch_multiqc_files = ch_multiqc_files.mix(ch_alignment_stats.collect { it[1] }.ifEmpty([]))
+ 
+@@ -1167,7 +1205,7 @@ workflow TAXTRIAGE {
+             input_alignment_files = input_alignment_files
+                 .map { items -> [ items[0].id, items ] }
+                 .join(
+-                    BAM_INPUT.out.counts.map { meta, countfile -> [meta.id, countfile] },
++                    BAM_PREP.out.counts.map { meta, countfile -> [meta.id, countfile] },
+                     by: 0, remainder: true
+                 )
+                 .filter { it[1] }

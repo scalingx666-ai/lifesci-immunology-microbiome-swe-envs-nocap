@@ -1,0 +1,584 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index b1af18c6..ee98b0f1 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -103,6 +103,7 @@ When modifying functions that touch time or epi structure, verify behavior acros
+ 
+ - `changestats.users.c` - Custom ERGM terms (`fuzzynodematch`, `absdiffby`, `absdiffnodemix`)
+ - `updatenw.c` - `shiftVec()`, the C helper behind `delete_vertices()` that renumbers vertex IDs after deletions
++- `attr_kernels.c` - One-pass compaction and append of plain attribute vectors for `remove_node_attr()` and `append_attr()`; vectors with attributes or of other types fall back to R
+ - `init.c` - Native routine registration; keeps dynamic symbol lookup on so ergm can find the custom change statistics by name
+ 
+ ### Multi-Network Support
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 162ea643..32a21093 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -103,6 +103,7 @@ When modifying functions that touch time or epi structure, verify behavior acros
+ 
+ - `changestats.users.c` - Custom ERGM terms (`fuzzynodematch`, `absdiffby`, `absdiffnodemix`)
+ - `updatenw.c` - `shiftVec()`, the C helper behind `delete_vertices()` that renumbers vertex IDs after deletions
++- `attr_kernels.c` - One-pass compaction and append of plain attribute vectors for `remove_node_attr()` and `append_attr()`; vectors with attributes or of other types fall back to R
+ - `init.c` - Native routine registration; keeps dynamic symbol lookup on so ergm can find the custom change statistics by name
+ 
+ ### Multi-Network Support
+diff --git a/NEWS.md b/NEWS.md
+index 7139ee5c..fe3f98a1 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -6,6 +6,8 @@
+ -   Fix `dedup_cumulative_edgelist()`, which invented spells across gaps, left overlaps, and closed ongoing spells, so `get_forward_reachable()` and `get_backward_reachable()` could report false paths on its output (#1106).
+ -   `trim_netest()` no longer modifies the `netest` object passed to it when the model was fit with `nested.edapprox = FALSE` or `edapprox = FALSE` (#1107).
+ -   The guards for the argument names removed in 2.6.1 now match only the `.m2` suffix, so names such as `area.km2` are accepted, and built-in models of every class now reject `b.rate` and `trans.rate` rather than storing them silently (#1108).
++-   `remove_node_attr()` and `delete_attr()` called with an empty ID vector now leave `dat` unchanged instead of dropping every node from every attribute (#1142).
++-   `get_attr()`, `set_attr()`, and `remove_node_attr()` now stop with an error when `posit_ids` holds `NA` or values below 1 (#1143).
+ 
+ ### OTHER
+ 
+@@ -13,6 +15,7 @@
+ -   `netsim()` now stops with an error naming the module when a module returns `dat` with an R attribute set on it, which is what happens when magrittr is attached after EpiModel and masks `set_attr()` (#1120).
+ -   `dissolution_coefs()` now warns when a duration is at or above 90% of the departure ceiling, `1 / (2 * d.rate - d.rate^2)`, naming the duration, and its error at the ceiling gives the ceiling and points at the duration before `d.rate` (#1138).
+ -   EpiModel no longer imports or links to Rcpp. Its one compiled helper, `shiftVec()`, which `delete_vertices()` uses to renumber vertex IDs after departures, is now plain C registered through R's native routine interface (#1140).
++-   Faster bookkeeping on departures and arrivals in tergmLite simulations, with identical output: `remove_node_attr()` and `append_attr()` copy plain attribute vectors in C, `delete_vertices()` renumbers the edgelist in one pass without sorting, and `update_cumulative_edgelist()` matches the current edges to the open partnerships on a pair key instead of a join (#1141).
+ 
+ ## EpiModel 2.7.0
+ 
+diff --git a/R/edgelists.R b/R/edgelists.R
+index 7a296f2a..84af1e69 100644
+--- a/R/edgelists.R
++++ b/R/edgelists.R
+@@ -294,11 +294,43 @@ update_cumulative_edgelist <- function(dat, network, truncate = 0) {
+     el_cuml_hist <- el_cuml_hist[rel.age <= truncate, ]
+   }
+ 
+-  el <- tibble::tibble(
+-    head = get_unique_ids(dat, el[, 2]),
+-    tail = get_unique_ids(dat, el[, 1]),
+-    current = TRUE
+-  )
++  head <- get_unique_ids(dat, el[, 2])
++  tail <- get_unique_ids(dat, el[, 1])
++
++  # Match the current edges against the open partnerships on a numeric pair
++  # key (head * key_base + tail, exact below 2^53). For unique keys this is the
++  # full_join below: open partnerships still in `el` keep their row and order,
++  # the ones missing from `el` are terminated, and the new edges are appended
++  # in `el` order.
++  key_base <- max(c(head, tail, el_cuml_cur$head, el_cuml_cur$tail, 0)) + 1
++  if (key_base < 2^26 && !anyNA(head) && !anyNA(tail)) {
++    key_el <- head * key_base + tail
++    key_cur <- el_cuml_cur$head * key_base + el_cuml_cur$tail
++    if (!anyDuplicated(key_el) && !anyDuplicated(key_cur)) {
++      is_continuing <- match(key_cur, key_el, 0L) > 0L
++      is_new <- !(key_el %in% key_cur)
++      n_new <- sum(is_new)
++      el_cuml_new <- tibble::new_tibble(
++        list(
++          head = c(el_cuml_cur$head[is_continuing], head[is_new]),
++          tail = c(el_cuml_cur$tail[is_continuing], tail[is_new]),
++          start = c(el_cuml_cur$start[is_continuing], rep(at, n_new)),
++          stop = c(el_cuml_cur$stop[is_continuing], rep(NA, n_new))
++        ),
++        nrow = sum(is_continuing) + n_new
++      )
++      if (!all(is_continuing) && truncate != 0) {
++        el_cuml_term <- el_cuml_cur[!is_continuing, ]
++        el_cuml_term$stop <- at - 1
++        el_cuml_hist <- dplyr::bind_rows(el_cuml_hist, el_cuml_term)
++      }
++      dat <- set_raw_elcuml(dat, network, el_cuml_new, active = TRUE)
++      dat <- set_raw_elcuml(dat, network, el_cuml_hist, active = FALSE)
++      return(dat)
++    }
++  }
++
++  el <- tibble::tibble(head = head, tail = tail, current = TRUE)
+ 
+   el_cuml_cur <- dplyr::full_join(el_cuml_cur, el, by = c("head", "tail"))
+ 
+diff --git a/R/net.fn.accessor.R b/R/net.fn.accessor.R
+index e3981edb..a2f19441 100644
+--- a/R/net.fn.accessor.R
++++ b/R/net.fn.accessor.R
+@@ -81,6 +81,24 @@
+ NULL
+ 
+ raw_get_attr_list <- function(dat) return(dat$run$attr)
++
++# An atomic integer, double, logical or character vector with no attributes:
++# what the C kernels in src/attr_kernels.c handle
++is_plain_vector <- function(x) {
++  is.null(attributes(x)) &&
++    (is.double(x) || is.integer(x) || is.logical(x) || is.character(x))
++}
++
++# TRUE for the pairs of plain vectors C_append_attr_c handles: the same type,
++# or integer or logical values appended to a double vector, or logical values
++# to an integer one. c() keeps the type of `old_vals` in each of these.
++can_append_in_c <- function(old_vals, new_vals) {
++  old_type <- typeof(old_vals)
++  new_type <- typeof(new_vals)
++  old_type == new_type ||
++    (old_type == "double" && new_type %in% c("integer", "logical")) ||
++    (old_type == "integer" && new_type == "logical")
++}
+ raw_set_attr_list <- function(dat, attr_list) {
+   dat$run$attr <- attr_list
+   return(dat)
+@@ -316,8 +334,15 @@ append_attr <- function(dat, item, value, n.new) {
+     n_active <- length(get_posit_ids(dat))
+     old_vals <- rep(NA, max(n_active - n.new, 0L))
+   }
+-  dat <- set_attr(dat, item, c(old_vals, new_vals),
+-                  override.length.check = TRUE)
++  # c(old_vals, new_vals) by memcpy for plain vectors in the type pairs where
++  # c() keeps the type of old_vals, and c() itself otherwise
++  if (is_plain_vector(old_vals) && is_plain_vector(new_vals) &&
++        can_append_in_c(old_vals, new_vals)) {
++    vals <- .Call(C_append_attr_c, old_vals, new_vals) # nolint: object_usage_linter.
++  } else {
++    vals <- c(old_vals, new_vals)
++  }
++  dat <- set_attr(dat, item, vals, override.length.check = TRUE)
+ 
+   return(dat)
+ }
+@@ -326,12 +351,20 @@ append_attr <- function(dat, item, value, n.new) {
+ #' @order 7
+ #' @export
+ remove_node_attr <- function(dat, posit_ids) {
+-  if (is.null(posit_ids)) {
++  if (length(posit_ids) == 0) {
++    # x[-integer(0)] is empty, which would drop every node (#1142)
+     return(dat)
+   }
++  # validated, sorted and unique here, so C_compact_attr_list does not check
++  # or sort the positions again
+   assert_valid_posit_ids(dat, posit_ids)
++  drop_pos <- sort(unique(as.integer(posit_ids)))
+   attr_list <- raw_get_attr_list(dat)
+-  attr_list <- lapply(attr_list, function(x) x[-posit_ids])
++  # one pass per plain vector in C; vectors with attributes or of another
++  # type are subset in R
++  is_plain <- vapply(attr_list, is_plain_vector, logical(1))
++  attr_list[is_plain] <- .Call(C_compact_attr_list, attr_list[is_plain], drop_pos) # nolint: object_usage_linter.
++  attr_list[!is_plain] <- lapply(attr_list[!is_plain], function(x) x[-drop_pos])
+   dat <- raw_set_attr_list(dat, attr_list)
+   return(dat)
+ }
+@@ -925,9 +958,13 @@ padded_vector <- function(orig, size) {
+ assert_valid_posit_ids <- function(dat, posit_ids) {
+   if (!is.numeric(posit_ids))
+     stop("`posit_ids` must be `numeric`")
++  if (anyNA(posit_ids))
++    stop("Some `posit_ids` are `NA`")
++  if (any(posit_ids < 1))
++    stop("Some `posit_ids` are lower than 1")
+   if (any(posit_ids > length(get_attr(dat, "active"))))
+     stop("Some `posit_ids` are larger than the number of nodes ",
+-         " in the network")
++         "in the network")
+   invisible(posit_ids)
+ }
+ 
+diff --git a/R/update.R b/R/update.R
+index d627ce7a..059f44cd 100644
+--- a/R/update.R
++++ b/R/update.R
+@@ -114,6 +114,27 @@ add_vertices <- function(el, nv) {
+ #'
+ delete_vertices <- function(el, vid) {
+ 
++  n_nodes <- attr(el, "n")
++  if (length(vid) > 0 && !is.null(n_nodes) && NROW(el) > 0 && is.numeric(vid) &&
++        !anyNA(vid) && all(vid >= 1 & vid <= n_nodes) && !anyDuplicated(vid)) {
++    # one pass: drop the edges of the deleted vertices, then map each remaining
++    # id to its id after the deletion
++    is_deleted <- logical(n_nodes)
++    is_deleted[vid] <- TRUE
++    rows_to_drop <- which(is_deleted[el[, 1]] | is_deleted[el[, 2]])
++    new.el <- el
++    if (length(rows_to_drop) > 0) {
++      new.el <- el[-rows_to_drop, , drop = FALSE]
++    }
++    if (NROW(new.el) > 0) {
++      new_id <- seq_len(n_nodes) - cumsum(is_deleted)
++      new.el[, 1] <- new_id[new.el[, 1]]
++      new.el[, 2] <- new_id[new.el[, 2]]
++    }
++    attr(new.el, "n") <- n_nodes - length(vid)
++    return(new.el)
++  }
++
+   vid <- sort(vid)
+ 
+   new.el <- delete_edges(el, vid)
+diff --git a/src/attr_kernels.c b/src/attr_kernels.c
+new file mode 100644
+index 00000000..bdd4e955
+--- /dev/null
++++ b/src/attr_kernels.c
+@@ -0,0 +1,142 @@
++#include <R.h>
++#include <Rinternals.h>
++#include <string.h>
++
++/* Kernels for the nodal attribute list of a netsim run, called from
++   remove_node_attr() and append_attr() in R/net.fn.accessor.R. Those callers
++   validate the inputs and pass only plain integer, double, logical or
++   character vectors without attributes (checking attributes needs ATTRIB(),
++   which is not part of R's API); everything else goes through `[` or c() in
++   R, so the result is always what base R would have produced. Any other type
++   reaching these functions is an error. */
++
++/* Copy the `n_elem` elements of `src`, each `elem_size` bytes, to `dst`,
++   skipping the 1-based positions drop_pos[0], ..., drop_pos[n_drop - 1],
++   which are increasing and at most `n_elem`. Each run of kept elements
++   between two dropped positions is one memcpy. */
++static void copy_skipping(char *dst, const char *src, R_xlen_t n_elem,
++                          size_t elem_size, const int *drop_pos,
++                          R_xlen_t n_drop) {
++  R_xlen_t run_start = 0; /* 0-based start of the current run of kept elements */
++  for (R_xlen_t k = 0; k < n_drop; k++) {
++    R_xlen_t run_end = drop_pos[k] - 1; /* 0-based dropped position */
++    R_xlen_t run_len = run_end - run_start;
++    if (run_len > 0) {
++      memcpy(dst, src + run_start * elem_size, run_len * elem_size);
++      dst += run_len * elem_size;
++    }
++    run_start = run_end + 1;
++  }
++  if (n_elem > run_start) {
++    memcpy(dst, src + run_start * elem_size, (n_elem - run_start) * elem_size);
++  }
++}
++
++/* Remove the positions `drop_pos` from every vector of the list `attr_list`.
++
++   attr_list: list of plain integer, double, logical or character vectors
++   drop_pos:  1-based positions to drop, an integer vector in increasing order
++              with no duplicates, NA or values below 1 (remove_node_attr()
++              validates the positions and passes sort(unique(.)))
++
++   Positions past the end of a vector are ignored, as they are by
++   `v[-drop_pos]`. Returns a list of the compacted vectors, with the names of
++   `attr_list`. */
++SEXP compact_attr_list(SEXP attr_list, SEXP drop_pos) {
++  if (TYPEOF(attr_list) != VECSXP || TYPEOF(drop_pos) != INTSXP) {
++    Rf_error("attr_list must be a list and drop_pos an integer vector");
++  }
++  const int *drop = INTEGER(drop_pos);
++  R_xlen_t n_drop = XLENGTH(drop_pos);
++  R_xlen_t n_attr = XLENGTH(attr_list);
++
++  SEXP out = PROTECT(Rf_allocVector(VECSXP, n_attr));
++  for (R_xlen_t a = 0; a < n_attr; a++) {
++    SEXP old_vec = VECTOR_ELT(attr_list, a);
++    int type = TYPEOF(old_vec);
++    if (type != INTSXP && type != REALSXP && type != LGLSXP && type != STRSXP) {
++      Rf_error("element %d of attr_list is not an integer, double, logical "
++               "or character vector", (int) (a + 1));
++    }
++    R_xlen_t old_len = XLENGTH(old_vec);
++
++    /* drop_pos is increasing, so the positions inside this vector come first */
++    R_xlen_t n_drop_in = n_drop;
++    while (n_drop_in > 0 && drop[n_drop_in - 1] > old_len) n_drop_in--;
++
++    SEXP new_vec = Rf_allocVector(type, old_len - n_drop_in);
++    SET_VECTOR_ELT(out, a, new_vec);
++
++    if (type == STRSXP) {
++      R_xlen_t next_pos = 0; /* next position of new_vec to fill */
++      R_xlen_t k = 0;        /* index in drop of the next position to skip */
++      for (R_xlen_t pos = 0; pos < old_len; pos++) {
++        if (k < n_drop_in && drop[k] == pos + 1) {
++          k++;
++          continue;
++        }
++        SET_STRING_ELT(new_vec, next_pos++, STRING_ELT(old_vec, pos));
++      }
++    } else if (type == REALSXP) {
++      copy_skipping((char *) REAL(new_vec), (const char *) REAL(old_vec),
++                    old_len, sizeof(double), drop, n_drop_in);
++    } else if (type == INTSXP) {
++      copy_skipping((char *) INTEGER(new_vec), (const char *) INTEGER(old_vec),
++                    old_len, sizeof(int), drop, n_drop_in);
++    } else {
++      copy_skipping((char *) LOGICAL(new_vec), (const char *) LOGICAL(old_vec),
++                    old_len, sizeof(int), drop, n_drop_in);
++    }
++  }
++  Rf_setAttrib(out, R_NamesSymbol, Rf_getAttrib(attr_list, R_NamesSymbol));
++  UNPROTECT(1);
++  return out;
++}
++
++/* c(old_vec, new_vals) for two plain vectors in the type pairs where c() keeps
++   the type of `old_vec`: the same type (integer, double, logical, character),
++   integer or logical into double, and logical into integer. append_attr()
++   checks the pair before calling; any other pair is an error. */
++SEXP append_attr_c(SEXP old_vec, SEXP new_vals) {
++  int old_type = TYPEOF(old_vec);
++  int new_type = TYPEOF(new_vals);
++  R_xlen_t old_len = XLENGTH(old_vec);
++  R_xlen_t new_len = XLENGTH(new_vals);
++  SEXP out;
++
++  if (old_type == STRSXP && new_type == STRSXP) {
++    out = PROTECT(Rf_allocVector(STRSXP, old_len + new_len));
++    for (R_xlen_t pos = 0; pos < old_len; pos++) {
++      SET_STRING_ELT(out, pos, STRING_ELT(old_vec, pos));
++    }
++    for (R_xlen_t pos = 0; pos < new_len; pos++) {
++      SET_STRING_ELT(out, old_len + pos, STRING_ELT(new_vals, pos));
++    }
++  } else if (old_type == REALSXP && new_type == REALSXP) {
++    out = PROTECT(Rf_allocVector(REALSXP, old_len + new_len));
++    memcpy(REAL(out), REAL(old_vec), old_len * sizeof(double));
++    memcpy(REAL(out) + old_len, REAL(new_vals), new_len * sizeof(double));
++  } else if (old_type == REALSXP && (new_type == INTSXP || new_type == LGLSXP)) {
++    out = PROTECT(Rf_allocVector(REALSXP, old_len + new_len));
++    double *out_ptr = REAL(out);
++    const int *new_ptr = (new_type == INTSXP) ? INTEGER(new_vals) : LOGICAL(new_vals);
++    memcpy(out_ptr, REAL(old_vec), old_len * sizeof(double));
++    for (R_xlen_t pos = 0; pos < new_len; pos++) {
++      out_ptr[old_len + pos] =
++        (new_ptr[pos] == NA_INTEGER) ? NA_REAL : (double) new_ptr[pos];
++    }
++  } else if ((old_type == INTSXP || old_type == LGLSXP) &&
++             (new_type == old_type || new_type == LGLSXP)) {
++    /* integer and logical vectors both store int */
++    out = PROTECT(Rf_allocVector(old_type, old_len + new_len));
++    int *out_ptr = (old_type == INTSXP) ? INTEGER(out) : LOGICAL(out);
++    const int *old_ptr = (old_type == INTSXP) ? INTEGER(old_vec) : LOGICAL(old_vec);
++    const int *new_ptr = (new_type == INTSXP) ? INTEGER(new_vals) : LOGICAL(new_vals);
++    memcpy(out_ptr, old_ptr, old_len * sizeof(int));
++    memcpy(out_ptr + old_len, new_ptr, new_len * sizeof(int));
++  } else {
++    Rf_error("c() does not keep the type of old_vec for this pair of types");
++  }
++  UNPROTECT(1);
++  return out;
++}
+diff --git a/src/init.c b/src/init.c
+index 3e22eb3a..e0439aae 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -3,9 +3,13 @@
+ #include <R_ext/Rdynload.h>
+ 
+ SEXP shiftVec(SEXP orig, SEXP del);
++SEXP compact_attr_list(SEXP attr_list, SEXP drop_pos);
++SEXP append_attr_c(SEXP old_vec, SEXP new_vals);
+ 
+ static const R_CallMethodDef CallEntries[] = {
+   {"shiftVec", (DL_FUNC) &shiftVec, 2},
++  {"compact_attr_list", (DL_FUNC) &compact_attr_list, 2},
++  {"append_attr_c", (DL_FUNC) &append_attr_c, 2},
+   {NULL, NULL, 0}
+ };
+ 
+diff --git a/tests/testthat/test-accessors.R b/tests/testthat/test-accessors.R
+index a0f1cd95..fe38364a 100644
+--- a/tests/testthat/test-accessors.R
++++ b/tests/testthat/test-accessors.R
+@@ -112,6 +112,9 @@ test_that("`dat` getters and setter", {
+ 
+   expect_error(dat <- set_attr(dat, "age", 1, posit_ids = TRUE))
+   expect_error(dat <- set_attr(dat, "age", 1, posit_ids = "a"))
++  expect_error(dat <- set_attr(dat, "age", 1, posit_ids = c(1, NA)), "`NA`")
++  expect_error(dat <- set_attr(dat, "age", 1, posit_ids = 0), "lower than 1")
++  expect_error(get_attr(dat, "age", -1), "lower than 1")
+ 
+ 
+   expect_error(get_attr_list(dat, "sex"))
+@@ -326,3 +329,66 @@ test_that("check_attr_lengths flags attributes of the wrong length", {
+   no.active$run$attr$active <- NULL
+   expect_error(check_attr_lengths(no.active), "`active` nodal attribute is missing")
+ })
++
++test_that("remove_node_attr compacts every attribute type like x[-ids] (#1141, #1142)", {
++  dat <- create_dat_object(control = list(nsteps = 10))
++  dat <- append_core_attr(dat, at = 1, n.new = 20)
++  dat <- set_attr(dat, "dbl", rnorm(20))
++  dat <- set_attr(dat, "int", sample.int(100, 20))
++  dat <- set_attr(dat, "lgl", sample(c(TRUE, FALSE, NA), 20, TRUE))
++  dat <- set_attr(dat, "chr", sample(c("a", "b", NA), 20, TRUE))
++  dat <- set_attr(dat, "fct", factor(sample(c("x", "y"), 20, TRUE)))
++  dat <- set_attr(dat, "named", setNames(runif(20), paste0("n", 1:20)))
++  dat <- set_attr(dat, "date", as.Date("2026-01-01") + 0:19)
++  dat <- set_attr(dat, "lst", as.list(1:20))
++
++  ref <- function(dat, ids) lapply(get_attr_list(dat), function(x) x[-ids])
++  for (ids in list(c(2, 5), c(5, 2, 5), 1, 20, c(1, 20), 1:20, c(3.7, 8.2))) {
++    expect_identical(get_attr_list(EpiModel:::remove_node_attr(dat, ids)), ref(dat, ids))
++  }
++  # an empty id vector leaves dat unchanged instead of dropping every node (#1142)
++  expect_identical(EpiModel:::remove_node_attr(dat, integer(0)), dat)
++  expect_identical(delete_attr(dat, NULL), dat)
++  expect_identical(delete_attr(dat, which(get_attr(dat, "active") == 0)), dat)
++  # positions past the end of a shorter vector are ignored, as by x[-ids]
++  short <- dat
++  short$run$attr$short <- 1:5
++  expect_identical(get_attr_list(EpiModel:::remove_node_attr(short, c(2, 8))), ref(short, c(2, 8)))
++  # zero, negative, NA and out of range positions are errors
++  expect_error(EpiModel:::remove_node_attr(dat, c(0, 3)), "lower than 1")
++  expect_error(EpiModel:::remove_node_attr(dat, -1), "lower than 1")
++  expect_error(EpiModel:::remove_node_attr(dat, c(NA, 3)), "`NA`")
++  expect_error(EpiModel:::remove_node_attr(dat, 21), "larger than")
++})
++
++test_that("append_attr concatenates like c() for every type pair (#1141)", {
++  dat <- create_dat_object(control = list(nsteps = 10))
++  dat <- append_core_attr(dat, at = 1, n.new = 5)
++  olds <- list(dbl = rnorm(5), int = 1:5, lgl = c(TRUE, FALSE, NA, TRUE, FALSE),
++               chr = letters[1:5], fct = factor(letters[1:5]),
++               named = setNames(1:5, letters[1:5]), date = as.Date("2026-01-01") + 0:4)
++  news <- list(dbl = c(1.5, NA, 3), int = c(7L, NA, 9L), lgl = c(NA, TRUE, FALSE),
++               chr = c("z", NA, "y"), fct = factor(c("a", "q", "a")),
++               named = c(x = 10L, y = 11L, z = 12L), date = as.Date("2027-01-01") + 0:2,
++               one = 4)
++  for (o in names(olds)) {
++    for (nw in names(news)) {
++      d <- set_attr(dat, "x", olds[[o]])
++      d <- append_core_attr(d, at = 2, n.new = 3)
++      val <- news[[nw]]
++      expected <- tryCatch(c(olds[[o]], if (length(val) == 1) rep(val, 3) else val),
++                           error = function(e) NULL)
++      if (is.null(expected)) {
++        # c() itself fails for this pair (a Date with a character), so must we
++        expect_error(append_attr(d, "x", val, 3))
++      } else {
++        d <- append_attr(d, "x", val, 3)
++        expect_identical(get_attr(d, "x"), expected, info = paste(o, "+", nw))
++      }
++    }
++  }
++  # an attribute that does not exist yet gets NA for the existing nodes
++  d <- append_core_attr(dat, at = 2, n.new = 3)
++  d <- append_attr(d, "new", 1:3, 3)
++  expect_identical(get_attr(d, "new"), c(rep(NA, 5), 1:3))
++})
+diff --git a/tests/testthat/test-cumulative_edgelist.R b/tests/testthat/test-cumulative_edgelist.R
+index 8949028c..6f2cbd9e 100644
+--- a/tests/testthat/test-cumulative_edgelist.R
++++ b/tests/testthat/test-cumulative_edgelist.R
+@@ -485,3 +485,72 @@ test_that("dedup_cumulative_edgelist merges overlapping spells only (#1106)", {
+   expect_s3_class(dedup_cumulative_edgelist(cel), "cumulative_edgelist")
+   expect_equal(nrow(dedup_cumulative_edgelist(cel[0, ])), 0)
+ })
++
++test_that("update_cumulative_edgelist match path equals the join (#1141)", {
++  update_cuml_ref <- function(dat, network, truncate) {
++    el <- get_edgelist(dat, network)
++    cur <- EpiModel:::get_raw_elcuml(dat, network, active = TRUE)
++    hist <- EpiModel:::get_raw_elcuml(dat, network, active = FALSE)
++    at <- get_current_timestep(dat)
++    if (truncate != Inf && truncate != 0) {
++      hist <- hist[at - hist$stop <= truncate, ]
++    }
++    el <- tibble::tibble(head = get_unique_ids(dat, el[, 2]),
++                         tail = get_unique_ids(dat, el[, 1]), current = TRUE)
++    cur <- dplyr::full_join(cur, el, by = c("head", "tail"))
++    new_ids <- which(is.na(cur$start))
++    if (length(new_ids) > 0) cur[new_ids, ]$start <- at
++    term <- which(is.na(cur$current))
++    cur$current <- NULL
++    if (length(term) > 0) {
++      tm <- cur[term, ]
++      if (truncate != 0) {
++        tm$stop <- at - 1
++        hist <- dplyr::bind_rows(hist, tm)
++      }
++      cur <- cur[-term, ]
++    }
++    list(cur = cur, hist = hist)
++  }
++
++  set.seed(10)
++  nw <- network_initialize(n = 200)
++  est <- netest(nw, ~edges, 100, dissolution_coefs(~offset(edges), 10, 0), verbose = FALSE)
++  param <- param.net(inf.prob = 0.3)
++  init <- init.net(i.num = 10)
++  control <- control.net(type = "SI", nsteps = 10, nsims = 1, tergmLite = TRUE,
++                         resimulate.network = TRUE, verbose = FALSE,
++                         cumulative.edgelist = TRUE, truncate.el.cuml = 5)
++  crosscheck.net(est, param, init, control)
++  dat <- initialize.net(est, param, init, control, s = 1)
++
++  for (step in 2:6) {
++    dat$run$current_timestep <- step
++    # turn over a quarter of the edges, keeping the edgelist sorted
++    el <- get_edgelist(dat, 1)
++    keep <- sort(sample.int(nrow(el), round(nrow(el) * 0.75)))
++    new <- cbind(sample.int(200, nrow(el) - length(keep)), sample.int(200, nrow(el) - length(keep)))
++    new <- cbind(pmin(new[, 1], new[, 2]), pmax(new[, 1], new[, 2]))
++    el2 <- unique(rbind(el[keep, ], new[new[, 1] != new[, 2], ]))
++    el2 <- el2[order(el2[, 1], el2[, 2]), ]
++    storage.mode(el2) <- "integer"
++    attr(el2, "n") <- attr(el, "n")
++    dat$run$el[[1]] <- el2
++
++    ref <- update_cuml_ref(dat, 1, truncate = 5)
++    dat <- update_cumulative_edgelist(dat, 1, truncate = 5)
++    expect_identical(EpiModel:::get_raw_elcuml(dat, 1, active = TRUE), ref$cur)
++    expect_identical(EpiModel:::get_raw_elcuml(dat, 1, active = FALSE), ref$hist)
++    expect_true(nrow(ref$hist) > 0)
++  }
++
++  # a duplicated edge falls back to the join and gives the same result
++  dat$run$current_timestep <- 7
++  el <- get_edgelist(dat, 1)
++  el2 <- rbind(el, el[1, ])
++  attr(el2, "n") <- attr(el, "n")
++  dat$run$el[[1]] <- el2
++  ref <- update_cuml_ref(dat, 1, truncate = 5)
++  dat <- update_cumulative_edgelist(dat, 1, truncate = 5)
++  expect_identical(EpiModel:::get_raw_elcuml(dat, 1, active = TRUE), ref$cur)
++})
+diff --git a/tests/testthat/test-utils.R b/tests/testthat/test-utils.R
+index aa1a57a2..7e303bab 100644
+--- a/tests/testthat/test-utils.R
++++ b/tests/testthat/test-utils.R
+@@ -370,3 +370,40 @@ test_that("shiftVec matches its R reference and handles edge cases", {
+   expect_identical(EpiModel:::shiftVec(c(3L, 5L), c(3L, 3L)), c(1L, 3L))
+   expect_error(EpiModel:::shiftVec("a", 1L), "orig and del must be numeric vectors")
+ })
++
++test_that("delete_vertices one-pass path matches the sort-based path (#1141)", {
++  delete_vertices_ref <- function(el, vid) {
++    vid <- sort(vid)
++    new.el <- delete_edges(el, vid)
++    if (length(vid) > 0 && NROW(new.el) > 0) {
++      o1 <- order(new.el[, 1])
++      new.el[, 1] <- EpiModel:::shiftVec(new.el[o1, 1], vid)[order(o1)]
++      o2 <- order(new.el[, 2])
++      new.el[, 2] <- EpiModel:::shiftVec(new.el[o2, 2], vid)[order(o2)]
++    }
++    if (!is.null(attr(el, "n"))) attr(new.el, "n") <- attr(el, "n") - length(vid)
++    new.el
++  }
++  set.seed(2)
++  for (k in 1:40) {
++    n <- sample(5:300, 1)
++    m <- sample(0:400, 1)
++    el <- cbind(sample.int(n, m, TRUE), sample.int(n, m, TRUE))
++    el <- el[el[, 1] != el[, 2], , drop = FALSE]
++    el <- unique(cbind(pmin(el[, 1], el[, 2]), pmax(el[, 1], el[, 2])))
++    el <- el[order(el[, 1], el[, 2]), , drop = FALSE]
++    storage.mode(el) <- if (k %% 2 == 0) "integer" else "double"
++    attr(el, "n") <- n
++    vid <- sample.int(n, sample(0:min(n, 30), 1))   # unsorted, may include isolates
++    expect_identical(delete_vertices(el, vid), delete_vertices_ref(el, vid))
++    expect_identical(delete_vertices(el, seq_len(n)), delete_vertices_ref(el, seq_len(n)))
++  }
++  # as.edgelist attributes survive, and an edgelist without n uses the sort path
++  nw <- network_initialize(10)
++  nw[1, 2] <- nw[3, 6] <- nw[2, 5] <- nw[8, 10] <- 1
++  el <- as.edgelist(nw)
++  expect_identical(delete_vertices(el, c(4, 7)), delete_vertices_ref(el, c(4, 7)))
++  expect_identical(delete_vertices(el, c(1, 10)), delete_vertices_ref(el, c(1, 10)))
++  el_plain <- matrix(c(1, 2, 3, 8, 2, 5, 6, 10), ncol = 2)
++  expect_identical(delete_vertices(el_plain, c(4, 7)), delete_vertices_ref(el_plain, c(4, 7)))
++})

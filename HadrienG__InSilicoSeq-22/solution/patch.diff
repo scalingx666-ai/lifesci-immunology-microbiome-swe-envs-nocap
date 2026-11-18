@@ -1,0 +1,385 @@
+diff --git a/iss/app.py b/iss/app.py
+index 6ab7310..6505f23 100644
+--- a/iss/app.py
++++ b/iss/app.py
+@@ -30,7 +30,7 @@ def generate_reads(args):
+         logger.info('Starting iss generate')
+         logger.info('Using %s ErrorModel' % args.model)
+         if args.model == 'kde':
+-            from iss.error_models import kde
++            from iss.error_models import kde, two_dim
+             if args.model_file == 'HiSeq2500':
+                 npz = os.path.join(
+                     os.path.dirname(__file__),
+@@ -41,7 +41,7 @@ def generate_reads(args):
+                     'profiles/MiSeq')
+             else:
+                 npz = args.model_file
+-            err_mod = kde.KDErrorModel(npz)
++            err_mod = two_dim.MultiKDErrorModel(npz)
+         elif args.model == 'basic':
+             from iss.error_models import basic
+             err_mod = basic.BasicErrorModel()
+diff --git a/iss/bam.py b/iss/bam.py
+index 4ad8939..d6fe979 100644
+--- a/iss/bam.py
++++ b/iss/bam.py
+@@ -39,14 +39,16 @@ def read_bam(bam_file):
+                     yield read
+ 
+ 
+-def write_to_file(model, read_length, hist_f, hist_r, sub_f, sub_r, ins_f,
+-                  ins_r, del_f, del_r, i_size, output):
++def write_to_file(model, read_length, mean_f, mean_r, hist_f, hist_r,
++                  sub_f, sub_r, ins_f, ins_r, del_f, del_r, i_size, output):
+     """Write variables to a .npz file
+ 
+     Args:
+         model (string): the type of error model
+         read_length (int): read length of the dataset
+         insert_size (int): mean insert size of the aligned reads
++        mean_count_forward (list): list of mean bin sizes
++        mean_count_reverse (list): list of mean bin sizes
+         quality_hist_forward (list): list of weights, indices if model is
+             cdf, list of cumulative distribution functions if model is kde
+         quality_hist_reverse (list): list of weights, indices if model is
+@@ -74,6 +76,8 @@ def write_to_file(model, read_length, hist_f, hist_r, sub_f, sub_r, ins_f,
+             model=model,
+             read_length=read_length,
+             insert_size=i_size,
++            mean_count_forward=mean_f,
++            mean_count_reverse=mean_r,
+             quality_hist_forward=hist_f,
+             quality_hist_reverse=hist_r,
+             subst_choices_forward=sub_f,
+@@ -120,9 +124,25 @@ def to_model(bam_path, output):
+ 
+         # get qualities
+         if read.is_read1:
+-            qualities_forward.append(read.query_qualities)
++            # get mean quality too
++            quality_means = []
++            read_quality = read.query_qualities
++            mean_quality = np.mean(read_quality)
++
++            quality_plus_mean = [
++                (quality, mean_quality) for quality in read_quality]
++            qualities_forward.append(np.asarray(quality_plus_mean))
++            # qualities_forward.append(read.query_qualities)
+         elif read.is_read2:
+-            qualities_reverse.append(read.query_qualities)
++            # get mean quality too
++            quality_means = []
++            read_quality = read.query_qualities
++            mean_quality = np.mean(read_quality)
++
++            quality_plus_mean = [
++                (quality, mean_quality) for quality in read_quality]
++            qualities_reverse.append(np.asarray(quality_plus_mean))
++            # qualities_reverse.append(read.query_qualities)
+ 
+         # get mismatches
+         alignment = read.get_aligned_pairs(
+@@ -148,10 +168,18 @@ def to_model(bam_path, output):
+     # insert_size = int(np.mean(insert_size_dist))
+     hist_insert_size = modeller.insert_size(insert_size_dist)
+ 
+-    logger.info('Calculating base quality distribution')
+-    hist_f = modeller.raw_qualities_to_histogram(qualities_forward)
+-    hist_r = modeller.raw_qualities_to_histogram(qualities_reverse)
+-    read_length = len(hist_f)
++    logger.info('Calculating mean and base quality distribution')
++    quality_bins_f = modeller.divide_qualities_into_bins(qualities_forward)
++    quality_bins_r = modeller.divide_qualities_into_bins(qualities_reverse)
++
++    # getting distribution of mean sequence quality
++    mean_f = [len(quality_bin) for quality_bin in quality_bins_f]
++    mean_r = [len(quality_bin) for quality_bin in quality_bins_r]
++
++    hists_f = modeller.quality_bins_to_histogram(quality_bins_f)
++    hists_r = modeller.quality_bins_to_histogram(quality_bins_r)
++    read_length = len(hists_f[-1])  # the first low quality bin might be empty
++
+     # now we can resize the substitution and indel matrices before
+     # doing operations on them
+     subst_matrix_f.resize([read_length, 16])
+@@ -177,8 +205,10 @@ def to_model(bam_path, output):
+     write_to_file(
+         'kde',
+         read_length,
+-        hist_f,
+-        hist_r,
++        mean_f,
++        mean_r,
++        hists_f,
++        hists_r,
+         subst_f,
+         subst_r,
+         ins_f,
+diff --git a/iss/error_models/__init__.py b/iss/error_models/__init__.py
+index 0fc2b21..e4bd9f5 100644
+--- a/iss/error_models/__init__.py
++++ b/iss/error_models/__init__.py
+@@ -60,10 +60,10 @@ def introduce_error_scores(self, record, orientation):
+         """
+         if orientation == 'forward':
+             record.letter_annotations["phred_quality"] = self.gen_phred_scores(
+-                self.quality_forward)
++                self.quality_forward, 'forward')
+         elif orientation == 'reverse':
+             record.letter_annotations["phred_quality"] = self.gen_phred_scores(
+-                self.quality_reverse)
++                self.quality_reverse, 'reverse')
+         return record
+ 
+     def mut_sequence(self, record, orientation):
+diff --git a/iss/error_models/basic.py b/iss/error_models/basic.py
+index e0891fa..56b9bc7 100644
+--- a/iss/error_models/basic.py
++++ b/iss/error_models/basic.py
+@@ -36,7 +36,7 @@ def __init__(self):
+             'A': 0.0, 'T': 0.0, 'C': 0.0, 'G': 0.0
+         } for _ in range(125)]
+ 
+-    def gen_phred_scores(self, mean_quality):
++    def gen_phred_scores(self, mean_quality, orientation):
+         """Generate a normal distribution, transform to phred scores
+ 
+         Generate a list of phred score according to a normal distribution
+diff --git a/iss/error_models/kde.py b/iss/error_models/kde.py
+index 41e57b4..6150fe7 100644
+--- a/iss/error_models/kde.py
++++ b/iss/error_models/kde.py
+@@ -17,6 +17,8 @@
+ class KDErrorModel(ErrorModel):
+     """KDErrorModel class.
+ 
++    Legacy 1D KDE error model
++
+     Error model based on an .npz files derived from read alignments.
+     the npz file must contain:
+ 
+@@ -46,7 +48,7 @@ def __init__(self, npz_path):
+         self.del_for = self.error_profile['del_forward']
+         self.del_rev = self.error_profile['del_reverse']
+ 
+-    def gen_phred_scores(self, cdfs):
++    def gen_phred_scores(self, cdfs, orientation):
+         """Generate a list of phred scores based on cdfs
+ 
+         For each position, draw a phred score from the cdf and append to the
+diff --git a/iss/error_models/two_dim.py b/iss/error_models/two_dim.py
+new file mode 100644
+index 0000000..50c1509
+--- /dev/null
++++ b/iss/error_models/two_dim.py
+@@ -0,0 +1,98 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++from builtins import super
++
++from iss import util
++from iss.error_models import ErrorModel
++from Bio.Seq import MutableSeq
++from Bio.SeqRecord import SeqRecord
++from scipy import stats
++
++import sys
++import random
++import numpy as np
++
++
++class MultiKDErrorModel(ErrorModel):
++    """KDErrorModel class.
++
++    Error model based on an .npz files derived from read alignments.
++    the npz file must contain:
++
++    - the length of the reads
++    - the mean insert size
++    - the size of mean sequence quality bins (for R1 and R2)
++    - a cumulative distribution function of quality scores for each position
++        (for R1 and R2)
++    - the substitution for each nucleotide at each position (for R1 and R2)
++    - the insertion and deletion rates for each position (for R1 and R2)
++    """
++    def __init__(self, npz_path):
++        super().__init__()
++        self.npz_path = npz_path
++        self.error_profile = self.load_npz(npz_path, 'kde')
++
++        self.read_length = self.error_profile['read_length']
++        self.i_size_cdf = self.error_profile['insert_size']
++
++        self.mean_forward = self.error_profile['mean_count_forward']
++        self.mean_reverse = self.error_profile['mean_count_reverse']
++
++        self.quality_forward = self.error_profile['quality_hist_forward']
++        self.quality_reverse = self.error_profile['quality_hist_reverse']
++
++        self.subst_choices_for = self.error_profile['subst_choices_forward']
++        self.subst_choices_rev = self.error_profile['subst_choices_reverse']
++
++        self.ins_for = self.error_profile['ins_forward']
++        self.ins_rev = self.error_profile['ins_reverse']
++        self.del_for = self.error_profile['del_forward']
++        self.del_rev = self.error_profile['del_reverse']
++
++    def gen_phred_scores(self, cdfs, orientation):
++        """Generate a list of phred scores based on cdfs and mean bins
++
++        For each position, draw a phred score from the cdf and append to the
++        phred score list
++
++        Args:
++            cdfs (ndarray): array containing the cdfs
++            orientation (string): orientation of the read. Can be 'forward' or
++                'reverse'
++
++        Returns:
++            list: a list of phred scores
++        """
++        # choose which mean bin to use
++        if orientation == 'forward':
++            mean = self.mean_forward
++        elif orientation == 'reverse':
++            mean = self.mean_reverse
++
++        norm_mean = mean / sum(mean)
++        quality_bin = np.searchsorted(norm_mean, np.random.rand())
++        # downgrades index out of bound (ex rand is 1, last bin in searchsorted
++        # is 0.95) to best quality bin
++        if quality_bin == 4:
++            quality_bin = 3
++
++        cdfs_bin = cdfs[quality_bin]
++
++        phred_list = []
++        for cdf in cdfs_bin:
++            random_quality = np.searchsorted(cdf, np.random.rand())
++            phred_list.append(random_quality)
++        return phred_list
++
++    def random_insert_size(self):
++        """Draw a random insert size from the insert size cdf
++
++        Args:
++            i_size_cdf: cumulative distribution function of the insert size
++
++        Returns:
++            int: an insert size
++        """
++        insert_size = np.searchsorted(self.i_size_cdf, np.random.rand())
++        return insert_size
+diff --git a/iss/modeller.py b/iss/modeller.py
+index 4f9588f..6fdf88d 100644
+--- a/iss/modeller.py
++++ b/iss/modeller.py
+@@ -33,6 +33,58 @@ def insert_size(insert_size_distribution):
+     return cdf
+ 
+ 
++def divide_qualities_into_bins(qualities, n_bins=4):
++    """Divides the raw quality scores in bins according to the mean phred
++    quality of the sequence they come from
++
++    Args:
++        qualities (list): raw count of all the phred scores and mean sequence
++            quality
++        n_bins (int): number of bins to create (default: 4)
++    """
++    bin_lists = [[] for _ in range(n_bins)]  # create list of `n_bins` list
++    ranges = np.split(np.array(range(40)), n_bins)
++    for quality in qualities:
++        mean = int(quality[0][1])  # mean is at 1 and same regardless of b pos
++        which_array = 0
++        for array in ranges:
++            if mean in array:
++                read = [q[0] for q in quality]
++                bin_lists[which_array].append(read)
++            which_array += 1
++    return bin_lists
++
++
++def quality_bins_to_histogram(bin_lists):
++    """Test function that calculates pseudo 2d cumulative density functions for
++    each position
++
++    Generate cumulative distribution functions for a number of mean quality
++    bins
++
++    EXPERIMENTAL
++
++    Args:
++        bins_lists (list): list of list containing raw count of all phred
++        scores
++
++    Returns:
++        list
++    """
++    logger = logging.getLogger(__name__)
++    cdf_bins = []
++    i = 0
++    for quality_bin in bin_lists:
++        if len(quality_bin) > 0:
++            cdfs_list = raw_qualities_to_histogram(quality_bin)
++            cdf_bins.append(cdfs_list)
++        else:
++            logger.debug('Mean quality bin #%s of length 0. Skipping' % i)
++            cdf_bins.append([])
++        i += 1
++    return cdf_bins
++
++
+ def raw_qualities_to_histogram(qualities):
+     """Calculate probabilities of each phred score at each position of the read
+ 
+@@ -49,11 +101,18 @@ def raw_qualities_to_histogram(qualities):
+         list: list of cumulative distribution functions. One cdf per base.
+             the list has the size of the read length
+     """
++    logger = logging.getLogger(__name__)
+ 
+     quals = [i for i in zip(*qualities)]
+     cdfs_list = []
+     for q in quals:
+-        kde = stats.gaussian_kde(q, bw_method=0.2 / np.std(q, ddof=1))
++        try:
++            kde = stats.gaussian_kde(q, bw_method=0.2 / np.std(q, ddof=1))
++        except np.linalg.linalg.LinAlgError as e:
++            logger.debug('np.std of %s is zero: %s' % (q, e))
++            q = list(q)
++            q[-1] += 1
++            kde = stats.gaussian_kde(q, bw_method=0.2 / np.std(q, ddof=1))
+         kde = kde.evaluate(range(41))
+         cdf = np.cumsum(kde)
+         cdf = cdf / cdf[-1]
+diff --git a/iss/profiles/HiSeq2500 b/iss/profiles/HiSeq2500
+index 32e9e95..467e850 100644
+Binary files a/iss/profiles/HiSeq2500 and b/iss/profiles/HiSeq2500 differ
+diff --git a/iss/profiles/MiSeq b/iss/profiles/MiSeq
+index 1254bbc..94e7a41 100644
+Binary files a/iss/profiles/MiSeq and b/iss/profiles/MiSeq differ
+diff --git a/iss/test/test_error_model.py b/iss/test/test_error_model.py
+index 0b39d4c..f2d80bc 100644
+--- a/iss/test/test_error_model.py
++++ b/iss/test/test_error_model.py
+@@ -14,14 +14,15 @@ def test_basic_phred():
+     np.random.seed(42)
+     err_mod = basic.BasicErrorModel()
+ 
+-    distribution = err_mod.gen_phred_scores(20)[:10]
++    distribution = err_mod.gen_phred_scores(20, 'forward')[:10]
+     assert distribution == [23, 19, 25, 40, 19, 19, 40, 26, 18, 23]
+ 
+ 
+ def test_kde_phred():
+     np.random.seed(42)
+     err_mod = kde.KDErrorModel('data/ecoli.npz')
+-    distribution = err_mod.gen_phred_scores(err_mod.quality_reverse)[:10]
++    distribution = err_mod.gen_phred_scores(err_mod.quality_reverse,
++                                            'forward')[:10]
+     assert distribution == [10, 20, 40, 40, 30, 30, 30, 40, 40, 40]
+ 
+ 

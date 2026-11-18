@@ -1,0 +1,492 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 89bdc21e4..a2c306c25 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [#1022](https://github.com/nf-core/ampliseq/issues/1022) - added new GloSED database for classification of Eukaryotic ITS. Not support for SH numbers as of yet. (by @tom-brekke)
+ - [#1021](https://github.com/nf-core/ampliseq/pull/1021),[#1023](https://github.com/nf-core/ampliseq/pull/1023),[#1025](https://github.com/nf-core/ampliseq/pull/1025) - Comparison of observed ASVs against expected sequences or their abundance is now available with `--expected_*` parameters (by @d4straub, reviewed by @erikrikarddaniel)
+ - [#1026](https://github.com/nf-core/ampliseq/pull/1026) - Add support for Oxford Nanopore Technology (ONT) R10.4 sequencing (preferably with SUP basecalling) with Savont (by @d4straub)
++- [#1042](https://github.com/nf-core/ampliseq/pull/1042) - DADA2 taxonomy tables (`ASV_tax.*.tsv`, `ASV_tax_species.*.tsv`) now include one `<rank>_confidence` column per rank, in addition to the existing overall `confidence` column (by @erikrikarddaniel)
++- [#1042](https://github.com/nf-core/ampliseq/pull/1042) - Added CI test coverage for `--addsh`, which previously had none (`test_pacbio_its` now also runs DADA2 taxonomy against the UNITE database it already uses for SINTAX) (by @erikrikarddaniel)
+ 
+ ### `Changed`
+ 
+@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ - [#1019](https://github.com/nf-core/ampliseq/pull/1019) - Improve channel assignment & improve some version reporting (by @d4straub)
+ - [#1027](https://github.com/nf-core/ampliseq/pull/1027) - SBDI's file `dna.tsv` recorded "paired" as lib_layout if `--single_end` was not specified alongside `--pacbio` or `--iontorrent`; now reports "single" in that cases (by @d4straub)
++- [#1042](https://github.com/nf-core/ampliseq/pull/1042) - DADA2's `confidence` column was incorrectly included as an extra, spurious rank when building the taxonomy string imported into QIIME2; no longer included (by @erikrikarddaniel)
+ - [#1038](https://github.com/nf-core/ampliseq/pull/1038) - Ensure that the ASV count matrix in exported R objects is consistently stored as integer regardless of the pipeline parameters (by @hindrek)
+ 
+ ### `Dependencies`
+diff --git a/bin/add_sh_to_taxonomy.py b/bin/add_sh_to_taxonomy.py
+index 77b7ec2c3..33dcc6000 100755
+--- a/bin/add_sh_to_taxonomy.py
++++ b/bin/add_sh_to_taxonomy.py
+@@ -37,14 +37,22 @@
+ shtax.loc[:, 9] = ""
+ 
+ # Read taxonomy table
+-# Determine number of taxonomy levels from header
+-# ASV_ID  Domain  Kingdom Phylum  Class   Order   Family  Genus   confidence      sequence
++# Determine taxonomy rank columns from header -- everything except ASV_ID, sequence,
++# the aggregate "confidence" column, and the per-rank "<rank>_confidence" columns,
++# none of which are taxonomy ranks
++# ASV_ID  Domain  Kingdom Phylum  Class   Order   Family  Genus   confidence  [rank_confidence columns]  sequence
+ taxtable = pd.read_csv(sys.argv[3], sep="\t", header=0)
+-num_ranks = len(taxtable.columns) - 3
+-# Add SH slot to table:
+-# ASV_ID  Domain  Kingdom Phylum  Class   Order   Family  Genus  SH confidence      sequence
+-taxtable.insert(num_ranks + 1, "SH", "", allow_duplicates=False)
+-tax_entries = list(taxtable.columns)[1 : num_ranks + 3]
++rank_cols = [
++    c
++    for c in taxtable.columns
++    if c not in ("ASV_ID", "sequence", "confidence") and not c.endswith("_confidence")
++]
++num_ranks = len(rank_cols)
++# Add SH slot to table, right after the last rank column:
++# ASV_ID  Domain  Kingdom Phylum  Class   Order   Family  Genus  SH confidence  [rank_confidence columns]  sequence
++sh_pos = taxtable.columns.get_loc(rank_cols[-1]) + 1
++taxtable.insert(sh_pos, "SH", "", allow_duplicates=False)
++tax_entries = rank_cols + ["SH", "confidence"]
+ 
+ # Go through vsearch matches and update taxonomy for those entries
+ fh = open(sys.argv[4], mode="r")
+diff --git a/bin/parse_dada2_taxonomy.r b/bin/parse_dada2_taxonomy.r
+index 7ebd1ec23..6eb09fc69 100755
+--- a/bin/parse_dada2_taxonomy.r
++++ b/bin/parse_dada2_taxonomy.r
+@@ -13,8 +13,11 @@ OUT="tax.tsv"
+ # read required files
+ tax = read.table(tax_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, comment.char = '', quote = '')
+ 
+-# Join columns 2:ncol(.) - 1, the taxonomy ranks (sequence is the last)
+-r <- colnames(tax)[!colnames(tax) %in% c('ASV_ID', 'sequence')]
++# Join the taxonomy rank columns only -- excludes ASV_ID, sequence, the aggregate
++# "confidence" column, and the per-rank "<rank>_confidence" columns, none of which
++# are taxonomic ranks and shouldn't end up in the QIIME2 taxonomy string
++non_rank_cols <- colnames(tax) %in% c('ASV_ID', 'sequence', 'confidence') | grepl('_confidence$', colnames(tax))
++r <- colnames(tax)[!non_rank_cols]
+ tax$taxonomy <- do.call(paste, c(tax[r], sep = ';'))
+ 
+ #write
+diff --git a/conf/test_pacbio_its.config b/conf/test_pacbio_its.config
+index b856129b3..63b57df1c 100644
+--- a/conf/test_pacbio_its.config
++++ b/conf/test_pacbio_its.config
+@@ -20,12 +20,13 @@ process {
+ 
+ params {
+     config_profile_name = 'Test profile PacBio ITS'
+-    config_profile_description = 'Minimal test dataset to check pipeline function with PacBio ITS sequences and options --cut_its (set to "full")'
++    config_profile_description = 'Minimal test dataset to check pipeline function with PacBio ITS sequences and options --cut_its (set to "full"), and DADA2 taxonomy incl. --addsh'
+ 
+     // Input data
+     primer_fwd = "CTTGGTCATTTAGAGGAAGTAA"
+     primer_rev = "TCCTGAGGGAAACTTCG"
+     sintax_ref_taxonomy = "unite-fungi=8.2"
++    dada_ref_taxonomy = "unite-fungi=8.2"
+     input = params.pipelines_testdata_base_path + "ampliseq/samplesheets/Samplesheet_pacbio_ITS_v3.tsv"
+     metadata = params.pipelines_testdata_base_path + "ampliseq/samplesheets/Metadata_pacbio_ITS.tsv"
+     sequencing_type = "pacbio"
+@@ -34,12 +35,18 @@ params {
+     cut_its = "full"
+     its_extractor = "itsxrust"
+ 
+-    // addsh = true
++    // Also runs DADA2 taxonomy (against the same UNITE database as --sintax_ref_taxonomy above)
++    // specifically to exercise --addsh, which requires a database with precomputed SH lookup
++    // files (UNITE only) and is otherwise not covered by any other test profile.
++    addsh = true
++    // dada2's addSpecies() fails here: a few ASVs in this dataset become identical once
++    // trimmed to just the ITS region, so R appends ".1" to the second occurrence to keep
++    // taxtable rownames unique, and that literal ".1" then gets rejected as a non-ACGT
++    // character. Unrelated to --addsh; addSpecies itself is already covered by the default
++    // test profile.
++    skip_dada_addspecies = true
+     skip_qiime = true
+     sbdiexport = true
+ 
+-    // Prevent default taxonomic classification
+-    skip_dada_taxonomy = true
+-
+     skip_phyloseq = true
+ }
+diff --git a/docs/output.md b/docs/output.md
+index 4fc9d1c15..dffdbd590 100644
+--- a/docs/output.md
++++ b/docs/output.md
+@@ -325,6 +325,8 @@ Taxonomic classification of ASVs can be performed with a choice of DADA2, SINTAX
+ 
+ DADA2 is the default method for taxonomy classification. Depending on the reference taxonomy database, sequences can be classified down to species rank. Species classification is reported in columns "Species" using DADA2's assignTaxonomy function or "Species_exact" using DADA2's addSpecies function, the latter only assigns exact sequence matches. Generally, species assignment without exact matches are much less trustworthy than those with exact matches. With short amplicons, e.g. 16S rRNA gene V4 region, the non-exact species annotation is not recommended to be trusted. The longer the ASVs are, the more acceptable is the non-exact species classification, e.g. PacBio (nearly) full length 16S rRNA gene sequences are thought to be trustworthy.
+ 
++In addition to the "confidence" column (the bootstrap support for the most specific rank assigned), each taxonomy table also has one `<rank>_confidence` column per rank (e.g. `phylum_confidence`), giving assignTaxonomy's bootstrap support at that specific rank.
++
+ Files when _not_ using ITSx (default):
+ 
+ <details markdown="1">
+diff --git a/modules/local/dada2_addspecies.nf b/modules/local/dada2_addspecies.nf
+index 0bb71693c..68f5abb97 100644
+--- a/modules/local/dada2_addspecies.nf
++++ b/modules/local/dada2_addspecies.nf
+@@ -33,9 +33,13 @@ process DADA2_ADDSPECIES {
+ 
+     #add "Species" if not already in taxlevels
+     taxlevels <- $taxlevels
++    # per-rank confidence columns, derived from the *original* assignTaxonomy taxlevels,
++    # before "Species" is force-appended below for the addSpecies output columns
++    rank_confidence_cols_all <- paste0(tolower(taxlevels), "_confidence")
+     if ( !"Species" %in% taxlevels ) { taxlevels <- c(taxlevels,"Species") }
+ 
+     taxtable <- readRDS(\"$taxtable\")
++    rank_confidence_cols <- intersect(rank_confidence_cols_all, colnames(taxtable))
+ 
+     #remove Species annotation from assignTaxonomy
+     taxa_nospecies <- taxtable[,!colnames(taxtable) %in% 'Species']
+@@ -44,7 +48,7 @@ process DADA2_ADDSPECIES {
+ 
+     # Create a table with specified column order
+     tmp <- data.frame(row.names(tx)) # To separate ASV_ID from sequence
+-    expected_order <- c("ASV_ID",taxlevels,"confidence")
++    expected_order <- c("ASV_ID",taxlevels,"confidence",rank_confidence_cols)
+     taxa <- as.data.frame( subset(tx, select = expected_order) )
+     taxa\$sequence <- tmp[,1]
+     row.names(taxa) <- row.names(tmp)
+diff --git a/modules/local/dada2_taxonomy.nf b/modules/local/dada2_taxonomy.nf
+index b6674439a..dd3ecde63 100644
+--- a/modules/local/dada2_taxonomy.nf
++++ b/modules/local/dada2_taxonomy.nf
+@@ -38,7 +38,8 @@ process DADA2_TAXONOMY {
+     # (1) Make a data frame, add ASV_ID from seq
+     tx <- data.frame(ASV_ID = names(seq), taxa, sequence = row.names(taxa\$tax), row.names = names(seq))
+ 
+-    # (2) Set confidence to the bootstrap for the most specific taxon
++    # (2) Set confidence to the bootstrap for the most specific taxon, and expose
++    # the per-rank bootstrap too (as a fractional confidence, one column per rank)
+     # extract columns with taxonomic values
+     tax <- tx[ , grepl( "tax." , names( tx ) ) ]
+     # find first occurrence of NA
+@@ -49,8 +50,11 @@ process DADA2_TAXONOMY {
+     res <- res-1
+     # if NA choose last entry
+     res[is.na(res)] <- ncol(tax)
+-    # extract bootstrap values
++    # extract bootstrap values (0-100) and expose them per rank as fractional confidence (0-1)
+     boot <- tx[ , grepl( "boot." , names( tx ) ) ]
++    rank_confidence <- boot / 100
++    colnames(rank_confidence) <- paste0(tolower(sub("boot.", "", colnames(boot))), "_confidence")
++    tx <- cbind(tx, rank_confidence)
+     boot\$last_tax <- res
+     valid_boot <- apply(boot,1,function(x) x[x[length(x)]][1]/100 )
+     # replace missing bootstrap values (NA) with 0
+@@ -59,7 +63,7 @@ process DADA2_TAXONOMY {
+     tx\$confidence <- valid_boot
+ 
+     # (3) Reorder columns before writing to file
+-    expected_order <- c("ASV_ID",paste0("tax.",taxlevels),"confidence","sequence")
++    expected_order <- c("ASV_ID",paste0("tax.",taxlevels),"confidence",colnames(rank_confidence),"sequence")
+     expected_order <- intersect(expected_order,colnames(tx))
+     taxa_export <- subset(tx, select = expected_order)
+     colnames(taxa_export) <- sub("tax.", "", colnames(taxa_export))
+@@ -68,7 +72,7 @@ process DADA2_TAXONOMY {
+     write.table(taxa_export, file = \"${fasta.baseName}${outfile}.tsv\", sep = "\\t", row.names = FALSE, col.names = TRUE, quote = FALSE, na = '')
+ 
+     # Save a version with rownames for addSpecies
+-    taxa_export <- cbind( ASV_ID = tx\$ASV_ID, taxa\$tax, confidence = tx\$confidence)
++    taxa_export <- cbind( ASV_ID = tx\$ASV_ID, taxa\$tax, confidence = tx\$confidence, rank_confidence)
+     saveRDS(taxa_export, "${fasta.baseName}${outfile}.rds")
+ 
+     write.table('assignTaxonomy\t$args\ntaxlevels\t$taxlevels\nseed\t$seed', file = "assignTaxonomy.args.txt", row.names = FALSE, col.names = FALSE, quote = FALSE, na = '')
+diff --git a/tests/default.nf.test.snap b/tests/default.nf.test.snap
+index a71bfc896..3687375d4 100644
+--- a/tests/default.nf.test.snap
++++ b/tests/default.nf.test.snap
+@@ -1167,8 +1167,6 @@
+                 "qiime2/barplot/level-7.jsonp",
+                 "qiime2/barplot/level-8.csv",
+                 "qiime2/barplot/level-8.jsonp",
+-                "qiime2/barplot/level-9.csv",
+-                "qiime2/barplot/level-9.jsonp",
+                 "qiime2/barplot/q2templateassets",
+                 "qiime2/barplot/q2templateassets/css",
+                 "qiime2/barplot/q2templateassets/css/base-template.css",
+@@ -1213,8 +1211,6 @@
+                 "qiime2/barplot_average/barplot_treatment1/level-7.jsonp",
+                 "qiime2/barplot_average/barplot_treatment1/level-8.csv",
+                 "qiime2/barplot_average/barplot_treatment1/level-8.jsonp",
+-                "qiime2/barplot_average/barplot_treatment1/level-9.csv",
+-                "qiime2/barplot_average/barplot_treatment1/level-9.jsonp",
+                 "qiime2/barplot_average/barplot_treatment1/q2templateassets",
+                 "qiime2/barplot_average/barplot_treatment1/q2templateassets/css",
+                 "qiime2/barplot_average/barplot_treatment1/q2templateassets/css/base-template.css",
+@@ -2308,10 +2304,10 @@
+             "lvl2-treatment1::b.volcano_plot.tsv:md5,d2d76d7f8824e748559295224c96d10e",
+             "ASV-treatment1::a.volcano_plot.tsv:md5,c999d1f72b221f6502b7b4a3d1112b32"
+         ],
+-        "timestamp": "2026-06-08T17:17:56.621828533",
++        "timestamp": "2026-08-04T20:21:51.346723842",
+         "meta": {
+             "nf-test": "0.9.5",
+-            "nextflow": "26.04.3"
++            "nextflow": "26.04.6"
+         }
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/failed.nf.test.snap b/tests/failed.nf.test.snap
+index 279346f16..655b3607c 100644
+--- a/tests/failed.nf.test.snap
++++ b/tests/failed.nf.test.snap
+@@ -322,8 +322,6 @@
+                 "qiime2/barplot/level-5.jsonp",
+                 "qiime2/barplot/level-6.csv",
+                 "qiime2/barplot/level-6.jsonp",
+-                "qiime2/barplot/level-7.csv",
+-                "qiime2/barplot/level-7.jsonp",
+                 "qiime2/barplot/q2templateassets",
+                 "qiime2/barplot/q2templateassets/css",
+                 "qiime2/barplot/q2templateassets/css/base-template.css",
+@@ -983,10 +981,10 @@
+             "multiqc_general_stats.txt:md5,0d19dc786ef0263939502acd5caa29de",
+             "multiqc_cutadapt.txt:md5,5660c331eff9d7ff9ac702804d3801f3"
+         ],
++        "timestamp": "2026-08-04T18:22:52.643673583",
+         "meta": {
+-            "nf-test": "0.9.3",
+-            "nextflow": "25.10.4"
+-        },
+-        "timestamp": "2026-04-21T12:04:36.209559248"
++            "nf-test": "0.9.5",
++            "nextflow": "26.04.6"
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/multi.nf.test.snap b/tests/multi.nf.test.snap
+index fe0398c42..9289024bf 100644
+--- a/tests/multi.nf.test.snap
++++ b/tests/multi.nf.test.snap
+@@ -242,8 +242,6 @@
+                 "qiime2/barplot/level-5.jsonp",
+                 "qiime2/barplot/level-6.csv",
+                 "qiime2/barplot/level-6.jsonp",
+-                "qiime2/barplot/level-7.csv",
+-                "qiime2/barplot/level-7.jsonp",
+                 "qiime2/barplot/q2templateassets",
+                 "qiime2/barplot/q2templateassets/css",
+                 "qiime2/barplot/q2templateassets/css/base-template.css",
+@@ -303,10 +301,10 @@
+             "descriptive_stats.tsv:md5,4616d22b044dc2b0f26c270565d2140d",
+             "seven_number_summary.tsv:md5,0d6f42cab31457c73e519f7bed4d46eb"
+         ],
++        "timestamp": "2026-08-04T17:36:35.6669463",
+         "meta": {
+-            "nf-test": "0.9.3",
+-            "nextflow": "25.10.4"
+-        },
+-        "timestamp": "2026-04-21T12:12:50.672816735"
++            "nf-test": "0.9.5",
++            "nextflow": "26.04.6"
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/pacbio_its.nf.test.snap b/tests/pacbio_its.nf.test.snap
+index cfd451904..2d3838c0a 100644
+--- a/tests/pacbio_its.nf.test.snap
++++ b/tests/pacbio_its.nf.test.snap
+@@ -2,6 +2,10 @@
+     "-profile test_pacbio_its": {
+         "content": [
+             {
++                "ASSIGNSH": {
++                    "python": "3.9.1",
++                    "pandas": "1.1.5"
++                },
+                 "BARRNAP": {
+                     "barrnap": 0.9
+                 },
+@@ -48,6 +52,10 @@
+                     "R": "4.5.2",
+                     "dada2": "1.38.0"
+                 },
++                "DADA2_TAXONOMY": {
++                    "R": "4.5.2",
++                    "dada2": "1.38.0"
++                },
+                 "FASTQC": {
+                     "fastqc": "0.12.1"
+                 },
+@@ -55,6 +63,10 @@
+                     "R": "4.0.3",
+                     "Biostrings": "2.58.0"
+                 },
++                "FORMAT_TAXONOMY": {
++                    "bash": "5.0.16(1)-release",
++                    "sed": 4.7
++                },
+                 "FORMAT_TAXONOMY_SINTAX": {
+                     "bash": "5.0.16(1)-release",
+                     "sed": 4.7
+@@ -62,6 +74,10 @@
+                 "FORMAT_TAXRESULTS_SINTAX": {
+                     "python": "3.9.1"
+                 },
++                "FORMAT_TAXRESULTS_STD": {
++                    "python": "3.9.1",
++                    "pandas": "1.1.5"
++                },
+                 "ITSXRUST_CUTASV": {
+                     "ITSxRust": "0.2.2"
+                 },
+@@ -84,6 +100,9 @@
+                 "VSEARCH_SINTAX": {
+                     "vsearch": "2.31.0"
+                 },
++                "VSEARCH_USEARCHGLOBAL": {
++                    "vsearch": "2.31.0"
++                },
+                 "Workflow": {
+                     "nf-core/ampliseq": "v2.19.0dev"
+                 }
+@@ -95,6 +114,9 @@
+                 "SBDI/dna.tsv",
+                 "SBDI/emof.tsv",
+                 "SBDI/event.tsv",
++                "assignsh",
++                "assignsh/ASV_ITS_tax.vsearch.txt",
++                "assignsh/ASV_tax_SH.unite-fungi_8_2.tsv",
+                 "barrnap",
+                 "barrnap/rrna.arc.gff",
+                 "barrnap/rrna.bac.gff",
+@@ -107,8 +129,10 @@
+                 "cutadapt/pb2.trimmed.cutadapt.log",
+                 "cutadapt/pb3.trimmed.cutadapt.log",
+                 "dada2",
++                "dada2/ASV_ITS_tax.unite-fungi_8_2.tsv",
+                 "dada2/ASV_seqs.fasta",
+                 "dada2/ASV_table.tsv",
++                "dada2/ASV_tax.unite-fungi_8_2.tsv",
+                 "dada2/DADA2_stats.tsv",
+                 "dada2/DADA2_table.rds",
+                 "dada2/DADA2_table.tsv",
+@@ -123,15 +147,19 @@
+                 "dada2/QC/svg/single_end_preprocessed_qual_stats.svg",
+                 "dada2/QC/svg/single_end_qual_stats.svg",
+                 "dada2/args",
++                "dada2/args/assignTaxonomy.args.txt",
+                 "dada2/args/dada.args.txt",
+                 "dada2/args/filterAndTrim.args.txt",
+                 "dada2/args/learnErrors.args.txt",
+                 "dada2/args/removeBimeraDenovo.args.txt",
+                 "dada2/args/single_end_plotQualityProfile.args.txt",
+                 "dada2/args/single_end_preprocessed_plotQualityProfile.args.txt",
++                "dada2/chunks",
++                "dada2/chunks/ASV_seqs.len.1.ASV_ITS_tax.unite-fungi_8_2.tsv",
+                 "dada2/log",
+                 "dada2/log/1.dada.log",
+                 "dada2/log/1.err.log",
++                "dada2/ref_taxonomy.unite-fungi_8_2.txt",
+                 "fastqc",
+                 "fastqc/pb1_fastqc.html",
+                 "fastqc/pb2_fastqc.html",
+@@ -248,6 +276,7 @@
+                 "sintax/ASV_tax_sintax.unite-fungi_8_2.tsv",
+                 "sintax/ref_taxonomy_sintax.txt",
+                 "summary_report",
++                "summary_report/dada2_taxonomic_classification_per_taxonomy_level.svg",
+                 "summary_report/itsx_preliminary_origin.svg",
+                 "summary_report/rrna_detection_with_barrnap.svg",
+                 "summary_report/sintax_taxonomic_classification_per_taxonomy_level.svg",
+@@ -255,6 +284,7 @@
+                 "summary_report/summary_report.html",
+                 "summary_report/versions.yml",
+                 "treesummarizedexperiment",
++                "treesummarizedexperiment/dada2_TreeSummarizedExperiment.rds",
+                 "treesummarizedexperiment/sintax_TreeSummarizedExperiment.rds"
+             ],
+             "overall_summary.tsv:md5,97a8ee12c40a0bc582ba1cefda117f95",
+@@ -278,10 +308,10 @@
+             "emof.tsv:md5,c6599c76a70fe5458db56ff8c2e89a37",
+             "event.tsv:md5,bfcf7d8ac2a3c6b48d075d6dc235f0e4"
+         ],
++        "timestamp": "2026-08-04T14:42:56.02771259",
+         "meta": {
+-            "nf-test": "0.9.3",
+-            "nextflow": "25.10.4"
+-        },
+-        "timestamp": "2026-04-21T09:19:33.698156989"
++            "nf-test": "0.9.5",
++            "nextflow": "26.04.6"
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/tests/savont.nf.test.snap b/tests/savont.nf.test.snap
+index a6544556e..66db7b1cf 100644
+--- a/tests/savont.nf.test.snap
++++ b/tests/savont.nf.test.snap
+@@ -368,8 +368,6 @@
+                 "qiime2/barplot/level-7.jsonp",
+                 "qiime2/barplot/level-8.csv",
+                 "qiime2/barplot/level-8.jsonp",
+-                "qiime2/barplot/level-9.csv",
+-                "qiime2/barplot/level-9.jsonp",
+                 "qiime2/barplot/q2templateassets",
+                 "qiime2/barplot/q2templateassets/css",
+                 "qiime2/barplot/q2templateassets/css/base-template.css",
+@@ -418,7 +416,7 @@
+                 "treesummarizedexperiment/dada2_TreeSummarizedExperiment.rds"
+             ]
+         ],
+-        "timestamp": "2026-07-10T14:46:36.072215793",
++        "timestamp": "2026-08-04T18:53:20.660667878",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.6"
+diff --git a/tests/sintax.nf.test.snap b/tests/sintax.nf.test.snap
+index 7e74ce506..f5d0e6dfe 100644
+--- a/tests/sintax.nf.test.snap
++++ b/tests/sintax.nf.test.snap
+@@ -666,8 +666,6 @@
+                 "qiime2/barplot/level-7.jsonp",
+                 "qiime2/barplot/level-8.csv",
+                 "qiime2/barplot/level-8.jsonp",
+-                "qiime2/barplot/level-9.csv",
+-                "qiime2/barplot/level-9.jsonp",
+                 "qiime2/barplot/q2templateassets",
+                 "qiime2/barplot/q2templateassets/css",
+                 "qiime2/barplot/q2templateassets/css/base-template.css",
+@@ -712,8 +710,6 @@
+                 "qiime2/barplot_average/barplot_var2/level-7.jsonp",
+                 "qiime2/barplot_average/barplot_var2/level-8.csv",
+                 "qiime2/barplot_average/barplot_var2/level-8.jsonp",
+-                "qiime2/barplot_average/barplot_var2/level-9.csv",
+-                "qiime2/barplot_average/barplot_var2/level-9.jsonp",
+                 "qiime2/barplot_average/barplot_var2/q2templateassets",
+                 "qiime2/barplot_average/barplot_var2/q2templateassets/css",
+                 "qiime2/barplot_average/barplot_var2/q2templateassets/css/base-template.css",
+@@ -757,8 +753,6 @@
+                 "qiime2/barplot_average/barplot_var3/level-7.jsonp",
+                 "qiime2/barplot_average/barplot_var3/level-8.csv",
+                 "qiime2/barplot_average/barplot_var3/level-8.jsonp",
+-                "qiime2/barplot_average/barplot_var3/level-9.csv",
+-                "qiime2/barplot_average/barplot_var3/level-9.jsonp",
+                 "qiime2/barplot_average/barplot_var3/q2templateassets",
+                 "qiime2/barplot_average/barplot_var3/q2templateassets/css",
+                 "qiime2/barplot_average/barplot_var3/q2templateassets/css/base-template.css",
+@@ -1515,10 +1509,10 @@
+             "multiqc_general_stats.txt:md5,1fef8358fe3cc974bf05e2f27fc7e250",
+             "multiqc_cutadapt.txt:md5,160135fece18361e17bef9e8d04cf0b9"
+         ],
+-        "timestamp": "2026-05-19T20:54:43.017242",
++        "timestamp": "2026-08-04T19:44:34.128481848",
+         "meta": {
+             "nf-test": "0.9.5",
+-            "nextflow": "25.10.4"
++            "nextflow": "26.04.6"
+         }
+     }
+ }
+\ No newline at end of file

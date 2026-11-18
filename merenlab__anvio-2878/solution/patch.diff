@@ -1,0 +1,3968 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index aff435bac1..4acfcc4b38 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -48,7 +48,10 @@ anvio/                    # The package
+   fastalib.py             # Fast FASTA I/O (custom, not biopython)
+   ttycolors.py            # Terminal color helpers
+   dbinfo.py               # DB introspection (DBInfo class)
++  programs.py             # Reads program metadata (AnvioPrograms, ProgramsNetwork)
++  programsdata.py         # Registries: ANVIO_ARTIFACTS, ANVIO_WORKFLOWS, THIRD_PARTY_PROGRAMS
+   cli/                    # One file per anvi-* program (~180 files)
++  docs/                   # Help page sources and the code that builds them (see Documentation below)
+   tables/                 # Database schema definitions
+     __init__.py           # All table_name / table_structure / table_types triplets
+     genecalls.py          # TablesForGeneCalls class
+@@ -762,6 +765,7 @@ anvio/docs/
+   programs/    # one .md file per anvi-* program
+   artifacts/   # one .md file per anvi'o artifact/data type
+   workflows/   # one .md file per anvi'o Snakemake workflow
++  *.py         # modules for building/rendering documentation
+ ```
+ 
+ **Programs** correspond 1-to-1 with `anvi-*` CLI commands. Each file describes what the program does, how to use it, its key flags, and worked examples. **Artifacts** are anvi'o's named data types (e.g. `contigs-db`, `profile-db`, `collection`, `fasta`) — the same names used in `__requires__` and `__provides__` in every CLI module. Artifact docs explain what that data type is and how it is created and consumed.
+diff --git a/anvio/argparse.py b/anvio/argparse.py
+index 3f5437f027..419fd1b9f4 100755
+--- a/anvio/argparse.py
++++ b/anvio/argparse.py
+@@ -9,7 +9,6 @@
+ from rich_argparse import RichHelpFormatter
+ 
+ import anvio
+-import anvio.docs as docs
+ import anvio.terminal as terminal
+ 
+ from anvio.programs import Program
+@@ -109,7 +108,7 @@ def get_anvio_epilogue(self):
+         general_help = f"https://anvio.org/help/{version}"
+         program_help = f"{general_help}/programs/{self.prog}"
+ 
+-        if os.path.exists(os.path.join(os.path.dirname(docs.__file__), f"programs/{self.prog}.md")):
++        if os.path.exists(os.path.join(anvio.DOCS_PATH, f"programs/{self.prog}.md")):
+             if atty:
+                 epilog += f'''\n🍺 {attr('bold')}More on `{self.prog}`:{attr('reset')}\n\n   {fg('cyan') + program_help + attr('reset')}'''
+             else:
+diff --git a/anvio/cli/gen_help_pages.py b/anvio/cli/gen_help_pages.py
+index 5d39b5c28f..e9c4f31420 100755
+--- a/anvio/cli/gen_help_pages.py
++++ b/anvio/cli/gen_help_pages.py
+@@ -1,12 +1,13 @@
+ #!/usr/bin/env python
+ 
+ import sys
++from pathlib import Path
+ 
+ import anvio
+-import anvio.programs as programs
+ import anvio.terminal as terminal
+ 
+ from anvio.argparse import ArgumentParser
++from anvio.docs import AnvioDocs, DocumentationData, HelpPagesRenderer
+ from anvio.errors import ConfigError, FilesNPathsError
+ 
+ __copyright__ = "Copyleft 2015-2024, The Anvi'o Project (http://anvio.org/)"
+@@ -22,8 +23,16 @@ def main():
+     args = get_args()
+ 
+     try:
+-        docs = programs.AnvioDocs(args)
+-        docs.generate()
++        if args.from_data:
++            path = Path(args.from_data)
++            docs_dataset = DocumentationData.load(path)
++        else:
++            docs = AnvioDocs(args)
++            docs_dataset = docs.collect()
++
++        output_dir = args.output_dir or 'ANVIO-HELP'
++        HelpPagesRenderer(dataset=docs_dataset, output_directory=output_dir).generate()
++
+     except ConfigError as e:
+         print(e)
+         sys.exit(-1)
+@@ -36,6 +45,9 @@ def get_args():
+     parser = ArgumentParser(description=__description__)
+ 
+     parser.add_argument(*anvio.A('output-dir'), **anvio.K('output-dir'))
++    parser.add_argument('--from-data', metavar='DOCUMENTATION_JSON',
++                        help="Rebuild help pages from an exported documentation.json and its adjacent images directory, "
++                             "without reading CLI metadata or documentation sources. Use a separate output directory.")
+ 
+     return parser.get_args(parser)
+ 
+diff --git a/anvio/cli/gen_programs_vignette.py b/anvio/cli/gen_programs_vignette.py
+index 1604ac9e00..11d3f93e50 100755
+--- a/anvio/cli/gen_programs_vignette.py
++++ b/anvio/cli/gen_programs_vignette.py
+@@ -3,8 +3,8 @@
+ import sys
+ 
+ import anvio
+-import anvio.programs as programs
+ 
++from anvio.docs import ProgramsVignette
+ from anvio.errors import ConfigError, FilesNPathsError
+ 
+ __copyright__ = "Copyleft 2015-2024, The Anvi'o Project (http://anvio.org/)"
+@@ -19,7 +19,7 @@ def main():
+     args = get_args()
+ 
+     try:
+-        vignette = programs.ProgramsVignette(args)
++        vignette = ProgramsVignette(args)
+         vignette.generate()
+     except ConfigError as e:
+         print(e)
+diff --git a/anvio/docs/__init__.py b/anvio/docs/__init__.py
+index c4067bf948..b8e85546d2 100644
+--- a/anvio/docs/__init__.py
++++ b/anvio/docs/__init__.py
+@@ -1,1125 +1,9 @@
+-"""Everything about anvi'o workflows and artifacts"""
++"""Collect, serialize, and render anvi'o documentation."""
+ 
+-# when defining a new anvi'o workflow, it is essential to document most critical
+-# artifacts produced by a given workflow. it is also important to mention the
+-# third party programs used (such as Bowtie2 or HMMER). there is no need to
+-# mention anvi'o programs here as it will be discovered from program tags. to
+-# associate a program with a workflow, please add the workflow name(s) to the
+-# meta tag `__anvio_workflows__`.
+-ANVIO_WORKFLOWS = {
+-    "contigs": {
+-        "authors": ['ShaiberAlon', 'ivagljiva', 'meren', 'mschecht'],
+-        "artifacts_produced": ['contigs-db'],
+-        "artifacts_accepted": ['fasta-txt'],
+-        "anvio_workflows_inherited": [],
+-        "third_party_programs_used": [
+-            ('Gene calling', ['pyrodigal-gv']),
+-            ('HMM search', ['HMMER']),
+-            ('Gene taxonomy', ['krakenuniq', 'centrifuge']),
+-            ('Sequence search against various databases', ['DIAMOND'])
+-            ],
+-        "one_sentence_summary": "From FASTA files to annotated anvi'o contigs databases",
+-        "one_paragraph_summary": ("This workflow is useful for converting a bunch of genomes into an anvi'o-compatible "
+-            "format. It generates contigs databases from each input FASTA file, and subsequently runs a variety of "
+-            "annotation programs of your choice to populate these databases with some useful information for your downstream "
+-            "work (i.e. functions, single-copy-core genes, taxonomy, etc).")
+-    },
++from anvio.docs.data import DocumentationData
++from anvio.docs.collect import AnvioDocs
++from anvio.docs.export import HelpPagesRenderer
++from anvio.docs.vignette import ProgramsVignette
+ 
+-    "metagenomics": {
+-        "authors": ['FlorianTrigodet', 'ShaiberAlon'],
+-        "artifacts_produced": ['contigs-db', 'profile-db'],
+-        "artifacts_accepted": ['samples-txt', 'fasta-txt'],
+-        "anvio_workflows_inherited": ['contigs'],
+-        "third_party_programs_used": [
+-            ('Quality control of short reads', ['illumina-utils']),
+-            ('Assembly', ['IDBA-UD', 'metaSPAdes', 'MEGAHIT']),
+-            ('BAM file manipulations', ['samtools']),
+-            ('Gene calling', ['pyrodigal-gv']),
+-            ('HMM search', ['HMMER']),
+-            ('Gene taxonomy', ['krakenuniq', 'centrifuge']),
+-            ('Read recruitment', ['Bowtie2'])
+-            ],
+-        "one_sentence_summary": "From FASTA and/or FASTQ files to anvi'o contigs and profile databases",
+-        "one_paragraph_summary": ("This workflow is for anyone who wants to do some high-throughput read recruitment. "
+-            "It has a few different modes depending on your input data. By default, it works with metagenomic short reads "
+-            "and will assemble those, use the assembly as a reference for read-recruitment, and create databases ready for "
+-            "anvi-interactive (i.e. for binning). If you don't need to assemble anything, you can also just give this "
+-            "program a set of reference contigs for read-recruitment. Regardless, you'll end up with at least one "
+-            "contigs database + merged profile database pair. Oh, and since this workflow internally uses the contigs "
+-            "workflow, you can optionally run annotation programs on your contigs database as well.")
+-    },
+-    "ecophylo": {
+-        "authors": ['FlorianTrigodet', 'Kekananen', 'mschecht'],
+-        "artifacts_accepted": ['samples-txt', 'hmm-list', 'external-genomes', 'metagenomes'],
+-        "artifacts_produced": ['contigs-db', 'profile-db'],
+-        "anvio_workflows_inherited": [],
+-        "third_party_programs_used": [
+-            ('Read recruitment', ['Bowtie2']),
+-            ('Cluster open reading frames', ['MMseqs2']),
+-            ('Align protein sequences', ['muscle']),
+-            ('Trim multiple sequence alignment', ['trimal']),
+-            ('Calculate phylogenetic tree', ['IQ-TREE']),
+-            ('Calculate phylogenetic tree', ['FastTree']),
+-            ('Search for homologous sequences', ['HMMER'])
+-            ],
+-        "one_sentence_summary": "Co-characterize the biogeography and phylogeny of any protein",
+-        "one_paragraph_summary": ("The ecophylo workflow explores the **eco**logical and **phylo**genetic relationships between a gene family and the environment. "
+-            "Briefly, the workflow extracts a target gene from any set of FASTA files (e.g., isolate genomes, [MAGs](https://anvio.org/vocabulary/#metagenome-assembled-genome-mag), "
+-            "[SAGs](https://anvio.org/vocabulary/#single-amplified-genome-sag), or simply [assembled metagenomes](https://anvio.org/vocabulary/#de-novo-assembly)) "
+-            "using a user-defined [HMM](https://anvio.org/vocabulary/#hidden-markov-models-hmms), and offers an integrated access "
+-            "to the phylogenetics of matching genes, and their distribution across environments.")
+-    },
+-    "phylogenomics": {
+-        "authors": ['Kekananen'],
+-        "artifacts_produced": ['phylogeny'],
+-        "artifacts_accepted": ['internal-genomes', 'external-genomes'],
+-        "anvio_workflows_inherited": ['contigs'],
+-        "third_party_programs_used": [
+-            ('Trim multiple sequence alignment', ['trimal']),
+-            ('Calculate phylogenetic tree', ['IQ-TREE']),
+-            ],
+-        "one_sentence_summary": "Infer a phylogeny from homologous protein sequences",
+-        "one_paragraph_summary": ("This workflow is for users who want to infer a phylogeny from homologous protein "
+-            "sequences extracted from anvi'o genome inputs. It uses the contigs workflow to prepare the underlying "
+-            "contigs databases, retrieves single-copy core genes or other HMM hits from those genomes, aligns the "
+-            "sequences, trims the alignment, and generates a phylogenetic tree that can be used downstream as a "
+-            "phylogeny artifact.")
+-    },
+-    "trnaseq": {
+-        "authors": ['semiller10'],
+-        "artifacts_accepted": ['samples-txt'],
+-        "artifacts_produced": ['trnaseq-db', 'trnaseq-contigs-db', 'trnaseq-profile-db', 'trnaseq-seed-txt', 'modifications-txt'],
+-        "anvio_workflows_inherited": [],
+-        "third_party_programs_used": [
+-            ('QC and merging of tRNA transcripts', ['illumina-utils']),
+-            ('Mapping transcripts to tRNA seeds', ['Bowtie2'])
+-            ],
+-        "one_sentence_summary": "Process transfer RNA transcripts from tRNA-seq datasets",
+-        "one_paragraph_summary": ("The trnaseq workflow takes in raw paired-end sequencing data generated from trna-seq libraries (i.e., the direct sequencing of "
+-            "transfer RNA transcripts from cultures or environmental samples), and processes these data to identify tRNA sequences and their structural features, "
+-            "predict chemical modification sites and modification fractions across samples, assign taxonomy to tRNA transcript seeds, and generate tables and summary "
+-            "data for downstream analyses. The tRNA-seq resources in anvi'o are operational, however, they are experimental. If you have datasets that are suitable "
+-            "for analysis, pelase consider getting in touch with us first.")
+-    },
+ 
+-    "sra-download": {
+-        "authors": ['mschecht', 'FlorianTrigodet', 'Kekananen'],
+-        "artifacts_accepted": [],
+-        "artifacts_produced": ['paired-end-fastq', 'samples-txt'],
+-        "anvio_workflows_inherited": [],
+-        "third_party_programs_used": [
+-            ('Downloads SRA accessions', ['prefetch']),
+-            ('Extracts FASTQ files from SRA accessions', ['fasterq-dump']),
+-            ('Compresses FASTQ files in parallel', ['pigz']),
+-            ],
+-        "one_sentence_summary": "Download, verify, extract, and gzip paired-end FASTQ files automatically from the NCBI short-read archive (SRA)",
+-        "one_paragraph_summary": ("The sra-download workflow automatizes the process of downloading paired-end FASTQ files "
+-            "for a given list of SRA-accessions using [NCBI sra-tools wiki](https://github.com/ncbi/sra-tools/wiki/08.-prefetch-and-fasterq-dump) "
+-            "then gzips them using [pigz](https://zlib.net/pigz/).")
+-    },
+-}
+-
+-# Make usernames lowercase as in GitHub
+-for a in ANVIO_WORKFLOWS:
+-    ANVIO_WORKFLOWS[a]["authors"] = [n.lower() for n in ANVIO_WORKFLOWS[a]["authors"]]
+-
+-# the purpose of this variable is to have a list of third-party programs used from
+-# within anvi'o workflows.
+-THIRD_PARTY_PROGRAMS = {
+-    'IDBA-UD': {'link': 'https://github.com/loneknightpy/idba'},
+-    'illumina-utils': {'link': 'https://github.com/merenlab/illumina-utils'},
+-    'metaSPAdes': {'link': "https://cab.spbu.ru/software/meta-spades/"},
+-    'MEGAHIT': {'link': 'https://github.com/voutcn/megahit'},
+-    'samtools': {'link': 'http://www.htslib.org/'},
+-    'pyrodigal-gv': {'link': 'https://github.com/althonos/pyrodigal-gv'},
+-    'HMMER': {'link': 'http://hmmer.org/'},
+-    'Bowtie2': {'link': 'https://github.com/BenLangmead/bowtie2'},
+-    'krakenuniq': {'link': 'https://github.com/fbreitwieser/krakenuniq'},
+-    'centrifuge': {'link': 'https://github.com/DaehwanKimLab/centrifuge'},
+-    'DIAMOND': {'link': 'https://uni-tuebingen.de/fakultaeten/mathematisch-naturwissenschaftliche-fakultaet/fachbereiche/informatik/lehrstuehle/algorithms-in-bioinformatics/software/diamond/'},
+-    'MMseqs2': {'link': 'https://github.com/soedinglab/MMseqs2'},
+-    'muscle': {'link': 'http://www.drive5.com/muscle/'},
+-    'FastTree': {'link': 'http://www.microbesonline.org/fasttree/'},
+-    'IQ-TREE': {'link': 'https://github.com/Cibiv/IQ-TREE'},
+-    'trimal': {'link': 'https://github.com/inab/trimal'},
+-    'pigz': {'link': 'https://zlib.net/pigz/'},
+-    'prefetch': {'link': 'https://github.com/ncbi/sra-tools'},
+-    'fasterq-dump': {'link': 'https://github.com/ncbi/sra-tools'}
+-    }
+-
+-# the purpose of dictionaries in this module is to describes all anvi'o items and concepts
+-# that are referred from 'requires' and 'provides' statements in anvi'o programs
+-ANVIO_ARTIFACTS ={
+-    "pan-db": {
+-        "name": "PAN",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pan-graph-db": {
+-        "name": "PAN GRAPH",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contigs-db": {
+-        "name": "CONTIGS",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trnaseq-db": {
+-        "name": "TRNASEQ",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trnaseq-contigs-db": {
+-        "name": "TRNASEQ CONTIGS",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trnaseq-profile-db": {
+-        "name": "TRNASEQ PROFILE",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "modules-db": {
+-        "name": "MODULES",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "fasta": {
+-        "name": "REGULAR FASTA",
+-        "type": "FASTA",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "contigs-fasta": {
+-        "name": "CONTIGS",
+-        "type": "FASTA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "dna-sequence": {
+-        "name": "DNA SEQUENCE",
+-        "type": "SEQUENCE",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "trnaseq-fasta": {
+-        "name": "TRNASEQ",
+-        "type": "FASTA",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "configuration-ini": {
+-        "name": "CONFIGURATION FILE",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "external-gene-calls": {
+-        "name": "EXTERNAL GENE CALLS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "external-structures": {
+-        "name": "EXTERNAL STRUCTURES",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "concatenated-gene-alignment-fasta": {
+-        "name": "CONCATENATED GENE ALIGNMENT",
+-        "type": "FASTA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "short-reads-fasta": {
+-        "name": "SHORT READS",
+-        "type": "FASTA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "paired-end-fastq": {
+-        "name": "SHORT READS",
+-        "type": "FASTQ",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "single-end-fastq": {
+-        "name": "SHORT READS",
+-        "type": "FASTQ",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "genes-fasta": {
+-        "name": "GENES",
+-        "type": "FASTA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "bam-file": {
+-        "name": "BAM FILE",
+-        "type": "BAM",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "bam-stats-txt": {
+-        "name": "BAM STATS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "discov-stats": {
+-        "name": "DISCOV STATS",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "bams-and-profiles-txt": {
+-        "name": "BAMS AND PROFILES TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "markdown-txt": {
+-        "name": "MARKDOWN TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "protein-structure-txt": {
+-        "name": "PDB FILE",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "samples-txt": {
+-        "name": "SAMPLES TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "sra-metadata-txt": {
+-        "name": "SRA METADATA TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user":True
+-    },
+-    "primers-txt": {
+-        "name": "PRIMERS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "fasta-txt": {
+-        "name": "FASTA TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "raw-bam-file": {
+-        "name": "RAW BAM FILE",
+-        "type": "BAM",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "locus-fasta": {
+-        "name": "LOCUS",
+-        "type": "FASTA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "structure-db": {
+-        "name": "PROTEIN STRUCTURES",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pdb-db": {
+-        "name": "PDB DB",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "kegg-data": {
+-        "name": "KEGG MODULES DB",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "user-modules-data": {
+-        "name": "USER MODULES DB",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "reaction-ref-data": {
+-        "name": "REACTION REFERENCE DATA",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "single-profile-db": {
+-        "name": "SINGLE PROFILE",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "profile-db": {
+-        "name": "PROFILE",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "genes-db": {
+-        "name": "GENES",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "genomes-storage-db": {
+-        "name": "GENOMES STORAGE",
+-        "type": "DB",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contigs-stats": {
+-        "name": "CONTIGS STATS",
+-        "type": "STATS",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "svg": {
+-        "name": "SVG",
+-        "type": "SVG",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "bin": {
+-        "name": "BIN",
+-        "type": "BIN",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "collection": {
+-        "name": "COLLECTION",
+-        "type": "COLLECTION",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "collection-txt": {
+-        "name": "COLLECTION",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "contig-classification": {
+-        "name": "CONTIG CLASSIFICATIONS",
+-        "type": "COLLECTION",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contig-classification-txt": {
+-        "name": "CONTIG CLASSIFICATIONS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "genes-of-interest-txt": {
+-        "name": "GENES OF INTEREST",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "pfam-accession": {
+-        "name": "PFAM ACCESSION",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "kofam-accession": {
+-        "name": "KOFAM ACCESSION",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "hmm-file": {
+-        "name": "HMM MODEL FILE",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "hmm-source": {
+-        "name": "HMM SOURCE",
+-        "type": "HMM",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "hmm-hits": {
+-        "name": "HMM PROFILE",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "completion": {
+-        "name": "COMPLETION",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "cogs-data": {
+-        "name": "COGs DATA",
+-        "type": "DATA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "globdb-data": {
+-        "name": "GLOBDB DATA",
+-        "type": "DATA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pfams-data": {
+-        "name": "PFAMs DATA",
+-        "type": "DATA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "cazyme-data": {
+-        "name": "CAZymes HMM DATA",
+-        "type": "DATA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-items-txt": {
+-        "name": "ITEMS DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user":True
+-    },
+-    "misc-data-items": {
+-        "name": "ITEMS DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-layers-txt": {
+-        "name": "LAYERS DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "misc-data-layers": {
+-        "name": "LAYERS DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-nucleotides-txt": {
+-        "name": "NUCLEOTIDES DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "misc-data-nucleotides": {
+-        "name": "NUCLEOTIDES DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-amino-acids-txt": {
+-        "name": "AMINO_ACIDS DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "misc-data-amino-acids": {
+-        "name": "AMINO_ACIDS DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "genome-similarity": {
+-        "name": "GENOME SIMILARITY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-layer-orders-txt": {
+-        "name": "LAYER ORDERS DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "misc-data-layer-orders": {
+-        "name": "LAYER ORDERS DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "misc-data-items-order-txt": {
+-        "name": "LAYER ORDERS DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "misc-data-items-order": {
+-        "name": "ITEM ORDERS DATA",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "dendrogram": {
+-        "name": "DENDROGRAM",
+-        "type": "NEWICK",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "metapangenome": {
+-        "name": "METAPANGENOME",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "oligotypes": {
+-        "name": "OLIGOTYPES",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "linkmers-txt": {
+-        "name": "LINKMERS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "palindromes-txt": {
+-        "name": "PALINDROMES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "inversions-txt": {
+-        "name": "INVERSIONS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "phylogeny": {
+-        "name": "PHYLOGENY",
+-        "type": "NEWICK",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "gene-calls-txt": {
+-        "name": "GENE CALLS",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "binding-frequencies-txt": {
+-        "name": "AMINO ACID BINDING FREQUENCIES TEXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "interacdome-data": {
+-        "name": "INTERACDOME DATA",
+-        "type": "DATA",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "functions": {
+-        "name": "GENE FUNCTIONS",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "functions-txt": {
+-        "name": "GENE FUNCTIONS",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "functional-enrichment-txt": {
+-        "name": "ENRICHMENT SCORES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "kegg-functions": {
+-        "name": "KOFAM FUNCTIONS",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "functions-across-genomes-txt": {
+-        "name": "FUNCTIONS ACROSS GENOMES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "hmm-hits-across-genomes-txt": {
+-        "name": "HMM HITS ACROSS GENOMES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "reaction-network": {
+-        "name": "REACTION NETWORK",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "reaction-network-json": {
+-        "name": "REACTION NETWORK JSON",
+-        "type": "JSON",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "kegg-pathway-map": {
+-        "name": "KEGG PATHWAY MAP",
+-        "type": "DISPLAY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "interactive": {
+-        "name": "INTERACTIVE DISPLAY",
+-        "type": "DISPLAY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "view-data": {
+-        "name": "VIEW DATA",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "layer-taxonomy": {
+-        "name": "LAYER TAXONOMY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "layer-taxonomy-txt": {
+-        "name": "LAYER TAXONOMY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "gene-taxonomy": {
+-        "name": "GENE TAXONOMY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "gene-taxonomy-txt": {
+-        "name": "GENE TAXONOMY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "genome-taxonomy": {
+-        "name": "GENOME TAXONOMY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "genome-taxonomy-txt": {
+-        "name": "GENOME TAXONOMY",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": False
+-    },
+-    "scgs-taxonomy-db": {
+-        "name": "SCG TAXONOMY DB",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "scgs-taxonomy": {
+-        "name": "SCG TAXONOMY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trna-taxonomy-db": {
+-        "name": "TRNA TAXONOMY DB",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trna-taxonomy": {
+-        "name": "TRNA TAXONOMY",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "external-genomes": {
+-        "name": "EXTERNAL GENOMES",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "internal-genomes": {
+-        "name": "INTERNAL GENOMES",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "metagenomes": {
+-        "name": "METAGENOMES",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "hmm-list": {
+-        "name": "HMM-LIST",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "coverages-txt": {
+-        "name": "COVERAGES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "detection-txt": {
+-        "name": "DETECTIONS",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "variability-profile": {
+-        "name": "VARIABILITY PROFILE",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "variability-profile-txt": {
+-        "name": "VARIABILITY PROFILE",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "variability-profile-xml": {
+-        "name": "VARIABILITY NETWORK",
+-        "type": "XML",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "codon-frequencies-txt": {
+-        "name": "CODON FREQUENCIES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "aa-frequencies-txt": {
+-        "name": "AA FREQUENCIES",
+-        "type": "TXT",
+-        "provided_by_anvio": True ,
+-        "provided_by_user": False
+-    },
+-    "fixation-index-matrix": {
+-        "name": "FIXATION INDEX MATRIX",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trnaseq-seed-txt": {
+-        "name": "TRNASEQ SEED SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "seeds-specific-txt": {
+-        "name": "TRNASEQ SEED SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "seeds-non-specific-txt": {
+-        "name": "TRNASEQ SEED SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "modifications-txt": {
+-        "name": "TRNASEQ MODIFICATION SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trna-gene-hits": {
+-        "name": "TRNA GENE HITS",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "trnaseq-plot": {
+-        "name": "TRNASEQ PLOT",
+-        "type": "DISPLAY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "summary": {
+-        "name": "STATIC SUMMARY",
+-        "type": "SUMMARY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pan-summary": {
+-        "name": "PAN SUMMARY",
+-        "type": "SUMMARY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pan-graph-summary": {
+-        "name": "PAN GRAPH SUMMARY",
+-        "type": "SUMMARY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "profile-summary": {
+-        "name": "PROFILE SUMMARY",
+-        "type": "SUMMARY",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "quick-summary": {
+-        "name": "QUICK SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "light-summary": {
+-        "name": "LIGHT SUMMARY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "split-bins": {
+-        "name": "SPLIT BINS",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "state": {
+-        "name": "INTERACTIVE STATE",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "ngrams": {
+-        "name": "NGRAM",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "state-json": {
+-        "name": "INTERACTIVE STATE",
+-        "type": "JSON",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "kegg-metabolism": {
+-        "name": "KEGG METABOLISM ESTIMATES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "user-metabolism": {
+-        "name": "USER METABOLISM ESTIMATES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "augustus-gene-calls": {
+-        "name": "AUGUSTUS GENE CALLS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "vcf": {
+-        "name": "VCF",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "blast-table": {
+-        "name": "BLAST TABLE",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "splits-txt": {
+-        "name": "SPLITS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "genbank-file": {
+-        "name": "GENBANK FILE",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "groups-txt": {
+-        "name": "GROUPS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "splits-taxonomy-txt": {
+-        "name": "SPLITS TAXONOMY",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "pn-ps-data": {
+-        "name": "PN/PS OUTPUT",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "clustering-configuration": {
+-        "name": "CLUSTERING CONFIG",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "workflow-config": {
+-        "name": "WORKFLOW CONFIG",
+-        "type": "JSON",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "workflow": {
+-        "name": "ANVIO SNAKEMAKE WORKFLOW",
+-        "type": "WORKFLOW",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contig-inspection" : {
+-        "name" : "CONTIG INSPECTION",
+-        "type" : "DISPLAY",
+-        "provided_by_anvio" : True,
+-        "provided_by_user" : False
+-    },
+-    "gene-cluster-inspection" : {
+-        "name" : "GENE CLUSTER INSPECTION",
+-        "type" : "DISPLAY",
+-        "provided_by_anvio" : True,
+-        "provided_by_user" : False
+-    },
+-    "gene-clusters": {
+-        "name": "GENE CLUSTERS",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "gene-clusters-txt": {
+-        "name": "GENE CLUSTERS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "enzymes-txt": {
+-        "name": "ENZYMES TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "kegg-reaction-txt": {
+-        "name": "KEGG REACTION TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "kegg-compound-txt": {
+-        "name": "KEGG COMPOUND TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "kegg-membership-colors-txt": {
+-        "name": "KEGG MEMBERSHIP COLORS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "kegg-value-colors-txt": {
+-        "name": "KEGG VALUE COLORS TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-    "kegg-slice-key-txt": {
+-        "name": "KEGG SLICE KEY TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "kegg-label-key-txt": {
+-        "name": "KEGG LABEL KEY TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "enzymes-list-for-module": {
+-        "name": "ENZYMES LIST",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user":True
+-    },
+-    "metabolic-independence-score": {
+-        "name": "METABOLIC INDEPENDENCE SCORE",
+-        "type": "CONCEPT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contig-rename-report-txt": {
+-        "name": "CONTIG RENAME REPORT TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "contig-circularity-report-txt": {
+-        "name": "CIRCULARITY REPORT TXT",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "rarefaction-curves": {
+-        "name": "RAREFACTION CURVES",
+-        "type": "SVG",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "metabolite-exchange-predictions": {
+-        "name": "PREDICTED METABOLITE EXCHANGES",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": False
+-    },
+-    "equivalent-compounds-txt": {
+-        "name": "EQUIVALENT COMPOUNDS",
+-        "type": "TXT",
+-        "provided_by_anvio": True,
+-        "provided_by_user": True
+-    },
+-    "genome-pairs": {
+-        "name": "GENOME PAIRS",
+-        "type": "TXT",
+-        "provided_by_anvio": False,
+-        "provided_by_user": True
+-    },
+-}
++__all__ = ["AnvioDocs", "DocumentationData", "HelpPagesRenderer", "ProgramsVignette"]
+diff --git a/anvio/docs/artifacts/00_README.md b/anvio/docs/artifacts/00_README.md
+index eb668cb89a..955cef4a30 100644
+--- a/anvio/docs/artifacts/00_README.md
++++ b/anvio/docs/artifacts/00_README.md
+@@ -1,10 +1,10 @@
+ This directory contains information about anvi'o artifacts.
+ 
+-A complete list of artifacts is listed in the `__init__.py` file located in the upper
+-directory. You can also access to the list of artifacts programmatically this way:
++A complete list of artifacts is listed in `anvio/programsdata.py`.
++You can also access to the list of artifacts programmatically this way:
+ 
+ ```
+-python -c 'import anvio.docs; print(anvio.docs.ANVIO_ARTIFACTS);'
++python -c 'import anvio.programsdata; print(anvio.programsdata.ANVIO_ARTIFACTS);'
+ ```
+ 
+ Information in this directory is compiled into help text shown in the following URL:
+diff --git a/anvio/docs/collect.py b/anvio/docs/collect.py
+new file mode 100644
+index 0000000000..b24d5bb348
+--- /dev/null
++++ b/anvio/docs/collect.py
+@@ -0,0 +1,163 @@
++"""Collect documentation from CLI metadata, source registries, Markdown, and images."""
++
++import os
++from pathlib import Path
++
++import anvio
++import anvio.filesnpaths as filesnpaths
++import anvio.terminal as terminal
++import anvio.utils as utils
++
++from anvio.programsdata import ANVIO_ARTIFACTS, THIRD_PARTY_PROGRAMS
++from anvio.docs.data import (
++    ArtifactDocumentation,
++    AuthorDocumentation,
++    BuildMetadata,
++    DocumentationAsset,
++    DocumentationData,
++    ProgramDocumentation,
++    ThirdPartyProgram,
++    WorkflowDocumentation,
++)
++from anvio.errors import ConfigError
++from anvio.programs import AnvioPrograms, AnvioArtifacts, AnvioWorkflows
++
++
++class AnvioDocs(AnvioPrograms, AnvioArtifacts, AnvioWorkflows):
++    """Collect source documentation and metadata into a serializable dataset."""
++
++
++    def __init__(self, args, r=terminal.Run(), p=terminal.Progress()):
++        self.args = args
++        self.run = r
++        self.progress = p
++
++        self.repo_root = os.path.abspath(os.path.join(os.path.dirname(anvio.__file__), '..'))
++
++        if not os.path.exists(anvio.DOCS_PATH):
++            raise ConfigError("The anvi'o docs path is not where it should be :/ Something funny is going on.")
++
++        self.version_short_identifier = 'm' if anvio.anvio_version_for_help_docs == 'main' else anvio.anvio_version_for_help_docs
++        self.base_url = os.path.join("/help", anvio.anvio_version_for_help_docs)
++
++        AnvioPrograms.__init__(self, args, r=self.run, p=self.progress)
++        self.init_programs()
++
++        AnvioArtifacts.__init__(self, args, r=self.run, p=self.progress)
++        self.init_artifacts()
++
++        AnvioWorkflows.__init__(self, args, r=self.run, p=self.progress)
++        self.init_workflows()
++
++        if not len(self.programs):
++            raise ConfigError("AnvioDocs is asked ot process the usage statements of some programs, but the "
++                              "`self.programs` dictionary seems to be empty :/")
++
++        self.images_source_directory = os.path.join(os.path.dirname(anvio.__file__), 'docs/images/png')
++
++        self.sanity_check()
++
++
++    def sanity_check(self):
++        """Quick sanity checks to ensure things are working"""
++
++        if not os.path.exists(self.images_source_directory):
++            raise ConfigError("AnvioDocs speaking: the images source directory does not seem to be "
++                              "where it should have been :/")
++
++        # make sure each artifact type has an icon
++        A_PNG = lambda x: os.path.exists(os.path.join(self.images_source_directory, 'icons', ANVIO_ARTIFACTS[x]['type'] + '.png'))
++        missing_images_for_artifact_types = [ANVIO_ARTIFACTS[artifact]['type'] for artifact in self.artifacts_info if not A_PNG(artifact)]
++        if len(missing_images_for_artifact_types):
++            raise ConfigError("Some artifacts do not have matching images. If you just added a new artifact type, you "
++                              "also need to add a corresponding PNG icon for the type under the directory '%s'. See "
++                              "examples in that directory, and if they are not enough, get in touch with a developer. "
++                              "Regardless. These are the artifact types missing images: %s."
++                                                                % (os.path.join(self.images_source_directory, 'icons'),
++                                                                   ', '.join(missing_images_for_artifact_types)))
++
++
++    def read_anvio_markdown(self, file_path):
++        """Collect authored Markdown; website formatting belongs to the renderer."""
++        filesnpaths.is_file_plain_text(file_path)
++        with open(file_path, encoding='utf-8') as source:
++            return source.read()
++
++
++    def collect(self) -> DocumentationData:
++        """Capture help records without presentation changes or inferred provenance."""
++        programs: dict[str, ProgramDocumentation] = {}
++        for name, program in self.programs.items():
++            metadata = program.meta_info
++            programs[name] = ProgramDocumentation(
++                id=f'program:{name}', kind='program', name=name,
++                source_markdown=program.usage,
++                documentation_path=f'anvio/docs/programs/{name}.md',
++                html_url=f'https://anvio.org{self.base_url}/programs/{name}/',
++                source_path=Path(program.program_path).relative_to(self.repo_root).as_posix(),
++                description=metadata['description']['value'],
++                authors=list(metadata['authors']['value']),
++                resources=[(title, url) for title, url in metadata['resources']['value']],
++                tags=list(metadata['tags']['value']),
++                anvio_workflows=list(metadata['anvio_workflows']['value']),
++                requires=[artifact.id for artifact in metadata['requires']['value']],
++                provides=[artifact.id for artifact in metadata['provides']['value']],
++                can_use=[artifact.id for artifact in metadata['can_use']['value']],
++                can_provide=[artifact.id for artifact in metadata['can_provide']['value']],
++            )
++        artifacts = {
++            name: ArtifactDocumentation(
++                id=f'artifact:{name}', kind='artifact', name=artifact['name'],
++                source_markdown=self.artifacts_info[name]['description'],
++                documentation_path=f'anvio/docs/artifacts/{name}.md',
++                html_url=f'https://anvio.org{self.base_url}/artifacts/{name}/',
++                type=artifact['type'], provided_by_anvio=artifact['provided_by_anvio'],
++                provided_by_user=artifact['provided_by_user'],
++            ) for name, artifact in ANVIO_ARTIFACTS.items()
++        }
++        workflows = {
++            name: WorkflowDocumentation(
++                id=f'workflow:{name}', kind='workflow', name=name,
++                source_markdown=workflow.get('description'),
++                documentation_path=f'anvio/docs/workflows/{name}.md',
++                html_url=f'https://anvio.org{self.base_url}/workflows/{name}/',
++                authors=list(workflow['authors']),
++                artifacts_produced=list(workflow['artifacts_produced']),
++                artifacts_accepted=list(workflow['artifacts_accepted']),
++                anvio_workflows_inherited=list(workflow['anvio_workflows_inherited']),
++                third_party_programs_used=[(purpose, list(names)) for purpose, names in workflow['third_party_programs_used']],
++                one_sentence_summary=workflow['one_sentence_summary'],
++                one_paragraph_summary=workflow['one_paragraph_summary'],
++                anvio_programs_used=list(workflow['anvio_programs_used']),
++            ) for name, workflow in self.workflows.items()
++        }
++        images = Path(self.images_source_directory)
++        asset_sources = {f'images/{image.relative_to(images).as_posix()}': image
++                         for image in sorted(images.rglob('*')) if image.is_file()}
++        authors: dict[str, AuthorDocumentation] = {}
++        for name, entry in self.authors.items():
++            source = Path(entry['avatar'])
++            destination = f'images/authors/{source.name}'
++            authors[name] = AuthorDocumentation(
++                github=entry['github'], name=entry['name'], email=entry['email'],
++                avatar=destination, web=entry.get('web'), twitter=entry.get('twitter'),
++            )
++            asset_sources[destination] = source
++        metadata = BuildMetadata(
++            docs_version=anvio.anvio_version_for_help_docs,
++            version=f'{anvio.anvio_version} ({anvio.anvio_codename})',
++            versions=anvio.get_version_tuples(),
++            date=utils.get_date(),
++            base_url=self.base_url,
++            version_short_identifier=self.version_short_identifier,
++        )
++        dataset = DocumentationData(
++            meta=metadata,
++            program_source_paths={name: Path(path).relative_to(self.repo_root).as_posix()
++                                  for name, path in self.program_names_and_paths.items()},
++            programs=programs, artifacts=artifacts, workflows=workflows, authors=authors,
++            third_party_programs={name: ThirdPartyProgram(link=record['link']) for name, record in THIRD_PARTY_PROGRAMS.items()},
++            assets=[DocumentationAsset(path=path, md5=utils.get_file_md5(source)) for path, source in asset_sources.items()],
++        )
++        dataset.asset_sources = asset_sources
++        return dataset
+diff --git a/anvio/docs/data.py b/anvio/docs/data.py
+new file mode 100644
+index 0000000000..d11f03de70
+--- /dev/null
++++ b/anvio/docs/data.py
+@@ -0,0 +1,189 @@
++"""Serializable documentation records collected from anvi'o source metadata.
++
++The dataset preserves authored Markdown, declared relationships, canonical URLs,
++and an image inventory. documentation.json and its adjacent images form a portable
++bundle that renderers can consume without consulting the source registries.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import asdict, dataclass, field
++from functools import cached_property
++from pathlib import Path
++
++import anvio.filesnpaths as filesnpaths
++
++from anvio.errors import ConfigError, FilesNPathsError
++
++
++SCHEMA_VERSION = 1
++DATASET_FILENAME = "documentation.json"
++RELATIONSHIPS = ("requires", "provides", "can_use", "can_provide")
++
++
++@dataclass(frozen=True, kw_only=True)
++class BuildMetadata:
++    docs_version: str
++    version: str
++    versions: list[tuple[str, str]]
++    date: str
++    base_url: str
++    version_short_identifier: str
++
++
++@dataclass(frozen=True, kw_only=True)
++class DocumentRecord:
++    id: str
++    kind: str
++    source_markdown: str | None
++    documentation_path: str
++    html_url: str
++
++
++@dataclass(frozen=True, kw_only=True)
++class ProgramDocumentation(DocumentRecord):
++    name: str
++    source_path: str
++    description: str
++    authors: list[str]
++    resources: list[tuple[str, str]]
++    tags: list[str]
++    anvio_workflows: list[str]
++    requires: list[str]
++    provides: list[str]
++    can_use: list[str]
++    can_provide: list[str]
++
++
++@dataclass(frozen=True, kw_only=True)
++class ArtifactDocumentation(DocumentRecord):
++    name: str
++    type: str
++    provided_by_anvio: bool
++    provided_by_user: bool
++
++
++@dataclass(frozen=True, kw_only=True)
++class WorkflowDocumentation(DocumentRecord):
++    name: str
++    authors: list[str]
++    artifacts_produced: list[str]
++    artifacts_accepted: list[str]
++    anvio_workflows_inherited: list[str]
++    third_party_programs_used: list[tuple[str, list[str]]]
++    one_sentence_summary: str
++    one_paragraph_summary: str
++    anvio_programs_used: list[str]
++
++
++@dataclass(frozen=True, kw_only=True)
++class AuthorDocumentation:
++    github: str
++    name: str
++    email: str
++    avatar: str
++    web: str | None = None
++    twitter: str | None = None
++
++
++@dataclass(frozen=True, kw_only=True)
++class ThirdPartyProgram:
++    link: str
++
++
++@dataclass(frozen=True, kw_only=True)
++class DocumentationAsset:
++    path: str
++    md5: str
++
++
++@dataclass(kw_only=True)
++class DocumentationData:
++    """Typed snapshot shared by serialization, page rendering, and network generation."""
++
++    meta: BuildMetadata
++    program_source_paths: dict[str, str]
++    programs: dict[str, ProgramDocumentation]
++    artifacts: dict[str, ArtifactDocumentation]
++    workflows: dict[str, WorkflowDocumentation]
++    authors: dict[str, AuthorDocumentation]
++    third_party_programs: dict[str, ThirdPartyProgram]
++    assets: list[DocumentationAsset]
++    schema_version: int = SCHEMA_VERSION
++    dataset_path: Path | None = field(default=None, repr=False, compare=False)
++
++
++    @cached_property
++    def asset_sources(self) -> dict[str, Path]:
++        if self.dataset_path is None:
++            raise ConfigError("DocumentationData does not know where to find its image assets. Please load an exported "
++                              "dataset with DocumentationData.load(), collect one with AnvioDocs.collect(), or provide "
++                              "an asset_sources dictionary that maps each asset path to its source file.")
++
++        return {asset.path: self.dataset_path.parent / asset.path for asset in self.assets}
++
++
++    @classmethod
++    def load(cls, path: Path) -> DocumentationData:
++        """Load an exported documentation dataset and locate its adjacent image assets."""
++
++        path = Path(path)
++        filesnpaths.is_file_exists(path)
++
++        try:
++            with path.open(encoding="utf-8") as source:
++                data = json.load(source)
++        except OSError as error:
++            raise FilesNPathsError(f"Anvi'o could not read the documentation dataset at '{path}'. Please check that this "
++                                   f"is a readable file. Here is the error from the operating system: {error}") from error
++        except (json.JSONDecodeError, UnicodeError) as error:
++            raise ConfigError(f"The documentation dataset at '{path}' could not be read as UTF-8 JSON. Please use the "
++                              f"documentation.json produced by anvi-script-gen-help-pages, or regenerate the export. "
++                              f"Here is what the reader reported: {error}") from error
++
++        try:
++            if data["schema_version"] != SCHEMA_VERSION:
++                raise ConfigError(f"The documentation dataset at '{path}' uses schema version '{data['schema_version']}', "
++                                  f"but this version of anvi'o reads schema version {SCHEMA_VERSION}. Please regenerate "
++                                  f"the dataset with this version of anvi'o, or use a compatible anvi'o installation.")
++
++            # Restore tuple fields from JSON arrays.
++            data["meta"]["versions"] = [(name, version) for name, version in data["meta"]["versions"]]
++            for record in data["programs"].values():
++                record["resources"] = [(label, url) for label, url in record["resources"]]
++            for record in data["workflows"].values():
++                record["third_party_programs_used"] = [(operation, programs) for operation, programs in record["third_party_programs_used"]]
++
++            return cls(schema_version=data["schema_version"],
++                       meta=BuildMetadata(**data["meta"]),
++                       program_source_paths=data["program_source_paths"],
++                       programs={name: ProgramDocumentation(**record) for name, record in data["programs"].items()},
++                       artifacts={name: ArtifactDocumentation(**record) for name, record in data["artifacts"].items()},
++                       workflows={name: WorkflowDocumentation(**record) for name, record in data["workflows"].items()},
++                       authors={name: AuthorDocumentation(**record) for name, record in data["authors"].items()},
++                       third_party_programs={name: ThirdPartyProgram(**record) for name, record in data["third_party_programs"].items()},
++                       assets=[DocumentationAsset(**record) for record in data["assets"]],
++                       dataset_path=path)
++        except (KeyError, TypeError, ValueError, AttributeError) as error:
++            raise ConfigError(f"The JSON file at '{path}' does not contain the documentation records anvi'o expected. "
++                              f"Please use a complete documentation.json export from anvi-script-gen-help-pages. "
++                              f"The record reader reported: {error}") from error
++
++
++    def write(self, path: Path) -> None:
++        """Write the dataset as JSON; image assets are copied separately by the renderer."""
++
++        path = Path(path)
++        filesnpaths.is_output_file_writable(path)
++        data = asdict(self)
++        # Local input locations are runtime state, not part of the portable dataset.
++        del data["dataset_path"]
++        try:
++            with path.open("w", encoding="utf-8") as output:
++                json.dump(data, output, ensure_ascii=False, indent=2)
++                output.write("\n")
++        except OSError as error:
++            raise FilesNPathsError(f"Anvi'o could not write the documentation dataset to '{path}'. Please check the "
++                                   f"available disk space and your write permissions, or choose another output path. "
++                                   f"Here is the error from the operating system: {error}") from error
+diff --git a/anvio/docs/export.py b/anvio/docs/export.py
+new file mode 100644
+index 0000000000..7edb2146cb
+--- /dev/null
++++ b/anvio/docs/export.py
+@@ -0,0 +1,539 @@
++"""Render the help website from a documentation dataset.
++
++Rendering uses only the dataset, its image assets, and installed website templates.
++It does not discover CLI programs or consult documentation source registries.
++"""
++
++from __future__ import annotations
++
++import os
++import json
++import shutil
++from collections import Counter
++from dataclasses import asdict
++from pathlib import Path
++from typing import Any
++
++import anvio
++import anvio.filesnpaths as filesnpaths
++import anvio.terminal as terminal
++import anvio.utils as utils
++
++from anvio.docs.data import (
++    DATASET_FILENAME, DocumentationData, DocumentRecord,
++)
++from anvio.errors import ConfigError, FilesNPathsError
++from anvio.summaryhtml import SummaryHTMLOutput
++
++
++run = terminal.Run()
++progress = terminal.Progress()
++
++
++class HelpPagesRenderer:
++    """Generate a docs output.
++
++    The purpose of this class is to generate a static HTML output with
++    interlinked files that serve as the primary documentation for anvi'o
++    programs, input files they expect, and output files the generate.
++
++    The default client of this class is `anvi-script-gen-help-docs`.
++    """
++
++
++    def __init__(self, dataset: DocumentationData, output_directory: str, r=run, p=progress):
++        self.dataset = dataset
++        self.output_directory = Path(output_directory).resolve()
++        self.run = r
++        self.progress = p
++        self.programs = dataset.programs
++        self.workflows = dataset.workflows
++        self.authors = dataset.authors
++        self.program_names_and_paths = dataset.program_source_paths
++        self.version_short_identifier = dataset.meta.version_short_identifier
++        self.base_url = dataset.meta.base_url
++        self.anvio_markdown_variables_conversion_dict = {}
++
++        # Resolve every body before replacing any existing output.
++        self.bodies = {record.id: self.render_body(record)
++                       for records in (dataset.programs, dataset.artifacts, dataset.workflows)
++                       for record in records.values()}
++
++        # The existing templates consume dictionaries rather than documentation records.
++        self.artifacts_info = {}
++        self.artifact_types = {}
++        for artifact, record in dataset.artifacts.items():
++            self.artifact_types.setdefault(record.type, []).append(artifact)
++            self.artifacts_info[artifact] = {'type': record.type, 'description': self.bodies[record.id]}
++            for relation, inverse in (('requires', 'required_by'), ('provides', 'provided_by'),
++                                      ('can_use', 'can_used_by'), ('can_provide', 'can_provided_by')):
++                self.artifacts_info[artifact][inverse] = [name for name, program in self.programs.items()
++                                                        if artifact in getattr(program, relation)]
++
++
++    def programs_network(self, program_names: list[str] | None = None, artifact_names_as_ids: bool = False) -> dict[str, Any]:
++        """Returns an association network for anvi'o programs and artifacs
++
++        By default this function will report a network for all programs, unless the user
++        passed program_names as a list of programs, in which case the function
++        will focus only on that program and its artifats, reporting a sub-network.
++        """
++
++        programs = {name: program for name, program in self.programs.items()
++                    if (program_names is None or name in program_names) and (program.requires or program.provides)}
++        artifact_names = {name: name if artifact_names_as_ids else record.name
++                          for name, record in self.dataset.artifacts.items()}
++
++        artifact_names_seen = set([])
++        artifacts_seen = Counter({})
++        all_artifacts = []
++        for program in programs.values():
++            all_program_artifacts = (program.provides +
++                                     program.requires +
++                                     program.can_use +
++                                     program.can_provide)
++            for artifact in all_program_artifacts:
++                artifacts_seen[artifact] += 1
++                if not artifact in artifact_names_seen:
++                    all_artifacts.append(artifact)
++                    artifact_names_seen.add(artifact)
++
++        programs_seen = Counter({})
++        for artifact in all_artifacts:
++            for program in programs.values():
++                all_program_artifacts = (program.provides +
++                                         program.requires +
++                                         program.can_use +
++                                         program.can_provide)
++                for program_artifact in all_program_artifacts:
++                    if artifact_names[artifact] == artifact_names[program_artifact]:
++                        programs_seen[program.name] += 1
++
++        network_dict = {"graph": [], "nodes": [], "links": [], "directed": False, "multigraph": False}
++
++        node_indices = {}
++
++        index = 0
++        for artifact in all_artifacts:
++            network_dict["nodes"].append({"size": artifacts_seen[artifact],
++                                          "score": 0.5 if self.dataset.artifacts[artifact].provided_by_anvio else 1,
++                                          "color": '#00AA00' if self.dataset.artifacts[artifact].provided_by_anvio else "#AA0000",
++                                          "id": artifact,
++                                          "name": artifact_names[artifact],
++                                          "provided_by_anvio": True if self.dataset.artifacts[artifact].provided_by_anvio else False,
++                                          "type": self.dataset.artifacts[artifact].type})
++            node_indices[artifact] = index
++            index += 1
++
++        for program in programs.values():
++            network_dict["nodes"].append({"size": programs_seen[program.name],
++                                          "score": 0.1,
++                                          "color": "#AAAA00",
++                                          "id": program.name,
++                                          "name": program.name,
++                                          "type": "PROGRAM"})
++            node_indices[program.name] = index
++            index += 1
++
++        for artifact in all_artifacts:
++            for program in programs.values():
++                for artifact_provided in program.provides:
++                    if artifact_provided == artifact:
++                        network_dict["links"].append({"source": node_indices[program.name], "target": node_indices[artifact], "type": "provides"})
++                for artifact_needed in program.requires:
++                    if artifact_needed == artifact:
++                        network_dict["links"].append({"target": node_indices[program.name], "source": node_indices[artifact], "type": "requires"})
++                for artifact_can_use in program.can_use:
++                    if artifact_can_use == artifact:
++                        network_dict["links"].append({"target": node_indices[program.name], "source": node_indices[artifact], "type": "can_use"})
++                for artifact_can_provide in program.can_provide:
++                    if artifact_can_provide == artifact:
++                        network_dict["links"].append({"source": node_indices[program.name], "target": node_indices[artifact], "type": "can_provide"})
++
++        return network_dict
++
++
++    def render_body(self, record: DocumentRecord) -> str | None:
++        if record.source_markdown is None:
++            return None
++        return self.render_anvio_markdown(record.source_markdown, record.documentation_path)
++
++
++    def init_anvio_markdown_variables_conversion_dict(self):
++        for program_name in self.program_names_and_paths:
++            self.anvio_markdown_variables_conversion_dict[program_name] = """<span class="artifact-p">[%s](%s/programs/%s)</span>""" % (program_name, self.base_url, program_name)
++
++        for artifact_name in self.dataset.artifacts:
++            self.anvio_markdown_variables_conversion_dict[artifact_name] = """<span class="artifact-n">[%s](%s/artifacts/%s)</span>""" % (artifact_name, self.base_url, artifact_name)
++
++
++    def render_anvio_markdown(self, content: str, source_path: str) -> str:
++        """Renders markdown descriptions filling in anvi'o variables.
++
++        Basically a lot of l_l83Я 1337 Я0XX0ЯZ stuff's going on down there, so you better run while you can.
++        """
++
++        markdown_content = content
++        file_path = source_path
++
++        if not len(self.anvio_markdown_variables_conversion_dict):
++            self.init_anvio_markdown_variables_conversion_dict()
++
++        # this is quite a big deal thing to do here:
++        try:
++            markdown_content = markdown_content % self.anvio_markdown_variables_conversion_dict
++        except KeyError as e:
++            self.progress.end()
++            raise ConfigError("One of the variables, %s, in '%s' is not yet described anywhere :/ If it is not a typo but "
++                              "a new artifact, you can add it to the file `anvio/programsdata.py`. After which everything "
++                              "should work. But please also remember to update provides / requires statements of programs "
++                              "for everything to be linked together." % (e, file_path))
++        except Exception as e:
++            self.progress.end()
++            additional_info = ("If you're stumped by that message, here are some common errors and their solutions: "
++                               "(1) 'unsupported format character' could mean that one of your tags specified with "
++                               "'%(tag)s' did not have the appended 's'. (2) 'not enough arguments for format string' "
++                               "could mean that your document has a '%' sign used in natural language, i.e. '85% similar'. "
++                               "This must be replaced with '85%% similar'.")
++            raise ConfigError("Something went wrong while working with '%s' :/ This is what we know: '%s'. %s" % (file_path, e, additional_info))
++
++        # now we have replaced anvi'o variables with markdown links, it is time to replace
++        # hyphens in anvi'o codeblocks with HTML hyphens so markdown does not freakout when it is
++        # time to visualize these and replace -- characters with en dash.
++        markdwon_lines = markdown_content.split('\n')
++        line_nums_for_codestart_tags = [i for i in range(0, len(markdwon_lines)) if markdwon_lines[i].strip() == "{{ codestart }}"]
++        line_nums_for_codestop_tags = [i for i in range(0, len(markdwon_lines)) if markdwon_lines[i].strip() == "{{ codestop }}"]
++
++        if len(line_nums_for_codestart_tags) != len(line_nums_for_codestop_tags):
++            self.progress.end()
++            raise ConfigError("In %s, the number of {{ codestart }} tags do not match to the number of {{ codestop }} tags :/" % file_path)
++
++
++        for line_start, line_end in list(zip(line_nums_for_codestart_tags, line_nums_for_codestop_tags)):
++            for line_num in range(line_start + 1, line_end):
++                markdwon_lines[line_num] = markdwon_lines[line_num].replace("-", "&#45;").replace("*", "&#42;").replace("==", "&#61;&#61;")
++
++        # all lines are processed: merge them back into a single text:
++        markdown_content = '\n'.join(markdwon_lines)
++
++        # now we have a proper markdown, it is time to remove anvi'o {{ codestart }} and {{ codestop }} blocks.
++        markdown_content = markdown_content.replace("""{{ codestart }}""", """<div class="codeblock" markdown="1">""")
++        markdown_content = markdown_content.replace("""{{ codestop }}""", """</div>""")
++
++        # return it like a pro.
++        return markdown_content
++
++
++    def generate(self) -> None:
++        """Validate the source bundle before preparing and writing the help output."""
++
++        asset_sources = self.dataset.asset_sources
++        source_paths = list(asset_sources.values())
++        if self.dataset.dataset_path is not None:
++            source_paths.append(self.dataset.dataset_path)
++        for source in source_paths:
++            if source.resolve() == self.output_directory or self.output_directory in source.resolve().parents:
++                raise ConfigError(f"The output directory '{self.output_directory}' contains a source file needed to "
++                                  f"render the documentation: '{source}'. Generating help pages replaces the output "
++                                  f"directory, so please choose a separate output directory to keep the source intact.")
++
++        try:
++            for asset in self.dataset.assets:
++                source = asset_sources.get(asset.path)
++                if source is None or not source.is_file():
++                    raise ConfigError(f"Anvi'o cannot find the documentation image '{asset.path}'. Please keep the "
++                                      f"exported images directory beside documentation.json when moving a bundle, "
++                                      f"or regenerate the documentation from its sources.")
++                if utils.get_file_md5(source) != asset.md5:
++                    raise ConfigError(f"The documentation image '{source}' no longer matches the checksum recorded "
++                                      f"in the dataset. Please restore the image from the same export, or regenerate "
++                                      f"the documentation so the dataset and its images agree.")
++
++            filesnpaths.check_output_directory(self.output_directory, ok_if_exists=True)
++            filesnpaths.gen_output_directory(self.output_directory, progress=self.progress, run=self.run,
++                                            delete_if_exists=True, dont_warn=True)
++            self.artifacts_output_dir = filesnpaths.gen_output_directory(self.output_directory / 'artifacts', progress=self.progress, run=self.run)
++            self.programs_output_dir = filesnpaths.gen_output_directory(self.output_directory / 'programs', progress=self.progress, run=self.run)
++            self.workflows_output_dir = filesnpaths.gen_output_directory(self.output_directory / 'workflows', progress=self.progress, run=self.run)
++
++            self.copy_images()
++
++            self.generate_pages_for_artifacts()
++
++            self.generate_pages_for_programs()
++
++            self.generate_pages_for_workflows()
++
++            self.generate_index_page()
++
++            self.dataset.write(self.output_directory / DATASET_FILENAME)
++        except OSError as error:
++            raise FilesNPathsError(f"Anvi'o could not finish generating documentation in '{self.output_directory}'. "
++                                   f"Please check that the source images are readable and the output location has "
++                                   f"enough disk space and write permissions. Here is the operating system error: "
++                                   f"{error}") from error
++        finally:
++            self.progress.end()
++
++
++    def copy_images(self):
++        """Copies images from the documentation dataset to the output directory"""
++
++        for asset in self.dataset.assets:
++            destination = self.output_directory / asset.path
++            filesnpaths.gen_output_directory(destination.parent, progress=self.progress, run=self.run)
++            shutil.copyfile(self.dataset.asset_sources[asset.path], destination)
++
++
++    def get_workflow_produced_artifacts_list(self, workflow_name, prefix="../../"):
++        return [(r, '%sartifacts/%s' % (prefix, r)) for r in self.workflows[workflow_name].artifacts_produced]
++
++
++    def get_workflow_accepted_artifacts_list(self, workflow_name, prefix="../../"):
++        return [(r, '%sartifacts/%s' % (prefix, r)) for r in self.workflows[workflow_name].artifacts_accepted]
++
++
++    def get_program_requires_provides_dict(self, prefix="../../"):
++        d = {}
++
++        for program_name in self.programs:
++            d[program_name] = {}
++
++            program = self.programs[program_name]
++            d[program_name]['requires'] = [(r, '%sartifacts/%s' % (prefix, r)) for r in program.requires]
++            d[program_name]['provides'] = [(r, '%sartifacts/%s' % (prefix, r)) for r in program.provides]
++            d[program_name]['can_use'] = [(r, '%sartifacts/%s' % (prefix, r)) for r in program.can_use]
++            d[program_name]['can_provide'] = [(r, '%sartifacts/%s' % (prefix, r)) for r in program.can_provide]
++            d[program_name]['anvio_workflows'] = [(w, '%sworkflows/%s' % (prefix, w)) for w in program.anvio_workflows]
++
++        return d
++
++
++    def generate_pages_for_artifacts(self):
++        """Generates static pages for artifacts in the output directory"""
++
++        self.progress.new("Rendering artifact pages", progress_total_items=len(self.dataset.artifacts))
++        self.progress.update('...')
++
++        for artifact in self.dataset.artifacts:
++            self.progress.update(f"'{artifact}' ...", increment=True)
++
++            d = {'artifact': asdict(self.dataset.artifacts[artifact]),
++                 'meta': {'summary_type': 'artifact',
++                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in self.dataset.meta.versions]),
++                          'date': self.dataset.meta.date,
++                          'version_short_identifier': self.version_short_identifier}
++                }
++
++            d['artifact']['name'] = artifact
++            d['artifact']['required_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['required_by']]
++            d['artifact']['provided_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['provided_by']]
++            d['artifact']['can_used_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['can_used_by']]
++            d['artifact']['can_provided_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['can_provided_by']]
++            d['artifact']['description'] = self.artifacts_info[artifact]['description']
++            d['artifact']['icon'] = '../../images/icons/%s.png' % self.dataset.artifacts[artifact].type
++
++            if anvio.DEBUG:
++                self.progress.reset()
++                self.run.warning(None, 'THE OUTPUT DICT')
++                import json
++                print(json.dumps(d, indent=2))
++
++            self.progress.update(f"'{artifact}' ... rendering ...", increment=False)
++            artifact_output_dir = filesnpaths.gen_output_directory(os.path.join(self.artifacts_output_dir, artifact), progress=self.progress, run=self.run)
++            output_file_path = os.path.join(artifact_output_dir, 'index.md')
++            open(output_file_path, 'w', encoding='utf-8').write(SummaryHTMLOutput(d, r=self.run, p=self.progress).render())
++
++        self.progress.end()
++
++
++    def get_HTML_formatted_authors_data(self, authors):
++        """for a given program, returns HTML-formatted authors data"""
++
++        d = ""
++
++        for author in authors:
++            d += '''<div class="anvio-person"><div class="anvio-person-info">'''
++            d += f'''<div class="anvio-person-photo"><img class="anvio-person-photo-img" src="../../images/authors/{os.path.basename(self.authors[author].avatar)}" /></div>'''
++            d += '''<div class="anvio-person-info-box">'''
++            d += f'''<a href="/people/{self.authors[author].github}" target="_blank"><span class="anvio-person-name">{self.authors[author].name}</span></a>'''
++            d += '''<div class="anvio-person-social-box">'''
++
++            if self.authors[author].web is not None:
++                d += f'''<a href="{self.authors[author].web}" class="person-social" target="_blank"><i class="fa fa-fw fa-home"></i>Web</a>'''
++
++            d += f'''<a href="mailto:{self.authors[author].email}" class="person-social" target="_blank"><i class="fa fa-fw fa-envelope-square"></i>Email</a>'''
++
++            if self.authors[author].twitter is not None:
++                d += f'''<a href="http://twitter.com/{self.authors[author].twitter}" class="person-social" target="_blank"><i class="fa fa-fw fa-twitter-square"></i>Twitter</a>'''
++
++            d += f'''<a href="http://github.com/{self.authors[author].github}" class="person-social" target="_blank"><i class="fa fa-fw fa-github"></i>Github</a>'''
++
++            d += '''</div></div></div></div>\n\n'''
++
++        return d
++
++
++    def get_HTML_formatted_authors_data_mini(self, authors):
++        """for a given list of authors, returns a tiny version of the HTML-formatted authors data"""
++
++        d = ""
++
++        for author in authors:
++            d += '''<div class="anvio-person-mini"><div class="anvio-person-photo-mini">'''
++            d += f'''<a href="/people/{self.authors[author].github}" target="_blank"><img class="anvio-person-photo-img-mini" title="{self.authors[author].name}" src="images/authors/{os.path.basename(self.authors[author].avatar)}" /></a>'''
++            d += '''</div></div>\n'''
++
++        return d
++
++
++    def get_HTML_formatted_third_party_programs(self, workflow_name):
++        """Get a template-friendly list of third-party programs used from within a workflow"""
++
++        d = []
++
++        for purpose, program_names in self.workflows[workflow_name].third_party_programs_used:
++            for program_name in program_names:
++                d.append(f'''<a href="{self.dataset.third_party_programs[program_name].link}" target="_blank">{program_name}</a> ({purpose})''')
++
++        return d
++
++
++    def generate_pages_for_workflows(self):
++        """Generate static pages for anvi'o workflows in the output directory"""
++
++        self.progress.new("Rendering workflow pages", progress_total_items=len(self.workflows))
++        self.progress.update('...')
++
++        for workflow_name in self.workflows:
++            self.progress.update(f"'{workflow_name}' ...", increment=True)
++
++            d = {'workflow': asdict(self.workflows[workflow_name]),
++                 'meta': {'summary_type': 'workflow',
++                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in self.dataset.meta.versions]),
++                          'date': self.dataset.meta.date,
++                          'version_short_identifier': self.version_short_identifier}
++                 }
++
++            d['workflow']['description'] = self.bodies[self.workflows[workflow_name].id]
++            d['workflow']['artifacts_produced'] = self.get_workflow_produced_artifacts_list(workflow_name)
++            d['workflow']['artifacts_accepted'] = self.get_workflow_accepted_artifacts_list(workflow_name)
++            d['workflow']['third_party_programs_used'] = self.get_HTML_formatted_third_party_programs(workflow_name)
++            d['workflow']['authors'] = self.get_HTML_formatted_authors_data(d['workflow']['authors'])
++
++            # also add information regarding the artifacts
++            d['artifacts'] = self.artifacts_info
++
++            if anvio.DEBUG:
++                self.progress.reset()
++                self.run.warning(None, 'THE WORKFLOW OUTPUT DICT')
++                import json
++                print(json.dumps(d, indent=2))
++
++            self.progress.update(f"'{workflow_name}' ... rendering ...", increment=False)
++            workflow_output_dir = filesnpaths.gen_output_directory(os.path.join(self.workflows_output_dir, workflow_name), progress=self.progress, run=self.run)
++            output_file_path = os.path.join(workflow_output_dir, 'index.md')
++            open(output_file_path, 'w', encoding='utf-8').write(SummaryHTMLOutput(d, r=self.run, p=self.progress).render())
++
++        self.progress.end()
++
++
++    def generate_pages_for_programs(self):
++        """Generates static pages for programs in the output directory"""
++
++        self.progress.new("Rendering program pages", progress_total_items=len(self.programs))
++        self.progress.update('...')
++
++        program_provides_requires_dict = self.get_program_requires_provides_dict()
++
++        resources_example_program = 'anvi-interactive'
++        resources_example_path = None
++        if resources_example_program in self.program_names_and_paths:
++            resources_example_path = self.program_names_and_paths[resources_example_program]
++            resources_example_path = resources_example_path.replace(os.sep, '/')
++
++        for program_name in self.programs:
++            self.progress.update(f"'{program_name}' ...", increment=True)
++
++            program = self.programs[program_name]
++            program_source_path = program.source_path
++            d = {'program': {},
++                 'meta': {'summary_type': 'program',
++                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in self.dataset.meta.versions]),
++                          'date': self.dataset.meta.date,
++                          'version_short_identifier': self.version_short_identifier}
++                }
++
++            d['program']['name'] = program_name
++            d['program']['usage'] = self.bodies[program.id]
++            d['program']['description'] = program.description
++            d['program']['resources'] = program.resources
++            d['program']['source_path'] = program_source_path
++            d['program']['resources_example_source_path'] = resources_example_path or program_source_path
++            d['program']['requires'] = program_provides_requires_dict[program_name]['requires']
++            d['program']['provides'] = program_provides_requires_dict[program_name]['provides']
++            d['program']['can_use'] = program_provides_requires_dict[program_name]['can_use']
++            d['program']['can_provide'] = program_provides_requires_dict[program_name]['can_provide']
++            d['program']['icon'] = '../../images/icons/%s.png' % 'PROGRAM'
++            d['program']['authors'] = self.get_HTML_formatted_authors_data(program.authors)
++            d['artifacts'] = self.artifacts_info
++            d['workflows'] = {name: asdict(workflow) for name, workflow in self.workflows.items()}
++
++            if anvio.DEBUG:
++                self.progress.reset()
++                self.run.warning(None, 'THE OUTPUT DICT')
++                print(json.dumps(d, indent=2))
++
++            self.progress.update(f"'{program_name}' ... rendering ...", increment=False)
++            program_output_dir = filesnpaths.gen_output_directory(os.path.join(self.programs_output_dir, program_name), progress=self.progress, run=self.run)
++            output_file_path = os.path.join(program_output_dir, 'index.md')
++            open(output_file_path, 'w', encoding='utf-8').write(SummaryHTMLOutput(d, r=self.run, p=self.progress).render())
++
++            # create the program network, too
++            self.progress.update(f"'{program_name}' ... rendering ... network json ...", increment=False)
++            program_output_dir = filesnpaths.gen_output_directory(os.path.join(self.programs_output_dir, program_name), progress=self.progress, run=self.run)
++            program_network = self.programs_network([program_name], artifact_names_as_ids=True)
++            with open(os.path.join(program_output_dir, "network.json"), "w", encoding="utf-8") as output:
++                json.dump(program_network, output, indent=2)
++
++        self.progress.end()
++
++
++    def generate_index_page(self):
++        """Generates the index page for help where all programs and artifacts are listed"""
++
++        self.progress.new("Index page")
++        self.progress.update('...')
++
++        # let's add the 'path' for each artifact to simplify
++        # access from the template:
++        for artifact in self.artifacts_info:
++            self.artifacts_info[artifact]['path'] = f"artifacts/{artifact}"
++
++        # quick update of the author information in workflows so they contain nice HTML
++        # code instad of a list of author names
++        workflows = {name: asdict(workflow) for name, workflow in self.workflows.items()}
++        for workflow in workflows:
++            workflows[workflow]['authors'] = self.get_HTML_formatted_authors_data_mini(self.workflows[workflow].authors)
++
++        # please note that artifacts get a fancy dictionary with everything, while programs get a crappy tuples list.
++        # if we need to improve the functionality of the help index page, we may need to update programs
++        # to a fancy dictionary, too.
++        d = {'programs': [(p, 'programs/%s' % p, self.programs[p].description, self.get_HTML_formatted_authors_data_mini(self.programs[p].authors)) for p in self.programs],
++             'workflows': workflows,
++             'artifacts': self.artifacts_info,
++             'artifact_types': self.artifact_types,
++             'meta': {'summary_type': 'programs_and_artifacts_index',
++                      'version': self.dataset.meta.version,
++                      'date': self.dataset.meta.date}
++            }
++
++        d['program_provides_requires'] = self.get_program_requires_provides_dict(prefix='')
++
++        self.progress.update('Rendering...')
++        output_file_path = os.path.join(self.output_directory, 'index.md')
++
++        self.progress.update('Writing...')
++        open(output_file_path, 'w', encoding='utf-8').write(SummaryHTMLOutput(d, r=self.run, p=self.progress).render())
++
++        self.progress.end()
+diff --git a/anvio/docs/vignette.py b/anvio/docs/vignette.py
+new file mode 100644
+index 0000000000..8a4b8a1407
+--- /dev/null
++++ b/anvio/docs/vignette.py
+@@ -0,0 +1,84 @@
++"""Generate the existing programs vignette from CLI help output."""
++
++import os
++
++import anvio
++import anvio.filesnpaths as filesnpaths
++import anvio.terminal as terminal
++import anvio.utils as utils
++
++from anvio.programs import AnvioPrograms, parse_help_output
++from anvio.summaryhtml import SummaryHTMLOutput
++
++
++class ProgramsVignette:
++    def __init__(self, args, r=terminal.Run(), p=terminal.Progress()):
++        self.args = args
++        self.run = r
++        self.progress = p
++
++        self.programs_to_skip = ['anvi-script-gen-programs-vignette']
++
++        self.anvio_programs = AnvioPrograms(args, r=self.run, p=self.progress)
++
++        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
++        self.output_file_path = A("output_file")
++
++
++    def generate(self):
++        self.anvio_programs.init_programs(okay_if_no_meta = True, quiet = True)
++        programs = self.anvio_programs.programs
++
++        d = {}
++        log_file = filesnpaths.get_temp_file_path()
++        for i, program_name in enumerate(programs):
++            program = programs[program_name]
++
++            if program_name in self.programs_to_skip:
++                self.run.warning("Someone doesn't want %s to be in the output :/ Fine. Skipping." % (program.name))
++
++            self.progress.new('Bleep bloop')
++            self.progress.update('%s (%d of %d)' % (program_name, i+1, len(programs)))
++
++            output = utils.run_command_STDIN('%s --help --quiet' % (program.program_path), log_file, '').split('\n')
++
++            if anvio.DEBUG:
++                usage, params, output = parse_help_output(output)
++            else:
++                try:
++                    usage, params, output = parse_help_output(output)
++                except Exception as e:
++                    self.progress.end()
++                    self.run.warning("The program '%s' does not seem to have the expected help menu output. Skipping to the next. "
++                                "For the curious, this was the error message: '%s'" % (program.name, str(e).strip()))
++                    continue
++
++            d[program.name] = {'usage': usage,
++                               'description': program.meta_info['description']['value'],
++                               'params': params,
++                               'tags': program.meta_info['tags']['value'],
++                               'resources': program.meta_info['resources']['value']}
++
++            self.progress.end()
++
++        os.remove(log_file)
++
++        # generate output
++        program_names = sorted([p for p in d if not p.startswith('anvi-script-')])
++        script_names = sorted([p for p in d if p.startswith('anvi-script-')])
++        vignette = {'vignette': d,
++                    'program_names': program_names,
++                    'script_names': script_names,
++                    'all_names': program_names + script_names,
++                    'meta': {'summary_type': 'vignette',
++                             'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in anvio.get_version_tuples()]),
++                             'date': utils.get_date()}}
++
++        if anvio.DEBUG:
++            self.run.warning(None, 'THE OUTPUT DICT')
++            import json
++            print(json.dumps(d, indent=2))
++
++        open(self.output_file_path, 'w').write(SummaryHTMLOutput(vignette, r=self.run, p=self.progress).render())
++
++        self.run.info('Output file', os.path.abspath(self.output_file_path))
+diff --git a/anvio/programs.py b/anvio/programs.py
+index 8fd2d0aa81..bea04888e5 100644
+--- a/anvio/programs.py
++++ b/anvio/programs.py
+@@ -4,7 +4,6 @@
+ import sys
+ import json
+ import copy
+-import argparse
+ import importlib
+ 
+ from collections import Counter
+@@ -16,8 +15,7 @@
+ 
+ from anvio.errors import ConfigError
+ from anvio.authors import AnvioAuthors
+-from anvio.docs import ANVIO_ARTIFACTS, ANVIO_WORKFLOWS, THIRD_PARTY_PROGRAMS
+-from anvio.summaryhtml import SummaryHTMLOutput
++from anvio.programsdata import ANVIO_ARTIFACTS, ANVIO_WORKFLOWS, THIRD_PARTY_PROGRAMS
+ 
+ 
+ __copyright__ = "Copyleft 2015-2024, The Anvi'o Project (http://anvio.org/)"
+@@ -585,7 +583,7 @@ def __init__(self, artifact_id, provided_by_anvio=True, optional=True, single=Tr
+             raise ConfigError("Ehem. Anvi'o does not know about artifact '%s'. There are two ways this could happen: "
+                               "one, you've made a typo (easy to fix), two, you've just updated __provides__, __requires__, "
+                               "__can_use__, or __can_provide__ in an anvi'o program with an artifact that does not exist "
+-                              "and have not yet updated `anvio/docs/__init__.py` (which is also easy to fix). Please "
++                              "and have not yet updated `anvio/programsdata.py` (which is also easy to fix). Please "
+                               "consider also adding a description of this artifact under anvio/docs/artifacts while you "
+                               "are at it :)" % artifact_id)
+ 
+@@ -664,7 +662,7 @@ def init_workflows(self):
+                                           f"description for third-party programs that are used from within, "
+                                           f"however, there is no entry for this program in the variable "
+                                           f"'THIRD_PARTY_PROGRAMS' in the file "
+-                                          f"'anvio/docs/__init__.py'. Please add a necessary description for "
++                                          f"'anvio/programsdata.py'. Please add a necessary description for "
+                                           f"this program into that dict, and try this again.")
+ 
+             # learn about the description of the workflow
+@@ -694,7 +692,7 @@ def init_workflows(self):
+                     raise ConfigError(f"The artifact '{artifact_name}' that is listed as one of the artifacts the workflow "
+                                       f"{workflow} accepts does not seem to be an artifact anvi'o knows about :/ If this is "
+                                       f"a new artifact for workflow, please first describe it in the dictionary `ANVIO_ARTIFACTS` "
+-                                      f"in anvio/docs/__init__.py")
++                                      f"in anvio/programsdata.py")
+ 
+         # sanity check of author names
+         author_names_appear_in_workflows = set([])
+@@ -704,7 +702,7 @@ def init_workflows(self):
+             self.run.warning(None, header="SOME SNAFU TOOK PLACE [poop emoji]")
+             self.run.info("Author names anvi'o knows about", ', '.join(self.authors), mc='green')
+             self.run.info("Author names anvi'o does not know about", ', '.join(author_names_missing_in_authors_file), mc='red')
+-            raise ConfigError("Some author names in anvi'o workflows defined under `anvio/docs/__init__.py` do not "
++            raise ConfigError("Some author names in anvi'o workflows defined under `anvio/programsdata.py` do not "
+                               "appear in the DEVELOPERS.yaml file. If there is no typo here, please update the "
+                               "contents of the DEVELOPERS.yaml file with the GitHub username of the developer you "
+                               "wish to associate with a workflow. The problematic authors are shown above.")
+@@ -713,7 +711,7 @@ def init_workflows(self):
+         workflows_missing_authors = set([])
+         [workflows_missing_authors.add(w) for w in self.workflows if not len(self.workflows[w]['authors'])]
+         if len(workflows_missing_authors):
+-            raise ConfigError(f"One or more workflows defined under `anvio/docs/__init__.py` do not have "
++            raise ConfigError(f"One or more workflows defined under `anvio/programsdata.py` do not have "
+                               f"any authors. Every workflow must have at least one :/ Here is the list of those that "
+                               f"are missing any authors: {', '.join(workflows_missing_authors)}")
+ 
+@@ -735,7 +733,7 @@ def init_workflows(self):
+         if len(unknown_workflows_mentioned_in_programs):
+             raise ConfigError(f"Some anvi'o programs include `__anvio_workflows__` tags with workflow names anvi'o "
+                               f"dees not recognize :/ Here is the missing workflow names so you can either fix some "
+-                              f"typos, or add entries for these workflows in `anvio/docs/__init.py__`: "
++                              f"typos, or add entries for these workflows in `anvio/programsdata.py`: "
+                               f"{', '.join(unknown_workflows_mentioned_in_programs)}")
+ 
+ 
+@@ -814,416 +812,6 @@ def init_artifacts(self):
+                                            ', '.join(artifacts_without_descriptions)), nl_after=1, nl_before=1)
+ 
+ 
+-class AnvioDocs(AnvioPrograms, AnvioArtifacts, AnvioWorkflows):
+-    """Generate a docs output.
+-
+-    The purpose of this class is to generate a static HTML output with
+-    interlinked files that serve as the primary documentation for anvi'o
+-    programs, input files they expect, and output files the generate.
+-
+-    The default client of this class is `anvi-script-gen-help-docs`.
+-    """
+-
+-    def __init__(self, args, r=terminal.Run(), p=terminal.Progress()):
+-        self.args = args
+-        self.run = r
+-        self.progress = p
+-
+-        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
+-        self.output_directory_path = A("output_dir") or 'ANVIO-HELP'
+-        self.repo_root = os.path.abspath(os.path.join(os.path.dirname(anvio.__file__), '..'))
+-
+-        if not os.path.exists(anvio.DOCS_PATH):
+-            raise ConfigError("The anvi'o docs path is not where it should be :/ Something funny is going on.")
+-
+-        filesnpaths.gen_output_directory(self.output_directory_path, delete_if_exists=True, dont_warn=True)
+-
+-        self.artifacts_output_dir = filesnpaths.gen_output_directory(os.path.join(self.output_directory_path, 'artifacts'))
+-        self.programs_output_dir = filesnpaths.gen_output_directory(os.path.join(self.output_directory_path, 'programs'))
+-        self.workflows_output_dir = filesnpaths.gen_output_directory(os.path.join(self.output_directory_path, 'workflows'))
+-
+-        self.version_short_identifier = 'm' if anvio.anvio_version_for_help_docs == 'main' else anvio.anvio_version_for_help_docs
+-        self.base_url = os.path.join("/help", anvio.anvio_version_for_help_docs)
+-        self.anvio_markdown_variables_conversion_dict = {}
+-
+-        AnvioPrograms.__init__(self, args, r=self.run, p=self.progress)
+-        self.init_programs()
+-
+-        AnvioArtifacts.__init__(self, args, r=self.run, p=self.progress)
+-        self.init_artifacts()
+-
+-        AnvioWorkflows.__init__(self, args, r=self.run, p=self.progress)
+-        self.init_workflows()
+-
+-        if not len(self.programs):
+-            raise ConfigError("AnvioDocs is asked ot process the usage statements of some programs, but the "
+-                              "`self.programs` dictionary seems to be empty :/")
+-
+-        self.images_source_directory = os.path.join(os.path.dirname(anvio.__file__), 'docs/images/png')
+-
+-        self.sanity_check()
+-
+-
+-    def sanity_check(self):
+-        """Quick sanity checks to ensure things are working"""
+-
+-        if not os.path.exists(self.images_source_directory):
+-            raise ConfigError("AnvioDocs speaking: the images source directory does not seem to be "
+-                              "where it should have been :/")
+-
+-        # make sure each artifact type has an icon
+-        A_PNG = lambda x: os.path.exists(os.path.join(self.images_source_directory, 'icons', ANVIO_ARTIFACTS[x]['type'] + '.png'))
+-        missing_images_for_artifact_types = [ANVIO_ARTIFACTS[artifact]['type'] for artifact in self.artifacts_info if not A_PNG(artifact)]
+-        if len(missing_images_for_artifact_types):
+-            raise ConfigError("Some artifacts do not have matching images. If you just added a new artifact type, you "
+-                              "also need to add a corresponding PNG icon for the type under the directory '%s'. See "
+-                              "examples in that directory, and if they are not enough, get in touch with a developer. "
+-                              "Regardless. These are the artifact types missing images: %s."
+-                                                                % (os.path.join(self.images_source_directory, 'icons'),
+-                                                                   ', '.join(missing_images_for_artifact_types)))
+-
+-
+-    def generate(self):
+-        self.copy_images()
+-
+-        self.generate_pages_for_artifacts()
+-
+-        self.generate_pages_for_programs()
+-
+-        self.generate_pages_for_workflows()
+-
+-        self.generate_index_page()
+-
+-
+-    def copy_images(self):
+-        """Copies images from the codebase to the output directory"""
+-
+-        utils.shutil.copytree(self.images_source_directory, os.path.join(self.output_directory_path, 'images'))
+-
+-        os.makedirs(os.path.join(self.output_directory_path, 'images/authors'))
+-
+-        for author in self.authors:
+-            utils.shutil.copy(self.authors[author]['avatar'], os.path.join(self.output_directory_path, 'images/authors', os.path.basename(self.authors[author]['avatar'])))
+-
+-
+-    def init_anvio_markdown_variables_conversion_dict(self):
+-        for program_name in self.program_names_and_paths:
+-            self.anvio_markdown_variables_conversion_dict[program_name] = """<span class="artifact-p">[%s](%s/programs/%s)</span>""" % (program_name, self.base_url, program_name)
+-
+-        for artifact_name in ANVIO_ARTIFACTS:
+-            self.anvio_markdown_variables_conversion_dict[artifact_name] = """<span class="artifact-n">[%s](%s/artifacts/%s)</span>""" % (artifact_name, self.base_url, artifact_name)
+-
+-
+-    def read_anvio_markdown(self, file_path):
+-        """Reads markdown descriptions filling in anvi'o variables.
+-
+-        Basically a lot of l_l83Я 1337 Я0XX0ЯZ stuff's going on down there, so you better run while you can.
+-        """
+-
+-        filesnpaths.is_file_plain_text(file_path)
+-
+-        if not len(self.anvio_markdown_variables_conversion_dict):
+-            self.init_anvio_markdown_variables_conversion_dict()
+-
+-        markdown_content = open(file_path).read()
+-
+-        # this is quite a big deal thing to do here:
+-        try:
+-            markdown_content = markdown_content % self.anvio_markdown_variables_conversion_dict
+-        except KeyError as e:
+-            self.progress.end()
+-            raise ConfigError("One of the variables, %s, in '%s' is not yet described anywhere :/ If it is not a typo but "
+-                              "a new artifact, you can add it to the file `anvio/docs/__init__.py`. After which everything "
+-                              "should work. But please also remember to update provides / requires statements of programs "
+-                              "for everything to be linked together." % (e, file_path))
+-        except Exception as e:
+-            self.progress.end()
+-            additional_info = ("If you're stumped by that message, here are some common errors and their solutions: "
+-                               "(1) 'unsupported format character' could mean that one of your tags specified with "
+-                               "'%(tag)s' did not have the appended 's'. (2) 'not enough arguments for format string' "
+-                               "could mean that your document has a '%' sign used in natural language, i.e. '85% similar'. "
+-                               "This must be replaced with '85%% similar'.")
+-            raise ConfigError("Something went wrong while working with '%s' :/ This is what we know: '%s'. %s" % (file_path, e, additional_info))
+-
+-        # now we have replaced anvi'o variables with markdown links, it is time to replace
+-        # hyphens in anvi'o codeblocks with HTML hyphens so markdown does not freakout when it is
+-        # time to visualize these and replace -- characters with en dash.
+-        markdwon_lines = markdown_content.split('\n')
+-        line_nums_for_codestart_tags = [i for i in range(0, len(markdwon_lines)) if markdwon_lines[i].strip() == "{{ codestart }}"]
+-        line_nums_for_codestop_tags = [i for i in range(0, len(markdwon_lines)) if markdwon_lines[i].strip() == "{{ codestop }}"]
+-
+-        if len(line_nums_for_codestart_tags) != len(line_nums_for_codestop_tags):
+-            raise ConfigError("In %s, the number of {{ codestart }} tags do not match to the number of {{ codestop }} tags :/" % file_path)
+-
+-
+-        for line_start, line_end in list(zip(line_nums_for_codestart_tags, line_nums_for_codestop_tags)):
+-            for line_num in range(line_start + 1, line_end):
+-                markdwon_lines[line_num] = markdwon_lines[line_num].replace("-", "&#45;").replace("*", "&#42;").replace("==", "&#61;&#61;")
+-
+-        # all lines are processed: merge them back into a single text:
+-        markdown_content = '\n'.join(markdwon_lines)
+-
+-        # now we have a proper markdown, it is time to remove anvi'o {{ codestart }} and {{ codestop }} blocks.
+-        markdown_content = markdown_content.replace("""{{ codestart }}""", """<div class="codeblock" markdown="1">""")
+-        markdown_content = markdown_content.replace("""{{ codestop }}""", """</div>""")
+-
+-        # return it like a pro.
+-        return markdown_content
+-
+-
+-    def get_program_requires_provides_dict(self, prefix="../../"):
+-        d = {}
+-
+-        for program_name in self.programs:
+-            d[program_name] = {}
+-
+-            program = self.programs[program_name]
+-            d[program_name]['requires'] = [(r.id, '%sartifacts/%s' % (prefix, r.id)) for r in program.meta_info['requires']['value']]
+-            d[program_name]['provides'] = [(r.id, '%sartifacts/%s' % (prefix, r.id)) for r in program.meta_info['provides']['value']]
+-            d[program_name]['can_use'] = [(r.id, '%sartifacts/%s' % (prefix, r.id)) for r in program.meta_info['can_use']['value']]
+-            d[program_name]['can_provide'] = [(r.id, '%sartifacts/%s' % (prefix, r.id)) for r in program.meta_info['can_provide']['value']]
+-            d[program_name]['anvio_workflows'] = [(w, '%sworkflows/%s' % (prefix, w)) for w in program.meta_info['anvio_workflows']['value']]
+-
+-        return d
+-
+-
+-    def get_workflow_produced_artifacts_list(self, workflow_name, prefix="../../"):
+-        return [(r, '%sartifacts/%s' % (prefix, r)) for r in self.workflows[workflow_name]['artifacts_produced']]
+-
+-
+-    def get_workflow_accepted_artifacts_list(self, workflow_name, prefix="../../"):
+-        return [(r, '%sartifacts/%s' % (prefix, r)) for r in self.workflows[workflow_name]['artifacts_accepted']]
+-
+-
+-    def generate_pages_for_artifacts(self):
+-        """Generates static pages for artifacts in the output directory"""
+-
+-        self.progress.new("Rendering artifact pages", progress_total_items=len(ANVIO_ARTIFACTS))
+-        self.progress.update('...')
+-
+-        for artifact in ANVIO_ARTIFACTS:
+-            self.progress.update(f"'{artifact}' ...", increment=True)
+-
+-            d = {'artifact': ANVIO_ARTIFACTS[artifact],
+-                 'meta': {'summary_type': 'artifact',
+-                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in anvio.get_version_tuples()]),
+-                          'date': utils.get_date(),
+-                          'version_short_identifier': self.version_short_identifier}
+-                }
+-
+-            d['artifact']['name'] = artifact
+-            d['artifact']['required_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['required_by']]
+-            d['artifact']['provided_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['provided_by']]
+-            d['artifact']['can_used_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['can_used_by']]
+-            d['artifact']['can_provided_by'] = [(r, '../../programs/%s' % r) for r in self.artifacts_info[artifact]['can_provided_by']]
+-            d['artifact']['description'] = self.artifacts_info[artifact]['description']
+-            d['artifact']['icon'] = '../../images/icons/%s.png' % ANVIO_ARTIFACTS[artifact]['type']
+-
+-            if anvio.DEBUG:
+-                self.progress.reset()
+-                run.warning(None, 'THE OUTPUT DICT')
+-                import json
+-                print(json.dumps(d, indent=2))
+-
+-            self.progress.update(f"'{artifact}' ... rendering ...", increment=False)
+-            artifact_output_dir = filesnpaths.gen_output_directory(os.path.join(self.artifacts_output_dir, artifact))
+-            output_file_path = os.path.join(artifact_output_dir, 'index.md')
+-            open(output_file_path, 'w').write(SummaryHTMLOutput(d, r=run, p=progress).render())
+-
+-        self.progress.end()
+-
+-
+-    def get_HTML_formatted_authors_data(self, authors):
+-        """for a given program, returns HTML-formatted authors data"""
+-
+-        d = ""
+-
+-        for author in authors:
+-            d += '''<div class="anvio-person"><div class="anvio-person-info">'''
+-            d += f'''<div class="anvio-person-photo"><img class="anvio-person-photo-img" src="../../images/authors/{os.path.basename(self.authors[author]['avatar'])}" /></div>'''
+-            d += '''<div class="anvio-person-info-box">'''
+-            d += f'''<a href="/people/{self.authors[author]['github']}" target="_blank"><span class="anvio-person-name">{self.authors[author]['name']}</span></a>'''
+-            d += '''<div class="anvio-person-social-box">'''
+-
+-            if 'web' in self.authors[author]:
+-                d += f'''<a href="{self.authors[author]['web']}" class="person-social" target="_blank"><i class="fa fa-fw fa-home"></i>Web</a>'''
+-
+-            d += f'''<a href="mailto:{self.authors[author]['email']}" class="person-social" target="_blank"><i class="fa fa-fw fa-envelope-square"></i>Email</a>'''
+-
+-            if 'twitter' in self.authors[author]:
+-                d += f'''<a href="http://twitter.com/{self.authors[author]['twitter']}" class="person-social" target="_blank"><i class="fa fa-fw fa-twitter-square"></i>Twitter</a>'''
+-
+-            d += f'''<a href="http://github.com/{self.authors[author]['github']}" class="person-social" target="_blank"><i class="fa fa-fw fa-github"></i>Github</a>'''
+-
+-            d += '''</div></div></div></div>\n\n'''
+-
+-        return d
+-
+-
+-    def get_HTML_formatted_authors_data_mini(self, authors):
+-        """for a given list of authors, returns a tiny version of the HTML-formatted authors data"""
+-
+-        d = ""
+-
+-        for author in authors:
+-            d += '''<div class="anvio-person-mini"><div class="anvio-person-photo-mini">'''
+-            d += f'''<a href="/people/{self.authors[author]['github']}" target="_blank"><img class="anvio-person-photo-img-mini" title="{self.authors[author]['name']}" src="images/authors/{os.path.basename(self.authors[author]['avatar'])}" /></a>'''
+-            d += '''</div></div>\n'''
+-
+-        return d
+-
+-
+-    def get_HTML_formatted_third_party_programs(self, workflow_name):
+-        """Get a template-friendly list of third-party programs used from within a workflow"""
+-
+-        d = []
+-
+-        for purpose, program_names in self.workflows[workflow_name]['third_party_programs_used']:
+-            for program_name in program_names:
+-                d.append(f'''<a href="{THIRD_PARTY_PROGRAMS[program_name]['link']}" target="_blank">{program_name}</a> ({purpose})''')
+-
+-        return d
+-
+-
+-    def generate_pages_for_workflows(self):
+-        """Generate static pages for anvi'o workflows in the output directory"""
+-
+-        self.progress.new("Rendering workflow pages", progress_total_items=len(self.workflows))
+-        self.progress.update('...')
+-
+-        for workflow_name in self.workflows:
+-            self.progress.update(f"'{workflow_name}' ...", increment=True)
+-
+-            d = {'workflow': self.workflows[workflow_name],
+-                 'meta': {'summary_type': 'workflow',
+-                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in anvio.get_version_tuples()]),
+-                          'date': utils.get_date(),
+-                          'version_short_identifier': self.version_short_identifier}
+-                 }
+-
+-            d['workflow']['artifacts_produced'] = self.get_workflow_produced_artifacts_list(workflow_name)
+-            d['workflow']['artifacts_accepted'] = self.get_workflow_accepted_artifacts_list(workflow_name)
+-            d['workflow']['third_party_programs_used'] = self.get_HTML_formatted_third_party_programs(workflow_name)
+-            d['workflow']['authors'] = self.get_HTML_formatted_authors_data(d['workflow']['authors'])
+-
+-            # also add information regarding the artifacts
+-            d['artifacts'] = self.artifacts_info
+-
+-            if anvio.DEBUG:
+-                self.progress.reset()
+-                run.warning(None, 'THE WORKFLOW OUTPUT DICT')
+-                import json
+-                print(json.dumps(d, indent=2))
+-
+-            self.progress.update(f"'{workflow_name}' ... rendering ...", increment=False)
+-            workflow_output_dir = filesnpaths.gen_output_directory(os.path.join(self.workflows_output_dir, workflow_name))
+-            output_file_path = os.path.join(workflow_output_dir, 'index.md')
+-            open(output_file_path, 'w').write(SummaryHTMLOutput(d, r=run, p=progress).render())
+-
+-        self.progress.end()
+-
+-
+-
+-    def generate_pages_for_programs(self):
+-        """Generates static pages for programs in the output directory"""
+-
+-        self.progress.new("Rendering program pages", progress_total_items=len(self.programs))
+-        self.progress.update('...')
+-
+-        program_provides_requires_dict = self.get_program_requires_provides_dict()
+-
+-        resources_example_program = 'anvi-interactive'
+-        resources_example_path = None
+-        if resources_example_program in self.program_names_and_paths:
+-            resources_example_path = os.path.relpath(self.program_names_and_paths[resources_example_program], self.repo_root)
+-            resources_example_path = resources_example_path.replace(os.sep, '/')
+-
+-        for program_name in self.programs:
+-            self.progress.update(f"'{program_name}' ...", increment=True)
+-
+-            program = self.programs[program_name]
+-            program_source_path = os.path.relpath(program.program_path, self.repo_root).replace(os.sep, '/')
+-            d = {'program': {},
+-                 'meta': {'summary_type': 'program',
+-                          'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in anvio.get_version_tuples()]),
+-                          'date': utils.get_date(),
+-                          'version_short_identifier': self.version_short_identifier}
+-                }
+-
+-            d['program']['name'] = program_name
+-            d['program']['usage'] = program.usage
+-            d['program']['description'] = program.meta_info['description']['value']
+-            d['program']['resources'] = program.meta_info['resources']['value']
+-            d['program']['source_path'] = program_source_path
+-            d['program']['resources_example_source_path'] = resources_example_path or program_source_path
+-            d['program']['requires'] = program_provides_requires_dict[program_name]['requires']
+-            d['program']['provides'] = program_provides_requires_dict[program_name]['provides']
+-            d['program']['can_use'] = program_provides_requires_dict[program_name]['can_use']
+-            d['program']['can_provide'] = program_provides_requires_dict[program_name]['can_provide']
+-            d['program']['icon'] = '../../images/icons/%s.png' % 'PROGRAM'
+-            d['program']['authors'] = self.get_HTML_formatted_authors_data(program.meta_info['authors']['value'])
+-            d['artifacts'] = self.artifacts_info
+-            d['workflows'] = self.workflows
+-
+-            if anvio.DEBUG:
+-                self.progress.reset()
+-                run.warning(None, 'THE OUTPUT DICT')
+-                import json
+-                print(json.dumps(d, indent=2))
+-
+-            self.progress.update(f"'{program_name}' ... rendering ...", increment=False)
+-            program_output_dir = filesnpaths.gen_output_directory(os.path.join(self.programs_output_dir, program_name))
+-            output_file_path = os.path.join(program_output_dir, 'index.md')
+-            open(output_file_path, 'w').write(SummaryHTMLOutput(d, r=run, p=progress).render())
+-
+-            # create the program network, too
+-            self.progress.update(f"'{program_name}' ... rendering ... network json ...", increment=False)
+-            program_output_dir = filesnpaths.gen_output_directory(os.path.join(self.programs_output_dir, program_name))
+-            program_network = ProgramsNetwork(argparse.Namespace(output_file=os.path.join(program_output_dir, "network.json"), program_names_to_focus=program_name), r=terminal.Run(verbose=False))
+-            program_network.generate()
+-
+-        self.progress.end()
+-
+-
+-    def generate_index_page(self):
+-        """Generates the index page for help where all programs and artifacts are listed"""
+-
+-        self.progress.new("Index page")
+-        self.progress.update('...')
+-
+-        # let's add the 'path' for each artifact to simplify
+-        # access from the template:
+-        for artifact in self.artifacts_info:
+-            self.artifacts_info[artifact]['path'] = f"artifacts/{artifact}"
+-
+-        # quick update of the author information in workflows so they contain nice HTML
+-        # code instad of a list of author names
+-        for workflow in self.workflows:
+-            self.workflows[workflow]['authors'] = self.get_HTML_formatted_authors_data_mini(ANVIO_WORKFLOWS[workflow]['authors'])
+-
+-        # please note that artifacts get a fancy dictionary with everything, while programs get a crappy tuples list.
+-        # if we need to improve the functionality of the help index page, we may need to update programs
+-        # to a fancy dictionary, too.
+-        d = {'programs': [(p, 'programs/%s' % p, self.programs[p].meta_info['description']['value'], self.get_HTML_formatted_authors_data_mini(self.programs[p].meta_info['authors']['value'])) for p in self.programs],
+-             'workflows': self.workflows,
+-             'artifacts': self.artifacts_info,
+-             'artifact_types': self.artifact_types,
+-             'meta': {'summary_type': 'programs_and_artifacts_index',
+-                      'version': '%s (%s)' % (anvio.anvio_version, anvio.anvio_codename),
+-                      'date': utils.get_date()}
+-            }
+-
+-        d['program_provides_requires'] = self.get_program_requires_provides_dict(prefix='')
+-
+-        self.progress.update('Rendering...')
+-        output_file_path = os.path.join(self.output_directory_path, 'index.md')
+-
+-        self.progress.update('Writing...')
+-        open(output_file_path, 'w').write(SummaryHTMLOutput(d, r=run, p=progress).render())
+-
+-        self.progress.end()
+-
+-
+ class ProgramsNetwork(AnvioPrograms):
+     def __init__(self, args, r=terminal.Run(), p=terminal.Progress()):
+         self.args = args
+@@ -1323,75 +911,3 @@ def report_network(self, program_name=None):
+ 
+         self.run.info('JSON description of network', self.output_file_path)
+         self.run.info('Artifacts seen', ', '.join(sorted(list(types_seen))))
+-
+-
+-class ProgramsVignette(AnvioPrograms):
+-    def __init__(self, args, r=terminal.Run(), p=terminal.Progress()):
+-        self.args = args
+-        self.run = r
+-        self.progress = p
+-
+-        self.programs_to_skip = ['anvi-script-gen-programs-vignette']
+-
+-        AnvioPrograms.__init__(self, args, r=self.run, p=self.progress)
+-
+-        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
+-        self.output_file_path = A("output_file")
+-
+-
+-    def generate(self):
+-        self.init_programs(okay_if_no_meta = True, quiet = True)
+-
+-        d = {}
+-        log_file = filesnpaths.get_temp_file_path()
+-        for i, program_name in enumerate(self.programs):
+-            program = self.programs[program_name]
+-
+-            if program_name in self.programs_to_skip:
+-                run.warning("Someone doesn't want %s to be in the output :/ Fine. Skipping." % (program.name))
+-
+-            progress.new('Bleep bloop')
+-            progress.update('%s (%d of %d)' % (program_name, i+1, len(self.programs)))
+-
+-            output = utils.run_command_STDIN('%s --help --quiet' % (program.program_path), log_file, '').split('\n')
+-
+-            if anvio.DEBUG:
+-                    usage, params, output = parse_help_output(output)
+-            else:
+-                try:
+-                    usage, params, output = parse_help_output(output)
+-                except Exception as e:
+-                    progress.end()
+-                    run.warning("The program '%s' does not seem to have the expected help menu output. Skipping to the next. "
+-                                "For the curious, this was the error message: '%s'" % (program.name, str(e).strip()))
+-                    continue
+-
+-            d[program.name] = {'usage': usage,
+-                               'description': program.meta_info['description']['value'],
+-                               'params': params,
+-                               'tags': program.meta_info['tags']['value'],
+-                               'resources': program.meta_info['resources']['value']}
+-
+-            progress.end()
+-
+-        os.remove(log_file)
+-
+-        # generate output
+-        program_names = sorted([p for p in d if not p.startswith('anvi-script-')])
+-        script_names = sorted([p for p in d if p.startswith('anvi-script-')])
+-        vignette = {'vignette': d,
+-                    'program_names': program_names,
+-                    'script_names': script_names,
+-                    'all_names': program_names + script_names,
+-                    'meta': {'summary_type': 'vignette',
+-                             'version': '\n'.join(['|%s|%s|' % (t[0], t[1]) for t in anvio.get_version_tuples()]),
+-                             'date': utils.get_date()}}
+-
+-        if anvio.DEBUG:
+-            run.warning(None, 'THE OUTPUT DICT')
+-            import json
+-            print(json.dumps(d, indent=2))
+-
+-        open(self.output_file_path, 'w').write(SummaryHTMLOutput(vignette, r=run, p=progress).render())
+-
+-        run.info('Output file', os.path.abspath(self.output_file_path))
+diff --git a/anvio/programsdata.py b/anvio/programsdata.py
+new file mode 100644
+index 0000000000..c4067bf948
+--- /dev/null
++++ b/anvio/programsdata.py
+@@ -0,0 +1,1125 @@
++"""Everything about anvi'o workflows and artifacts"""
++
++# when defining a new anvi'o workflow, it is essential to document most critical
++# artifacts produced by a given workflow. it is also important to mention the
++# third party programs used (such as Bowtie2 or HMMER). there is no need to
++# mention anvi'o programs here as it will be discovered from program tags. to
++# associate a program with a workflow, please add the workflow name(s) to the
++# meta tag `__anvio_workflows__`.
++ANVIO_WORKFLOWS = {
++    "contigs": {
++        "authors": ['ShaiberAlon', 'ivagljiva', 'meren', 'mschecht'],
++        "artifacts_produced": ['contigs-db'],
++        "artifacts_accepted": ['fasta-txt'],
++        "anvio_workflows_inherited": [],
++        "third_party_programs_used": [
++            ('Gene calling', ['pyrodigal-gv']),
++            ('HMM search', ['HMMER']),
++            ('Gene taxonomy', ['krakenuniq', 'centrifuge']),
++            ('Sequence search against various databases', ['DIAMOND'])
++            ],
++        "one_sentence_summary": "From FASTA files to annotated anvi'o contigs databases",
++        "one_paragraph_summary": ("This workflow is useful for converting a bunch of genomes into an anvi'o-compatible "
++            "format. It generates contigs databases from each input FASTA file, and subsequently runs a variety of "
++            "annotation programs of your choice to populate these databases with some useful information for your downstream "
++            "work (i.e. functions, single-copy-core genes, taxonomy, etc).")
++    },
++
++    "metagenomics": {
++        "authors": ['FlorianTrigodet', 'ShaiberAlon'],
++        "artifacts_produced": ['contigs-db', 'profile-db'],
++        "artifacts_accepted": ['samples-txt', 'fasta-txt'],
++        "anvio_workflows_inherited": ['contigs'],
++        "third_party_programs_used": [
++            ('Quality control of short reads', ['illumina-utils']),
++            ('Assembly', ['IDBA-UD', 'metaSPAdes', 'MEGAHIT']),
++            ('BAM file manipulations', ['samtools']),
++            ('Gene calling', ['pyrodigal-gv']),
++            ('HMM search', ['HMMER']),
++            ('Gene taxonomy', ['krakenuniq', 'centrifuge']),
++            ('Read recruitment', ['Bowtie2'])
++            ],
++        "one_sentence_summary": "From FASTA and/or FASTQ files to anvi'o contigs and profile databases",
++        "one_paragraph_summary": ("This workflow is for anyone who wants to do some high-throughput read recruitment. "
++            "It has a few different modes depending on your input data. By default, it works with metagenomic short reads "
++            "and will assemble those, use the assembly as a reference for read-recruitment, and create databases ready for "
++            "anvi-interactive (i.e. for binning). If you don't need to assemble anything, you can also just give this "
++            "program a set of reference contigs for read-recruitment. Regardless, you'll end up with at least one "
++            "contigs database + merged profile database pair. Oh, and since this workflow internally uses the contigs "
++            "workflow, you can optionally run annotation programs on your contigs database as well.")
++    },
++    "ecophylo": {
++        "authors": ['FlorianTrigodet', 'Kekananen', 'mschecht'],
++        "artifacts_accepted": ['samples-txt', 'hmm-list', 'external-genomes', 'metagenomes'],
++        "artifacts_produced": ['contigs-db', 'profile-db'],
++        "anvio_workflows_inherited": [],
++        "third_party_programs_used": [
++            ('Read recruitment', ['Bowtie2']),
++            ('Cluster open reading frames', ['MMseqs2']),
++            ('Align protein sequences', ['muscle']),
++            ('Trim multiple sequence alignment', ['trimal']),
++            ('Calculate phylogenetic tree', ['IQ-TREE']),
++            ('Calculate phylogenetic tree', ['FastTree']),
++            ('Search for homologous sequences', ['HMMER'])
++            ],
++        "one_sentence_summary": "Co-characterize the biogeography and phylogeny of any protein",
++        "one_paragraph_summary": ("The ecophylo workflow explores the **eco**logical and **phylo**genetic relationships between a gene family and the environment. "
++            "Briefly, the workflow extracts a target gene from any set of FASTA files (e.g., isolate genomes, [MAGs](https://anvio.org/vocabulary/#metagenome-assembled-genome-mag), "
++            "[SAGs](https://anvio.org/vocabulary/#single-amplified-genome-sag), or simply [assembled metagenomes](https://anvio.org/vocabulary/#de-novo-assembly)) "
++            "using a user-defined [HMM](https://anvio.org/vocabulary/#hidden-markov-models-hmms), and offers an integrated access "
++            "to the phylogenetics of matching genes, and their distribution across environments.")
++    },
++    "phylogenomics": {
++        "authors": ['Kekananen'],
++        "artifacts_produced": ['phylogeny'],
++        "artifacts_accepted": ['internal-genomes', 'external-genomes'],
++        "anvio_workflows_inherited": ['contigs'],
++        "third_party_programs_used": [
++            ('Trim multiple sequence alignment', ['trimal']),
++            ('Calculate phylogenetic tree', ['IQ-TREE']),
++            ],
++        "one_sentence_summary": "Infer a phylogeny from homologous protein sequences",
++        "one_paragraph_summary": ("This workflow is for users who want to infer a phylogeny from homologous protein "
++            "sequences extracted from anvi'o genome inputs. It uses the contigs workflow to prepare the underlying "
++            "contigs databases, retrieves single-copy core genes or other HMM hits from those genomes, aligns the "
++            "sequences, trims the alignment, and generates a phylogenetic tree that can be used downstream as a "
++            "phylogeny artifact.")
++    },
++    "trnaseq": {
++        "authors": ['semiller10'],
++        "artifacts_accepted": ['samples-txt'],
++        "artifacts_produced": ['trnaseq-db', 'trnaseq-contigs-db', 'trnaseq-profile-db', 'trnaseq-seed-txt', 'modifications-txt'],
++        "anvio_workflows_inherited": [],
++        "third_party_programs_used": [
++            ('QC and merging of tRNA transcripts', ['illumina-utils']),
++            ('Mapping transcripts to tRNA seeds', ['Bowtie2'])
++            ],
++        "one_sentence_summary": "Process transfer RNA transcripts from tRNA-seq datasets",
++        "one_paragraph_summary": ("The trnaseq workflow takes in raw paired-end sequencing data generated from trna-seq libraries (i.e., the direct sequencing of "
++            "transfer RNA transcripts from cultures or environmental samples), and processes these data to identify tRNA sequences and their structural features, "
++            "predict chemical modification sites and modification fractions across samples, assign taxonomy to tRNA transcript seeds, and generate tables and summary "
++            "data for downstream analyses. The tRNA-seq resources in anvi'o are operational, however, they are experimental. If you have datasets that are suitable "
++            "for analysis, pelase consider getting in touch with us first.")
++    },
++
++    "sra-download": {
++        "authors": ['mschecht', 'FlorianTrigodet', 'Kekananen'],
++        "artifacts_accepted": [],
++        "artifacts_produced": ['paired-end-fastq', 'samples-txt'],
++        "anvio_workflows_inherited": [],
++        "third_party_programs_used": [
++            ('Downloads SRA accessions', ['prefetch']),
++            ('Extracts FASTQ files from SRA accessions', ['fasterq-dump']),
++            ('Compresses FASTQ files in parallel', ['pigz']),
++            ],
++        "one_sentence_summary": "Download, verify, extract, and gzip paired-end FASTQ files automatically from the NCBI short-read archive (SRA)",
++        "one_paragraph_summary": ("The sra-download workflow automatizes the process of downloading paired-end FASTQ files "
++            "for a given list of SRA-accessions using [NCBI sra-tools wiki](https://github.com/ncbi/sra-tools/wiki/08.-prefetch-and-fasterq-dump) "
++            "then gzips them using [pigz](https://zlib.net/pigz/).")
++    },
++}
++
++# Make usernames lowercase as in GitHub
++for a in ANVIO_WORKFLOWS:
++    ANVIO_WORKFLOWS[a]["authors"] = [n.lower() for n in ANVIO_WORKFLOWS[a]["authors"]]
++
++# the purpose of this variable is to have a list of third-party programs used from
++# within anvi'o workflows.
++THIRD_PARTY_PROGRAMS = {
++    'IDBA-UD': {'link': 'https://github.com/loneknightpy/idba'},
++    'illumina-utils': {'link': 'https://github.com/merenlab/illumina-utils'},
++    'metaSPAdes': {'link': "https://cab.spbu.ru/software/meta-spades/"},
++    'MEGAHIT': {'link': 'https://github.com/voutcn/megahit'},
++    'samtools': {'link': 'http://www.htslib.org/'},
++    'pyrodigal-gv': {'link': 'https://github.com/althonos/pyrodigal-gv'},
++    'HMMER': {'link': 'http://hmmer.org/'},
++    'Bowtie2': {'link': 'https://github.com/BenLangmead/bowtie2'},
++    'krakenuniq': {'link': 'https://github.com/fbreitwieser/krakenuniq'},
++    'centrifuge': {'link': 'https://github.com/DaehwanKimLab/centrifuge'},
++    'DIAMOND': {'link': 'https://uni-tuebingen.de/fakultaeten/mathematisch-naturwissenschaftliche-fakultaet/fachbereiche/informatik/lehrstuehle/algorithms-in-bioinformatics/software/diamond/'},
++    'MMseqs2': {'link': 'https://github.com/soedinglab/MMseqs2'},
++    'muscle': {'link': 'http://www.drive5.com/muscle/'},
++    'FastTree': {'link': 'http://www.microbesonline.org/fasttree/'},
++    'IQ-TREE': {'link': 'https://github.com/Cibiv/IQ-TREE'},
++    'trimal': {'link': 'https://github.com/inab/trimal'},
++    'pigz': {'link': 'https://zlib.net/pigz/'},
++    'prefetch': {'link': 'https://github.com/ncbi/sra-tools'},
++    'fasterq-dump': {'link': 'https://github.com/ncbi/sra-tools'}
++    }
++
++# the purpose of dictionaries in this module is to describes all anvi'o items and concepts
++# that are referred from 'requires' and 'provides' statements in anvi'o programs
++ANVIO_ARTIFACTS ={
++    "pan-db": {
++        "name": "PAN",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pan-graph-db": {
++        "name": "PAN GRAPH",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contigs-db": {
++        "name": "CONTIGS",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trnaseq-db": {
++        "name": "TRNASEQ",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trnaseq-contigs-db": {
++        "name": "TRNASEQ CONTIGS",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trnaseq-profile-db": {
++        "name": "TRNASEQ PROFILE",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "modules-db": {
++        "name": "MODULES",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "fasta": {
++        "name": "REGULAR FASTA",
++        "type": "FASTA",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "contigs-fasta": {
++        "name": "CONTIGS",
++        "type": "FASTA",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "dna-sequence": {
++        "name": "DNA SEQUENCE",
++        "type": "SEQUENCE",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "trnaseq-fasta": {
++        "name": "TRNASEQ",
++        "type": "FASTA",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "configuration-ini": {
++        "name": "CONFIGURATION FILE",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "external-gene-calls": {
++        "name": "EXTERNAL GENE CALLS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "external-structures": {
++        "name": "EXTERNAL STRUCTURES",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "concatenated-gene-alignment-fasta": {
++        "name": "CONCATENATED GENE ALIGNMENT",
++        "type": "FASTA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "short-reads-fasta": {
++        "name": "SHORT READS",
++        "type": "FASTA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "paired-end-fastq": {
++        "name": "SHORT READS",
++        "type": "FASTQ",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "single-end-fastq": {
++        "name": "SHORT READS",
++        "type": "FASTQ",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "genes-fasta": {
++        "name": "GENES",
++        "type": "FASTA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "bam-file": {
++        "name": "BAM FILE",
++        "type": "BAM",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "bam-stats-txt": {
++        "name": "BAM STATS TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "discov-stats": {
++        "name": "DISCOV STATS",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "bams-and-profiles-txt": {
++        "name": "BAMS AND PROFILES TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "markdown-txt": {
++        "name": "MARKDOWN TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "protein-structure-txt": {
++        "name": "PDB FILE",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "samples-txt": {
++        "name": "SAMPLES TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "sra-metadata-txt": {
++        "name": "SRA METADATA TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user":True
++    },
++    "primers-txt": {
++        "name": "PRIMERS TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "fasta-txt": {
++        "name": "FASTA TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "raw-bam-file": {
++        "name": "RAW BAM FILE",
++        "type": "BAM",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "locus-fasta": {
++        "name": "LOCUS",
++        "type": "FASTA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "structure-db": {
++        "name": "PROTEIN STRUCTURES",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pdb-db": {
++        "name": "PDB DB",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "kegg-data": {
++        "name": "KEGG MODULES DB",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "user-modules-data": {
++        "name": "USER MODULES DB",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "reaction-ref-data": {
++        "name": "REACTION REFERENCE DATA",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "single-profile-db": {
++        "name": "SINGLE PROFILE",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "profile-db": {
++        "name": "PROFILE",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "genes-db": {
++        "name": "GENES",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "genomes-storage-db": {
++        "name": "GENOMES STORAGE",
++        "type": "DB",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contigs-stats": {
++        "name": "CONTIGS STATS",
++        "type": "STATS",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "svg": {
++        "name": "SVG",
++        "type": "SVG",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "bin": {
++        "name": "BIN",
++        "type": "BIN",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "collection": {
++        "name": "COLLECTION",
++        "type": "COLLECTION",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "collection-txt": {
++        "name": "COLLECTION",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "contig-classification": {
++        "name": "CONTIG CLASSIFICATIONS",
++        "type": "COLLECTION",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contig-classification-txt": {
++        "name": "CONTIG CLASSIFICATIONS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "genes-of-interest-txt": {
++        "name": "GENES OF INTEREST",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "pfam-accession": {
++        "name": "PFAM ACCESSION",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "kofam-accession": {
++        "name": "KOFAM ACCESSION",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "hmm-file": {
++        "name": "HMM MODEL FILE",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "hmm-source": {
++        "name": "HMM SOURCE",
++        "type": "HMM",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "hmm-hits": {
++        "name": "HMM PROFILE",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "completion": {
++        "name": "COMPLETION",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "cogs-data": {
++        "name": "COGs DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "globdb-data": {
++        "name": "GLOBDB DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pfams-data": {
++        "name": "PFAMs DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "cazyme-data": {
++        "name": "CAZymes HMM DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-items-txt": {
++        "name": "ITEMS DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user":True
++    },
++    "misc-data-items": {
++        "name": "ITEMS DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-layers-txt": {
++        "name": "LAYERS DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "misc-data-layers": {
++        "name": "LAYERS DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-nucleotides-txt": {
++        "name": "NUCLEOTIDES DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "misc-data-nucleotides": {
++        "name": "NUCLEOTIDES DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-amino-acids-txt": {
++        "name": "AMINO_ACIDS DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "misc-data-amino-acids": {
++        "name": "AMINO_ACIDS DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "genome-similarity": {
++        "name": "GENOME SIMILARITY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-layer-orders-txt": {
++        "name": "LAYER ORDERS DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "misc-data-layer-orders": {
++        "name": "LAYER ORDERS DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "misc-data-items-order-txt": {
++        "name": "LAYER ORDERS DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "misc-data-items-order": {
++        "name": "ITEM ORDERS DATA",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "dendrogram": {
++        "name": "DENDROGRAM",
++        "type": "NEWICK",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "metapangenome": {
++        "name": "METAPANGENOME",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "oligotypes": {
++        "name": "OLIGOTYPES",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "linkmers-txt": {
++        "name": "LINKMERS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "palindromes-txt": {
++        "name": "PALINDROMES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "inversions-txt": {
++        "name": "INVERSIONS TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "phylogeny": {
++        "name": "PHYLOGENY",
++        "type": "NEWICK",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "gene-calls-txt": {
++        "name": "GENE CALLS",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "binding-frequencies-txt": {
++        "name": "AMINO ACID BINDING FREQUENCIES TEXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "interacdome-data": {
++        "name": "INTERACDOME DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "functions": {
++        "name": "GENE FUNCTIONS",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "functions-txt": {
++        "name": "GENE FUNCTIONS",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "functional-enrichment-txt": {
++        "name": "ENRICHMENT SCORES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "kegg-functions": {
++        "name": "KOFAM FUNCTIONS",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "functions-across-genomes-txt": {
++        "name": "FUNCTIONS ACROSS GENOMES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "hmm-hits-across-genomes-txt": {
++        "name": "HMM HITS ACROSS GENOMES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "reaction-network": {
++        "name": "REACTION NETWORK",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "reaction-network-json": {
++        "name": "REACTION NETWORK JSON",
++        "type": "JSON",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "kegg-pathway-map": {
++        "name": "KEGG PATHWAY MAP",
++        "type": "DISPLAY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "interactive": {
++        "name": "INTERACTIVE DISPLAY",
++        "type": "DISPLAY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "view-data": {
++        "name": "VIEW DATA",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "layer-taxonomy": {
++        "name": "LAYER TAXONOMY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "layer-taxonomy-txt": {
++        "name": "LAYER TAXONOMY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "gene-taxonomy": {
++        "name": "GENE TAXONOMY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "gene-taxonomy-txt": {
++        "name": "GENE TAXONOMY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "genome-taxonomy": {
++        "name": "GENOME TAXONOMY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "genome-taxonomy-txt": {
++        "name": "GENOME TAXONOMY",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": False
++    },
++    "scgs-taxonomy-db": {
++        "name": "SCG TAXONOMY DB",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "scgs-taxonomy": {
++        "name": "SCG TAXONOMY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trna-taxonomy-db": {
++        "name": "TRNA TAXONOMY DB",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trna-taxonomy": {
++        "name": "TRNA TAXONOMY",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "external-genomes": {
++        "name": "EXTERNAL GENOMES",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "internal-genomes": {
++        "name": "INTERNAL GENOMES",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "metagenomes": {
++        "name": "METAGENOMES",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "hmm-list": {
++        "name": "HMM-LIST",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "coverages-txt": {
++        "name": "COVERAGES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "detection-txt": {
++        "name": "DETECTIONS",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "variability-profile": {
++        "name": "VARIABILITY PROFILE",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "variability-profile-txt": {
++        "name": "VARIABILITY PROFILE",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "variability-profile-xml": {
++        "name": "VARIABILITY NETWORK",
++        "type": "XML",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "codon-frequencies-txt": {
++        "name": "CODON FREQUENCIES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "aa-frequencies-txt": {
++        "name": "AA FREQUENCIES",
++        "type": "TXT",
++        "provided_by_anvio": True ,
++        "provided_by_user": False
++    },
++    "fixation-index-matrix": {
++        "name": "FIXATION INDEX MATRIX",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trnaseq-seed-txt": {
++        "name": "TRNASEQ SEED SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "seeds-specific-txt": {
++        "name": "TRNASEQ SEED SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "seeds-non-specific-txt": {
++        "name": "TRNASEQ SEED SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "modifications-txt": {
++        "name": "TRNASEQ MODIFICATION SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trna-gene-hits": {
++        "name": "TRNA GENE HITS",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "trnaseq-plot": {
++        "name": "TRNASEQ PLOT",
++        "type": "DISPLAY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "summary": {
++        "name": "STATIC SUMMARY",
++        "type": "SUMMARY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pan-summary": {
++        "name": "PAN SUMMARY",
++        "type": "SUMMARY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pan-graph-summary": {
++        "name": "PAN GRAPH SUMMARY",
++        "type": "SUMMARY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "profile-summary": {
++        "name": "PROFILE SUMMARY",
++        "type": "SUMMARY",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "quick-summary": {
++        "name": "QUICK SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "light-summary": {
++        "name": "LIGHT SUMMARY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "split-bins": {
++        "name": "SPLIT BINS",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "state": {
++        "name": "INTERACTIVE STATE",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "ngrams": {
++        "name": "NGRAM",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "state-json": {
++        "name": "INTERACTIVE STATE",
++        "type": "JSON",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "kegg-metabolism": {
++        "name": "KEGG METABOLISM ESTIMATES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "user-metabolism": {
++        "name": "USER METABOLISM ESTIMATES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "augustus-gene-calls": {
++        "name": "AUGUSTUS GENE CALLS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "vcf": {
++        "name": "VCF",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "blast-table": {
++        "name": "BLAST TABLE",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "splits-txt": {
++        "name": "SPLITS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "genbank-file": {
++        "name": "GENBANK FILE",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "groups-txt": {
++        "name": "GROUPS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "splits-taxonomy-txt": {
++        "name": "SPLITS TAXONOMY",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "pn-ps-data": {
++        "name": "PN/PS OUTPUT",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "clustering-configuration": {
++        "name": "CLUSTERING CONFIG",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "workflow-config": {
++        "name": "WORKFLOW CONFIG",
++        "type": "JSON",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "workflow": {
++        "name": "ANVIO SNAKEMAKE WORKFLOW",
++        "type": "WORKFLOW",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contig-inspection" : {
++        "name" : "CONTIG INSPECTION",
++        "type" : "DISPLAY",
++        "provided_by_anvio" : True,
++        "provided_by_user" : False
++    },
++    "gene-cluster-inspection" : {
++        "name" : "GENE CLUSTER INSPECTION",
++        "type" : "DISPLAY",
++        "provided_by_anvio" : True,
++        "provided_by_user" : False
++    },
++    "gene-clusters": {
++        "name": "GENE CLUSTERS",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "gene-clusters-txt": {
++        "name": "GENE CLUSTERS TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "enzymes-txt": {
++        "name": "ENZYMES TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "kegg-reaction-txt": {
++        "name": "KEGG REACTION TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "kegg-compound-txt": {
++        "name": "KEGG COMPOUND TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "kegg-membership-colors-txt": {
++        "name": "KEGG MEMBERSHIP COLORS TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "kegg-value-colors-txt": {
++        "name": "KEGG VALUE COLORS TXT",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++    "kegg-slice-key-txt": {
++        "name": "KEGG SLICE KEY TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "kegg-label-key-txt": {
++        "name": "KEGG LABEL KEY TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "enzymes-list-for-module": {
++        "name": "ENZYMES LIST",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user":True
++    },
++    "metabolic-independence-score": {
++        "name": "METABOLIC INDEPENDENCE SCORE",
++        "type": "CONCEPT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contig-rename-report-txt": {
++        "name": "CONTIG RENAME REPORT TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "contig-circularity-report-txt": {
++        "name": "CIRCULARITY REPORT TXT",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "rarefaction-curves": {
++        "name": "RAREFACTION CURVES",
++        "type": "SVG",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "metabolite-exchange-predictions": {
++        "name": "PREDICTED METABOLITE EXCHANGES",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
++    "equivalent-compounds-txt": {
++        "name": "EQUIVALENT COMPOUNDS",
++        "type": "TXT",
++        "provided_by_anvio": True,
++        "provided_by_user": True
++    },
++    "genome-pairs": {
++        "name": "GENOME PAIRS",
++        "type": "TXT",
++        "provided_by_anvio": False,
++        "provided_by_user": True
++    },
++}

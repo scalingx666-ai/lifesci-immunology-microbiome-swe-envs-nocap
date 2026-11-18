@@ -1,0 +1,498 @@
+diff --git a/iss/app.py b/iss/app.py
+index a72d4b5..0a3c4b1 100644
+--- a/iss/app.py
++++ b/iss/app.py
+@@ -34,7 +34,9 @@ def generate_reads(args):
+     logger.debug("Using verbose logger")
+     logger.info("Starting iss generate")
+ 
+-    error_model = load_error_model(args.mode, args.seed, args.model, args.fragment_length, args.fragment_length_sd)
++    error_model = load_error_model(
++        args.mode, args.seed, args.model, args.fragment_length, args.fragment_length_sd, args.store_mutations
++    )
+ 
+     genome_list, genome_file = load_genomes(
+         args.genomes, args.draft, args.ncbi, args.n_genomes_ncbi, args.output, args.n_genomes
+@@ -54,6 +56,9 @@ def generate_reads(args):
+         error_model,
+     )
+ 
++    if args.store_mutations:
++        logger.info(f"Storing inserted sequence errors in {args.output}.vcf")
++
+     logger.info("Using %s cpus for read generation" % args.cpus)
+ 
+     if readcount_dic is not None:
+@@ -104,7 +109,8 @@ def generate_reads(args):
+         logger.error("iss generate interrupted: %s" % e)
+         temp_R1 = [temp_file + "_R1.fastq" for temp_file in temp_file_list]
+         temp_R2 = [temp_file + "_R2.fastq" for temp_file in temp_file_list]
+-        full_tmp_list = temp_R1 + temp_R2
++        temp_mut = [temp_file + ".vcf" for temp_file in temp_file_list]
++        full_tmp_list = temp_R1 + temp_R2 + temp_mut
+         full_tmp_list.append(genome_file)
+         if os.path.exists("%s.memmap" % args.output):
+             full_tmp_list.append("%s.memmap" % args.output)
+@@ -116,9 +122,16 @@ def generate_reads(args):
+         # and reads were appended to the same temp file.
+         temp_R1 = [temp_file + "_R1.fastq" for temp_file in temp_file_list]
+         temp_R2 = [temp_file + "_R2.fastq" for temp_file in temp_file_list]
++        temp_mut = [temp_file + ".vcf" for temp_file in temp_file_list] if args.store_mutations else []
+         util.concatenate(temp_R1, args.output + "_R1.fastq")
+         util.concatenate(temp_R2, args.output + "_R2.fastq")
+-        full_tmp_list = temp_R1 + temp_R2
++        if args.store_mutations:
++            util.concatenate(
++                temp_mut,
++                args.output + ".vcf",
++                "##fileformat=VCFv4.1\n" + "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"]),
++            )
++        full_tmp_list = temp_R1 + temp_R2 + temp_mut
+         full_tmp_list.append(genome_file)
+         if os.path.exists("%s.memmap" % args.output):
+             full_tmp_list.append("%s.memmap" % args.output)
+@@ -126,6 +139,8 @@ def generate_reads(args):
+         if args.compress:
+             util.compress(args.output + "_R1.fastq")
+             util.compress(args.output + "_R2.fastq")
++            if args.store_mutations:
++                util.compress(args.output + ".vcf")
+         logger.info("Read generation complete")
+ 
+ 
+@@ -381,6 +396,13 @@ def main():
+         type=int,
+         help="Fragment length standard deviation for metagenomics sequencing (default: %(default)s).",
+     )
++    parser_gen.add_argument(
++        "--store_mutations",
++        "-M",
++        action="store_true",
++        default=False,
++        help="Generates an additional VCF file with the mutations introduced in the reads",
++    )
+     parser_gen._optionals.title = "arguments"
+     parser_gen.set_defaults(func=generate_reads)
+ 
+diff --git a/iss/error_models/__init__.py b/iss/error_models/__init__.py
+index 5378fd9..81b9bf5 100644
+--- a/iss/error_models/__init__.py
++++ b/iss/error_models/__init__.py
+@@ -78,7 +78,7 @@ def mut_sequence(self, record, orientation):
+                 'reverse'
+ 
+         Returns:
+-            Seq: a sequence
++            SeqRecord: the read record with substitution errors
+         """
+ 
+         # get the right subst_matrix
+@@ -92,11 +92,24 @@ def mut_sequence(self, record, orientation):
+         position = 0
+         for nucl, qual in zip(mutable_seq, quality_list):
+             if random.random() > util.phred_to_prob(qual) and nucl.upper() not in "RYWSMKHBVDN":
+-                mutable_seq[position] = str(
++                mutated_nuc = str(
+                     np.random.choice(nucl_choices[position][nucl.upper()][0], p=nucl_choices[position][nucl.upper()][1])
+                 )
++                if self.store_mutations and mutated_nuc != record.annotations["original"][position]:
++                    record.annotations["mutations"].append(
++                        {
++                            "id": record.id,
++                            "position": position,
++                            "ref": mutable_seq[position],
++                            "alt": mutated_nuc,
++                            "quality": qual,
++                            "type": "sub",
++                        }
++                    )
++                mutable_seq[position] = mutated_nuc
+             position += 1
+-        return Seq(mutable_seq)
++        record.seq = Seq(mutable_seq)
++        return record
+ 
+     def adjust_seq_length(self, mut_seq, orientation, full_sequence, bounds):
+         """Truncate or Extend reads to make them fit the read length
+@@ -158,7 +171,7 @@ def introduce_indels(self, record, orientation, full_seq, bounds):
+             bounds (tuple): the position of the read in the full_sequence
+ 
+         Returns:
+-            Seq: a sequence with (eventually) indels
++            SeqRecord: a sequence record with indel errors
+         """
+ 
+         # get the right indel arrays
+@@ -181,11 +194,35 @@ def introduce_indels(self, record, orientation, full_seq, bounds):
+                     if random.random() < prob:
+                         # we want to insert after the base read
+                         mutable_seq.insert(position + 1, str(nucl_to_insert))
++                        if self.store_mutations:
++                            record.annotations["mutations"].append(
++                                {
++                                    "id": record.id,
++                                    "position": position,
++                                    "ref": mutable_seq[position],
++                                    "alt": mutable_seq[position] + nucl_to_insert,
++                                    "quality": ".",
++                                    "type": "ins",
++                                }
++                            )
++
+                 if random.random() < deletions[position][mutable_seq[nucl].upper()]:
+                     mutable_seq.pop(position)
++                    if self.store_mutations:
++                        record.annotations["mutations"].append(
++                            {
++                                "id": record.id,
++                                "position": position,
++                                "ref": mutable_seq[position],
++                                "alt": ".",
++                                "quality": ".",
++                                "type": "del",
++                            }
++                        )
+                 position += 1
+             except IndexError:
+                 continue
+ 
+         seq = self.adjust_seq_length(mutable_seq, orientation, full_seq, bounds)
+-        return seq
++        record.seq = seq
++        return record
+diff --git a/iss/error_models/basic.py b/iss/error_models/basic.py
+index 03c7232..7f07b55 100644
+--- a/iss/error_models/basic.py
++++ b/iss/error_models/basic.py
+@@ -15,12 +15,13 @@ class BasicErrorModel(ErrorModel):
+     equal between all nucleotides.
+     """
+ 
+-    def __init__(self, fragment_length=None, fragment_sd=None):
++    def __init__(self, fragment_length=None, fragment_sd=None, store_mutations=False):
+         super().__init__()
+         self.read_length = 125
+         self.insert_size = 200
+         self.fragment_length = fragment_length
+         self.fragment_sd = fragment_sd
++        self.store_mutations = store_mutations
+         self.quality_forward = self.quality_reverse = 30
+         self.subst_choices_for = self.subst_choices_rev = [
+             {
+diff --git a/iss/error_models/kde.py b/iss/error_models/kde.py
+index 75887fe..3d21e2e 100644
+--- a/iss/error_models/kde.py
++++ b/iss/error_models/kde.py
+@@ -21,10 +21,11 @@ class KDErrorModel(ErrorModel):
+     - the insertion and deletion rates for each position (for R1 and R2)
+     """
+ 
+-    def __init__(self, npz_path, fragment_length=None, fragment_sd=None):
++    def __init__(self, npz_path, fragment_length=None, fragment_sd=None, store_mutations=False):
+         super().__init__()
+         self.npz_path = npz_path
+         self.error_profile = self.load_npz(npz_path, "kde")
++        self.store_mutations = store_mutations
+ 
+         self.read_length = self.error_profile["read_length"]
+         self.i_size_cdf = self.error_profile["insert_size"]
+diff --git a/iss/generator.py b/iss/generator.py
+index 737506a..7c7bc3f 100644
+--- a/iss/generator.py
++++ b/iss/generator.py
+@@ -25,6 +25,7 @@ def simulate_reads(
+     cpu_number,
+     forward_handle,
+     reverse_handle,
++    mutations_handle,
+     sequence_type,
+     gc_bias=False,
+     mode="default",
+@@ -42,6 +43,7 @@ def simulate_reads(
+             function. Is used for naming the output file
+         forward_handle (file): a file handle to write the forward reads to
+         reverse_handle (file): a file handle to write the reverse reads to
++        mutations_handle (file): a file handle to write the mutations to
+         sequencing_type (str): metagenomics or amplicon sequencing used
+         gc_bias (bool): if set, the function may skip a read due to abnormal
+             GC content
+@@ -56,11 +58,12 @@ def simulate_reads(
+ 
+     logger.debug("Cpu #%s: Generating %s read pairs" % (cpu_number, n_pairs))
+ 
+-    for forward_record, reverse_record in reads_generator(
++    for forward_record, reverse_record, mutations in reads_generator(
+         n_pairs, record, error_model, cpu_number, gc_bias, sequence_type
+     ):
+         SeqIO.write(forward_record, forward_handle, "fastq-sanger")
+         SeqIO.write(reverse_record, reverse_handle, "fastq-sanger")
++        write_mutations(mutations, mutations_handle)
+ 
+ 
+ def reads_generator(n_pairs, record, error_model, cpu_number, gc_bias, sequence_type):
+@@ -69,7 +72,8 @@ def reads_generator(n_pairs, record, error_model, cpu_number, gc_bias, sequence_
+     i = 0
+     while i < n_pairs:
+         try:
+-            forward, reverse = simulate_read(record, error_model, i, cpu_number, sequence_type)
++            forward, reverse, mutations = simulate_read(record, error_model, i, cpu_number, sequence_type)
++
+         except AssertionError:
+             logger.warning("%s shorter than read length for this ErrorModel" % record.id)
+             logger.warning("Skipping %s. You will have less reads than specified" % record.id)
+@@ -79,15 +83,15 @@ def reads_generator(n_pairs, record, error_model, cpu_number, gc_bias, sequence_
+                 stiched_seq = forward.seq + reverse.seq
+                 gc_content = gc_fraction(stiched_seq)
+                 if 40 < gc_content < 60:
+-                    yield (forward, reverse)
++                    yield (forward, reverse, mutations)
+                     i += 1
+                 elif np.random.rand() < 0.90:
+-                    yield (forward, reverse)
++                    yield (forward, reverse, mutations)
+                     i += 1
+                 else:
+                     continue
+             else:
+-                yield (forward, reverse)
++                yield (forward, reverse, mutations)
+                 i += 1
+ 
+ 
+@@ -145,10 +149,13 @@ def simulate_read(record, error_model, i, cpu_number, sequence_type):
+     forward = SeqRecord(
+         Seq(str(sequence[forward_start:forward_end])), id="%s_%s_%s/1" % (header, i, cpu_number), description=""
+     )
++    forward.annotations["mutations"] = []
++    forward.annotations["original"] = str(forward.seq)
++
+     # add the indels, the qual scores and modify the record accordingly
+-    forward.seq = error_model.introduce_indels(forward, "forward", sequence, bounds)
++    forward = error_model.introduce_indels(forward, "forward", sequence, bounds)
+     forward = error_model.introduce_error_scores(forward, "forward")
+-    forward.seq = error_model.mut_sequence(forward, "forward")
++    forward = error_model.mut_sequence(forward, "forward")
+ 
+     # generate the reverse read
+     # assign start position reverse read
+@@ -174,13 +181,15 @@ def simulate_read(record, error_model, i, cpu_number, sequence_type):
+         id="%s_%s_%s/2" % (header, i, cpu_number),
+         description="",
+     )
++    reverse.annotations["mutations"] = []
++    reverse.annotations["original"] = str(reverse.seq)
+ 
+     # add the indels, the qual scores and modify the record accordingly
+-    reverse.seq = error_model.introduce_indels(reverse, "reverse", sequence, bounds)
++    reverse = error_model.introduce_indels(reverse, "reverse", sequence, bounds)
+     reverse = error_model.introduce_error_scores(reverse, "reverse")
+-    reverse.seq = error_model.mut_sequence(reverse, "reverse")
++    reverse = error_model.mut_sequence(reverse, "reverse")
+ 
+-    return (forward, reverse)
++    return (forward, reverse, forward.annotations["mutations"] + reverse.annotations["mutations"])
+ 
+ 
+ def to_fastq(generator, output):
+@@ -217,6 +226,7 @@ def worker_iterator(work, error_model, cpu_number, worker_prefix, seed, sequence
+     try:
+         forward_handle = open(f"{worker_prefix}_R1.fastq", "w")
+         reverse_handle = open(f"{worker_prefix}_R2.fastq", "w")
++        mutation_handle = open(f"{worker_prefix}.vcf", "w")
+     except PermissionError as e:
+         logger.error("Failed to write temporary output file(s): %s" % e)
+         sys.exit(1)
+@@ -225,7 +235,7 @@ def worker_iterator(work, error_model, cpu_number, worker_prefix, seed, sequence
+         random.seed(seed + cpu_number)
+         np.random.seed(seed + cpu_number)
+ 
+-    with forward_handle, reverse_handle:
++    with forward_handle, reverse_handle, mutation_handle:
+         for record, n_pairs, mode in work:
+             simulate_reads(
+                 record=record,
+@@ -235,6 +245,7 @@ def worker_iterator(work, error_model, cpu_number, worker_prefix, seed, sequence
+                 cpu_number=cpu_number,
+                 forward_handle=forward_handle,
+                 reverse_handle=reverse_handle,
++                mutations_handle=mutation_handle,
+                 sequence_type=sequence_type,
+                 gc_bias=gc_bias,
+             )
+@@ -345,7 +356,7 @@ def generate_work_divider(
+         yield chunk_work
+ 
+ 
+-def load_error_model(mode, seed, model, fragment_length, fragment_length_sd):
++def load_error_model(mode, seed, model, fragment_length, fragment_length_sd, store_mutations):
+     """
+     Load the error model based on the specified mode and parameters.
+ 
+@@ -387,12 +398,12 @@ def load_error_model(mode, seed, model, fragment_length, fragment_length_sd):
+             npz = os.path.join(os.path.dirname(__file__), "profiles/MiSeq")
+         else:
+             npz = model
+-        err_mod = kde.KDErrorModel(npz, fragment_length, fragment_length_sd)
++        err_mod = kde.KDErrorModel(npz, fragment_length, fragment_length_sd, store_mutations)
+     elif mode == "basic":
+         if model is not None:
+             logger.warning("--model %s will be ignored in --mode %s" % (model, mode))
+ 
+-        err_mod = basic.BasicErrorModel(fragment_length, fragment_length_sd)
++        err_mod = basic.BasicErrorModel(fragment_length, fragment_length_sd, store_mutations)
+     elif mode == "perfect":
+         if model is not None:
+             logger.warning("--model %s will be ignored in --mode %s" % (model, mode))
+@@ -575,3 +586,28 @@ def load_readcount_or_abundance(
+         sys.exit(1)
+ 
+     return readcount_dic, abundance_dic
++
++
++def write_mutations(mutations, mutations_handle):
++    """Write mutations to a file
++
++    Args:
++        mutations (list): List of mutations.
++        mutations_handle (file): File handle to write the mutations to.
++    """
++    for vcf_dict in mutations:
++        mutations_handle.write(
++            "\t".join(
++                [
++                    str(vcf_dict["id"]),
++                    str(vcf_dict["position"] + 1),  # vcf files have 1-based index
++                    ".",
++                    vcf_dict["ref"],
++                    str(vcf_dict["alt"]),
++                    str(vcf_dict["quality"]),
++                    "",
++                    "",
++                ]
++            )
++            + "\n"
++        )
+diff --git a/iss/test/test_error_model.py b/iss/test/test_error_model.py
+index 6835665..6038035 100644
+--- a/iss/test/test_error_model.py
++++ b/iss/test/test_error_model.py
+@@ -52,7 +52,7 @@ def test_mut_sequence():
+ 
+     read = SeqRecord(Seq(str("AAAAA" * 25)), id="read_1", description="test read")
+     read.letter_annotations["phred_quality"] = [5] * 125
+-    read.seq = err_mod.mut_sequence(read, "forward")
++    read = err_mod.mut_sequence(read, "forward")
+     assert str(read.seq[:10]) == "AAAACAGAAA"
+ 
+ 
+@@ -66,7 +66,7 @@ def test_introduce_indels():
+     bounds = (5, 130)
+     read = SeqRecord(Seq(str("ATATA" * 25)), id="read_1", description="test read")
+     ref_genome = SeqRecord(Seq(str("ATATA" * 100)), id="ref_genome", description="test reference")
+-    read.seq = err_mod.introduce_indels(read, "forward", ref_genome, bounds)
++    read = err_mod.introduce_indels(read, "forward", ref_genome, bounds)
+     assert len(read.seq) == 125
+     assert read.seq[:10] == "ATGATAATAT"
+ 
+@@ -81,7 +81,7 @@ def test_adjust_seq_length_extend():
+     bounds = (480, 500)
+     read = SeqRecord(Seq(str("ATTTA" * 4)), id="read_1", description="test read")
+     ref_genome = SeqRecord(Seq(str("ATTTA" * 100)), id="ref_genome", description="test reference")
+-    read.seq = err_mod.introduce_indels(read, "forward", ref_genome, bounds)
++    read = err_mod.introduce_indels(read, "forward", ref_genome, bounds)
+     assert len(read.seq) == 20
+     assert read.seq[:10] == "TTAATTTAAT"
+     assert read.seq[10:] == "TTAATTTAAA"
+@@ -100,7 +100,7 @@ def test_introduce_indels_rev():
+ 
+     ref_genome = SeqRecord(Seq("GG" + str("GTACC" * 100) + "GG"), id="ref_genome", description="test reference")
+     read = SeqRecord(Seq(rev_comp(str(ref_genome.seq[484:504]))), id="read_1", description="test read")
+-    read.seq = err_mod.introduce_indels(read, "reverse", ref_genome, bounds)
++    read = err_mod.introduce_indels(read, "reverse", ref_genome, bounds)
+     assert len(read.seq) == 20
+     assert read.seq == "CGTACGGTACGGTACGGTAC"
+ 
+diff --git a/iss/test/test_generator.py b/iss/test/test_generator.py
+index 37d2811..eaca114 100644
+--- a/iss/test/test_generator.py
++++ b/iss/test/test_generator.py
+@@ -13,18 +13,17 @@
+ from iss.error_models import basic, kde
+ from iss.util import cleanup
+ 
+-# due to inconsistent seeding between python 2 and 3, some of the following
+-# tests are disabled with python2
+-
+-
+-def teardown_cleanup():
+-    cleanup(["data/.test.iss.tmp.my_genome.0_R1.fastq", "data/.test.iss.tmp.my_genome.0_R2.fastq"])
+-
+ 
+ @pytest.fixture
+ def setup_and_teardown():
+     yield
+-    cleanup(["data/.test.iss.tmp.my_genome.0_R1.fastq", "data/.test.iss.tmp.my_genome.0_R2.fastq"])
++    cleanup(
++        [
++            "data/.test.iss.tmp.my_genome.0_R1.fastq",
++            "data/.test.iss.tmp.my_genome.0_R2.fastq",
++            "data/.test.iss.tmp.my_genome.tsv",
++        ]
++    )
+ 
+ 
+ def test_cleanup_fail():
+@@ -43,7 +42,10 @@ def test_simulate_and_save(setup_and_teardown):
+     ref_genome = SeqRecord(Seq(str("AAAAACCCCC" * 100)), id="my_genome", description="test genome")
+     forward_handle = open("data/.test.iss.tmp.my_genome.0_R1.fastq", "w")
+     reverse_handle = open("data/.test.iss.tmp.my_genome.0_R2.fastq", "w")
+-    generator.simulate_reads(ref_genome, err_mod, 1000, 0, forward_handle, reverse_handle, "metagenomics", gc_bias=True)
++    mutations_handle = open("data/.test.iss.tmp.my_genome.tsv", "w")
++    generator.simulate_reads(
++        ref_genome, err_mod, 1000, 0, forward_handle, reverse_handle, mutations_handle, "metagenomics", gc_bias=True
++    )
+ 
+ 
+ def test_simulate_and_save_short(setup_and_teardown):
+@@ -51,7 +53,10 @@ def test_simulate_and_save_short(setup_and_teardown):
+     ref_genome = SeqRecord(Seq(str("AACCC" * 100)), id="my_genome", description="test genome")
+     forward_handle = open("data/.test.iss.tmp.my_genome.0_R1.fastq", "w")
+     reverse_handle = open("data/.test.iss.tmp.my_genome.0_R2.fastq", "w")
+-    generator.simulate_reads(ref_genome, err_mod, 1000, 0, forward_handle, reverse_handle, "metagenomics", gc_bias=True)
++    mutations_handle = open("data/.test.iss.tmp.my_genome.tsv", "w")
++    generator.simulate_reads(
++        ref_genome, err_mod, 1000, 0, forward_handle, reverse_handle, mutations_handle, "metagenomics", gc_bias=True
++    )
+ 
+ 
+ def test_small_input():
+@@ -88,7 +93,6 @@ def test_kde_short(with_seed):
+ 
+ def test_amp(with_seed):
+     err_mod = kde.KDErrorModel(os.path.join(os.path.dirname(__file__), "../profiles/MiSeq"), 1000, 10)
+-    print(err_mod.read_length)
+     ref_genome = SeqRecord(
+         Seq(
+             (
+diff --git a/iss/util.py b/iss/util.py
+index cc64436..580ee21 100644
+--- a/iss/util.py
++++ b/iss/util.py
+@@ -210,7 +210,7 @@ def reservoir(records, record_list, n=None):
+             yield record
+ 
+ 
+-def concatenate(file_list, output):
++def concatenate(file_list, output, header=None):
+     """Concatenate files together
+ 
+     Args:
+@@ -226,6 +226,8 @@ def concatenate(file_list, output):
+         sys.exit(1)
+ 
+     with out_file:
++        if header is not None:
++            out_file.write(str.encode(header + "\n"))
+         for file_name in file_list:
+             if file_name is not None:
+                 with open(file_name, "rb") as f:

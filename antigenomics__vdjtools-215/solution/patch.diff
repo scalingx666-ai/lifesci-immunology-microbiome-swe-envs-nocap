@@ -1,0 +1,153 @@
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 96a12ce9..f3a2f6f8 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -799,7 +799,10 @@ Sample and model-build workers use serial inner numerical kernels. Excessive cou
+ Import-time settings also apply to non-signature CLI commands. Existing BLAS pools
+ are limited at runtime; their idle OS threads may remain. An already initialized
+ multi-thread Polars pool cannot be resized, so outer thread pools require a fresh
+-interpreter or ``workers=1``. The default sample-thread backend shares resources
++interpreter or ``workers=1``. A preinitialized Polars pool must still fit the detected
++CPU allocation: sample maps raise if that immutable pool is wider than the allocation,
++including for single-worker workflows. Start a fresh process and import
++vdjtools before Polars in that case. The default sample-thread backend shares resources
+ in one interpreter and supports closures and deferred readers.
+ 
+ For file-backed, Python-heavy summaries, ``io.map_samples(..., backend="process")``
+diff --git a/python/vdjtools/cores.py b/python/vdjtools/cores.py
+index 0b745343..46eb0f6b 100644
+--- a/python/vdjtools/cores.py
++++ b/python/vdjtools/cores.py
+@@ -254,13 +254,21 @@ def numerical_kernels(threads: int = 1):
+         yield budget
+ 
+ 
+-def require_serial_pools() -> None:
+-    """Reject an immutable multi-thread Polars pool before launching outer thread workers."""
++def require_serial_pools(*, outer: bool = True) -> None:
++    """Check immutable pool allocation; outer workers additionally require serial kernels."""
+     import polars as pl
++
++    pool = pl.thread_pool_size()
++    budget = available_cores()
++    if pool > budget:
++        raise RuntimeError(f"Polars has {pool} threads but the CPU allocation is {budget}; "
++                           "start a fresh process and import vdjtools before Polars")
++    if not outer:
++        return
+     from threadpoolctl import threadpool_limits
+ 
+     threadpool_limits(limits=1)
+-    if pl.thread_pool_size() > 1:
++    if pool > 1:
+         raise RuntimeError("Polars was initialized with multiple threads before vdjtools; "
+                            "start a fresh process and import vdjtools before Polars, "
+                            "or use workers=1")
+diff --git a/python/vdjtools/signature/cohort.py b/python/vdjtools/signature/cohort.py
+index 5c83bfe9..5a261943 100644
+--- a/python/vdjtools/signature/cohort.py
++++ b/python/vdjtools/signature/cohort.py
+@@ -58,6 +58,8 @@ def row(item):
+             return fn(item)
+ 
+     if workers < 2:
++        if workers:
++            require_serial_pools(outer=False)
+         return [row(it) for it in items]
+     require_serial_pools()
+ 
+diff --git a/tests/python/test_thread_budget.py b/tests/python/test_thread_budget.py
+index 0e2311fe..c232e749 100644
+--- a/tests/python/test_thread_budget.py
++++ b/tests/python/test_thread_budget.py
+@@ -103,9 +103,12 @@ def test_preinitialized_polars_fails_before_outer_threads_start():
+ def test_serial_sample_map_accepts_preinitialized_polars():
+     import subprocess
+     import sys
+-    code = """import polars as pl
++    from vdjtools.cores import available_cores
++    pool = min(4, available_cores())
++    code = """import os
++import polars as pl
+ pl.DataFrame({'x':[1]}).select(pl.col('x').sum())
+-assert pl.thread_pool_size() == 4
++assert pl.thread_pool_size() == int(os.environ['POLARS_MAX_THREADS'])
+ import vdjtools
+ from vdjtools.signature.cohort import parallel_rows
+ assert parallel_rows([1,2], abs, 1) == [1,2]
+@@ -118,7 +121,7 @@ def test_serial_sample_map_accepts_preinitialized_polars():
+     else:
+         raise AssertionError('outer pool accepted multithreaded Polars')
+ """
+-    env = {**os.environ, 'POLARS_MAX_THREADS': '4'}
++    env = {**os.environ, 'POLARS_MAX_THREADS': str(pool)}
+     subprocess.run([sys.executable, '-c', code], env=env, check=True, timeout=30)
+ 
+ 
+@@ -138,3 +141,66 @@ def read(path):
+     assert (base / 'pod', v2) in paths
+     assert (base, v2) in paths
+     assert (base / 'parent' / 'pod', v2) not in paths
++
++
++def test_preinitialized_polars_cannot_exceed_allocation_in_serial_map():
++    import subprocess
++    import sys
++    code = '''import polars as pl
++assert pl.thread_pool_size() == 4
++import vdjtools
++from vdjtools.signature.cohort import parallel_rows
++try:
++    parallel_rows([1], abs, 1)
++except RuntimeError as exc:
++    assert 'Polars' in str(exc) and 'allocation' in str(exc) and 'fresh process' in str(exc)
++else:
++    raise AssertionError('four-thread Polars pool accepted under a two-CPU allocation')
++'''
++    env = {**os.environ, 'POLARS_MAX_THREADS': '4', 'SLURM_CPUS_PER_TASK': '2'}
++    subprocess.run([sys.executable, '-c', code], env=env, check=True, timeout=30)
++
++
++def test_serial_map_rechecks_changed_allocation():
++    import subprocess
++    import sys
++    from vdjtools.cores import available_cores
++    if available_cores() < 2:
++        pytest.skip('requires a two-thread pool before reducing the allocation')
++    code = '''import os
++import polars as pl
++assert pl.thread_pool_size() == 2
++import vdjtools
++from vdjtools.signature.cohort import parallel_rows
++os.environ['SLURM_CPUS_PER_TASK'] = '1'
++try:
++    parallel_rows([1], abs, 1)
++except RuntimeError as exc:
++    assert 'allocation' in str(exc)
++else:
++    raise AssertionError('single-worker map ignored the reduced allocation')
++'''
++    env = {**os.environ, 'POLARS_MAX_THREADS': '2', 'SLURM_CPUS_PER_TASK': '2'}
++    subprocess.run([sys.executable, '-c', code], env=env, check=True, timeout=30)
++
++
++def test_process_map_can_leave_oversized_parent_polars_pool_idle(tmp_path):
++    import subprocess
++    import sys
++    from vdjtools.cores import available_cores
++    if available_cores() < 2:
++        pytest.skip('requires two allocated process workers')
++    sample = tmp_path / 'sample.tsv'
++    sample.write_text('v_call\tj_call\tjunction_aa\tduplicate_count\nTRBV1\tTRBJ1\tCASSLF\t3\n')
++    script = tmp_path / 'process_map.py'
++    script.write_text('''import sys
++import polars as pl
++if __name__ == '__main__':
++    assert pl.thread_pool_size() == 4
++    import vdjtools
++    from vdjtools.io import map_samples
++    assert map_samples(len, [('a', sys.argv[1]), ('b', sys.argv[1])],
++                       workers=2, backend='process') == [('a', 1), ('b', 1)]
++''')
++    env = {**os.environ, 'POLARS_MAX_THREADS': '4', 'SLURM_CPUS_PER_TASK': '2'}
++    subprocess.run([sys.executable, str(script), str(sample)], env=env, check=True, timeout=30)

@@ -1,0 +1,574 @@
+diff --git a/docs/model.rst b/docs/model.rst
+index d8a6c8bd..fd313f85 100644
+--- a/docs/model.rst
++++ b/docs/model.rst
+@@ -856,6 +856,44 @@ Packed-model state is bounded; successive EM iterations do not retain an unbound
+ ``j_canonical`` fields. Consumers can reuse the repair classifications without rerunning markup.
+ The repaired amino-acid junction remains authoritative when applying nucleotide flanks.
+ 
++Pure-N codon origin probabilities
++---------------------------------
++
++``n_region_posterior_batch`` computes the conditional probability that **all three
++bases** of a codon come from stochastic N additions, given an amino-acid junction
++and optional V/J calls::
++
++   from vdjtools.model import load_bundled, n_region_posterior_batch
++
++   model = load_bundled("TRB", source="isalgo", organism="human")
++   origins = n_region_posterior_batch(
++       model, ["CASSVGLYSTDTQYF"], positions=[[5, 6]], threads=0)
++
++The output is a flat table with ``row``, ``position``, ``n_probability`` and
++``supported``. Positions are zero-based amino-acid coordinates in the
++anchor-inclusive junction. Omit ``positions`` to request every codon; requesting
++only the sites needed by an analysis avoids unnecessary probability sums.
++Requested order and duplicate positions are preserved. An amino-acid query with
++zero model probability returns null probabilities and ``supported=False``;
++unknown gene names and invalid positions raise instead of silently changing the
++conditioning population.
++
++This is an exact sum-product calculation over compatible histories, including
++single- and tandem-D branches. Palindromic P extensions belong to template
++contributions and cannot be counted as N. Retained germline is immutable under
++the generation model; the training error model is not applied. A probability
++below one does **not** identify the complement as pure germline: P and mixed
++boundary codons remain possible. Likewise, random N additions do not imply
++uniform amino-acid frequencies.
++
++The native batch runner shares the packed model read-only, releases the GIL and
++preserves results across thread counts. It evaluates one total AA normalization
++per query and one constrained sum per requested position. It neither fits model
++parameters nor caches/exports generation probabilities. For independent scoring
++or posterior interpretation, retain the model identity and the conditioning
++V/J calls. The returned origin is a model posterior, not observed nucleotide
++history or evidence of antigen recognition.
++
+ Native sampling from the command line
+ -------------------------------------
+ 
+diff --git a/include/vdjtools/model.hpp b/include/vdjtools/model.hpp
+index 5f81673f..5e790c06 100644
+--- a/include/vdjtools/model.hpp
++++ b/include/vdjtools/model.hpp
+@@ -75,6 +75,15 @@ double pgen_nt(const PackedModel& m, const std::vector<int8_t>& cdr3, int v_idx,
+ // Generation probability of an amino-acid CDR3 (codon-marginalizing transfer matrix). ``aa`` is the
+ // CDR3 amino-acid string; v_idx/j_idx as for ``pgen_nt`` (-1 = agnostic / sum over all genes).
+ double pgen_aa(const PackedModel& m, const std::string& aa, int v_idx, int j_idx);
++// Joint mass of the AA query and a pure-N codon, not a top-k approximation.
++double pgen_aa_n_codon(const PackedModel& m, const std::string& aa, int position, int v_idx, int j_idx);
++// Exact conditional probability of a pure-N codon at requested query positions.
++// NaN marks zero total AA mass; rows/positions and duplicates retain input order.
++std::vector<std::vector<double>> n_region_posterior_batch(
++    const PackedModel& m, const std::vector<std::string>& seqs,
++    const std::vector<std::vector<int>>& positions,
++    const std::vector<int>& v_idxs, const std::vector<int>& j_idxs, int nthreads);
++
+ 
+ // Total Pgen of ``aa`` and all its Hamming-distance-1 amino-acid neighbours (one substitution),
+ // via the inclusion-exclusion identity over per-position wildcards. v_idx/j_idx as above.
+diff --git a/pyproject.toml b/pyproject.toml
+index 0721608b..e358509b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "vdjtools"  # if the PyPI name is taken, fall back to a distinct dist name (cf. arda -> arda-mapper)
+-version = "5.6.0"
++version = "5.7.0"
+ description = "TCR/BCR repertoire analysis — Pgen/generation/inference, diversity, overlap, biomarkers (Python + C++)"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/python/vdjtools/model/__init__.py b/python/vdjtools/model/__init__.py
+index 78bd6e29..8178fb84 100644
+--- a/python/vdjtools/model/__init__.py
++++ b/python/vdjtools/model/__init__.py
+@@ -22,7 +22,7 @@
+     set_marginals,
+ )
+ from .model import Model
+-from .native import best_aa_scenarios, best_aa_scenarios_batch, gene_to_allele, pgen_aa, pgen_aa_batch
++from .native import n_region_posterior_batch, best_aa_scenarios, best_aa_scenarios_batch, gene_to_allele, pgen_aa, pgen_aa_batch
+ from .reference import (
+     cut_segment,
+     load_germline,
+@@ -87,6 +87,7 @@
+     "infer_nt_batch",
+     "best_aa_scenarios",
+     "best_aa_scenarios_batch",
++    "n_region_posterior_batch",
+     "gene_to_allele",
+     "pgen_aa",
+     "pgen_aa_batch",
+diff --git a/python/vdjtools/model/native.py b/python/vdjtools/model/native.py
+index cb93f950..d669675e 100644
+--- a/python/vdjtools/model/native.py
++++ b/python/vdjtools/model/native.py
+@@ -334,6 +334,43 @@ def pgen_aa_degenerate_batch(
+     return _batch(pm, sets, v_idxs, j_idxs, kernel_threads(threads))
+ 
+ 
++def n_region_posterior_batch(model: Model, cdr3_aas: list[str],
++                             positions: list[list[int]] | None = None,
++                             v: list[str | None] | None = None,
++                             j: list[str | None] | None = None,
++                             threads: int = 0):
++    """Exact P(all three codon bases are N additions | AA junction, V/J).
++
++    Reuses the native sum-product engine, including tandem-D histories. P-extended
++    templates are not N; a non-N result does not distinguish germline/P/mixed
++    boundary origins. No mutation/error likelihood or fitted-model update occurs.
++
++    ``positions`` are zero-based junction AA coordinates; omitted means all sites.
++    The flat frame retains every requested row/position, including duplicates.
++    Zero model likelihood yields null ``n_probability`` and ``supported=False``.
++    Unknown V/J calls raise exactly as in ``pgen_aa_batch``. No Pgen is cached or
++    exported. Threads are handled by the existing native batch runner.
++    """
++    import numpy as np
++    import polars as pl
++    from .._core import n_region_posterior_batch as _batch
++    seqs=[s.upper() for s in cdr3_aas]
++    if positions is None:
++        positions=[list(range(len(s))) for s in seqs]
++    if len(positions)!=len(seqs) or (v is not None and len(v)!=len(seqs)) or (j is not None and len(j)!=len(seqs)):
++        raise ValueError("query, position and gene-call batch lengths must match")
++    pm,vi,ji=pack(model)
++    vs=[_gene_idx(vi,x,"V") for x in v] if v is not None else []
++    js=[_gene_idx(ji,x,"J") for x in j] if j is not None else []
++    values=_batch(pm,seqs,positions,vs,js,kernel_threads(threads))
++    sizes=[len(p) for p in positions]
++    return pl.DataFrame({
++        "row":pl.Series(np.repeat(np.arange(len(seqs)),sizes),dtype=pl.Int64),
++        "position":pl.Series([p for row in positions for p in row],dtype=pl.Int64),
++        "n_probability":pl.Series([p for row in values for p in row],dtype=pl.Float64).fill_nan(None),
++    }).with_columns(pl.col("n_probability").is_not_null().alias("supported"))
++
++
+ def pgen_aa_batch(
+     model: Model,
+     cdr3_aas: list[str],
+diff --git a/skills/vdjtools/SKILL.md b/skills/vdjtools/SKILL.md
+index e2087541..167ecefa 100644
+--- a/skills/vdjtools/SKILL.md
++++ b/skills/vdjtools/SKILL.md
+@@ -76,6 +76,13 @@ gene-level calls, `model.native.pgen_aa_gene_batch` sums the appropriate model
+ alleles in one batch. Unknown calls raise; do not catch errors and silently
+ marginalize over genes. Explicit multi-allele models retain allele-specific scoring.
+ 
++`model.n_region_posterior_batch(model, cdr3_aas, positions=None, v=None, j=None,
++threads=0)` returns flat `row, position, n_probability, supported` rows. Positions
++are zero-based codons in anchor-inclusive junctions. It sums all compatible
++histories for pure-N codons; P extensions and mixed codons are excluded. Zero
++likelihood gives null probability/unsupported, not N origin. The complement does
++not distinguish germline, P and mixed origins. No Pgen result is cached.
++
+ Pgen is exact and error-free by default. The explicit AA option
+ `approximate_tandem=True` (CLI `--approximate-tandem`) uses rank-one tandem
+ coefficients for supported dense joint-history models, including human isalgo IGH.
+diff --git a/src/_bindings.cpp b/src/_bindings.cpp
+index 027fb520..095285eb 100644
+--- a/src/_bindings.cpp
++++ b/src/_bindings.cpp
+@@ -93,6 +93,11 @@ PYBIND11_MODULE(_core, m) {
+           py::call_guard<py::gil_scoped_release>(),
+           "Batch pgen_aa_degenerate over many motifs, parallelized across queries and "
+           "bitwise-identical to the per-query calls; threads=0 -> serial (Python APIs resolve allocation).");
++    m.def("n_region_posterior_batch", &vdjtools::n_region_posterior_batch,
++          py::arg("model"), py::arg("seqs"), py::arg("positions"),
++          py::arg("v_idxs") = std::vector<int>{}, py::arg("j_idxs") = std::vector<int>{},
++          py::arg("threads") = 0, py::call_guard<py::gil_scoped_release>(),
++          "Exact pure-N codon posterior from existing sum-product recurrences; NaN for unsupported AA queries.");
+     m.def("pgen_aa_batch", &vdjtools::pgen_aa_batch, py::arg("model"), py::arg("seqs"),
+           py::arg("v_idxs") = std::vector<int>{}, py::arg("j_idxs") = std::vector<int>{},
+           py::arg("mismatches") = 0, py::arg("threads") = 0, py::arg("anchored_only") = false,
+diff --git a/src/pgen.cpp b/src/pgen.cpp
+index 48fad7ce..a1f813b4 100644
+--- a/src/pgen.cpp
++++ b/src/pgen.cpp
+@@ -343,7 +343,7 @@ void mk_left_tm(const PackedModel& m, const uint64_t* allowed, int N, int v_idx,
+                 const std::vector<double>& pins, const std::vector<double>& R,
+                 const std::vector<double>& bias, int jbind,
+                 std::vector<double>& Lf, std::vector<char>& lf_any,
+-                const double* pv_override = nullptr) {
++                const double* pv_override = nullptr, int n_codon = -1) {
+     Lf.assign((N + 1) * 25, 0.0);
+     std::vector<double> seed((N + 1) * 25, 0.0);
+     std::vector<char> has_seed(N + 1, 0);
+@@ -358,6 +358,7 @@ void mk_left_tm(const PackedModel& m, const uint64_t* allowed, int N, int v_idx,
+         const auto& gv = m.cut_v[v];
+         int Lv = gv.size();
+         for (int len_v = 1; len_v <= std::min(Lv, N); ++len_v) {
++            if (n_codon >= 0 && len_v > 3*n_codon) continue;
+             int div = Lv - len_v;
+             if (div < 0 || div >= m.nbins_v) continue;
+             double pdv = m.del_v[v * m.nbins_v + div];
+@@ -419,7 +420,7 @@ void mk_left_tm(const PackedModel& m, const uint64_t* allowed, int N, int v_idx,
+ // state s = (nt[p], nt[p+1]); Pins(DJ) + bias baked in; complete codons in [p,N) constrained. The
+ // DJ Markov reads 3'->5', so the backward pass extends leftward from the J boundary.
+ void mk_right_tm(const PackedModel& m, const uint64_t* allowed, int N, int D, int j_idx,
+-                 std::vector<double>& Rb, std::vector<char>& rb_any) {
++                 std::vector<double>& Rb, std::vector<char>& rb_any, int n_codon = -1) {
+     Rb.assign((N + 1) * 25, 0.0);
+     const auto& pins = m.ins_dj;
+     const auto& R = m.R_dj;
+@@ -436,6 +437,7 @@ void mk_right_tm(const PackedModel& m, const uint64_t* allowed, int N, int D, in
+         int Lj = gj.size();
+         for (int len_j = 1; len_j <= std::min(Lj, N); ++len_j) {
+             int right = N - len_j, idxj = Lj - len_j;
++            if (n_codon >= 0 && right < 3*n_codon+3) continue;
+             if (idxj < 0 || idxj >= m.nbins_j) continue;
+             double pdj = m.del_j[j * m.nbins_j + idxj];
+             if (pdj == 0.0) continue;
+@@ -619,7 +621,7 @@ inline bool thread_one(std::vector<double>& dp, std::vector<double>& ndp, int nt
+ double pgen_aa_vdj(const PackedModel& m, const uint64_t* allowed, int alen, int v_idx, int j_idx,
+                     const std::vector<double>* shared_left = nullptr,
+                     const std::vector<char>* shared_any = nullptr,
+-                    const double* pv_override = nullptr) {
++                    const double* pv_override = nullptr, int n_codon = -1) {
+     int N = 3 * alen;
+     std::vector<double> local_left, Rb, res, reduced((N + 1) * 4);
+     std::vector<uint64_t> right_terms(N + 1);
+@@ -627,7 +629,7 @@ double pgen_aa_vdj(const PackedModel& m, const uint64_t* allowed, int alen, int
+     std::vector<int> first, last;
+     std::vector<char> local_any, rb_any, live;
+     if (!shared_left)
+-        mk_left_tm(m, allowed, N, v_idx, m.ins_vd, m.R_vd, m.bias_vd, -1, local_left, local_any, pv_override);
++        mk_left_tm(m, allowed, N, v_idx, m.ins_vd, m.R_vd, m.bias_vd, -1, local_left, local_any, pv_override, n_codon);
+     const auto& Lf = shared_left ? *shared_left : local_left;
+     const auto& lf_any = shared_any ? *shared_any : local_any;
+     double total = 0.0;
+@@ -653,7 +655,7 @@ double pgen_aa_vdj(const PackedModel& m, const uint64_t* allowed, int alen, int
+         }
+     }
+     for (int D : m.func_d) {
+-        mk_right_tm(m, allowed, N, D, j_idx, Rb, rb_any);
++        mk_right_tm(m, allowed, N, D, j_idx, Rb, rb_any, n_codon);
+         // Empty, one-base and two-base prefixes recur across cuts of this D.
+         // Their nonnegative boundary probabilities are local to this query/D.
+         std::fill(short_results.begin(), short_results.end(), -1.0);
+@@ -751,7 +753,10 @@ double pgen_aa_vdj(const PackedModel& m, const uint64_t* allowed, int alen, int
+                 int ld = Ld - idx5 - idx3;
+                 const double* r = &res[ld * (N + 1)];
+                 // Outside this interval every contribution is exactly zero.
+-                for (int pos = first[ld]; pos <= last[ld]; ++pos) total += pdel * r[pos];
++                for (int pos = first[ld]; pos <= last[ld]; ++pos) {
++                    if (n_codon >= 0 && ld > 0 && pos < 3*n_codon+3 && pos+ld > 3*n_codon) continue;
++                    total += pdel * r[pos];
++                }
+             }
+         }
+     }
+@@ -879,7 +884,7 @@ struct TandemScratch {
+ // After two fixed bases the 25-state message has exactly one possible state.
+ template<class Emit>
+ void d_prefixes(const PackedModel& m, int d, const std::vector<double>& deletions,
+-                PrefixPreparation& prepared, int end, const uint64_t* allowed, Emit emit) {
++                PrefixPreparation& prepared, int end, const uint64_t* allowed, Emit emit, int n_codon = -1) {
+     if (end < 2) return;
+     const auto& cut = m.cut_d[d];
+     const int L = cut.size();
+@@ -921,7 +926,8 @@ void d_prefixes(const PackedModel& m, int d, const std::vector<double>& deletion
+                 const int i3 = L - i5 - len;
+                 if (i3 >= m.nbins_d3) continue;
+                 const double weight = row[i5 * m.nbins_d3 + i3];
+-                if (weight != 0.0) emit(pos + len, state, weight, sole);
++                if (weight != 0.0 && !(n_codon >= 0 && pos < 3*n_codon+3 && pos+len > 3*n_codon))
++                    emit(pos + len, state, weight, sole);
+             }
+         }
+     }
+@@ -986,7 +992,7 @@ double rank_one_residual(double sum, double diagonal, const double* weights,
+ // the right message before walking D2; linearity preserves every history.
+ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, int j_idx,
+                        const std::vector<double>& Lf, TandemScratch& scratch,
+-                       const RankOneHistory* rank1 = nullptr) {
++                       const RankOneHistory* rank1 = nullptr, int n_codon = -1) {
+     const int N = 3 * alen, width = (N + 1) * 25;
+     std::vector<double> Rb, Mf(width), seeds(width), dp(25);
+     std::vector<char> rb_any;
+@@ -1013,7 +1019,7 @@ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, i
+     if (active_d.empty()) return 0.0;
+     for (size_t k = 0; k < js.size(); ++k)
+         if (active_j[k])
+-            mk_right_tm(m, allowed, N, -1, js[k], rights[k], rb_any);
++            mk_right_tm(m, allowed, N, -1, js[k], rights[k], rb_any, n_codon);
+     auto& first_prepared = scratch.first;
+     first_prepared.prepare(Lf, N - 2, allowed);
+     double total = 0.0;
+@@ -1041,7 +1047,7 @@ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, i
+             [&](int q, const double* state, double w, int sole) {
+                 if (sole >= 0) seeds[q * 25 + sole] += w * state[sole];
+                 else for (int s = 0; s < 25; ++s) seeds[q * 25 + s] += w * state[s];
+-            });
++            }, n_codon);
+         std::fill(Mf.begin(), Mf.end(), 0.0);
+         for (int q = 1; q < N - 1; ++q) {
+             const double* seed = seeds.data() + q * 25;
+@@ -1070,7 +1076,7 @@ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, i
+             d_prefixes(m, d2, m.del_d2, second_prepared, N - 1, allowed,
+                 [&](int q, const double* state, double w, int sole) {
+                     total += w * contract_right(state, coefficients.data() + q * 25, sole);
+-                });
++                }, n_codon);
+         }
+     }
+     // With many D genes (IGH), mix D1 histories on the left instead. This
+@@ -1108,7 +1114,7 @@ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, i
+             d_prefixes(m, d2, m.del_d2, second_prepared, N - 1, allowed,
+                 [&](int q, const double* state, double w, int sole) {
+                     total += w * contract_right(state, coefficients.data() + q * 25, sole);
+-                });
++                }, n_codon);
+         }
+     }
+     return total;
+@@ -1119,7 +1125,7 @@ double pgen_aa_vdj_dd(const PackedModel& m, const uint64_t* allowed, int alen, i
+ // the fixed J germline suffix over [N-len_j, N) and sum. O(nJ * N * 25) — replaces the old
+ // per-scenario enumeration, which was ~1000x slower on VJ loci with many V/J alleles.
+ double pgen_aa_vj(const PackedModel& m, const uint64_t* allowed, int alen, int v_idx, int j_idx,
+-                  const double* pv_override = nullptr) {
++                  const double* pv_override = nullptr, int n_codon = -1) {
+     int N = 3 * alen;
+     double total = 0.0;
+     std::vector<double> Lf, dp(25), ndp(25);
+@@ -1147,9 +1153,10 @@ double pgen_aa_vj(const PackedModel& m, const uint64_t* allowed, int alen, int v
+             }
+         }
+         if (!possible) continue;
+-        mk_left_tm(m, allowed, N, v_idx, m.ins_vj, m.R_vj, m.bias_vj, j, Lf, lf_any, pv_override);
++        mk_left_tm(m, allowed, N, v_idx, m.ins_vj, m.R_vj, m.bias_vj, j, Lf, lf_any, pv_override, n_codon);
+         for (int len_j = 1; len_j <= std::min(Lj, N); ++len_j) {
+             int p = N - len_j, idxj = Lj - len_j;
++            if (n_codon >= 0 && p < 3*n_codon+3) continue;
+             if (p < 1 || !lf_any[p]) continue;  // >=1 V/insertion nt before J
+             if (idxj < 0 || idxj >= m.nbins_j) continue;
+             double pdj = m.del_j[j * m.nbins_j + idxj];
+@@ -1187,17 +1194,17 @@ double pgen_aa_vj(const PackedModel& m, const uint64_t* allowed, int alen, int v
+ static double pgen_aa_masked_scratch(const PackedModel& m, const uint64_t* allowed, int L,
+                                      int v_idx, int j_idx, TandemScratch& scratch,
+                                      const double* pv_override = nullptr,
+-                                     const RankOneHistory* rank1 = nullptr) {
+-    if (!m.vdj) return pgen_aa_vj(m, allowed, L, v_idx, j_idx, pv_override);
++                                     const RankOneHistory* rank1 = nullptr, int n_codon = -1) {
++    if (!m.vdj) return pgen_aa_vj(m, allowed, L, v_idx, j_idx, pv_override, n_codon);
+     // Share the V+VD message across both branches of the exact n_D mixture.
+     if (!m.dd || !(m.p_nd2 > 0.0))
+-        return m.p_nd1 * pgen_aa_vdj(m, allowed, L, v_idx, j_idx, nullptr, nullptr, pv_override);
++        return m.p_nd1 * pgen_aa_vdj(m, allowed, L, v_idx, j_idx, nullptr, nullptr, pv_override, n_codon);
+     std::vector<double> left;
+     std::vector<char> any;
+-    mk_left_tm(m, allowed, 3 * L, v_idx, m.ins_vd, m.R_vd, m.bias_vd, -1, left, any, pv_override);
++    mk_left_tm(m, allowed, 3 * L, v_idx, m.ins_vd, m.R_vd, m.bias_vd, -1, left, any, pv_override, n_codon);
+     double r = m.p_nd1 == 0.0 ? 0.0 :
+-        m.p_nd1 * pgen_aa_vdj(m, allowed, L, v_idx, j_idx, &left, &any);
+-    r += m.p_nd2 * pgen_aa_vdj_dd(m, allowed, L, j_idx, left, scratch, rank1);
++        m.p_nd1 * pgen_aa_vdj(m, allowed, L, v_idx, j_idx, &left, &any, nullptr, n_codon);
++    r += m.p_nd2 * pgen_aa_vdj_dd(m, allowed, L, j_idx, left, scratch, rank1, n_codon);
+     return r;
+ }
+ 
+@@ -1213,6 +1220,20 @@ double pgen_aa(const PackedModel& m, const std::string& aa, int v_idx, int j_idx
+     return pgen_aa_masked(m, allowed.data(), L, v_idx, j_idx);
+ }
+ 
++// Joint AA mass with one complete codon contributed only by N additions.
++// Reuse the exact sum-product engine, including both tandem-D branches. Template
++// contributions include P extensions, so these cannot be mislabelled as N.
++double pgen_aa_n_codon(const PackedModel& m, const std::string& aa, int position,
++                       int v_idx, int j_idx) {
++    const int L = aa.size();
++    if (position < 0 || position >= L) throw std::invalid_argument("N-origin position outside junction");
++    std::vector<uint64_t> allowed(L);
++    for (int c = 0; c < L; ++c) allowed[c] = mask_for_aa(aa[c]);
++    TandemScratch scratch;
++    return pgen_aa_masked_scratch(m, allowed.data(), L, v_idx, j_idx, scratch,
++                                 nullptr, nullptr, position);
++}
++
+ // Total Pgen of the amino-acid CDR3 and every sequence within Hamming distance 1 of it (one aa
+ // substitution). By inclusion-exclusion this is  sum_k Pgen(a with position k wildcarded)
+ //   - (L-1) Pgen(a)  (OLGA's identity), but each term here is one fast transfer-matrix pass and the
+@@ -1291,6 +1312,39 @@ auto run_batch(size_t n, int nthreads, F&& one, bool expensive = false)
+ 
+ }  // namespace
+ 
++// Exact requested-codon pure-N posterior; reuse the existing native batch runner.
++std::vector<std::vector<double>> n_region_posterior_batch(
++    const PackedModel& m, const std::vector<std::string>& seqs,
++    const std::vector<std::vector<int>>& positions,
++    const std::vector<int>& v_idxs, const std::vector<int>& j_idxs, int nthreads) {
++    if (positions.size()!=seqs.size() || (!v_idxs.empty() && v_idxs.size()!=seqs.size()) ||
++        (!j_idxs.empty() && j_idxs.size()!=seqs.size()))
++        throw std::invalid_argument("query, position and gene-call batch lengths must match");
++    for (size_t i=0; i<seqs.size(); ++i) {
++        for (int p : positions[i])
++            if (p<0 || p>=static_cast<int>(seqs[i].size()))
++                throw std::invalid_argument("N-origin position outside junction");
++        if ((!v_idxs.empty() && (v_idxs[i]<-1 || v_idxs[i]>=m.nV())) ||
++            (!j_idxs.empty() && (j_idxs[i]<-1 || j_idxs[i]>=m.nJ())))
++            throw std::invalid_argument("gene index outside model");
++    }
++    return run_batch(seqs.size(),nthreads,[&](size_t i) {
++        const int v=v_idxs.empty() ? -1 : v_idxs[i], j=j_idxs.empty() ? -1 : j_idxs[i];
++        std::vector<double> out(positions[i].size(),std::numeric_limits<double>::quiet_NaN());
++        if (out.empty()) return out;
++        const double total=pgen_aa(m,seqs[i],v,j);
++        if (!(total>0.) || !std::isfinite(total)) return out;
++        for (size_t k=0; k<out.size(); ++k) {
++            const double mass=pgen_aa_n_codon(m,seqs[i],positions[i][k],v,j);
++            const double probability=mass/total;
++            if (!std::isfinite(probability) || probability<0. || probability>1.+1e-10)
++                throw std::runtime_error("N-origin joint mass exceeds total AA mass");
++            out[k]=std::min(1.,probability);
++        }
++        return out;
++    },m.vdj);
++}
++
+ // Batch aa Pgen over many sequences, parallelized across sequences. Each output is the exact
+ // per-sequence pgen_aa (mismatches=0) or pgen_aa_hamming1 (mismatches=1) — the parallelism is
+ // embarrassingly disjoint (no shared state, no reduction), so the result is bitwise-identical to
+diff --git a/tests/cpp/test_pgen_messages.cpp b/tests/cpp/test_pgen_messages.cpp
+index 63844653..506ba05f 100644
+--- a/tests/cpp/test_pgen_messages.cpp
++++ b/tests/cpp/test_pgen_messages.cpp
+@@ -57,6 +57,64 @@ void extend_ins_reference(const std::vector<double>& dp0, int q0, int N, const u
+ 
+ int main() {
+     using namespace vdjtools;
++    // Pure-N mass is an exact constrained sum, not a top-k history label.
++    PackedModel origin;
++    origin.cut_v = {{3,2,3}}; origin.cut_j = {{3,3,3}}; // Cys ... Phe
++    origin.func_v = origin.func_j = {0};
++    origin.pv = origin.pjv = origin.pj = {1.};
++    origin.nbins_v = origin.nbins_j = 1;
++    origin.del_v = origin.del_j = {1.};
++    origin.ins_vj = origin.ins_vd = {0.,0.,0.,1.};
++    origin.ins_dj = {1.};
++    origin.R_vj = origin.R_vd = origin.R_dj = std::vector<double>(16,.25);
++    origin.bias_vj = origin.bias_vd = origin.bias_dj = std::vector<double>(4,.25);
++    auto check_origin = [&](const PackedModel& model, const std::string& aa,
++                            const std::vector<int>& pure) {
++        const double total = pgen_aa(model,aa,-1,-1);
++        if (!(total > 0.)) return false;
++        for (int position=0; position<static_cast<int>(aa.size()); ++position) {
++            const double mass = pgen_aa_n_codon(model,aa,position,-1,-1);
++            const double expected = std::find(pure.begin(),pure.end(),position)==pure.end() ? 0. : total;
++            if (std::abs(mass-expected)>1e-12*total) return false;
++        }
++        return true;
++    };
++    if (!check_origin(origin,"CAF",{1}) || std::abs(pgen_aa(origin,"CAF",-1,-1)-1./16)>1e-14) return 10;
++    auto boundary=origin;
++    boundary.cut_v={{3,2,3,0}}; boundary.maxpal_v3=1; // retained palindromic A
++    boundary.ins_vj={0.,0.,1.};
++    if (!check_origin(boundary,"CKF",{})) return 11;
++    auto ambiguous=boundary;
++    ambiguous.nbins_v=2; ambiguous.del_v={.5,.5};
++    ambiguous.ins_vj={0.,0.,.5,.5};
++    const double ambiguous_mass=pgen_aa(ambiguous,"CKF",-1,-1);
++    const double n_mass=pgen_aa_n_codon(ambiguous,"CKF",1,-1,-1);
++    // The same AA admits P+N (4/5 posterior) and pure-N (1/5) histories.
++    if (std::abs(ambiguous_mass-5./128)>1e-14 || std::abs(n_mass/ambiguous_mass-.2)>1e-13) return 16;
++    boundary=origin; boundary.cut_j={{0,3,3,3}}; boundary.maxpal_j5=1;
++    boundary.ins_vj={0.,0.,1.};
++    if (!check_origin(boundary,"CKF",{})) return 12;
++    origin.vdj=true; origin.cut_d={{2,2,3},{3,1,3}}; // Gly and Ser
++    origin.func_d={0,1}; origin.nbins_d5=origin.nbins_d3=1;
++    origin.del_d={1.,1.}; origin.pd_given_j={1.,0.};
++    if (!check_origin(origin,"CAGF",{1})) return 13;
++    auto alternate=origin;
++    alternate.cut_d={{2,2,3},{2,1,3}}; // Gly versus Ala from different D histories
++    alternate.pd_given_j={.5,.5};
++    alternate.ins_vd=alternate.ins_dj={.5,0.,0.,.5};
++    const double alternate_mass=pgen_aa(alternate,"CAGF",-1,-1);
++    if (std::abs(alternate_mass-1./64)>1e-14) return 17;
++    for (int pos : {1,2})
++        if (std::abs(pgen_aa_n_codon(alternate,"CAGF",pos,-1,-1)/alternate_mass-.5)>1e-13) return 18;
++    origin.dd=origin.joint_history=true; origin.p_nd1=0.; origin.p_nd2=1.;
++    origin.q_tandem={0.,1.,0.,0.};
++    origin.del_d_tandem=origin.del_d2={1.,1.};
++    origin.ins_dd={0.,0.,0.,1.}; origin.R_dd=std::vector<double>(16,.25);
++    origin.bias_dd=std::vector<double>(4,.25);
++    if (!check_origin(origin,"CAGASF",{1,3})) return 14;
++    // Exercise the alternative left-mixture contraction as well.
++    origin.q_tandem={0.,.5,.5,0.};
++    if (!check_origin(origin,"CAGASF",{1,3})) return 15;
+     constexpr int N = 12;
+     const uint64_t masks[] = {mask_for_aa('A'), mask_for_aa('R'), mask_wildcard(), mask_for_aa('G')};
+     std::vector<double> right((N + 1) * 25), left(25);
+diff --git a/tests/python/test_n_region_posterior.py b/tests/python/test_n_region_posterior.py
+new file mode 100644
+index 00000000..5538012d
+--- /dev/null
++++ b/tests/python/test_n_region_posterior.py
+@@ -0,0 +1,67 @@
++"""Exact pure-N posterior through the owning native batch API; no inferred-NT truth."""
++import json
++from pathlib import Path
++import numpy as np
++import polars as pl
++import pytest
++from vdjtools.model import Model,load_bundled,n_region_posterior_batch
++from vdjtools.model.io import from_germline
++from vdjtools.cores import available_cores
++
++
++@pytest.fixture(scope='module')
++def toy():
++    germline=pl.DataFrame([dict(allele=a,gene=a.split('*')[0],segment=k,
++        sequence=s,cdr3_anchor=-1,functional=True,full_germline='')
++        for a,k,s in [('TOYV1*01','V','TGT'),('TOYJ1*01','J','TTT')]])
++    model=from_germline(germline,locus='TOY',ins_max=3,
++                        palindrome_max={'v_3':1,'j_5':0})
++    tables=dict(model.tables)
++    tables['v_3_del']=tables['v_3_del'].with_columns(p=pl.when(pl.col('ndel').is_in([-1,0])).then(.5).otherwise(0.))
++    tables['j_5_del']=tables['j_5_del'].with_columns(p=(pl.col('ndel')==0).cast(pl.Float64))
++    tables['vj_ins']=tables['vj_ins'].with_columns(p=pl.when(pl.col('length').is_in([2,3])).then(.5).otherwise(0.))
++    for name in ['vj_dinucl','vj_first_nt']:
++        tables[name]=tables[name].with_columns(p=pl.lit(.25))
++    return Model(manifest=model.manifest,tables=tables,genomic=model.genomic).validate()
++
++
++def test_fractional_origin_and_input_order(toy):
++    result=n_region_posterior_batch(toy,['CKF','AAA'],positions=[[1,0,1,2],[1]],threads=1)
++    assert result['row'].to_list()==[0,0,0,0,1]
++    assert result['position'].to_list()==[1,0,1,2,1]
++    assert np.allclose(result['n_probability'][:4],[.2,0,.2,0])
++    assert result['n_probability'][-1] is None and not result['supported'][-1]
++    all_positions=n_region_posterior_batch(toy,['CKF'])
++    assert np.allclose(all_positions['n_probability'],[0,.2,0])
++    assert n_region_posterior_batch(toy,[]).is_empty()
++
++
++def test_vj_threaded_path_and_validation(toy):
++    seqs=['CKF']*64;positions=[[0,1,2]]*64
++    assert n_region_posterior_batch(toy,seqs,positions,threads=1).equals(
++        n_region_posterior_batch(toy,seqs,positions,threads=min(4,available_cores())))
++    with pytest.raises(ValueError):
++        n_region_posterior_batch(toy,['CKF'],[[-1]])
++    with pytest.raises(ValueError):
++        n_region_posterior_batch(toy,['CKF'],[[3]])
++    with pytest.raises(ValueError):
++        n_region_posterior_batch(toy,['CKF'],[])
++    with pytest.raises(ValueError):
++        n_region_posterior_batch(toy,['CKF'],v=[])
++    with pytest.raises(KeyError):
++        n_region_posterior_batch(toy,['CKF'],v=['missing'])
++
++
++@pytest.mark.parametrize('locus',['TRB','TRD','IGH'])
++def test_current_tandem_models_thread_equality_and_immutable_anchors(locus):
++    golden=json.loads((Path(__file__).parent/'fixtures/tandem_pgen_golden.json').read_text())[locus]
++    model=load_bundled(locus,source='isalgo')
++    seqs=golden['data']['junction_aa'][:4]
++    positions=[[0,len(s)//2,len(s)-1] for s in seqs]
++    vs=golden['data']['v_call'][:4];js=golden['data']['j_call'][:4]
++    serial=n_region_posterior_batch(model,seqs,positions,vs,js,threads=1)
++    parallel=n_region_posterior_batch(model,seqs,positions,vs,js,threads=min(4,available_cores()))
++    assert serial.equals(parallel) and serial['supported'].all()
++    values=serial['n_probability'].to_numpy().reshape(-1,3)
++    assert np.all(values>=0) and np.all(values<=1)
++    assert np.array_equal(values[:,[0,2]],np.zeros((len(seqs),2)))

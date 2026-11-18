@@ -1,0 +1,159 @@
+diff --git a/src/sourmash/commands.py b/src/sourmash/commands.py
+index b2d2c994d4..0738159eb4 100644
+--- a/src/sourmash/commands.py
++++ b/src/sourmash/commands.py
+@@ -1192,6 +1192,8 @@ def multigather(args):
+         error("Error! must specify at least one query signature with --query")
+         sys.exit(-1)
+ 
++    scaled = int(args.scaled) if args.scaled else None
++
+     # flatten --db and --query
+     args.db = [item for sublist in args.db for item in sublist]
+     inp_files = [item for sublist in args.query for item in sublist]
+@@ -1203,13 +1205,23 @@ def multigather(args):
+     query = next(
+         iter(
+             sourmash_args.load_file_as_signatures(
+-                inp_files[0], ksize=args.ksize, select_moltype=moltype
++                inp_files[0],
++                ksize=args.ksize,
++                select_moltype=moltype,
++                scaled=scaled,
+             )
+         )
+     )
+ 
++    if scaled and scaled != query.minhash.scaled:
++        notify(
++            f"downsampling query from scaled={query.minhash.scaled} to {int(scaled)}"
++        )
++        with query.update() as query:
++            query.minhash = query.minhash.downsample(scaled=scaled)
++
+     notify(
+-        f"loaded first query: {str(query)[:30]}... (k={query.minhash.ksize}, {sourmash_args.get_moltype(query)})"
++        f"loaded first query: {str(query)[:30]}... (k={query.minhash.ksize}, {sourmash_args.get_moltype(query)}, scaled={query.minhash.scaled})"
+     )
+ 
+     databases = sourmash_args.load_dbs_and_sigs(
+@@ -1223,10 +1235,10 @@ def multigather(args):
+     for queryfile in inp_files:
+         # load the query signature(s) & figure out all the things
+         for query in sourmash_args.load_file_as_signatures(
+-            queryfile, ksize=args.ksize, select_moltype=moltype
++            queryfile, ksize=args.ksize, select_moltype=moltype, scaled=scaled
+         ):
+             notify(
+-                f"loaded query: {str(query)[:30]}... (k={query.minhash.ksize}, {sourmash_args.get_moltype(query)})"
++                f"loaded query: {str(query)[:30]}... (k={query.minhash.ksize}, {sourmash_args.get_moltype(query)}, scaled={query.minhash.scaled})"
+             )
+ 
+             # verify signature was computed right.
+@@ -1234,12 +1246,12 @@ def multigather(args):
+                 error("query signature needs to be created with --scaled; skipping")
+                 continue
+ 
+-            if args.scaled and args.scaled != query.minhash.scaled:
++            if scaled and scaled != query.minhash.scaled:
+                 notify(
+-                    f"downsampling query from scaled={query.minhash.scaled} to {int(args.scaled)}"
++                    f"downsampling query from scaled={query.minhash.scaled} to {int(scaled)}"
+                 )
+                 with query.update() as query:
+-                    query.minhash = query.minhash.downsample(scaled=args.scaled)
++                    query.minhash = query.minhash.downsample(scaled=scaled)
+ 
+             # empty?
+             if not len(query.minhash):
+diff --git a/src/sourmash/index/sqlite_index.py b/src/sourmash/index/sqlite_index.py
+index 9be39afb28..24f6ae7063 100644
+--- a/src/sourmash/index/sqlite_index.py
++++ b/src/sourmash/index/sqlite_index.py
+@@ -820,7 +820,7 @@ def _make_select(self):
+                 values.append(select_d["ksize"])
+             if "num" in select_d and select_d["num"] > 0:
+                 conditions.append("sourmash_sketches.num > 0")
+-            if "scaled" in select_d and select_d["scaled"] > 0:
++            if "scaled" in select_d and select_d["scaled"] and select_d["scaled"] > 0:
+                 conditions.append("sourmash_sketches.scaled > 0")
+             if "containment" in select_d and select_d["containment"]:
+                 conditions.append("sourmash_sketches.scaled > 0")
+diff --git a/src/sourmash/lca/lca_db.py b/src/sourmash/lca/lca_db.py
+index a8b33da22a..826a0f28b6 100644
+--- a/src/sourmash/lca/lca_db.py
++++ b/src/sourmash/lca/lca_db.py
+@@ -266,7 +266,7 @@ def select(
+         if num:
+             raise ValueError("cannot use 'num' MinHashes to search LCA database")
+ 
+-        if scaled > self.scaled and not containment:
++        if scaled and scaled > self.scaled and not containment:
+             raise ValueError(
+                 f"cannot use scaled={scaled} on this database (scaled={self.scaled})"
+             )
+diff --git a/src/sourmash/sourmash_args.py b/src/sourmash/sourmash_args.py
+index 20028fa921..dac097c579 100644
+--- a/src/sourmash/sourmash_args.py
++++ b/src/sourmash/sourmash_args.py
+@@ -775,6 +775,7 @@ def load_file_as_signatures(
+     *,
+     select_moltype=None,
+     ksize=None,
++    scaled=None,
+     picklist=None,
+     yield_all_files=False,
+     progress=None,
+@@ -808,7 +809,7 @@ def load_file_as_signatures(
+     if not _use_manifest and db.manifest:
+         db.manifest = None
+ 
+-    db = db.select(moltype=select_moltype, ksize=ksize)
++    db = db.select(moltype=select_moltype, ksize=ksize, scaled=scaled)
+ 
+     # apply pattern search & picklist
+     db = apply_picklist_and_pattern(db, picklist, pattern)
+diff --git a/tests/test_sourmash.py b/tests/test_sourmash.py
+index 6fda884124..a081c25bfb 100644
+--- a/tests/test_sourmash.py
++++ b/tests/test_sourmash.py
+@@ -4501,6 +4501,39 @@ def test_multigather_metagenome(runtmp):
+     )
+ 
+ 
++def test_multigather_metagenome_scaled(runtmp):
++    # does multigather properly downsample query sketches with --scaled?
++    testdata_glob = utils.get_test_data("gather/GCF*.sig")
++    testdata_sigs = glob.glob(testdata_glob)
++
++    query_sig = utils.get_test_data("gather/combined.sig")
++
++    cmd = ["index", "gcf_all.rocksdb"]
++    cmd.extend(testdata_sigs)
++    # rocksdb will complain if scaled does not match
++    cmd.extend(["-k", "21", "-F", "rocksdb", "--scaled", "100_000"])
++
++    runtmp.sourmash(*cmd)
++
++    assert os.path.exists(runtmp.output("gcf_all.rocksdb"))
++
++    runtmp.sourmash(
++        "multigather",
++        "--query",
++        query_sig,
++        "--db",
++        "gcf_all.rocksdb",
++        "-k",
++        "21",
++        "--scaled",
++        "100_000",
++        "--threshold-bp=0",
++    )
++
++    print(runtmp.last_result.out)
++    print(runtmp.last_result.err)
++
++
+ def test_multigather_check_scaled_bounds_negative(runtmp):
+     c = runtmp
+     testdata_glob = utils.get_test_data("gather/GCF*.sig")

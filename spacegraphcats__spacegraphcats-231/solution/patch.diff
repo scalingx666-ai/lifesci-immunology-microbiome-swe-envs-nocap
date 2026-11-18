@@ -1,0 +1,607 @@
+diff --git a/doc/developing-spacegraphcats.md b/doc/developing-spacegraphcats.md
+index e264435c..40950407 100644
+--- a/doc/developing-spacegraphcats.md
++++ b/doc/developing-spacegraphcats.md
+@@ -13,9 +13,9 @@
+     * commands.log - a partial log of all of the commands
+ * the `dory_k21_r1_search_oh0/` directory contains the output of a search:
+     * results.csv - summary results for the queries (containment, similarity, etc.)
+-    * dory-head.fa.cdbg_ids.txt.gz - for the `dory-head.fa` query, the cDBG node IDs that were retrieved
++    * dory-head.fa.cdbg_ids.txt.gz - cDBG node IDs (unitig IDs) matching query
+     * dory-head.fa.contigs.sig - the sourmash signature of the entire match in the cDBG
+-    * dory-head.fa.frontier.txt.gz - (undefined for the moment)
++    * dory-head.fa.frontier.txt.gz - catlas node IDs matching query
+     * dory-head.fa.response.txt - response curve showing how much overhead is gained for each node
+     * command.txt - a partial log of the commands run
+ 
+diff --git a/spacegraphcats/conf/Snakefile b/spacegraphcats/conf/Snakefile
+index b8f417ac..67d7edd8 100644
+--- a/spacegraphcats/conf/Snakefile
++++ b/spacegraphcats/conf/Snakefile
+@@ -175,7 +175,7 @@ rule searchquick:
+         expand("{search_dir}/results.csv", search_dir=search_dir),
+         make_query_base(config['searchquick']),
+     shell:
+-        "{python} -m spacegraphcats.search.extract_nodes_by_query {catlas_dir} {search_dir} --query {config[searchquick]} -k {ksize} --overhead={overhead} {cdbg_only}"
++        "{python} -m spacegraphcats.search.query_by_sequence {catlas_dir} {search_dir} --query {config[searchquick]} -k {ksize} {cdbg_only}"
+ 
+ 
+ # do a full search!
+@@ -190,7 +190,7 @@ rule search:
+         expand("{search_dir}/results.csv", search_dir=search_dir),
+         make_query_base(config['search']),
+     shell:
+-        "{python} -m spacegraphcats.search.extract_nodes_by_query {catlas_dir} {search_dir} --query {config[search]} -k {ksize} --overhead={overhead} {cdbg_only}"
++        "{python} -m spacegraphcats.search.query_by_sequence {catlas_dir} {search_dir} --query {config[search]} -k {ksize} {cdbg_only}"
+ 
+ ruleorder: search > searchquick
+ 
+diff --git a/spacegraphcats/search/__init__.py b/spacegraphcats/search/__init__.py
+index 03c0781a..e4372a01 100644
+--- a/spacegraphcats/search/__init__.py
++++ b/spacegraphcats/search/__init__.py
+@@ -1,3 +1,2 @@
+ from .index import MPHF_KmerIndex
+ from .catlas import CAtlas
+-from .extract_nodes_by_query import Query
+diff --git a/spacegraphcats/search/extract_unassembled_nodes.py b/spacegraphcats/search/extract_unassembled_nodes.py
+index bf3c38c4..a414c511 100644
+--- a/spacegraphcats/search/extract_unassembled_nodes.py
++++ b/spacegraphcats/search/extract_unassembled_nodes.py
+@@ -16,7 +16,6 @@
+ 
+ import screed
+ from . import search_utils
+-from .frontier_search import find_shadow
+ from .catlas import CAtlas
+ 
+ 
+@@ -133,11 +132,9 @@ def find_unassembled_nodes(node_id, threshold=0.0):
+     # build cDBG shadow ID list, tagged by parent catlas node.
+     cdbg_id_to_node = {}
+     for n in terminal:
+-        this_shadow = find_shadow([n], catlas.children)
+-        for x in this_shadow:
+-            v = catlas.layer1_to_cdbg[x]
+-            for vv in v:
+-                cdbg_id_to_node[vv] = n
++        shadow = catlas.shadow([n])
++        for cdbg_id in shadow:
++            cdbg_id_to_node[cdbg_id] = n
+ 
+     #### extract contigs
+     print('extracting contigs & building a sourmash signature')
+diff --git a/spacegraphcats/search/frontier_search.py b/spacegraphcats/search/frontier_search.py
+deleted file mode 100755
+index e6ac6751..00000000
+--- a/spacegraphcats/search/frontier_search.py
++++ /dev/null
+@@ -1,213 +0,0 @@
+-#! /usr/bin/env python
+-import heapq
+-import time
+-from collections import defaultdict
+-from typing import Dict, List, Set, Tuple, Union
+-
+-
+-class NoContainment(ValueError):
+-    pass
+-
+-
+-def find_shadow(nodes: List[int], dag: Dict[int, List[int]]) -> Set[int]:
+-    shadow = set()  # type: Set[int]
+-
+-    seen_nodes = set()  # type: Set[int]
+-
+-    def add_to_shadow(node_id: int):
+-        if node_id in seen_nodes:
+-            return
+-        seen_nodes.add(node_id)
+-
+-        children_ids = dag[node_id]
+-
+-        if len(children_ids) == 0:
+-            shadow.add(node_id)
+-        else:
+-            for child in children_ids:
+-                add_to_shadow(child)
+-
+-    for node in nodes:
+-        add_to_shadow(node)
+-
+-    return shadow
+-
+-
+-def frontier_search_exact(catlas,
+-                          node_query_kmers,
+-                          max_overhead):
+-
+-    # nodes and minhases that are in the frontier
+-    frontier = []  # type: List[int]
+-    frontier_minhash = None
+-
+-    # nodes and minhashes for leaves with large overhead
+-    seen_nodes = set()  # type: Set[int]
+-
+-    num_leaves = 0
+-    num_empty = 0
+-
+-    def node_containment(node_id):
+-        query_kmers = node_query_kmers.get(node_id, 0)
+-        total_kmers = catlas.index_sizes[node_id]
+-        containment = query_kmers / total_kmers
+-        assert query_kmers <= total_kmers
+-
+-        return containment
+-
+-    def node_overhead(node_id):
+-        return 1 - node_containment(node_id)
+-
+-    def add_node(node_id: int):
+-        frontier.append(node_id)
+-
+-    n_truncated = 0
+-
+-    # This visits every node for which containment != 1.0, and adds
+-    # all children with any kind of containment.
+-    def add_to_frontier4(node_id):
+-        nonlocal n_truncated
+-
+-        if node_id in seen_nodes:
+-            return
+-
+-        seen_nodes.add(node_id)
+-
+-        containment = node_containment(node_id)
+-        if containment == 0:
+-            n_truncated += 1
+-            return
+-
+-        if containment >= 1.0 - max_overhead:
+-            add_node(node_id)
+-            n_truncated += 1
+-            return
+-
+-        children_ids = catlas.children[node_id]
+-
+-        # leaf node: some containment? keep.
+-        if not children_ids and containment > 0.0:
+-            add_node(node_id)
+-            return
+-
+-        # recurse into children to get more resolution
+-        for child_id in children_ids:
+-            add_to_frontier4(child_id)
+-
+-    add_to_frontier4(catlas.root)
+-
+-    frontier = set(frontier)
+-
+-    print('search visited {} catlas nodes.'.format(len(seen_nodes)))
+-    print('search truncated at {}'.format(n_truncated))
+-
+-    return frontier, num_leaves, num_empty, frontier_minhash
+-
+-
+-def frontier_search(catlas,
+-                    node_query_kmers,
+-                    max_overhead,
+-                    min_containment):
+-    # the initial frontier is just the root
+-    root_match = node_query_kmers.get(catlas.root, 0)
+-    root_total = catlas.index_sizes[catlas.root]
+-    root_precision = root_match/root_total
+-
+-    # since python implements heaps as min-heaps but we want to prioritize the
+-    # largest overheads, we store the precision (matches/total), since that is
+-    # 1 - overhead
+-    frontier = [(root_precision, root_match, root_total, catlas.root)]
+-    f_match = root_match
+-    f_total = root_total
+-
+-    # keep refining until we either get the frontier overhead low enough, the
+-    # containment gets too low, or we run out of vertices
+-    while frontier and\
+-            1.0 - f_match/f_total > max_overhead and\
+-            f_match/root_match > min_containment:
+-        # remove worst overhead from the frontier
+-        _, curr_match, curr_total, curr = heapq.heappop(frontier)
+-        # update the quality metrics to reflect removal
+-        f_total = f_total - curr_total
+-        f_match = f_match - curr_match
+-        # descend into children
+-        for child in catlas.children[curr]:
+-            child_match = node_query_kmers.get(child, 0)
+-            # if the child has no match, we don't want to include it
+-            if child_match == 0:
+-                continue
+-
+-            # compute the other metrics
+-            child_total = catlas.index_sizes[child]
+-            child_precision = child_match/child_total
+-            f_total += child_total
+-            f_match += child_match
+-
+-            # add to frontier
+-            heapq.heappush(frontier,
+-                           (child_precision, child_match, child_total, child))
+-
+-    if len(frontier) > 0:
+-        frontier = list(zip(*frontier))[3]
+-    return frontier, 0, 0, None
+-
+-
+-def collect_frontier(catlas,
+-                     catlas_match_counts,
+-                     max_overhead,
+-                     min_containment,
+-                     verbose=False):
+-    start = time.time()
+-
+-    # gather results into total_frontier
+-    total_frontier = defaultdict(set)
+-
+-    # do queries!
+-    try:
+-        frontier, num_leaves, num_empty, frontier_mh = \
+-          frontier_search(catlas,
+-                          catlas_match_counts,
+-                          max_overhead,
+-                          min_containment)
+-    except NoContainment:
+-        print('** WARNING: no containment!?')
+-        frontier = []
+-
+-    # record which seed (always 0, here) contributed to which node
+-    for node in frontier:
+-        total_frontier[node].add(0)
+-
+-    end = time.time()
+-    print('catlas query time: {:.1f}s'.format(end-start))
+-
+-    return total_frontier
+-
+-
+-def collect_frontier_exact(catlas,
+-                           catlas_match_counts,
+-                           overhead=0.0,
+-                           verbose=False):
+-    start = time.time()
+-
+-    # gather results into total_frontier
+-    total_frontier = defaultdict(set)
+-
+-    # do queries!
+-    try:
+-        frontier, num_leaves, num_empty, frontier_mh = \
+-          frontier_search_exact(catlas,
+-                                catlas_match_counts,
+-                                overhead)
+-
+-    except NoContainment:
+-        print('** WARNING: no containment!?')
+-        frontier = []
+-
+-    # record which seed (always 0, here) contributed to which node
+-    for node in frontier:
+-        total_frontier[node].add(0)
+-
+-    end = time.time()
+-    print('catlas query time: {:.1f}s'.format(end-start))
+-
+-    return total_frontier
+diff --git a/spacegraphcats/search/nodeinfo_by_query.py b/spacegraphcats/search/nodeinfo_by_query.py
+index 542c9ed7..3443db3e 100644
+--- a/spacegraphcats/search/nodeinfo_by_query.py
++++ b/spacegraphcats/search/nodeinfo_by_query.py
+@@ -15,7 +15,6 @@
+ import screed
+ from .catlas import CAtlas
+ from . import search_utils
+-from .frontier_search import find_shadow
+ 
+ 
+ def main(args=sys.argv[1:]):
+diff --git a/spacegraphcats/search/extract_nodes_by_query.py b/spacegraphcats/search/query_by_sequence.py
+similarity index 73%
+rename from spacegraphcats/search/extract_nodes_by_query.py
+rename to spacegraphcats/search/query_by_sequence.py
+index d3584499..1dbf264c 100644
+--- a/spacegraphcats/search/extract_nodes_by_query.py
++++ b/spacegraphcats/search/query_by_sequence.py
+@@ -1,7 +1,9 @@
+ #! /usr/bin/env python
+ """
+-Do a frontier search with one or more query sequences, and retrieve
+-cDBG node IDs and MinHash signature for the matching contigs.
++Query a catlas with a sequence (read, contig, or genome), and retrieve
++cDBG node IDs and MinHash signatures for the matching unitigs in the graph.
++
++XX optionally retrieve contig sequences?
+ """
+ import argparse
+ import csv
+@@ -12,26 +14,25 @@
+ 
+ import khmer
+ import screed
+-import sourmash_lib
+-from sourmash_lib import MinHash
++import sourmash
++from sourmash import MinHash
+ 
+-from .frontier_search import (collect_frontier, collect_frontier_exact)
+ from . import search_utils
+ from .index import MPHF_KmerIndex
+ from .catlas import CAtlas
+ 
+ 
+ class QueryOutput:
+-    def __init__(self, query, catlas, kmer_idx, frontier, scaled):
++    def __init__(self, query, catlas, kmer_idx, leaves):
+         self.query = query
+         self.catlas = catlas
+         self.kmer_idx = kmer_idx
+-        self.frontier = frontier
+-        self.shadow = self.catlas.shadow(self.frontier)
++        self.leaves = leaves
++        self.shadow = self.catlas.shadow(leaves)
+         self.total_bp = 0
+         self.total_seq = 0
+-        self.query_sig = self.query.build_query_mh_for_seed(42, scaled)
+-        self.contigs_minhash = self.query_sig.minhash.copy_and_clear()
++        self.query_sig = self.query.sig
++        self.contigs_minhash = self.query.mh.copy_and_clear()
+ 
+     def __add_sequence(self, sequence):
+         self.contigs_minhash.add_sequence(str(sequence), True)
+@@ -52,9 +53,9 @@ def retrieve_contigs(self, contigs):
+         retrieve_start = time.time()
+         # walk through the contigs, retrieving.
+         print('extracting contigs...')
+-        for n, record in enumerate(
+-                search_utils.get_contigs_by_cdbg(contigs,
+-                                                 self.shadow)):
++
++        contigs_iter = search_utils.get_contigs_by_cdbg(contigs, self.shadow)
++        for n, record in enumerate(contigs_iter):
+             if n and n % 10000 == 0:
+                 offset_f = self.total_seq / len(self.shadow)
+                 print('...at n {} ({:.1f}% of shadow)'.format(self.total_seq,
+@@ -96,23 +97,21 @@ def write(self, csv_writer, csvoutfp, outdir):
+         # write out signature from retrieved contigs.
+         sig_filename = os.path.basename(q_name) + '.contigs.sig'
+         with open(os.path.join(outdir, sig_filename), 'wt') as fp:
+-            ss = sourmash_lib.SourmashSignature(self.contigs_minhash,
++            ss = sourmash.SourmashSignature(self.contigs_minhash,
+                                                 name='nbhd:'+self.query.name,
+                                                 filename=sig_filename)
+-            sourmash_lib.save_signatures([ss], fp)
++            sourmash.save_signatures([ss], fp)
+ 
+         # write out cDBG IDs
+         cdbg_listname = os.path.basename(q_name) + '.cdbg_ids.txt.gz'
+         with gzip.open(os.path.join(outdir, cdbg_listname), 'wt') as fp:
+             fp.write("\n".join([str(x) for x in sorted(self.shadow)]))
+ 
+-        # write out frontier nodes by seed
++        # write out catlas nodes
+         frontier_listname = os.path.basename(q_name) + '.frontier.txt.gz'
+         with gzip.open(os.path.join(outdir, frontier_listname), 'wt') as fp:
+-            for node, seedlist in sorted(self.frontier.items()):
+-                fp.write('{},{}\n'.format(node,
+-                                          " ".join([str(x) for x in
+-                                                    sorted(seedlist)])))
++            for node in sorted(self.leaves):
++                fp.write('{}\n'.format(node))
+ 
+         # write response curve
+         response_curve_filename = os.path.basename(q_name) + '.response.txt'
+@@ -126,15 +125,19 @@ def write(self, csv_writer, csvoutfp, outdir):
+ 
+ 
+ class Query:
+-    def __init__(self, query_file, ksize):
++    def __init__(self, query_file, ksize, scaled, debug=True):
+         self.filename = query_file
+         self.ksize = ksize
+         self.kmers = set()
+         self.name = None
++        mh = MinHash(0, ksize, scaled=scaled)
++        self.mh = mh
++        self.debug = debug
++        
+         print('----')
+         print('QUERY FILE:', self.filename)
+ 
+-        # build hashes for all the query k-mers
++        # build hashes for all the query k-mers & create signature
+         print('loading query kmers...', end=' ')
+         bf = khmer.Nodetable(ksize, 1, 1)
+ 
+@@ -143,64 +146,52 @@ def __init__(self, query_file, ksize):
+                 self.name = record.name
+             if len(record.sequence) >= int(ksize):
+                 self.kmers.update(bf.get_kmer_hashes(record.sequence))
++            mh.add_sequence(record.sequence, True)
++
++        self.sig = sourmash.SourmashSignature(mh, name=self.name,
++                                              filename=self.filename)
+ 
+         print('got {}'.format(len(self.kmers)))
+ 
+         self.cdbg_match_counts = {}
+         self.catlas_match_counts = {}
+ 
+-    def build_query_mh_for_seed(self, seed, scaled):
+-        mh = MinHash(0, self.ksize, scaled=scaled, seed=seed)
+-        for record in screed.open(self.filename):
+-            mh.add_sequence(record.sequence, True)
+-
+-        return sourmash_lib.SourmashSignature(mh, name=self.name,
+-                                              filename=self.filename)
+-
+-    def execute(self, catlas, kmer_idx, scaled, overhead, verbose,
+-                max_overhead, min_containment):
++    def execute(self, catlas, kmer_idx):
+         cat_id = catlas.name
++
+         # construct dict cdbg_id -> # of query k-mers
+         self.cdbg_match_counts[cat_id] = kmer_idx.get_match_counts(self.kmers)
+         for k, v in self.cdbg_match_counts[cat_id].items():
+             assert v <= kmer_idx.get_cdbg_size(k), k
++
+         # calculate the cDBG matching k-mers sizes for each catlas node.
+         self.catlas_match_counts[cat_id] =\
+             kmer_idx.build_catlas_match_counts(self.cdbg_match_counts[cat_id],
+                                                catlas)
+ 
+-        # check a few things - we've propagated properly:
+-        assert sum(self.cdbg_match_counts[cat_id].values()) ==\
+-            self.catlas_match_counts[cat_id][catlas.root]
+-
+-        # ...and all nodes have no more matches than total k-mers.
+-        for v, match_amount in self.catlas_match_counts[cat_id].items():
+-            assert match_amount <= catlas.index_sizes[v], v
+-
+-        self.con_sim_upper_bounds(catlas, kmer_idx)
+-
+-        # gather results of all queries
+-        fuzzy = max_overhead != 1.0
+-        if fuzzy:
+-            frontier = collect_frontier(catlas,
+-                                        self.catlas_match_counts[cat_id],
+-                                        max_overhead=max_overhead,
+-                                        min_containment=min_containment)
+-        else:
+-            frontier = collect_frontier_exact(catlas,
+-                                              self.catlas_match_counts[cat_id],
+-                                              overhead=overhead,
+-                                              verbose=verbose)
+-
+-        # calculate level 1 nodes for this frontier in the catlas
+-        leaves = catlas.leaves(frontier)
+-        # calculate associated cDBG nodes
+-        cdbg_shadow = catlas.shadow(leaves)
++        if self.debug:
++            # check a few things - we've propagated properly:
++            assert sum(self.cdbg_match_counts[cat_id].values()) ==\
++                self.catlas_match_counts[cat_id][catlas.root]
++
++            # ...and all nodes have no more matches than total k-mers.
++            for v, match_amount in self.catlas_match_counts[cat_id].items():
++                assert match_amount <= catlas.index_sizes[v], v
++
++            # calculate best possible.
++            self.con_sim_upper_bounds(catlas, kmer_idx)
++
++        # gather domset nodes matching query k-mers
++        cdbg_shadow = set()
++        leaves = set()
++        for cdbg_node in self.cdbg_match_counts[cat_id]:
++            cdbg_shadow.add(cdbg_node)
++            leaves.add(catlas.cdbg_to_layer1[cdbg_node])
+ 
+         print('done searching! {} frontier, {} catlas shadow nodes, {}'
+-              ' cdbg nodes.'.format(len(frontier), len(leaves),
++              ' cdbg nodes.'.format(len(leaves), len(leaves),
+                                     len(cdbg_shadow)))
+-        return QueryOutput(self, catlas, kmer_idx, frontier, scaled)
++        return QueryOutput(self, catlas, kmer_idx, leaves)
+ 
+     def con_sim_upper_bounds(self, catlas, kmer_idx):
+         """
+@@ -243,23 +234,22 @@ def con_sim_upper_bounds(self, catlas, kmer_idx):
+ 
+ 
+ def main(argv):
+-    p = argparse.ArgumentParser()
++    """\
++    Query a catlas with a sequence (read, contig, or genome), and retrieve
++    cDBG node IDs and MinHash signatures for the matching unitigs in the graph.
++    """
++
++    p = argparse.ArgumentParser(description=main.__doc__)
+     p.add_argument('catlas_prefix', help='catlas prefix')
+-    p.add_argument('--overhead', help='\% of overhead', type=float,
+-                   default=0.0)
+     p.add_argument('output')
+-    p.add_argument('--min_containment', help="minimum containment",
+-                   type=float, default=1.0)
+-    p.add_argument('--max_overhead', help="largest overhead allowed",
+-                   type=float, default=1.0)
+     p.add_argument('--query', help='query sequences', nargs='+')
+     p.add_argument('-k', '--ksize', default=31, type=int,
+                    help='k-mer size (default: 31)')
+     p.add_argument('--scaled', default=1000, type=float,
+                    help="scaled value for contigs minhash output")
+     p.add_argument('-v', '--verbose', action='store_true')
+-    p.add_argument('--cdbg-only', action='store_true',
+-                   help="(for paper eval) do not expand query using domset)")
++#    p.add_argument('--cdbg-only', action='store_true',
++#                   help="(for paper eval) do not expand query using domset)")
+ 
+     args = p.parse_args(argv)
+     outdir = args.output
+@@ -320,14 +310,12 @@ def main(argv):
+     # iterate over each query, do the thing.
+     for query_file in args.query:
+         start_time = time.time()
+-        query = Query(query_file, ksize)
++        query = Query(query_file, ksize, scaled)
+         if not len(query.kmers):
+             print('query {} is empty; skipping.'.format(query_file))
+             continue
+ 
+-        q_output = query.execute(catlas, kmer_idx, scaled, args.overhead,
+-                                 args.verbose, args.max_overhead,
+-                                 args.min_containment)
++        q_output = query.execute(catlas, kmer_idx)
+         q_output.retrieve_contigs(contigs)
+         print('total time: {:.1f}s'.format(time.time() - start_time))
+ 
+diff --git a/spacegraphcats/search/test_search.py b/spacegraphcats/search/test_search.py
+deleted file mode 100644
+index 84c51c05..00000000
+--- a/spacegraphcats/search/test_search.py
++++ /dev/null
+@@ -1,13 +0,0 @@
+-import unittest
+-
+-from .frontier_search import find_shadow
+-
+-
+-class SearchTest(unittest.TestCase):
+-    def test_find_shadow(self):
+-        dag = {0: [1, 2], 1: [3, 4, 6], 2: [5, 6], 3: [], 4: [], 5: [], 6: []}
+-
+-        self.assertEqual(find_shadow([0], dag), set([3, 4, 5, 6]))
+-
+-if __name__ == '__main__':
+-    unittest.main()
+diff --git a/spacegraphcats/search/test_workflow.py b/spacegraphcats/search/test_workflow.py
+index c91011b6..b6107bcb 100644
+--- a/spacegraphcats/search/test_workflow.py
++++ b/spacegraphcats/search/test_workflow.py
+@@ -5,7 +5,7 @@
+ 
+ from spacegraphcats.catlas import catlas
+ from spacegraphcats.index import index_contigs_by_kmer
+-from spacegraphcats.search import extract_nodes_by_query
++from spacegraphcats.search import query_by_sequence
+ from spacegraphcats.search import characterize_catlas_regions
+ from spacegraphcats.search import extract_unassembled_nodes
+ from spacegraphcats.search import evaluate_overhead
+@@ -79,10 +79,10 @@ def test_dory():
+         index_contigs_by_kmer.main(args)
+ 
+         # do search!!
+-        args='dory_k21_r1 dory_k21_r1_search_oh0 --query data/dory-head.fa -k 21 --overhead=0.0'.split()
++        args='dory_k21_r1 dory_k21_r1_search_oh0 --query data/dory-head.fa -k 21'.split()
+ 
+         try:
+-            extract_nodes_by_query.main(args)
++            query_by_sequence.main(args)
+         except SystemExit as e:
+             assert e.code == 0, str(e)
+ 

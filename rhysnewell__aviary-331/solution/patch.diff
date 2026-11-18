@@ -1,0 +1,201 @@
+diff --git a/.github/workflows/deploy-docs.yaml b/.github/workflows/deploy-docs.yaml
+index 12f01f87..2d2acdb6 100755
+--- a/.github/workflows/deploy-docs.yaml
++++ b/.github/workflows/deploy-docs.yaml
+@@ -13,9 +13,8 @@ on:
+   workflow_dispatch:
+ 
+ permissions:
+-  contents: read
+-  pages: write
+-  id-token: write
++  contents: write
++  pages: read
+ 
+ concurrency:
+   group: pages
+@@ -48,19 +47,10 @@ jobs:
+         run: mkdocs build --config-file mkdocs-pdf.yml
+       - name: Verify generated manual
+         run: test -s site/pdf/aviary-manual.pdf
+-      - name: Upload Pages artifact
+-        uses: actions/upload-pages-artifact@v3
+-        with:
+-          path: site/
+-
+-  deploy:
+-    name: Deploy to GitHub Pages
+-    runs-on: ubuntu-latest
+-    needs: build
+-    environment:
+-      name: github-pages
+-      url: ${{ steps.deployment.outputs.page_url }}
+-    steps:
+-      - name: Deploy to GitHub Pages
+-        id: deployment
+-        uses: actions/deploy-pages@v4
++      - name: Deploy to gh-pages
++        run: |
++          git config --local user.email "action@github.com"
++          git config --local user.name "GitHub Action"
++          git add -f site/
++          git commit -m "Deploy docs to gh-pages"
++          git push origin `git subtree split --prefix site main`:gh-pages --force
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 13935135..3949697a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,15 @@
+ # Changelog
+ 
++## v0.13.4 - 2026-10-07
++
++### Fixed
++
++- **`Short-read racon polishing stage`**: Errored with `empty sequence set` even 
++though patterns from the file were loaded. Error in seqkit original code 
++`^(\S+?)(?:/[12])?\s?$` this caused headers with more than a word to not be matched
++resulting in zero reads extracted. Now `^(\S+?)(?:/[12])?(?:\s|$)` seqkit takes the
++first word and ignores any descriptor possibly present. Previous usage is retained. 
++
+ ## v0.13.3 - 2026-09-01
+ 
+ ### Added
+diff --git a/aviary/modules/assembly/scripts/polish.py b/aviary/modules/assembly/scripts/polish.py
+index 1a4ed026..f952a40a 100644
+--- a/aviary/modules/assembly/scripts/polish.py
++++ b/aviary/modules/assembly/scripts/polish.py
+@@ -15,6 +15,18 @@
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+ from aviary import aligner_preset_args
+ 
++# seqkit --id-regexp for run_polish()'s mapper_needs_suffix_leniency path
++# (see its use below). Non-greedy capture + optional /1 or /2 so seqkit's ID
++# for a header matches the suffix-free qnames run_polish() writes to its
++# pattern file, whether or not the header actually has a mate suffix -- vs.
++# the default "^(\S+)\s?", which would keep it. The boundary is "whitespace
++# or end", not "optional single trailing whitespace then end": a real header
++# commonly carries a description field after the first token (e.g. SRA-style
++# "@1_r1 INSTRUMENT:...", added by clean_short_reads' @-prefix sed), and an
++# end anchor there refuses to match at all, leaving every read unmatched and
++# the extracted fastq empty.
++SEQKIT_MATE_SUFFIX_LENIENT_ID_REGEXP = r'^(\S+?)(?:/[12])?(?:\s|$)'
++
+ 
+ def clean_short_reads(
+     cat_or_zcat: str,
+@@ -28,7 +40,7 @@ def clean_short_reads(
+     sed_cmd = f"""sed s/@/@{read_pair}_/""".split()
+ 
+     with open(log, "a") as logf:
+-        logf.write(f"Shell command: {' '.join(cat_cmd)} | {' '.join(sed_cmd)} > {output_path}\n")
++        logf.write(f"Shell command: {' '.join(cat_cmd)} | {' '.join(sed_cmd)} >> {output_path}\n")
+         logf.write(' '.join(sed_cmd))
+         with open(output_path, 'a') as out:
+             cat = Popen(cat_cmd, stdout=PIPE, stderr=logf)
+@@ -568,10 +580,9 @@ def run_polish(
+                     # (see the qname normalization above); seqkit_id_regexp below
+                     # strips a real /1 or /2 from the target read headers to match.
+                     o.write(i + '\n')
+-            # Non-greedy capture + optional /1 or /2 so seqkit's ID for a header
+-            # matches i above whether or not the header actually has a mate
+-            # suffix -- vs. the default "^(\S+)\s?", which would keep it.
+-            seqkit_id_regexp = r'^(\S+?)(?:/[12])?\s?$' if mapper_needs_suffix_leniency else None
++            seqkit_id_regexp = (
++                SEQKIT_MATE_SUFFIX_LENIENT_ID_REGEXP if mapper_needs_suffix_leniency else None
++            )
+             logging.info("Retrieving reads...")
+             if not isinstance(reads, str):
+                 for read in reads:
+diff --git a/test/test_mappers.py b/test/test_mappers.py
+index 08504ecc..348f4f9a 100644
+--- a/test/test_mappers.py
++++ b/test/test_mappers.py
+@@ -12,8 +12,10 @@
+ The corresponding end-to-end coverage lives in test_integration.py.
+ """
+ 
++import gzip
+ import importlib.util
+ import os
++import shutil
+ import tempfile
+ import unittest
+ from unittest import mock
+@@ -506,5 +508,76 @@ def test_defaults_need_no_flags_and_stay_strobealign_and_rammap(self):
+         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+ 
+ 
++@unittest.skipUnless(shutil.which("seqkit") and shutil.which("pigz"),
++                      "seqkit/pigz not on PATH -- run inside the polishing pixi env")
++class TestSeqkitIdRegexpSuffixLeniency(unittest.TestCase):
++    """run_polish()'s seqkit_id_regexp must match a real seqkit read header,
++    not just the pattern strings polish.py itself writes.
++
++    Regression test for a bug where polish_meta_racon_ill silently extracted
++    zero reads and racon then died with "empty sequences set!". The old
++    regexp (`^(\\S+?)(?:/[12])?\\s?$`) end-anchors right after an optional
++    single trailing-whitespace character, so it only matched a header that
++    was a single whitespace-free token. wgsim -- the only read source the
++    existing racon-polishing integration tests in test_integration.py use --
++    always emits single-token headers (e.g.
++    "@CP006915.1_405386_405827_3:0:0_6:1:0_0/1"), so those tests kept passing
++    while never exercising this. Real short reads (SRA/fastq-dump output)
++    commonly carry a second, whitespace-separated description field on the
++    header, e.g. "@ERR10225372.1 E00582:421:H7WWLCCX2:8:1101:10176:25095/1"
++    -- which the old regexp could never match, however matching the pattern
++    file's ID exactly. This test runs the real seqkit binary (as
++    run_polish() does), not just the Python regex, so it catches seqkit's own
++    --id-regexp parsing behavior, not just a plausible-looking pattern.
++    """
++
++    def _extract(self, header, pattern):
++        """Run run_seqkit()'s current id_regexp against one read/pattern
++        pair and return the extracted (decompressed) fastq text, empty
++        string if nothing matched."""
++        with tempfile.TemporaryDirectory() as tmp:
++            reads_path = os.path.join(tmp, "reads.fq")
++            pattern_path = os.path.join(tmp, "pattern.lst")
++            output_path = os.path.join(tmp, "out.fastq.gz")
++            log_path = os.path.join(tmp, "log")
++            with open(reads_path, "w") as handle:
++                handle.write(f"{header}\nACGT\n+\nIIII\n")
++            with open(pattern_path, "w") as handle:
++                handle.write(f"{pattern}\n")
++
++            polish.run_seqkit(
++                reads=reads_path,
++                pattern_file=pattern_path,
++                output_file=output_path,
++                threads=1,
++                log=log_path,
++                id_regexp=polish.SEQKIT_MATE_SUFFIX_LENIENT_ID_REGEXP,
++                strip_mate_suffix_from_output=True,
++            )
++            with gzip.open(output_path, "rt") as handle:
++                return handle.read()
++
++    def test_extracts_read_with_sra_style_description_field(self):
++        # The exact shape from the bug report: clean_short_reads()'s "@" ->
++        # "@{pair}_" sed has already run, and the header carries a
++        # description field after the ID token.
++        extracted = self._extract(
++            header="@1_ERR10225372.1 E00582:421:H7WWLCCX2:8:1101:10176:25095/1",
++            pattern="1_ERR10225372.1",
++        )
++        self.assertIn("ERR10225372.1", extracted,
++                       "seqkit extracted nothing for a header with a "
++                       "description field -- this is the empty-reads bug")
++
++    def test_still_extracts_single_token_wgsim_style_header(self):
++        # Must not regress the header shape the existing racon-polishing
++        # integration tests actually run against.
++        extracted = self._extract(
++            header="@CP006915.1_405386_405827_3:0:0_6:1:0_0/1",
++            pattern="CP006915.1_405386_405827_3:0:0_6:1:0_0",
++        )
++        self.assertIn("CP006915.1_405386_405827_3", extracted)
++
++
+ if __name__ == '__main__':
+     unittest.main()

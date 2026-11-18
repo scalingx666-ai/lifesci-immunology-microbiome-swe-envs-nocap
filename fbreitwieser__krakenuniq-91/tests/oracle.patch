@@ -1,0 +1,1007 @@
+diff --git a/scripts/krakenuniq b/scripts/krakenuniq
+index ed480c7..5764fcf 100755
+--- a/scripts/krakenuniq
++++ b/scripts/krakenuniq
+@@ -56,6 +56,7 @@ my $fastq_input = 0;
+ my @db_prefix;
+ my $threads;
+ my $preload = 0;
++my $preload_size;
+ my $gunzip = 0;
+ my $bunzip2 = 0;
+ my $paired = 0;
+@@ -85,6 +86,7 @@ GetOptions(
+   "o|output=s" => \$outfile,
+   "report-file=s" => \$report_file,
+   "preload" => \$preload,
++  "preload-size=s" => \$preload_size,
+   "paired" => \$paired,
+   "hll-precision=i", \$hll_precision,
+   "exact", \$use_exact_counting,
+@@ -198,6 +200,7 @@ push @flags, "-C", $classified_out if defined $classified_out;
+ push @flags, "-o", $outfile if defined $outfile;
+ push @flags, "-c", if $only_classified_output;
+ push @flags, "-M" if $preload;
++push @flags, "-x", $preload_size if defined $preload_size;
+ push @flags, "-r", $report_file if defined $report_file;
+ push @flags, "-a", $db_prefix[0]."/taxDB";
+ push @flags, "-s" if $print_sequence;
+@@ -310,6 +313,7 @@ Options:
+   --only-classified-output
+                           Print no Kraken output for unclassified sequences
+   --preload               Loads DB into memory before classification
++  --preload-size SIZE     Loads DB into memory in chunks of SIZE, e.g. 500M or 7G (if RAM is small)
+   --paired                The two filenames provided are paired-end reads
+   --check-names           Ensure each pair of reads have names that agree
+                           with each other; ignored if --paired is not specified
+diff --git a/src/classify.cpp b/src/classify.cpp
+index 82243f7..1b297e7 100644
+--- a/src/classify.cpp
++++ b/src/classify.cpp
+@@ -28,6 +28,8 @@
+ #include "gzstream.h"
+ #include "uid_mapping.hpp"
+ #include <sstream>
++#include <inttypes.h>
++#include <cassert>
+ 
+ const size_t DEF_WORK_UNIT_SIZE = 500000;
+ int New_taxid_start = 1000000000;
+@@ -50,14 +52,19 @@ using namespace kraken;
+ #endif
+ 
+ 
++#ifndef _OPENMP
++  int omp_get_thread_num() { return 0; }
++#endif
+ 
+ void parse_command_line(int argc, char **argv);
+ void usage(int exit_code=EX_USAGE);
+ void process_file(char *filename);
++void process_file_with_db_chunk(char *filename);
++void classify_sequence_with_db_chunk(std::pair<DNASequence, uint32_t> & seq, FILE* fp, const uint32_t db_chunk_id, const uint32_t db_id);
+ bool classify_sequence(DNASequence &dna, ostringstream &koss,
+                        ostringstream &coss, ostringstream &uoss,
+                        unordered_map<uint32_t, READCOUNTS>&);
+-inline void print_sequence(ostringstream* oss_ptr, const DNASequence& dna);
++inline void print_sequence(ostream* oss_ptr, const DNASequence& dna);
+ string hitlist_string(const vector<uint32_t> &taxa, const vector<char>& ambig_list);
+ 
+ 
+@@ -76,6 +83,7 @@ bool Print_unclassified = false;
+ bool Print_kraken = true;
+ bool Print_kraken_report = false;
+ bool Populate_memory = false;
++uint64_t Populate_memory_size = 0;
+ bool Only_classified_kraken_output = false;
+ bool Print_sequence = false;
+ bool Print_Progress = true;
+@@ -135,22 +143,6 @@ ostream* cout_or_file(string file, bool append = false) {
+     }
+ }
+ 
+-void loadKrakenDB(KrakenDB& database, string DB_filename, string Index_filename) {
+-  QuickFile db_file;
+-  db_file.open_file(DB_filename);
+-  if (Populate_memory) {
+-    db_file.load_file();
+-  }
+-  database = KrakenDB(db_file.ptr());
+-  QuickFile idx_file;
+-  idx_file.open_file(Index_filename);
+-  if (Populate_memory)
+-    idx_file.load_file();
+-
+-  KrakenDBIndex db_index(idx_file.ptr());
+-  database.set_index(&db_index);
+-}
+-
+ int main(int argc, char **argv) {
+   #ifdef _OPENMP
+   omp_set_num_threads(1);
+@@ -173,7 +165,7 @@ int main(int argc, char **argv) {
+     //}
+   }
+ 
+-  if (Populate_memory)
++  if (Populate_memory && Populate_memory_size == 0)
+     cerr << "Loading database(s)... " << endl;
+ 
+   static vector<QuickFile> idx_files (DB_filenames.size());
+@@ -185,18 +177,25 @@ int main(int argc, char **argv) {
+   for (size_t i=0; i < DB_filenames.size(); ++i) {
+     cerr << " Database " << DB_filenames[i] << endl;
+     db_files[i].open_file(DB_filenames[i]);
+-    if (Populate_memory)
+-      db_files[i].load_file();
+ 
+     KrakenDatabases.push_back(new KrakenDB(db_files[i].ptr()));
+     idx_files[i].open_file(Index_filenames[i]);
+-    if (Populate_memory)
+-      idx_files[i].load_file();
++    // NOTE: we switched the order, i.e., we are creating the objects before loading everything into main memory
+     db_indices[i] = KrakenDBIndex(idx_files[i].ptr());
+     KrakenDatabases[i]->set_index(&db_indices[i]);
++
++    if (Populate_memory && Populate_memory_size == 0) // only when no chunk size is passed!
++    {
++      db_files[i].load_file();
++      idx_files[i].load_file();
++    }
++    else if (Populate_memory && Populate_memory_size > 0)
++    {
++      KrakenDatabases[i]->prepare_chunking(Populate_memory_size);
++    }
+   }
+ 
+-  // TODO: Check all databases have the same k
++  // Check all databases have the same k
+   uint8_t kmer_size = KrakenDatabases[0]->get_k();
+   for (size_t i = 1; i < KrakenDatabases.size(); ++i) {
+     uint8_t kmer_size_i = KrakenDatabases[i]->get_k();
+@@ -207,7 +206,7 @@ int main(int argc, char **argv) {
+   };
+   KmerScanner::set_k(kmer_size);
+ 
+-  if (Populate_memory)
++  if (Populate_memory && Populate_memory_size == 0)
+     cerr << "\ncomplete." << endl;
+ 
+ 
+@@ -244,8 +243,12 @@ int main(int argc, char **argv) {
+ 
+   struct timeval tv1, tv2;
+   gettimeofday(&tv1, NULL);
+-  for (int i = optind; i < argc; i++)
+-    process_file(argv[i]);
++  for (int i = optind; i < argc; i++) {
++    if (Populate_memory && Populate_memory_size > 0)
++      process_file_with_db_chunk(argv[i]);
++    else
++      process_file(argv[i]);
++  }
+   gettimeofday(&tv2, NULL);
+ 
+   report_stats(tv1, tv2);
+@@ -331,6 +334,10 @@ int main(int argc, char **argv) {
+     ogzs->close();
+   }
+ 
++  for (size_t i=0; i < KrakenDatabases.size(); ++i) {
++    delete KrakenDatabases[i];
++  }
++
+   return 0;
+ }
+ 
+@@ -363,6 +370,96 @@ void report_stats(struct timeval time1, struct timeval time2) {
+           (total_sequences - total_classified) * 100.0 / total_sequences);
+ }
+ 
++void merge_intermediate_results_by_workers(const bool first_intermediate_output) {
++  const std::string filename_merged_summary = Kraken_output_file + ".tmp";
++
++  FILE *fp_prev_merged_summary = NULL;
++  std::string filename_prev_merged_summary;
++  if (!first_intermediate_output)
++  {
++    filename_prev_merged_summary = filename_merged_summary + ".prev";
++    rename(filename_merged_summary.c_str(), filename_prev_merged_summary.c_str());
++    fp_prev_merged_summary = fopen(filename_prev_merged_summary.c_str(), "rb");
++  }
++
++  FILE *fp_merged_summary = fopen(filename_merged_summary.c_str(), "wb");
++
++  std::vector<FILE*> worker_files(Num_threads);
++  std::vector<uint32_t> next_read_id(Num_threads);
++  for (int worker_id = 0; worker_id < Num_threads; ++worker_id)
++  {
++    const std::string worker_filename = filename_merged_summary + "." + std::to_string(worker_id);
++    worker_files[worker_id] = fopen(worker_filename.c_str(), "rb");
++
++    if (fread(&next_read_id[worker_id], sizeof(next_read_id[worker_id]), 1, worker_files[worker_id]) != 1)
++      next_read_id[worker_id] = 0; // 0 indicates that there is no read left in this file (reads are indexed starting at 1)
++  }
++
++  std::vector<uint32_t> taxa, taxa_prev_summary;
++  uint32_t seq_idx = 1;
++  while (true)
++  {
++    // determine worker to get this read info from
++    int worker_to_retrieve_from = -1;
++    for (int worker_id = 0; worker_id < Num_threads; ++worker_id) {
++      if (seq_idx == next_read_id[worker_id]) {
++        worker_to_retrieve_from = worker_id;
++        break;
++      }
++    }
++    if (worker_to_retrieve_from == -1)
++      break; // finished processing all files
++
++    // retrieve from that worker and load next sequence name
++    uint32_t taxa_size;
++    fread(&taxa_size, sizeof(uint32_t), 1, worker_files[worker_to_retrieve_from]);
++    taxa.resize(taxa_size);
++    fread(&taxa[0], sizeof(uint32_t), taxa_size, worker_files[worker_to_retrieve_from]);
++
++    if (!first_intermediate_output)
++    {
++      uint32_t taxa_prev_size;
++      fread(&taxa_prev_size, sizeof(uint32_t), 1, fp_prev_merged_summary);
++      assert(taxa_size == taxa_prev_size);
++      taxa_prev_summary.resize(taxa_prev_size);
++      fread(&taxa_prev_summary[0], sizeof(uint32_t), taxa_prev_size, fp_prev_merged_summary);
++
++      for (uint32_t i = 0; i < taxa_prev_summary.size(); ++i)
++      {
++        assert(!(taxa[i] && taxa_prev_summary[i])); // a kmer cannot be found in more than one database chunk
++        if (taxa_prev_summary[i])
++        {
++          taxa[i] = taxa_prev_summary[i]; // if previous chunk/database got a match, keep the tax info
++        }
++      }
++    }
++
++    fwrite(&taxa_size, sizeof(uint32_t), 1, fp_merged_summary);
++    fwrite(&taxa[0], sizeof(uint32_t), taxa_size, fp_merged_summary);
++
++    // load the next read id from that file
++    if (fread(&next_read_id[worker_to_retrieve_from], sizeof(next_read_id[worker_to_retrieve_from]), 1, worker_files[worker_to_retrieve_from]) != 1)
++      next_read_id[worker_to_retrieve_from] = 0; // 0 indicates that there is no read left in this file (reads are indexed starting at 1)
++
++    ++seq_idx;
++  }
++
++  for (int worker_id = 0; worker_id < Num_threads; ++worker_id)
++  {
++    fclose(worker_files[worker_id]);
++    const std::string worker_filename = filename_merged_summary + "." + std::to_string(worker_id);
++    unlink(worker_filename.c_str());
++  }
++
++  if (!first_intermediate_output)
++  {
++    fclose(fp_prev_merged_summary);
++    unlink(filename_prev_merged_summary.c_str());
++  }
++
++  fclose(fp_merged_summary);
++}
++
+ void process_file(char *filename) {
+   string file_str(filename);
+   DNASequenceReader *reader;
+@@ -440,8 +537,221 @@ void process_file(char *filename) {
+   delete reader;
+ }
+ 
++void process_file_with_db_chunk(char *filename) {
++  string file_str(filename);
++  DNASequence dna;
++
++  // iterate over databases
++  bool first_intermediate_output = true;
++  for (size_t i=0; i<KrakenDatabases.size(); ++i)
++  {
++    for (uint32_t db_chunk_id = 0; db_chunk_id < KrakenDatabases[0]->chunks(); ++db_chunk_id)
++    {
++      total_sequences = 0;
++      total_bases = 0;
++      KrakenDatabases[i]->load_chunk(db_chunk_id);
++
++      DNASequenceReader *reader;
++      if (Fastq_input)
++        reader = new FastqReader(file_str);
++      else
++        reader = new FastaReader(file_str);
++      uint32_t seq_idx = 1;
++
++#ifdef _OPENMP
++      #pragma omp parallel
++#endif
++      {
++        vector <std::pair<DNASequence, uint32_t> > work_unit;
++        const int worker_id = omp_get_thread_num();
++        const std::string worker_filename = Kraken_output_file + ".tmp." + std::to_string(worker_id);
++
++        FILE *fp = fopen(worker_filename.c_str(), "wb");
++
++        while (reader->is_valid()) {
++          work_unit.clear();
++          size_t total_nt = 0;
++
++#ifdef _OPENMP
++          #pragma omp critical(get_input)
++#endif
++          {
++            while (total_nt < Work_unit_size) {
++              dna = reader->next_sequence();
++              if (!reader->is_valid())
++                break;
++              work_unit.emplace_back(dna, seq_idx);
++              total_nt += dna.seq.size();
++              ++seq_idx;
++            }
++          }
++          if (total_nt == 0)
++            break;
++
++          for (size_t j = 0; j < work_unit.size(); j++) {
++            classify_sequence_with_db_chunk(work_unit[j], fp, db_chunk_id, 0);
++          }
++
++#ifdef _OPENMP
++          #pragma omp critical(progress)
++#endif
++          {
++            total_sequences += work_unit.size();
++            total_bases += total_nt;
++            if (Print_Progress) {
++              fprintf(stderr, "\r Processed %llu sequences (database chunk %" PRIu32" of %" PRIu32 ")",
++                      total_sequences, db_chunk_id + 1, KrakenDatabases[i]->chunks());
++            }
++          }
++        }
++        fclose(fp);
++      }  // end parallel section
++
++      delete reader;
++      merge_intermediate_results_by_workers(first_intermediate_output);
++      first_intermediate_output = false;
++    }
++  }
++
++  fprintf(stderr, "\r Processed %llu sequences\n", total_sequences);
++
++  // merge intermediate results of all chunks and classify
++  // TODO: parallelize this (need to buffer reads), we also do not care about the final output order
++  total_sequences = 0;
++  total_classified = 0;
++
++  DNASequenceReader *reader;
++  if (Fastq_input)
++    reader = new FastqReader(file_str);
++  else
++    reader = new FastaReader(file_str);
++
++  unordered_map<uint32_t, uint32_t> hit_counts;
++  vector<uint32_t> taxa;
++  vector<char> ambig_list;
++
++  const std::string taxa_summary_filename = Kraken_output_file + ".tmp";
++  FILE* fp_taxa_summary = fopen(taxa_summary_filename.c_str(), "rb");
++
++  while (reader->is_valid()) {
++    hit_counts.clear();
++    taxa.clear();
++    ambig_list.clear();
++
++    dna = reader->next_sequence();
++    if (!reader->is_valid())
++      break;
++
++    // merge results from chunks into 'taxa'
++    uint32_t hits = 0;
++
++    // get number of elements (taxa.size())
++    uint32_t taxa_size;
++    fread(&taxa_size, sizeof(taxa_size), 1, fp_taxa_summary);
++
++    taxa.resize(taxa_size);
++    fread(&taxa[0], sizeof(uint32_t), taxa_size, fp_taxa_summary);
++
++    for (uint32_t i = 0; i < taxa.size(); ++i)
++    {
++      if (taxa[i])
++      {
++        ++hit_counts[taxa[i]];
++        // TODO: stop querying this read with other databases
++        if (Quick_mode && ++hits >= Minimum_hit_count)
++          goto quick_mode_call;
++      }
++    }
++
++quick_mode_call:
++    uint64_t *kmer_ptr;
++    uint32_t taxon = 0;
++    if (dna.seq.size() >= KrakenDatabases[0]->get_k()) {
++      KmerScanner scanner(dna.seq);
++      uint32_t taxa_idx = 0;
++      while ((kmer_ptr = scanner.next_kmer()) != NULL) {
++        if (scanner.ambig_kmer()) {
++          ambig_list.push_back(1);
++        } else {
++          ambig_list.push_back(0);
++          uint64_t cannonical_kmer = KrakenDatabases[0]->canonical_representation(*kmer_ptr);
++          taxon = taxa[taxa_idx];
++          taxon_counts[taxon].add_kmer(cannonical_kmer);
++        }
++        ++taxa_idx;
++      }
++    }
++
++    uint32_t call = 0;
++    if (Map_UIDs) {
++      if (Quick_mode) {
++        cerr << "Quick mode not available when mapping UIDs" << endl;
++        exit(1);
++      } else {
++        call = resolve_uids3(hit_counts, Parent_map, Uid_dict,
++                             UID_to_TaxID_map_file.ptr(), UID_to_TaxID_map_file.size());
++      }
++    } else {
++      if (Quick_mode)
++        call = hits >= Minimum_hit_count ? taxon : 0;
++      else
++        call = resolve_tree(hit_counts, Parent_map);
++    }
++
++    total_classified += (call != 0);
++    taxon_counts[call].incrementReadCount();
++
++    if (Print_unclassified && !call)
++      print_sequence(Unclassified_output, dna);
++
++    if (Print_classified && call)
++      print_sequence(Classified_output, dna);
++
++    if (!Print_kraken) {
++      goto next_read; // return call;
++    }
++
++    if (call) {
++      (*Kraken_output) << "C\t";
++    }
++    else {
++      if (Only_classified_kraken_output) {
++        goto next_read; // return false;
++      }
++      (*Kraken_output) << "U\t";
++    }
++    (*Kraken_output) << dna.id << '\t' << call << '\t' << dna.seq.size() << '\t';
++
++    if (Quick_mode) {
++      (*Kraken_output) << "Q:" << hits;
++    }
++    else {
++      if (taxa.empty())
++        (*Kraken_output) << "0:0";
++      else
++        (*Kraken_output) << hitlist_string(taxa, ambig_list);
++    }
++
++    if (Print_sequence)
++      (*Kraken_output) << "\t" << dna.seq;
++
++    (*Kraken_output) << "\n";
++    // return call;
++next_read:
++    ++total_sequences;
++    fprintf(stderr, "\r Processed %llu sequences (%.2f%% classified)",
++            total_sequences, total_classified * 100.0 / total_sequences);
++    (void)1;
++  }
++
++  fclose(fp_taxa_summary);
++  unlink(taxa_summary_filename.c_str());
++
++  delete reader;
++}
++
+ 
+-inline void print_sequence(ostringstream* oss_ptr, const DNASequence& dna) {
++inline void print_sequence(ostream* oss_ptr, const DNASequence& dna) {
+       if (Fastq_input) {
+         (*oss_ptr) << "@" << dna.header_line << endl
+             << dna.seq << endl
+@@ -473,7 +783,7 @@ void append_hitlist_string(string& hitlist_string, uint32_t& last_taxon, uint32_
+ }
+ */
+ 
+-string hitlist_string(const vector<uint32_t> &taxa, const vector<uint8_t> &ambig)
++string hitlist_string(const vector<uint32_t> &taxa, const vector<char> &ambig)
+ {
+   int64_t last_code;
+   int code_count = 1;
+@@ -548,7 +858,7 @@ bool classify_sequence(DNASequence &dna, ostringstream &koss,
+                        ostringstream &coss, ostringstream &uoss,
+                        unordered_map<uint32_t, READCOUNTS>& my_taxon_counts) {
+   vector<uint32_t> taxa;
+-  vector<uint8_t> ambig_list;
++  vector<char> ambig_list;
+   unordered_map<uint32_t, uint32_t> hit_counts;
+   uint64_t *kmer_ptr;
+   uint32_t taxon = 0;
+@@ -661,6 +971,44 @@ bool classify_sequence(DNASequence &dna, ostringstream &koss,
+   return call;
+ }
+ 
++void classify_sequence_with_db_chunk(std::pair<DNASequence, uint32_t> & seq, FILE* fp, const uint32_t db_chunk_id, const uint32_t db_id) {
++  vector<uint32_t> taxa;
++  uint64_t *kmer_ptr;
++  uint32_t taxon;
++
++  auto & dna = seq.first;
++  const uint32_t & seq_idx = seq.second;
++
++  vector<db_status> db_statuses(KrakenDatabases.size());
++
++  if (dna.seq.size() >= KrakenDatabases[0]->get_k()) {
++    size_t n_kmers = dna.seq.size()-KrakenDatabases[0]->get_k()+1;
++    taxa.reserve(n_kmers);
++    KmerScanner scanner(dna.seq);
++    while ((kmer_ptr = scanner.next_kmer()) != NULL) {
++      taxon = 0;
++      if (!scanner.ambig_kmer()) {
++        uint64_t cannonical_kmer = KrakenDatabases[db_id]->canonical_representation(*kmer_ptr);
++        const uint64_t minimizer = KrakenDatabases[db_id]->bin_key(cannonical_kmer); // TODO: inefficient because minimizer will also be computed in kmer_query()
++
++        if (KrakenDatabases[db_id]->is_minimizer_in_chunk(minimizer, db_chunk_id)) {
++          uint32_t* val_ptr = KrakenDatabases[db_id]->kmer_query_with_db_chunks(
++                  cannonical_kmer, &db_statuses[db_id].current_bin_key,
++                  &db_statuses[db_id].current_min_pos, &db_statuses[db_id].current_max_pos);
++          if (val_ptr)
++            taxon = *val_ptr;
++        }
++      }
++      taxa.push_back(taxon);
++    }
++  }
++
++  const uint32_t taxa_size = taxa.size();
++  fwrite(&seq_idx, sizeof(uint32_t), 1, fp); // seq_idx
++  fwrite(&taxa_size, sizeof(uint32_t), 1, fp); // number of elements
++  fwrite(&taxa[0], sizeof(uint32_t), taxa_size, fp); // elements
++}
++
+ set<uint32_t> get_ancestry(uint32_t taxon) {
+   set<uint32_t> path;
+ 
+@@ -677,7 +1025,7 @@ void parse_command_line(int argc, char **argv) {
+ 
+   if (argc > 1 && strcmp(argv[1], "-h") == 0)
+     usage(0);
+-  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qfcC:U:Ma:r:sI:p:")) != -1) {
++  while ((opt = getopt(argc, argv, "d:i:t:u:n:m:o:qfcC:U:Ma:r:sI:p:x:")) != -1) {
+     switch (opt) {
+       case 'd' :
+         DB_filenames.push_back(optarg);
+@@ -743,6 +1091,10 @@ void parse_command_line(int argc, char **argv) {
+       case 'M' :
+         Populate_memory = true;
+         break;
++      case 'x' :
++        Populate_memory = true;
++        Populate_memory_size = parse_human_readable_size(optarg); // strtoull(optarg, NULL, 0);
++        break;
+       case 'I' :
+         UID_to_TaxID_map_filename = optarg;
+         Map_UIDs = true;
+@@ -786,6 +1138,7 @@ void usage(int exit_code) {
+        << "  -f               Input is in FASTQ format" << endl
+        << "  -c               Only include classified reads in output" << endl
+        << "  -M               Preload database files" << endl
++       << "  -x size          Preload database files using x amount of RAM (e.g. 10G)" << endl
+        << "  -s               Print read sequence in Kraken output" << endl
+        << "  -h               Print this message" << endl
+        << endl
+diff --git a/src/hyperloglogplus.hpp b/src/hyperloglogplus.hpp
+index 27cc8e1..dce07df 100644
+--- a/src/hyperloglogplus.hpp
++++ b/src/hyperloglogplus.hpp
+@@ -28,6 +28,7 @@
+ #include<vector>
+ #include<unordered_set>
+ #include<cstdint>
++#include<limits>
+ using namespace std;
+ 
+ //#define HLL_DEBUG
+diff --git a/src/krakendb.cpp b/src/krakendb.cpp
+index f035e09..a12e3e8 100644
+--- a/src/krakendb.cpp
++++ b/src/krakendb.cpp
+@@ -77,6 +77,11 @@ KrakenDB::KrakenDB(char *ptr, size_t filesize) {
+   std::cerr << "Loaded database with " << key_ct << " keys with k of " << (size_t)k << " [val_len " << val_len << ", key_len " << key_len << "]." << std::endl;
+ }
+ 
++// destructor
++KrakenDB::~KrakenDB() {
++  munmap(data, data_size);
++}
++
+ size_t KrakenDB::filesize() const {
+   return _filesize;
+ }
+@@ -320,6 +325,204 @@ uint32_t *KrakenDB::kmer_query(uint64_t kmer) {
+   return kmer_query(kmer, NULL, NULL, NULL, false);
+ }
+ 
++// perform search over last range to speed up queries
++// NOTE: retry_on_failure implies all pointer params are non-NULL
++uint32_t *KrakenDB::kmer_query_with_db_chunks(uint64_t kmer, uint64_t *last_bin_key,
++                               int64_t *min_pos, int64_t *max_pos,
++                               bool retry_on_failure)
++{
++  int64_t min, max, mid;
++  uint64_t comp_kmer;
++  uint64_t b_key;
++  size_t pair_sz = pair_size();
++
++  // Use provided values if they exist and are valid
++  if (retry_on_failure && *min_pos <= *max_pos) {
++    b_key = *last_bin_key;
++    min = *min_pos;
++    max = *max_pos;
++  }
++  else {
++    b_key = bin_key(kmer);
++    min = index_ptr->at_with_db_chunks(b_key);
++    max = index_ptr->at_with_db_chunks(b_key + 1) - 1;
++    // Invalid min/max values + retry_on_failure means min/max need to be
++    // initialized and set in caller
++    if (retry_on_failure) {
++      *last_bin_key = b_key;
++      *min_pos = min;
++      *max_pos = max;
++    }
++  }
++
++  // Binary search with large window
++  while (min + 15 <= max) {
++    mid = min + (max - min) / 2;
++    comp_kmer = 0;
++    memcpy(&comp_kmer, data + pair_sz * mid - data_offset, key_len);
++    comp_kmer &= (1ull << key_bits) - 1;  // trim any excess
++    if (kmer > comp_kmer)
++      min = mid + 1;
++    else if (kmer < comp_kmer)
++      max = mid - 1;
++    else
++      return (uint32_t *) (data + pair_sz * mid - data_offset + key_len);
++  }
++  // Linear search once window shrinks
++  for (mid = min; mid <= max; mid++) {
++    comp_kmer = 0;
++    memcpy(&comp_kmer, data + pair_sz * mid - data_offset, key_len);
++    comp_kmer &= (1ull << key_bits) - 1;  // trim any excess
++    if (kmer == comp_kmer)
++      return (uint32_t *) (data + pair_sz * mid - data_offset + key_len);
++  }
++
++  uint32_t *answer = NULL;
++  // ROF implies the provided values might be out of date
++  // If they are, we'll update them and search again
++  if (retry_on_failure) {
++    b_key = bin_key(kmer);
++    // If bin key hasn't changed, search fails
++    if (b_key == *last_bin_key)
++      return NULL;
++    min = index_ptr->at_with_db_chunks(b_key);
++    max = index_ptr->at_with_db_chunks(b_key + 1) - 1;
++    // Recursive call w/ adjusted search params and w/o retry
++    answer = kmer_query_with_db_chunks(kmer, &b_key, &min, &max, false);
++    // Update caller's search params due to bin key change
++    if (last_bin_key != NULL) {
++      *last_bin_key = b_key;
++      *min_pos = min;
++      *max_pos = max;
++    }
++  }
++  return answer;
++}
++
++// Binary search w/in the k-mer's bin
++uint32_t *KrakenDB::kmer_query_with_db_chunks(uint64_t kmer) {
++  return kmer_query_with_db_chunks(kmer, NULL, NULL, NULL, false);
++}
++
++uint32_t KrakenDB::chunks() const {
++  return this->_chunks;
++}
++
++void KrakenDB::load_chunk(const uint32_t db_chunk_id) {
++  char* db_chunk_start = get_pair_ptr() + dbx_chunk_bounds[db_chunk_id] * pair_size();
++  data_offset = dbx_chunk_bounds[db_chunk_id] * pair_size();
++  const size_t db_chunk_len = (dbx_chunk_bounds[db_chunk_id + 1] - dbx_chunk_bounds[db_chunk_id]) * pair_size();
++  memcpy(data, db_chunk_start, db_chunk_len);
++
++  char* id_chunk_start = index_ptr->fptr + strlen(KRAKEN_INDEX_STRING) + 1 + (idx_chunk_bounds[db_chunk_id] * 8);
++  index_ptr->data_offset = idx_chunk_bounds[db_chunk_id] * 8;
++  const size_t id_chunk_len = (idx_chunk_bounds[db_chunk_id + 1] - idx_chunk_bounds[db_chunk_id]) * 8;
++
++  index_ptr->data = data + db_chunk_len;
++  memcpy(index_ptr->data, id_chunk_start, id_chunk_len);
++}
++
++// returns first element LARGER
++// half-open interval. first is inclusive, last is exclusive
++// the return value has to be treated as inclusive (closed interval)
++uint64_t KrakenDB::upper_bound(uint64_t first, const uint64_t last)
++{
++  uint64_t it;
++  uint64_t count, step;
++  count = last - first;
++
++  const uint64_t orig_first = first;
++  const uint64_t data_orig_first = index_ptr->mmap_at(orig_first);
++
++  // printf("upper_bound(%llu, %llu)\n", orig_first, last);
++  // float max_size = 1.0f * data_size / (1024 * 1024 * 1024);
++  // printf("- max_size = %f\n", max_size);
++
++  while (count > 0) {
++    it = first;
++    step = count / 2;
++    it += step;
++
++    uint64_t size_index = (it + 1 - orig_first) * 8;
++    uint64_t size_data = (index_ptr->mmap_at(it + 1) - data_orig_first) * pair_size();
++    // float total_size_gb = 1.0f * (size_index + size_data) / (1024 * 1024 * 1024);
++
++    // printf("- it = %llu (size: %f)\n", it, total_size_gb);
++    if (size_index + size_data <= data_size) { // if (!(data_size < size_index + size_data)) // if (!comp(value, *it))
++      first = ++it;
++      count -= step + 1;
++    }
++    else
++      count = step;
++  }
++  return first;
++}
++
++void KrakenDB::prepare_chunking(const uint64_t max_bytes_for_db) {
++  data = (char*) mmap(0, max_bytes_for_db, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (data == (void *) -1)
++  {
++    printf("ERROR: Could not allocated memory for loading database chunks (error code %i: %s)\n", errno, strerror(errno));
++    exit(-1);
++  }
++  data_size = max_bytes_for_db;
++  mlock(data, data_size);
++
++  this->_chunks = 0;
++
++  const uint64_t max_idx_pos = 1ull << (2 * index_ptr->indexed_nt()); // excl bound (half-open interval)
++  // const uint64_t max_dbx_pos = index_ptr->mmap_at(max_idx_pos); // excl bound (half-open interval)
++  uint64_t idx_pos = 0;
++  uint64_t dbx_pos = 0; // == index_ptr->mmap_at(0);
++  idx_chunk_bounds.push_back(idx_pos);
++  dbx_chunk_bounds.push_back(dbx_pos);
++
++  while (idx_pos < max_idx_pos)
++  {
++    // upper_bound returns element idx_pos that is the first that "is greater" (i.e., that does not fit into "data")
++    // in other terms, idx_pos closes our half-open interval (excl. upper bound), hence we don't need to decrement it
++    idx_pos = upper_bound(idx_pos, max_idx_pos);
++    // get starting position for next larger minimizer (that does not fit into "data")
++    // in other terms, dbx_pos closes our half-open interval (excl. upper bound), hence we don't need to decrement it
++    dbx_pos = index_ptr->mmap_at(idx_pos);
++
++    // uint64_t idx_size = (idx_pos - idx_chunk_bounds.back()) * 8;
++    // uint64_t dbx_size = (dbx_pos - dbx_chunk_bounds.back()) * pair_size();
++    // printf("- %" PRIu64 ": %s\n", idx_size + dbx_size, (idx_size + dbx_size <= data_size ? "ok" : "NOT OK, does not fit into data"));
++
++    // especially the last chunk can have 0 k-mers but a huge part of minimizers in it (that did not occur in any k-mer in the database)
++    // in that case we can skip that chunk!
++    if (dbx_pos == dbx_chunk_bounds.back())
++      continue;
++
++    idx_chunk_bounds.push_back(idx_pos);
++    dbx_chunk_bounds.push_back(dbx_pos);
++
++    this->_chunks++;
++  }
++
++  // printf("Chunk bounds\n");
++  // for (uint32_t i = 0; i < this->_chunks + 1; ++i)
++  //   printf("%llu\t%llu\n", idx_chunk_bounds[i], dbx_chunk_bounds[i]);
++
++  // printf("Chunk sizes\n");
++  // for (uint32_t i = 1; i < this->_chunks + 1; ++i) {
++    // uint64_t idx_size = (idx_chunk_bounds[i] - idx_chunk_bounds[i - 1]) * 8;
++    // uint64_t dbx_size = (dbx_chunk_bounds[i] - dbx_chunk_bounds[i - 1]) * pair_size();
++    // float idx_size_gb = 1.0f * idx_size / (1024 * 1024 * 1024);
++    // float dbx_size_gb = 1.0f * dbx_size / (1024 * 1024 * 1024);
++    // printf("Chunk %u: %.2f GB\t%.2f GB (upper bounds: %llu\t%llu)\n", i - 1, idx_size_gb, dbx_size_gb, idx_chunk_bounds[i], dbx_chunk_bounds[i]);
++    // if (idx_size + dbx_size > data_size) {
++    //   printf("ERROR: %llu > %llu\n", idx_size + dbx_size, data_size);
++    //   exit(1);
++    // }
++  // }
++}
++
++bool KrakenDB::is_minimizer_in_chunk(const uint64_t minimizer, const uint32_t db_chunk_id) const {
++    return idx_chunk_bounds[db_chunk_id] <= minimizer && minimizer < idx_chunk_bounds[db_chunk_id + 1];
++}
++
+ KrakenDBIndex::KrakenDBIndex() {
+   fptr = NULL;
+   idx_type = 1;
+@@ -348,6 +551,30 @@ uint8_t KrakenDBIndex::indexed_nt() {
+   return nt;
+ }
+ 
++// Convenience method, allows for testing guard
++uint64_t KrakenDBIndex::mmap_at(uint64_t idx) {
++  uint64_t *array = (uint64_t*) (fptr + strlen(KRAKEN_INDEX_STRING) + 1);
++  #ifdef TESTING
++  if (idx > 1 + (1ull << (nt * 2)))
++    errx(EX_SOFTWARE, "KrakenDBIndex::at() called with illegal index");
++  #endif
++  return array[idx];
++}
++
++// Return start of index array (skips header)
++uint64_t *KrakenDBIndex::get_array_with_db_chunks() { // TODO: remove wrapper
++  return (uint64_t *) data;
++}
++
++uint64_t KrakenDBIndex::at_with_db_chunks(uint64_t idx) {
++  uint64_t *array = get_array_with_db_chunks();
++#ifdef TESTING
++  if ((idx - (data_offset / 8)) > 1 + (1ull << (nt * 2)))
++errx(EX_SOFTWARE, "KrakenDBIndex::at() called with illegal index");
++#endif
++  return array[idx - (data_offset / 8)];
++}
++
+ // Return start of index array (skips header)
+ uint64_t *KrakenDBIndex::get_array() {
+   return (uint64_t *) (fptr + strlen(KRAKEN_INDEX_STRING) + 1);
+diff --git a/src/krakendb.hpp b/src/krakendb.hpp
+index 5a19a71..34ef65e 100644
+--- a/src/krakendb.hpp
++++ b/src/krakendb.hpp
+@@ -25,6 +25,8 @@
+ #include <map>
+ 
+ namespace kraken {
++  class KrakenDB;
++
+   class KrakenDBIndex {
+     public:
+     KrakenDBIndex();
+@@ -33,13 +35,21 @@ namespace kraken {
+ 
+     uint8_t index_type();
+     uint8_t indexed_nt();
++    uint64_t mmap_at(uint64_t idx);
++    uint64_t *get_array_with_db_chunks();
++    uint64_t at_with_db_chunks(uint64_t idx);
+     uint64_t *get_array();
+     uint64_t at(uint64_t idx);
+ 
++    friend KrakenDB;
++
+     private:
+     uint8_t idx_type;
+     char *fptr;
+     uint8_t nt;
++
++    char *data;
++    uint64_t data_offset;
+   };
+ 
+   class KrakenDB {
+@@ -63,6 +73,12 @@ namespace kraken {
+                          int64_t *min_pos, int64_t *max_pos,
+                          bool retry_on_failure=true);
+ 
++    uint32_t *kmer_query_with_db_chunks(uint64_t kmer);  // return ptr to pair w/ kmer
++
++    // perform search over last range to speed up queries
++    uint32_t *kmer_query_with_db_chunks(uint64_t kmer, uint64_t *last_bin_key,
++                                        int64_t *min_pos, int64_t *max_pos,
++                                        bool retry_on_failure=true);
+ 
+     // return a count of k-mers for all taxons
+     std::map<uint32_t,uint64_t> count_taxons();
+@@ -94,6 +110,12 @@ namespace kraken {
+     // ptr points to start of mmap'ed DB in read or read/write mode
+     KrakenDB(char *ptr, size_t filesize = 0);
+ 
++    ~KrakenDB();
++
++    uint32_t chunks() const;
++    void load_chunk(const uint32_t db_chunk_id);
++    void prepare_chunking(const uint64_t max_bytes_for_db);
++    bool is_minimizer_in_chunk(const uint64_t minimizer, const uint32_t db_chunk_id) const;
+ 
+     private:
+ 
+@@ -105,6 +127,16 @@ namespace kraken {
+     uint64_t key_len;
+     uint64_t val_len;
+     uint64_t key_ct;
++
++    uint64_t upper_bound(const uint64_t first, const uint64_t last);
++
++    uint32_t _chunks;
++    std::vector<uint64_t> idx_chunk_bounds;
++    std::vector<uint64_t> dbx_chunk_bounds;
++
++    char *data;
++    uint64_t data_size;
++    uint64_t data_offset;
+   };
+ }
+ 
+diff --git a/src/krakenutil.cpp b/src/krakenutil.cpp
+index b63fbaa..6052ef2 100644
+--- a/src/krakenutil.cpp
++++ b/src/krakenutil.cpp
+@@ -27,6 +27,32 @@
+ using namespace std;
+ 
+ namespace kraken {
++  uint64_t parse_human_readable_size(char * size_str) {
++    char *endp = size_str;
++    int sh;
++    errno = 0;
++    uint64_t x = strtoumax(size_str, &endp, 10);
++    if (errno || endp == size_str)
++      return 0;
++    switch(*endp) {
++      case 'k':
++      case 'K':
++        sh=10; break;
++      case 'm':
++      case 'M':
++        sh=20; break;
++      case 'g':
++      case 'G':
++        sh=30; break;
++      case 0:
++        sh=0; break;
++      default:
++        return 0;
++    }
++    if (x > SIZE_MAX >> sh)
++      return 0;
++    return x << sh;
++  }
+ 
+   // Build a node->parent unordered_map from NCBI Taxonomy nodes.dmp file
+   unordered_map<uint32_t, uint32_t> build_parent_map(string filename) {
+diff --git a/src/krakenutil.hpp b/src/krakenutil.hpp
+index 18b3a9f..f936f14 100644
+--- a/src/krakenutil.hpp
++++ b/src/krakenutil.hpp
+@@ -22,9 +22,12 @@
+ #define KRAKENUTIL_HPP
+ 
+ #include "kraken_headers.hpp"
++#include <inttypes.h>
+ #include <unordered_map>
+ 
+ namespace kraken {
++  uint64_t parse_human_readable_size(char * size_str);
++
+   // Build a map of node to parent from an NCBI taxonomy nodes.dmp file
+   std::unordered_map<uint32_t, uint32_t> build_parent_map(std::string filename);
+ 
+diff --git a/src/quickfile.cpp b/src/quickfile.cpp
+index 10b5f86..b747007 100644
+--- a/src/quickfile.cpp
++++ b/src/quickfile.cpp
+@@ -43,6 +43,10 @@ void QuickFile::open_file(string filename_str, string mode, size_t size) {
+                   : mode == "r" ? O_RDONLY : O_RDWR;
+   int m_flags = mode == "r" ? MAP_PRIVATE : MAP_SHARED;
+ 
++  int m_prot = PROT_READ;
++  if (mode != "r")
++    m_prot |= PROT_WRITE;
++
+   fd = open(filename, o_flags, 0666);
+   // Second try for R/W if failure was due to non-existence
+   if (fd < 0 && mode == "rw" && errno == ENOENT) {
+@@ -66,7 +70,7 @@ void QuickFile::open_file(string filename_str, string mode, size_t size) {
+     filesize = sb.st_size;
+   }
+ 
+-  fptr = (char *)mmap(0, filesize, PROT_READ | PROT_WRITE, m_flags, fd, 0);
++  fptr = (char *)mmap(0, filesize, m_prot, m_flags, fd, 0);
+   madvise(fptr, filesize, MADV_WILLNEED);
+   if (fptr == MAP_FAILED)
+     err(EX_OSERR, "unable to mmap %s", filename);

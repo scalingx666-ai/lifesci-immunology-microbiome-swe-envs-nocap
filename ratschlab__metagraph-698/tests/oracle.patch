@@ -1,0 +1,831 @@
+diff --git a/.github/workflows/pymetagraph.yml b/.github/workflows/pymetagraph.yml
+new file mode 100644
+index 0000000000..57959b3b44
+--- /dev/null
++++ b/.github/workflows/pymetagraph.yml
+@@ -0,0 +1,102 @@
++name: pymetagraph
++
++on:
++  push:
++    branches:
++      - master
++    paths:
++      - 'metagraph/src/**'
++      - 'metagraph/api/python/pymetagraph/**'
++      - 'metagraph/CMakeLists*'
++      - 'metagraph/external-libraries/**'
++      - '.gitmodules'
++      - '.github/workflows/pymetagraph.yml'
++  pull_request:
++    branches:
++      - master
++    paths:
++      - 'metagraph/src/**'
++      - 'metagraph/api/python/pymetagraph/**'
++      - 'metagraph/CMakeLists*'
++      - 'metagraph/external-libraries/**'
++      - '.gitmodules'
++      - '.github/workflows/pymetagraph.yml'
++  workflow_dispatch:
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  build-and-test:
++    name: Build extension and run pytest
++    runs-on: ubuntu-24.04
++
++    env:
++      CCACHE_DIR: ~/.cache/ccache
++
++    defaults:
++      run:
++        shell: bash
++
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Get dependency revision
++        id: submodules
++        run: echo "revision=$(git rev-parse HEAD:metagraph/external-libraries)" >> "$GITHUB_OUTPUT"
++
++      - name: Checkout submodules cache
++        uses: actions/cache@v4
++        with:
++          path: |
++            .git/modules
++            metagraph/external-libraries
++          key: submodules-${{ hashFiles('.gitmodules') }}-${{ steps.submodules.outputs.revision }}
++
++      - name: Checkout submodules
++        run: git submodule update --init --recursive --depth 1
++
++      - name: Install build dependencies
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y g++-13 cmake make ccache libbz2-dev libboost-all-dev libdeflate-dev liblzma-dev libzstd-dev
++          echo "CC=$(which gcc-13)" >> $GITHUB_ENV
++          echo "CXX=$(which g++-13)" >> $GITHUB_ENV
++
++      - name: Set up Python
++        uses: actions/setup-python@v6
++        with:
++          python-version: 3.13
++
++      - name: Install Python dependencies
++        run: python -m pip install pybind11 pytest
++
++      - name: Cache ccache
++        uses: actions/cache@v4
++        with:
++          path: ${{ env.CCACHE_DIR }}
++          key: ccache-pymetagraph-${{ github.sha }}
++          restore-keys: |
++            ccache-pymetagraph-
++
++      - name: Configure
++        run: |
++          ccache --set-config=max_size=1G
++          cmake -S metagraph -B metagraph/build \
++            -DCMAKE_BUILD_TYPE=Release \
++            -DBUILD_PYTHON_BINDINGS=ON \
++            -DPython_EXECUTABLE="$(which python)"
++
++      - name: Build metagraph and the extension
++        run: cmake --build metagraph/build -j"$(getconf _NPROCESSORS_ONLN)" --target metagraph _pymetagraph_core
++
++      - name: Run pymetagraph tests
++        env:
++          METAGRAPH: ${{ github.workspace }}/metagraph/build/metagraph
++          PYMETAGRAPH_REQUIRE_METAGRAPH: '1'
++          PYTHONPATH: ${{ github.workspace }}/metagraph/api/python/pymetagraph
++        run: |
++          ln -s "$PWD"/metagraph/build/_pymetagraph_core*.so metagraph/api/python/pymetagraph/pymetagraph/
++          cd metagraph/api/python/pymetagraph
++          pytest -v tests
+diff --git a/.gitignore b/.gitignore
+index d4ff01ddd3..6081fff992 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,6 +21,8 @@ database-cli
+ *._*
+ metagraph/build*
+ metagraph/**/build*
++metagraph/api/python/pymetagraph/pymetagraph/_pymetagraph_core*
++*.egg-info
+ .*.swp
+ .ipynb_checkpoints
+ *lsf.o*
+diff --git a/metagraph/CMakeLists.txt b/metagraph/CMakeLists.txt
+index ebb4c74487..a50ba7c300 100644
+--- a/metagraph/CMakeLists.txt
++++ b/metagraph/CMakeLists.txt
+@@ -20,6 +20,24 @@ include(CheckFunctionExists)
+ include(CheckLibraryExists)
+ include(CMakeListsHelpers.txt)
+ 
++# Building the pymetagraph Python extension requires every static library in the
++# link chain (including vendored deps and HTSLIB) to be position-independent.
++# This is opt-in so the default static `metagraph` binary build is unaffected.
++option(BUILD_PYTHON_BINDINGS "Build the pymetagraph pybind11 extension" OFF)
++if(BUILD_PYTHON_BINDINGS)
++  if(BUILD_STATIC)
++    message(FATAL_ERROR "BUILD_PYTHON_BINDINGS cannot be combined with BUILD_STATIC: "
++                        "the extension must link shared (or position-independent) libraries")
++  endif()
++  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++
++  # jemalloc (pulled in via folly, if present on the system) can exhaust the
++  # static TLS space, so importing the extension fails with "cannot allocate
++  # memory in static TLS block" unless libjemalloc is preloaded. Build the
++  # extension without it; builds without BUILD_PYTHON_BINDINGS keep jemalloc.
++  set(CMAKE_DISABLE_FIND_PACKAGE_Jemalloc ON)
++endif()
++
+ enable_testing()
+ include(GoogleTest)
+ 
+@@ -202,6 +220,7 @@ configure_file(CMakeListsKMC.txt.in KMC/CMakeLists.txt @ONLY)
+ execute_process(COMMAND ${CMAKE_COMMAND} -G "${CMAKE_GENERATOR}"
+   -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+   -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
++  -DCMAKE_POSITION_INDEPENDENT_CODE=${CMAKE_POSITION_INDEPENDENT_CODE}
+   .
+   RESULT_VARIABLE result
+   WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/KMC
+@@ -313,7 +332,14 @@ if(APPLE)
+   get_filename_component(ICU_DATA_LIBRARY_PATH ${ICU_DATA_LIBRARY} DIRECTORY)
+ endif()
+ 
+-set(Boost_USE_STATIC_LIBS ON)
++# Static Boost libraries of Linux distributions are usually not
++# position-independent, so they cannot be linked into the Python extension.
++# On macOS, code is position-independent by default.
++if(BUILD_PYTHON_BINDINGS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++  set(Boost_USE_STATIC_LIBS OFF)
++else()
++  set(Boost_USE_STATIC_LIBS ON)
++endif()
+ find_package(Boost REQUIRED COMPONENTS iostreams)
+ find_library(LIBDEFLATE_LIBRARY NAMES deflate HINTS ENV LIBRARY_PATH
+              PATHS ${HOMEBREW_DIR}/lib REQUIRED)
+@@ -386,17 +412,31 @@ else()
+ endif()
+ 
+ include(ExternalProject)
++# HTSLIB is built via autoconf/make, outside CMAKE_POSITION_INDEPENDENT_CODE's reach,
++# so -fPIC has to be injected into its CFLAGS/CPPFLAGS by hand when building the
++# Python extension (see BUILD_PYTHON_BINDINGS above).
++set(HTSLIB_PIC_FLAG "")
++if(BUILD_PYTHON_BINDINGS)
++  set(HTSLIB_PIC_FLAG "-fPIC ")
++endif()
++# $(MAKE) joins the jobserver of a make-driven build; other generators, such as
++# Ninja (the scikit-build-core default), need a make program by name.
++if(CMAKE_GENERATOR MATCHES "Makefiles")
++  set(HTSLIB_MAKE "$(MAKE)")
++else()
++  find_program(HTSLIB_MAKE NAMES gmake make REQUIRED)
++endif()
+ ExternalProject_Add(HTSLIB
+   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib
+   PREFIX "${PROJECT_BINARY_DIR}/HTSLIB-build"
+   CONFIGURE_COMMAND
+     ${CMAKE_COMMAND} -E env
+       "CC=${HTSLIB_CC}"
+-      "CPPFLAGS=${OSX_ARCH_FLAGS}\ -I${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/zlib"
+-      "CFLAGS=${OSX_ARCH_FLAGS}\ -I${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/zlib"
++      "CPPFLAGS=${HTSLIB_PIC_FLAG}${OSX_ARCH_FLAGS}\ -I${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/zlib"
++      "CFLAGS=${HTSLIB_PIC_FLAG}${OSX_ARCH_FLAGS}\ -I${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/zlib"
+       "LDFLAGS=${OSX_ARCH_FLAGS}\ -L${PROJECT_BINARY_DIR}/external-libraries/zlib"
+     /bin/sh -c "autoreconf -i ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib && exec ${CMAKE_CURRENT_SOURCE_DIR}/external-libraries/htslib/configure --disable-libcurl --disable-bz2 --disable-lzma"
+-  BUILD_COMMAND $(MAKE) -j${N} lib-static
++  BUILD_COMMAND ${HTSLIB_MAKE} -j${N} lib-static
+   #INSTALL_COMMAND $(MAKE) install prefix=${HTSLIB_INSTALL}  # this installs both static and dynamic
+   # Install only static lib to avoid the dependency
+   INSTALL_COMMAND
+@@ -434,6 +474,8 @@ list(REVERSE metagraph_core_files)  # for compiling faster
+ list(FILTER metagraph_core_files EXCLUDE REGEX ".*\\._.*")
+ list(FILTER metagraph_core_files EXCLUDE REGEX ".*main.cpp")
+ list(FILTER metagraph_core_files EXCLUDE REGEX ".*/cli/.*")
++list(FILTER metagraph_core_files EXCLUDE REGEX ".*/pybindings/.*")
++
+ add_library(metagraph-core STATIC ${metagraph_core_files})
+ 
+ # Set up include directories for metagraph-core
+@@ -577,6 +619,25 @@ if(METAGRAPH_BUILD_EXECUTABLE)
+   add_dependencies(metagraph link_target)
+ endif()
+ 
++#-------------------
++# pymetagraph Python extension
++#-------------------
++if(BUILD_PYTHON_BINDINGS)
++  find_package(Python 3.9 REQUIRED COMPONENTS Interpreter Development.Module)
++  execute_process(
++    COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
++    OUTPUT_VARIABLE pybind11_DIR
++    OUTPUT_STRIP_TRAILING_WHITESPACE
++    COMMAND_ERROR_IS_FATAL ANY
++  )
++  find_package(pybind11 CONFIG REQUIRED)
++
++  pybind11_add_module(_pymetagraph_core src/pybindings/pymetagraph_bindings.cpp)
++  target_link_libraries(_pymetagraph_core PRIVATE metagraph-cli metagraph-core)
++  add_dependencies(_pymetagraph_core HTSLIB)
++  install(TARGETS _pymetagraph_core DESTINATION pymetagraph COMPONENT _pymetagraph_core)
++endif()
++
+ 
+ #-------------------
+ # install library
+diff --git a/metagraph/api/python/pymetagraph/README.md b/metagraph/api/python/pymetagraph/README.md
+new file mode 100644
+index 0000000000..d1224e5dc9
+--- /dev/null
++++ b/metagraph/api/python/pymetagraph/README.md
+@@ -0,0 +1,72 @@
++# pymetagraph
++
++Python bindings for querying an annotated MetaGraph index in-process, without a running
++`metagraph server`. They expose the label query behind `metagraph query` for batches of sequences
++and return plain `(label, k-mer count)` results. To query a remote server, use the `metagraph`
++client package in `metagraph/api/python` instead.
++
++The bindings are experimental.
++
++## Building
++
++Initialize the git submodules (see the top-level README), then build and install from this
++directory:
++
++```
++pip install .
++```
++
++This compiles MetaGraph with `-DBUILD_PYTHON_BINDINGS=ON` through `scikit-build-core`, so it takes
++as long as a regular MetaGraph build. CMake options can be passed with the `CMAKE_ARGS`
++environment variable, for example `CMAKE_ARGS="-DBoost_DIR=..."` to select a Boost installation.
++After a failed build, delete `build/` before retrying.
++
++To rebuild the extension incrementally while working on the C++ side, configure CMake directly
++from the repository root, then link the built module into the package:
++
++```
++cmake -S metagraph -B build -DBUILD_PYTHON_BINDINGS=ON -DPython_EXECUTABLE=$(which python3)
++cmake --build build --target _pymetagraph_core
++ln -s $PWD/build/_pymetagraph_core*.so metagraph/api/python/pymetagraph/pymetagraph/
++```
++
++and put `metagraph/api/python/pymetagraph` on `PYTHONPATH`.
++
++## Usage
++
++```python
++import pymetagraph
++
++graph = pymetagraph.AnnotatedGraph("graph.dbg", "graph.column.annodbg", threads=8)
++graph.k        # 31
++graph.labels   # ['ref_A', 'ref_B']
++
++hits = graph.query(["ACGT...", "TTGA..."], num_top_labels=1, discovery_fraction=0.1)
++# [[('ref_A', 412)], []]   one list of (label, matching k-mers) per sequence
++graph.query("ACGT...")     # a single sequence gives a single list
++```
++
++`query` has the defaults of `metagraph query`: all labels (`num_top_labels=None`),
++`discovery_fraction=0.7` (`--min-kmers-fraction-label`) and `presence_fraction=0.0`.
++It releases the GIL and spreads the sequences over `threads` threads.
++
++## Tests
++
++The tests build a small index with the `metagraph` binary, taken from `$METAGRAPH` or from `PATH`,
++and compare the results with `metagraph query`:
++
++```
++METAGRAPH=/path/to/metagraph pytest tests
++```
++
++## Known limitations
++
++- Exactly one annotation file is supported.
++- Missing files raise `FileNotFoundError`, but a graph or annotation that MetaGraph cannot load
++  ends the Python process, as the loaders exit on errors.
++- On Linux, the extension links Boost dynamically and the wheel does not bundle it, so the Boost
++  runtime (`libboost_iostreams`) it was built against must be installed where it is imported.
++  The wheel is meant for the machine that built it.
++- `BUILD_STATIC=ON` cannot be combined with `BUILD_PYTHON_BINDINGS=ON`.
++- The extension is built without jemalloc, which can otherwise exhaust the static TLS space when
++  the extension is imported.
+diff --git a/metagraph/api/python/pymetagraph/pymetagraph/__init__.py b/metagraph/api/python/pymetagraph/pymetagraph/__init__.py
+new file mode 100644
+index 0000000000..a3d3a88252
+--- /dev/null
++++ b/metagraph/api/python/pymetagraph/pymetagraph/__init__.py
+@@ -0,0 +1,7 @@
++# -*- coding: utf-8 -*-
++
++"""In-process queries against an annotated metagraph index."""
++
++from .annotated_graph import AnnotatedGraph
++
++__all__ = ["AnnotatedGraph"]
+diff --git a/metagraph/api/python/pymetagraph/pymetagraph/annotated_graph.py b/metagraph/api/python/pymetagraph/pymetagraph/annotated_graph.py
+new file mode 100644
+index 0000000000..facde5b39c
+--- /dev/null
++++ b/metagraph/api/python/pymetagraph/pymetagraph/annotated_graph.py
+@@ -0,0 +1,60 @@
++import math
++from pathlib import Path
++from typing import Iterable, List, Optional, Tuple, Union
++
++from . import _pymetagraph_core
++
++Hits = List[Tuple[str, int]]
++
++
++class AnnotatedGraph:
++    """An annotated de Bruijn graph loaded into the current process.
++
++    :param graph: Path to the graph (``.dbg``).
++    :param annotation: Path to the annotation (e.g. ``.column.annodbg``).
++    :param threads: Number of threads used by :meth:`query`.
++    """
++
++    def __init__(self, graph: Union[str, Path], annotation: Union[str, Path], threads: int = 1):
++        # metagraph's loaders exit() the process on missing files, so check here first
++        for path in (graph, annotation):
++            if not Path(path).is_file():
++                raise FileNotFoundError(f"{path} does not exist")
++        if threads < 1:
++            raise ValueError("threads must be at least 1")
++        self._graph = _pymetagraph_core.AnnotatedGraph(str(graph), str(annotation), threads)
++
++    @property
++    def k(self) -> int:
++        """k-mer length of the graph."""
++        return self._graph.k
++
++    @property
++    def labels(self) -> List[str]:
++        """All labels in the annotation."""
++        return self._graph.labels
++
++    def query(self, seqs: Union[str, Iterable[str]],
++              num_top_labels: Optional[int] = None,
++              discovery_fraction: float = 0.7,
++              presence_fraction: float = 0.0) -> Union[Hits, List[Hits]]:
++        """Top labels of each sequence with their numbers of matching k-mers.
++
++        Same semantics as ``metagraph query``: a label is reported if at least
++        ``discovery_fraction`` of the sequence's k-mers carry it, and only if at
++        least ``presence_fraction`` of its k-mers are in the graph at all.
++        The defaults are those of ``metagraph query``: all labels
++        (``num_top_labels=None``), ``discovery_fraction=0.7`` and
++        ``presence_fraction=0.0``.
++
++        :param seqs: A sequence, or an iterable of sequences.
++        :return: For each sequence, a list of ``(label, kmer_count)`` sorted by
++            decreasing count, empty if nothing passes the thresholds or the
++            sequence is shorter than ``k``. A single sequence gives a single list.
++        """
++        for fraction in (discovery_fraction, presence_fraction):
++            if not (math.isfinite(fraction) and 0 <= fraction <= 1):
++                raise ValueError("discovery_fraction and presence_fraction must be in [0, 1]")
++        if isinstance(seqs, str):
++            return self._graph.query([seqs], num_top_labels, discovery_fraction, presence_fraction)[0]
++        return self._graph.query(list(seqs), num_top_labels, discovery_fraction, presence_fraction)
+diff --git a/metagraph/api/python/pymetagraph/pyproject.toml b/metagraph/api/python/pymetagraph/pyproject.toml
+new file mode 100644
+index 0000000000..b4c5c31b52
+--- /dev/null
++++ b/metagraph/api/python/pymetagraph/pyproject.toml
+@@ -0,0 +1,28 @@
++[build-system]
++requires = ["scikit-build-core", "pybind11"]
++build-backend = "scikit_build_core.build"
++
++[project]
++name = "pymetagraph"
++version = "0.2.0"
++description = "In-process queries against an annotated metagraph index"
++readme = "README.md"
++authors = [
++    { name = "ratschlab", email = "grlab@ratschlab.org" },
++]
++requires-python = ">=3.9"
++dependencies = []
++classifiers = [
++    "Development Status :: 3 - Alpha",
++    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
++    "Programming Language :: Python :: 3 :: Only",
++]
++
++[tool.scikit-build]
++build-dir = "build"
++cmake.source-dir = "../../.."
++cmake.args = ["-DBUILD_PYTHON_BINDINGS=ON"]
++cmake.build-type = "Release"
++wheel.packages = ["pymetagraph"]
++build.targets = ["_pymetagraph_core"]
++install.components = ["_pymetagraph_core"]
+diff --git a/metagraph/api/python/pymetagraph/tests/test_annotated_graph.py b/metagraph/api/python/pymetagraph/tests/test_annotated_graph.py
+new file mode 100644
+index 0000000000..89b3955d4b
+--- /dev/null
++++ b/metagraph/api/python/pymetagraph/tests/test_annotated_graph.py
+@@ -0,0 +1,142 @@
++"""Tests for pymetagraph.AnnotatedGraph.
++
++The fixture is built from metagraph's own test data with the `metagraph`
++binary (taken from $METAGRAPH, else from PATH); the tests using it are skipped if
++neither is available, unless PYMETAGRAPH_REQUIRE_METAGRAPH=1. Query results
++are compared to `metagraph query`.
++"""
++import os
++import re
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++import pymetagraph
++
++DATA = Path(__file__).resolve().parents[4] / "tests" / "data" / "metasub_fake_data.fa"
++K = 21
++METAGRAPH = os.environ.get("METAGRAPH") or shutil.which("metagraph")
++
++# CI sets PYMETAGRAPH_REQUIRE_METAGRAPH=1 so that a missing binary fails the
++# tests instead of skipping them
++if METAGRAPH is None and os.environ.get("PYMETAGRAPH_REQUIRE_METAGRAPH") == "1":
++    raise RuntimeError("metagraph binary not found: set METAGRAPH or add it to PATH")
++
++
++def read_fasta(path):
++    records, name = {}, None
++    for line in open(path):
++        line = line.strip()
++        if line.startswith(">"):
++            name = line[1:]
++            records[name] = ""
++        else:
++            records[name] += line
++    return records
++
++
++@pytest.fixture(scope="module")
++def index(tmp_path_factory):
++    # only the tests that need an index are skipped without the binary
++    if METAGRAPH is None:
++        pytest.skip("metagraph binary not found")
++    out = tmp_path_factory.mktemp("index") / "graph"
++    subprocess.run([METAGRAPH, "build", "-k", str(K), "-o", str(out), str(DATA)],
++                   check=True, capture_output=True)
++    subprocess.run([METAGRAPH, "annotate", "-i", f"{out}.dbg", "--anno-header",
++                    "-o", str(out), str(DATA)], check=True, capture_output=True)
++    return Path(f"{out}.dbg"), Path(f"{out}.column.annodbg")
++
++
++@pytest.fixture(scope="module")
++def graph(index):
++    return pymetagraph.AnnotatedGraph(*index, threads=2)
++
++
++def cli_query(index, fasta, discovery_fraction=None):
++    """{sequence index: [(label, kmer_count)]} as reported by `metagraph query`,
++    with its default options unless discovery_fraction is given."""
++    options = [] if discovery_fraction is None else ["--min-kmers-fraction-label", str(discovery_fraction)]
++    result = subprocess.run(
++        [METAGRAPH, "query", "-i", str(index[0]), "-a", str(index[1]), *options, str(fasta)],
++        check=True, capture_output=True, text=True)
++    hits = {}
++    for line in result.stdout.splitlines():
++        fields = line.split("\t")
++        # each hit is printed as <label>:<kmer_count>
++        hits[int(fields[0])] = [(m.group(1), int(m.group(2)))
++                                for m in (re.fullmatch(r"<(.*)>:(\d+)", f) for f in fields[2:] if f)]
++    return hits
++
++
++def test_properties(graph):
++    assert graph.k == K
++    assert sorted(graph.labels) == sorted(read_fasta(DATA))
++
++
++def write_queries(tmp_path):
++    seqs = list(read_fasta(DATA).values())
++    queries = [seqs[0], seqs[1][:100], seqs[2][50:150], seqs[2], "ACGT" * 30]
++    fasta = tmp_path / "queries.fa"
++    fasta.write_text("".join(f">{i}\n{s}\n" for i, s in enumerate(queries)))
++    return queries, fasta
++
++
++def test_defaults_match_cli(graph, index, tmp_path):
++    queries, fasta = write_queries(tmp_path)
++    expected = cli_query(index, fasta)
++    result = graph.query(queries)
++    assert any(len(hits) > 1 for hits in result)
++    for i, hits in enumerate(result):
++        assert sorted(hits) == sorted(expected.get(i, []))
++
++
++def test_matches_cli(graph, index, tmp_path):
++    queries, fasta = write_queries(tmp_path)
++
++    for discovery_fraction in (0.0, 0.5, 1.0):
++        expected = cli_query(index, fasta, discovery_fraction)
++        result = graph.query(queries, discovery_fraction=discovery_fraction)
++        for i, hits in enumerate(result):
++            assert sorted(hits) == sorted(expected.get(i, []))
++            # the CLI prints untruncated hits in label order, query sorts them
++            counts = [count for _, count in hits]
++            assert counts == sorted(counts, reverse=True)
++
++
++def test_counts_and_order(graph):
++    seq = next(iter(read_fasta(DATA).values()))
++    hits = graph.query(seq)
++    counts = [count for _, count in hits]
++    assert counts == sorted(counts, reverse=True)
++    assert counts[0] == len(seq) - K + 1
++    assert graph.query(seq, num_top_labels=1) == hits[:1]
++
++
++def test_single_sequence_and_edge_cases(graph):
++    seq = next(iter(read_fasta(DATA).values()))
++    assert graph.query(seq) == graph.query([seq])[0]
++    assert graph.query(["", "A" * (K - 1)]) == [[], []]
++    assert graph.query([]) == []
++
++
++def test_invalid_arguments(graph, index):
++    with pytest.raises(FileNotFoundError):
++        pymetagraph.AnnotatedGraph("missing.dbg", index[1])
++    with pytest.raises(ValueError):
++        pymetagraph.AnnotatedGraph(*index, threads=0)
++    for fraction in (1.5, -0.1, float("nan"), float("inf")):
++        with pytest.raises(ValueError):
++            graph.query(["ACGT"], discovery_fraction=fraction)
++        with pytest.raises(ValueError):
++            graph.query("ACGT", presence_fraction=fraction)
++        # the extension checks the same without the Python wrapper
++        with pytest.raises(ValueError):
++            graph._graph.query(["ACGT"], None, fraction, 0.0)
++
++
++def test_worker_error_raises():
++    with pytest.raises(RuntimeError, match="error in worker"):
++        pymetagraph._pymetagraph_core._raise_in_worker(threads=2)
+diff --git a/metagraph/docs/source/api.rst b/metagraph/docs/source/api.rst
+index ef09b31f79..c2775edf6a 100644
+--- a/metagraph/docs/source/api.rst
++++ b/metagraph/docs/source/api.rst
+@@ -6,6 +6,9 @@ Python API
+ The MetaGraph API provides a simple way to query indexes (running on a remote server or locally) in Python and supports both exact k-mer
+ matching as well as inexact search (alignment).
+ 
++.. note:: To query an index inside the Python process, without running a server, see
++    :ref:`In-process queries with pymetagraph <pymetagraph>` below.
++
+ .. attention:: The API described here was used in the internal implementation of :ref:`metagraph_online`
+     and can also be used to query indexes hosted **locally**. For the API of MetaGraph Online, refer to
+     `MetaGraph Online Help <https://metagraph.ethz.ch/help#api-cli>`_.
+@@ -220,3 +223,54 @@ must be started to load up an index for query. This can be done, for instance, a
+ Other examples
+ ^^^^^^^^^^^^^^
+ Find more examples `here <https://github.com/ratschlab/metagraph_paper_resources/blob/master/notebooks/>`_.
++
++
++.. _pymetagraph:
++
++In-process queries with pymetagraph
++-----------------------------------
++.. attention:: pymetagraph is experimental. Its interface may still change.
++
++``pymetagraph`` loads an annotated index into the Python process and runs the same label query as
++``metagraph query``, without a ``metagraph server_query`` process. It is built from source together
++with MetaGraph.
++
++Install it from a clone with initialized submodules::
++
++    git clone --recursive https://github.com/ratschlab/metagraph.git
++    cd metagraph/metagraph/api/python/pymetagraph
++    pip install .
++
++This compiles MetaGraph with ``-DBUILD_PYTHON_BINDINGS=ON``, so it takes as long as a regular
++MetaGraph build. The result is meant for the machine that built it: it uses the SSE4.2 and AVX2
++instructions if the build machine's CPU has them, and links the Boost libraries found there. See the
++`pymetagraph README <https://github.com/ratschlab/metagraph/tree/master/metagraph/api/python/pymetagraph>`_
++for build options and known limitations.
++
++Usage::
++
++    import pymetagraph
++
++    graph = pymetagraph.AnnotatedGraph("graph.dbg", "annotation.column.annodbg", threads=8)
++    graph.k        # k-mer length
++    graph.labels   # all labels in the annotation
++
++    hits = graph.query(["ACGT...", "TTGA..."])
++    # one list of (label, number of matching k-mers) per sequence, by decreasing count
++    graph.query("ACGT...", num_top_labels=1, discovery_fraction=0.1)
++
++The options and their defaults are those of ``metagraph query``:
++
++========================  =================================  =========
++pymetagraph               ``metagraph query``                default
++========================  =================================  =========
++``num_top_labels``        ``--num-top-labels``               all labels (``None``)
++``discovery_fraction``    ``--min-kmers-fraction-label``     0.7
++``presence_fraction``     ``--min-kmers-fraction-graph``     0.0
++``threads``               ``-p``                             1
++========================  =================================  =========
++
++For indexes with coordinates and a ``.seqs`` file, labels are mapped to sequence headers, as in
++``metagraph query``. Only this label query is available: strand options (``--fwd-and-reverse``),
++alignment (``--align``), and the ``labels``, ``counts-sum``, ``signature``, ``counts`` and ``coords``
++query modes are not exposed. Use the command line tool or the server API above for those.
+diff --git a/metagraph/src/pybindings/pymetagraph_bindings.cpp b/metagraph/src/pybindings/pymetagraph_bindings.cpp
+new file mode 100644
+index 0000000000..255c0ebd21
+--- /dev/null
++++ b/metagraph/src/pybindings/pymetagraph_bindings.cpp
+@@ -0,0 +1,173 @@
++// In-process Python bindings for querying an annotated metagraph index.
++//
++// Exposes AnnotatedDBG::get_top_labels -- the primitive behind `metagraph query`
++// and the server's /search endpoint -- for batches of sequences, without
++// running a server. Results are plain (label, k-mer count) pairs, so the
++// bindings carry no assumptions about how callers turn them into decisions.
++
++#include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
++
++#include <algorithm>
++#include <cmath>
++#include <exception>
++#include <functional>
++#include <future>
++#include <limits>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <shared_mutex>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "cli/config/config.hpp"
++#include "cli/load/load_annotated_graph.hpp"
++#include "cli/load/load_graph.hpp"
++#include "common/threads/threading.hpp"
++#include "graph/annotated_dbg.hpp"
++
++namespace py = pybind11;
++
++namespace {
++
++// Loading an annotation goes through the CLI's Config (it carries the
++// annotation type and loading options), so build a minimal `server_query`
++// command line for it. "server_query" is the CLI identity that accepts -i/-a
++// without positional input files.
++mtg::cli::Config make_config(const std::string &graph,
++                             const std::string &annotation,
++                             unsigned int threads) {
++    std::vector<std::string> args = {
++        "pymetagraph", "server_query",
++        "-i", graph,
++        "-a", annotation,
++        "-p", std::to_string(std::max(1u, threads)),
++    };
++    std::vector<char*> argv;
++    argv.reserve(args.size());
++    for (auto &arg : args) {
++        argv.push_back(arg.data());
++    }
++    return mtg::cli::Config(static_cast<int>(argv.size()), argv.data());
++}
++
++// Config sets MetaGraph's process-global (non-atomic) thread count, which the
++// loaders and some annotation queries read. Constructions write it exclusively,
++// queries read it under a shared lock.
++std::shared_mutex num_threads_mutex;
++
++// Run task(i) for every i in indices on the pool and wait for all of them.
++// ThreadPool terminates the process if a task throws on a worker, so catch
++// inside each task and rethrow the first exception once all have finished.
++void run_in_pool(ThreadPool &pool, const std::vector<size_t> &indices,
++                 const std::function<void(size_t)> &task) {
++    std::mutex error_mutex;
++    std::exception_ptr error;
++    std::vector<std::shared_future<void>> futures;
++    futures.reserve(indices.size());
++    for (size_t i : indices) {
++        futures.push_back(pool.enqueue([&, i]() {
++            try {
++                task(i);
++            } catch (...) {
++                std::lock_guard<std::mutex> lock(error_mutex);
++                if (!error)
++                    error = std::current_exception();
++            }
++        }));
++    }
++    for (auto &future : futures) {
++        future.wait();
++    }
++    if (error)
++        std::rethrow_exception(error);
++}
++
++} // namespace
++
++class AnnotatedGraph {
++  public:
++    using Hits = std::vector<std::pair<std::string, size_t>>;
++
++    AnnotatedGraph(const std::string &graph,
++                   const std::string &annotation,
++                   unsigned int threads) {
++        std::unique_lock<std::shared_mutex> lock(num_threads_mutex);
++        auto config = make_config(graph, annotation, threads);
++        graph_ = mtg::cli::load_critical_dbg(config.infbase);
++        anno_dbg_ = mtg::cli::initialize_annotated_dbg(graph_, config);
++        thread_pool_ = std::make_unique<ThreadPool>(std::max(1u, threads));
++    }
++
++    size_t k() const { return graph_->get_k(); }
++
++    std::vector<std::string> labels() const {
++        return anno_dbg_->get_annotator().get_label_encoder().get_labels();
++    }
++
++    // Top labels of each sequence with their numbers of matching k-mers, by
++    // decreasing count. A sequence without hits (or shorter than k) gets an
++    // empty list. No num_top_labels means no limit, as in `metagraph query`.
++    std::vector<Hits> query(const std::vector<std::string> &seqs,
++                            std::optional<size_t> num_top_labels,
++                            double discovery_fraction,
++                            double presence_fraction) const {
++        if (!std::isfinite(discovery_fraction) || !std::isfinite(presence_fraction)
++                || discovery_fraction < 0 || discovery_fraction > 1
++                || presence_fraction < 0 || presence_fraction > 1) {
++            throw std::invalid_argument(
++                "discovery_fraction and presence_fraction must be in [0, 1]");
++        }
++        const size_t max_labels = num_top_labels.value_or(std::numeric_limits<size_t>::max());
++        std::shared_lock<std::shared_mutex> lock(num_threads_mutex);
++        std::vector<Hits> results(seqs.size());
++        std::vector<size_t> indices;
++        for (size_t i = 0; i < seqs.size(); ++i) {
++            if (seqs[i].size() >= k())
++                indices.push_back(i);
++        }
++        run_in_pool(*thread_pool_, indices, [&](size_t i) {
++            results[i] = anno_dbg_->get_top_labels(seqs[i], max_labels,
++                                                   discovery_fraction,
++                                                   presence_fraction);
++            // get_top_labels sorts only when it truncates to num_top_labels
++            std::ranges::stable_sort(results[i], std::greater<>(), &Hits::value_type::second);
++        });
++
++        return results;
++    }
++
++  private:
++    std::shared_ptr<mtg::graph::DeBruijnGraph> graph_;
++    std::unique_ptr<mtg::graph::AnnotatedDBG> anno_dbg_;
++    std::unique_ptr<ThreadPool> thread_pool_;
++};
++
++PYBIND11_MODULE(_pymetagraph_core, m) {
++    m.doc() = "In-process queries against an annotated metagraph index";
++
++    py::class_<AnnotatedGraph>(m, "AnnotatedGraph")
++        .def(py::init<const std::string&, const std::string&, unsigned int>(),
++             py::arg("graph"), py::arg("annotation"), py::arg("threads") = 1,
++             py::call_guard<py::gil_scoped_release>())
++        .def_property_readonly("k", &AnnotatedGraph::k)
++        .def_property_readonly("labels", &AnnotatedGraph::labels)
++        .def("query", &AnnotatedGraph::query,
++             // same defaults as `metagraph query`
++             py::arg("seqs"), py::arg("num_top_labels") = py::none(),
++             py::arg("discovery_fraction") = 0.7, py::arg("presence_fraction") = 0.0,
++             py::call_guard<py::gil_scoped_release>());
++
++    // Test hook: a task that throws on a worker thread must surface as a Python
++    // exception rather than terminate the process
++    m.def("_raise_in_worker", [](unsigned int threads) {
++        ThreadPool pool(std::max(1u, threads));
++        run_in_pool(pool, { 0, 1, 2, 3 }, [](size_t i) {
++            if (i == 2)
++                throw std::runtime_error("error in worker");
++        });
++    }, py::arg("threads") = 2, py::call_guard<py::gil_scoped_release>());
++}

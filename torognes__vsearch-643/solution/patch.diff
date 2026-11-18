@@ -1,0 +1,354 @@
+diff --git a/src/db.h b/src/db.h
+index edbac9111..224caa63e 100644
+--- a/src/db.h
++++ b/src/db.h
+@@ -69,6 +69,14 @@ struct seqinfo_s
+   std::size_t header_p {};
+   std::size_t seq_p {};
+   std::size_t qual_p {};
++  // headerlen and seqlen are intentionally kept 32-bit: --maxseqlength is
++  // capped at UINT32_MAX (see cli.cc), so no accepted record can overflow
++  // them, and the two fields share a single 8-byte slot here. Widening either
++  // to 64-bit grows seqinfo_s from 40 to 48 bytes — +8 bytes per sequence in
++  // the seqindex array (alignment padding makes widening just one cost the
++  // same as widening both). If the --maxseqlength cap is ever raised above
++  // UINT32_MAX, widen both to uint64_t (and drop the narrowing casts in
++  // db_add()); until then the cap is the guard for the N1(c) storage path.
+   unsigned int headerlen {};
+   unsigned int seqlen {};
+   uint64_t size {};  // abundance; 64-bit so a per-sequence ;size= above UINT_MAX
+diff --git a/src/fasta.cc b/src/fasta.cc
+index 26c776f37..092d341c2 100644
+--- a/src/fasta.cc
++++ b/src/fasta.cc
+@@ -443,19 +443,22 @@ auto fasta_print_sequence(std::FILE * output_handle, char const * seq, uint64_t
+     Specify width of lines - zero (or <1) means linearize (all on one line).
+   */
+ 
+-  auto const sequence_length = static_cast<int>(len);
+-
+   if (width < 1)  // no sequence folding
+     {
+-      std::fprintf(output_handle, "%.*s\n", sequence_length, seq);
++      /* len may exceed INT_MAX, which the "%.*s" precision (an int) cannot
++         express, so write the bytes directly rather than through fprintf. */
++      std::fwrite(seq, 1, len, output_handle);
++      std::fprintf(output_handle, "\n");
+     }
+   else  // sequence folding every 'width'
+     {
+-      auto rest = sequence_length;
+-      for (auto i = 0; i < sequence_length; i += width)
++      auto const width_u = static_cast<uint64_t>(width);
++      for (uint64_t i = 0; i < len; i += width_u)
+         {
+-          std::fprintf(output_handle, "%.*s\n", std::min(rest, width), seq + i);
+-          rest -= width;
++          /* each chunk is at most 'width' (an int), so the cast is safe even
++             when the whole sequence is longer than INT_MAX */
++          auto const chunk = static_cast<int>(std::min(len - i, width_u));
++          std::fprintf(output_handle, "%.*s\n", chunk, seq + i);
+         }
+     }
+ }
+@@ -476,6 +479,15 @@ inline auto fprint_seq_label(std::FILE * output_handle, char const * seq, int co
+ }
+ 
+ 
++// NOTE: the sequence length `len` is still carried as int here and used for
++// the length= annotation, the --relabel_sha1/md5 digest and the
++// --relabel_self label (fprint_seq_label). fasta_print_sequence itself now
++// handles 64-bit lengths, but a single sequence longer than INT_MAX would
++// still be mis-annotated / mis-hashed and its relabel_self label truncated.
++// Widening this interface (and its ~15 callers, the digest chain and the
++// fastq equivalent) is the deferred S5 Tier-2 sweep; see CODE_REVIEW.md.
++// Reachable only with a >2 GB single sequence and --maxseqlength raised, and
++// read-only (wrong output, no corruption).
+ auto fasta_print_general(std::FILE * output_handle,
+                          char const * prefix,
+                          char const * seq,
+diff --git a/src/fastq.cc b/src/fastq.cc
+index 9ac90a3b2..3991298d2 100644
+--- a/src/fastq.cc
++++ b/src/fastq.cc
+@@ -692,6 +692,12 @@ inline auto fprint_seq_label(std::FILE * output_handle, char const * seq, int co
+ }
+ 
+ 
++// NOTE: the sequence length `len` is carried as int and used directly in the
++// "%.*s" sequence/quality output below, so a single sequence longer than
++// INT_MAX would be printed as garbage/truncated (the "%.*s" precision is an
++// int). Widening this interface and its callers is the deferred S5 Tier-2
++// sweep; see CODE_REVIEW.md. Reachable only with a >2 GB single sequence and
++// --maxseqlength raised, and read-only (no corruption).
+ auto fastq_print_general(FILE * output_handle,
+                          char const * seq,
+                          int const len,
+diff --git a/src/fastx.cc b/src/fastx.cc
+index 5bb7d07e8..96a124fc9 100644
+--- a/src/fastx.cc
++++ b/src/fastx.cc
+@@ -72,6 +72,7 @@
+ #include <cstdlib>  // std::exit, EXIT_FAILURE
+ #include <cstring>  // std::memcpy, std::memcmp, std::strcmp
+ #include <iterator> // std::distance
++#include <limits>  // std::numeric_limits
+ #include <vector>
+ 
+ 
+@@ -189,6 +190,31 @@ auto fastx_filter_header(fastx_handle input_handle, bool truncateatspace) -> voi
+   auto const count = truncateatspace ? find_header_end_first_blank(raw_header) : find_header_end(raw_header);
+   input_handle->header_buffer.length = count;
+ 
++  /* Reject a header too long for the int header-length bookkeeping used
++     downstream (searchinfo_s::query_head_len / query_head_alloc, where the
++     allocation is query_head_len + 2001). Such a header would be narrowed to a
++     negative int and overflow the per-query header buffer. The sequence length
++     is bounded by --maxseqlength, but the header length is not, so guard it
++     here, at the single point all FASTA/FASTQ (and DB) reads pass through.
++     Mirrors the deferred/fatal handling of the illegal-character check below:
++     on a worker thread the error is recorded and reported from the main
++     thread, never fatal()ed here. */
++  static constexpr auto max_header_length =
++    static_cast<std::size_t>(std::numeric_limits<int>::max()) - 2001;
++  if (count > max_header_length) {
++    std::array<char, 256> message {{}};
++    std::snprintf(message.data(), message.size(),
++                  "FASTA/FASTQ header too long (%" PRIu64 " bytes) on line %"
++                  PRIu64 ".\nHeaders longer than %" PRIu64 " bytes are not supported.",
++                  static_cast<uint64_t>(count), input_handle->lineno_start,
++                  static_cast<uint64_t>(max_header_length));
++    if (input_handle->defer_errors) {
++      fastx_set_deferred_error(input_handle, message.data());
++      return;
++    }
++    fatal(message.data());
++  }
++
+   // scan for unusual symbols
+   auto const trimmed_header = raw_header.first(count);
+   for (auto const symbol: trimmed_header) {
+diff --git a/src/getseq.cc b/src/getseq.cc
+index f478d58c9..833dafcf3 100644
+--- a/src/getseq.cc
++++ b/src/getseq.cc
+@@ -176,25 +176,25 @@ auto test_label_match(fastx_handle input_handle) -> bool
+ {
+   char const * header = fastx_get_header(input_handle);
+   auto const header_length = fastx_get_header_length(input_handle);
+-  int const hlen = static_cast<int>(header_length);
++  auto const hlen = static_cast<std::size_t>(header_length);
+   auto const header_view = Span<char>{header, header_length};
+   auto const longest_label = find_length_longest_label(labels_data);
+   std::vector<char> field_buffer;
+-  int field_len = 0;
++  std::size_t field_len = 0;
+   if (opt_label_field != nullptr)
+     {
+-      field_len = static_cast<int>(std::strlen(opt_label_field));
+-      int field_buffer_size = field_len + 2;
++      field_len = std::strlen(opt_label_field);
++      std::size_t field_buffer_size = field_len + 2;
+       if (opt_label_word != nullptr)
+         {
+-          field_buffer_size += static_cast<int>(std::strlen(opt_label_word));
++          field_buffer_size += std::strlen(opt_label_word);
+         }
+       else
+         {
+-          field_buffer_size += static_cast<int>(longest_label);
++          field_buffer_size += longest_label;
+         }
+-      field_buffer.resize(static_cast<std::size_t>(field_buffer_size));
+-      std::snprintf(field_buffer.data(), static_cast<std::size_t>(field_buffer_size), "%s=", opt_label_field);
++      field_buffer.resize(field_buffer_size);
++      std::snprintf(field_buffer.data(), field_buffer_size, "%s=", opt_label_field);
+     }
+ 
+   if (opt_label != nullptr)
+@@ -231,10 +231,10 @@ auto test_label_match(fastx_handle input_handle) -> bool
+       char const * needle = opt_label_word;
+       if (opt_label_field != nullptr)
+         {
+-          std::strcpy(&field_buffer[static_cast<std::size_t>(field_len + 1)], needle);
++          std::strcpy(&field_buffer[field_len + 1], needle);
+           needle = field_buffer.data();
+         }
+-      int const wlen = static_cast<int>(std::strlen(needle));
++      auto const wlen = std::strlen(needle);
+       char const * hit = header_view.data();
+       while (true)
+         {
+@@ -269,21 +269,21 @@ auto test_label_match(fastx_handle input_handle) -> bool
+     }
+   else if (opt_label_words != nullptr)
+     {
+-      char const * const header_end = std::next(header, hlen);
++      char const * const header_end = header + hlen;
+       for (auto const & label: labels_data) {
+         // labels read from a file are stored as std::vector<char>
+         // without a trailing '\0', so the needle length must come from
+         // label.size() and the search must be range-based; strlen and
+         // strstr would read past the vector's storage
+         char const * needle = label.data();
+-        int wlen = static_cast<int>(label.size());
++        std::size_t wlen = label.size();
+         if (opt_label_field != nullptr)
+           {
+-            std::copy(label.begin(), label.end(), &field_buffer[static_cast<std::size_t>(field_len + 1)]);
++            std::copy(label.begin(), label.end(), &field_buffer[field_len + 1]);
+             needle = field_buffer.data();
+-            wlen = field_len + 1 + static_cast<int>(label.size());
++            wlen = field_len + 1 + label.size();
+           }
+-        char const * const needle_end = std::next(needle, wlen);
++        char const * const needle_end = needle + wlen;
+         char const * hit = header;
+         while (true)
+           {
+diff --git a/src/otutable.cc b/src/otutable.cc
+index c74e729d2..b3cb60613 100644
+--- a/src/otutable.cc
++++ b/src/otutable.cc
+@@ -178,7 +178,7 @@ auto otutable_add(char const * query_header, char const * target_header, int64_t
+ {
+   /* read sample annotation in query */
+ 
+-  int len_sample = 0;
++  std::size_t len_sample = 0;
+   char const * start_sample = query_header;
+   std::vector<char> sample_name;
+ 
+@@ -189,36 +189,36 @@ auto otutable_add(char const * query_header, char const * target_header, int64_t
+       if (regexec(&otutable->regex_sample, query_header, 5, pmatch_sample.data(), 0) == 0)
+         {
+           /* match: use the matching sample name */
+-          len_sample = pmatch_sample[3].rm_eo - pmatch_sample[3].rm_so;
++          len_sample = static_cast<std::size_t>(pmatch_sample[3].rm_eo - pmatch_sample[3].rm_so);
+           start_sample += pmatch_sample[3].rm_so;
+         }
+ #else
+       std::cmatch cmatch_sample;
+       if (std::regex_search(query_header, cmatch_sample, regex_sample))
+         {
+-          len_sample = cmatch_sample.length(3);
++          len_sample = static_cast<std::size_t>(cmatch_sample.length(3));
+           start_sample += cmatch_sample.position(3);
+         }
+ #endif
+       else
+         {
+           /* no match: use first name in header with A-Za-z0-9_ */
+-          len_sample = static_cast<int>(std::strspn(query_header,
++          len_sample = std::strspn(query_header,
+                               "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                               "abcdefghijklmnopqrstuvwxyz"
+                               "_"
+-                              "0123456789"));
++                              "0123456789");
+         }
+ 
+-      sample_name.resize(static_cast<std::size_t>(len_sample) + 1);
+-      std::copy(start_sample, std::next(start_sample, len_sample), sample_name.begin());
+-      sample_name[static_cast<std::size_t>(len_sample)] = '\0';
++      sample_name.resize(len_sample + 1);
++      std::copy(start_sample, start_sample + len_sample, sample_name.begin());
++      sample_name[len_sample] = '\0';
+     }
+ 
+ 
+   /* read OTU annotation in target */
+ 
+-  int len_otu = 0;
++  std::size_t len_otu = 0;
+   char const * start_otu = target_header;
+   std::vector<char> otu_name;
+ 
+@@ -229,26 +229,26 @@ auto otutable_add(char const * query_header, char const * target_header, int64_t
+       if (regexec(&otutable->regex_otu, target_header, 4, pmatch_otu.data(), 0) == 0)
+         {
+           /* match: use the matching otu name */
+-          len_otu = pmatch_otu[2].rm_eo - pmatch_otu[2].rm_so;
++          len_otu = static_cast<std::size_t>(pmatch_otu[2].rm_eo - pmatch_otu[2].rm_so);
+           start_otu += pmatch_otu[2].rm_so;
+         }
+ #else
+       std::cmatch cmatch_otu;
+       if (std::regex_search(target_header, cmatch_otu, regex_otu))
+         {
+-          len_otu = cmatch_otu.length(2);
++          len_otu = static_cast<std::size_t>(cmatch_otu.length(2));
+           start_otu += cmatch_otu.position(2);
+         }
+ #endif
+       else
+         {
+           /* no match: use first name in header up to ; */
+-          len_otu = static_cast<int>(std::strcspn(target_header, ";"));
++          len_otu = std::strcspn(target_header, ";");
+         }
+ 
+-      otu_name.resize(static_cast<std::size_t>(len_otu) + 1);
+-      std::copy(start_otu, std::next(start_otu, len_otu), otu_name.begin());
+-      otu_name[static_cast<std::size_t>(len_otu)] = '\0';
++      otu_name.resize(len_otu + 1);
++      std::copy(start_otu, start_otu + len_otu, otu_name.begin());
++      otu_name[len_otu] = '\0';
+ 
+       /* read tax annotation in target */
+ 
+@@ -257,13 +257,13 @@ auto otutable_add(char const * query_header, char const * target_header, int64_t
+       if (regexec(&otutable->regex_tax, target_header, 4, pmatch_tax.data(), 0) == 0)
+         {
+           /* match: use the matching tax name */
+-          int const len_tax = pmatch_tax[2].rm_eo - pmatch_tax[2].rm_so;
++          std::size_t const len_tax = static_cast<std::size_t>(pmatch_tax[2].rm_eo - pmatch_tax[2].rm_so);
+           char const * start_tax = target_header;
+           start_tax += pmatch_tax[2].rm_so;
+ 
+-          std::vector<char> tax_name(static_cast<std::size_t>(len_tax) + 1);
+-          std::copy(start_tax, std::next(start_tax, len_tax), tax_name.begin());
+-          tax_name[static_cast<std::size_t>(len_tax)] = '\0';
++          std::vector<char> tax_name(len_tax + 1);
++          std::copy(start_tax, start_tax + len_tax, tax_name.begin());
++          tax_name[len_tax] = '\0';
+           otutable->otu_tax_map[otu_name.data()] = tax_name.data();
+         }
+ #else
+diff --git a/src/results.cc b/src/results.cc
+index 538c7ba4d..7887fc75f 100644
+--- a/src/results.cc
++++ b/src/results.cc
+@@ -727,7 +727,7 @@ auto results_show_alnout(std::FILE * output_handle,
+       std::fprintf(output_handle,"Target %*" PRId64 "nt >%s\n", numwidth,
+               dseqlen, db_getheader(target));
+ 
+-      int const rowlen = (opt_rowlen == 0) ? static_cast<int>(qseqlen + dseqlen) : static_cast<int>(opt_rowlen);
++      int64_t const rowlen = (opt_rowlen == 0) ? (qseqlen + dseqlen) : opt_rowlen;
+ 
+       align_show(output_handle,
+                  qsequence,
+diff --git a/src/showalign.cc b/src/showalign.cc
+index a89996222..c28965a48 100644
+--- a/src/showalign.cc
++++ b/src/showalign.cc
+@@ -306,7 +306,7 @@ auto align_show(std::FILE * output_handle,
+                 int64_t const cigarlen,
+                 int const numwidth,
+                 int const namewidth,
+-                int const alignwidth,
++                int64_t const alignwidth,
+                 int const strand) -> void
+ {
+ 
+diff --git a/src/showalign.h b/src/showalign.h
+index be3365cbd..7052367e2 100644
+--- a/src/showalign.h
++++ b/src/showalign.h
+@@ -85,5 +85,5 @@ auto align_show(std::FILE * output_handle,
+                 int64_t cigarlen,
+                 int numwidth,
+                 int namewidth,
+-                int alignwidth,
++                int64_t alignwidth,
+                 int strand) -> void;

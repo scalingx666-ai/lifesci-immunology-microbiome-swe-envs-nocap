@@ -1,0 +1,369 @@
+diff --git a/bin/check_samplesheet.py b/bin/check_samplesheet.py
+index 0cd27833..a1eb67b1 100755
+--- a/bin/check_samplesheet.py
++++ b/bin/check_samplesheet.py
+@@ -47,7 +47,23 @@ class RowChecker:
+         ".fastq.clean.gz",
+         ".fq.clean.gz",
+         ".fastq",
+-        ".fq"
++        ".fq",
++        # FASTA formats — these inputs skip QC steps (fastp, fastqc, trimming, host removal)
++        ".fa",
++        ".fasta",
++        ".fna",
++        ".fa.gz",
++        ".fasta.gz",
++        ".fna.gz",
++    )
++
++    FASTA_FORMATS = (
++        ".fa",
++        ".fasta",
++        ".fna",
++        ".fa.gz",
++        ".fasta.gz",
++        ".fna.gz",
+     )
+ 
+     def __init__(
+@@ -97,19 +113,72 @@ def validate_and_transform(self, row):
+ 
+         """
+         self._validate_sample(row)
+-        # check if the path of row['fastq_1'] is a directory or file
+-        # if directory, then row['fastq_1'] is the directory name
+-        # if file, then row['fastq_1'] is the file name , check if the path is a directory too
+-        if row['fastq_1'] and row['fastq_1'] != '' and not any(row['fastq_1'].endswith(extension) for extension in self.VALID_FORMATS):
++
++        # ── Multi-file support ────────────────────────────────────────────────
++        # fastq_1 may contain multiple file paths separated by ';', e.g.:
++        #   reads1.fa;reads2.fa;reads3.fa
++        # Each path is validated individually.  All paths must be the same type
++        # (all FASTA or all FASTQ); mixing raises an error.
++        # The normalised ';'-joined string is written back to the field so that
++        # downstream parsing in input_check.nf just needs to split on ';'.
++        # ─────────────────────────────────────────────────────────────────────
++        raw_value = row.get(self._first_col, '') or ''
++        raw_paths = [p.strip() for p in raw_value.split(';') if p.strip()]
++        is_multi = len(raw_paths) > 1
++
++        # Single path with no recognised extension → directory (ONT/ARTIC mode)
++        if (not is_multi and raw_paths
++                and not any(raw_paths[0].endswith(ext) for ext in self.VALID_FORMATS)):
+             row[self._single_col] = True
+             row[self._dir_col] = True
++            row['is_fasta'] = False
++            row[self._needscompressing] = None
+             self._seen.add((row[self._sample_col], row[self._first_col]))
++
++        elif raw_paths and all(any(p.endswith(ext) for ext in self.FASTA_FORMATS)
++                               for p in raw_paths):
++            # One or more FASTA files
++            row[self._single_col] = True
++            row[self._dir_col] = False
++            row['is_fasta'] = True
++            row[self._needscompressing] = None
++            # FASTA inputs are always single-end; ignore fastq_2 if present
++            if row.get(self._second_col):
++                row[self._second_col] = None
++            row[self._first_col] = ';'.join(raw_paths)
++            self._seen.add((row[self._sample_col], row[self._first_col]))
++
++        elif raw_paths and any(any(p.endswith(ext) for ext in self.FASTA_FORMATS)
++                               for p in raw_paths):
++            # Mixed FASTA + FASTQ → not supported
++            raise AssertionError(
++                f"fastq_1 contains a mix of FASTA and FASTQ files, which is not "
++                f"supported: {raw_value}"
++            )
++
+         else:
++            # All FASTQ (single or multiple files)
+             row[self._single_col] = True
+             row[self._dir_col] = False
+-            self._validate_first(row)
+-            self._validate_second(row)
+-            self._validate_pair(row)
++            row['is_fasta'] = False
++            if is_multi:
++                # Multiple FASTQ files → validate each path individually.
++                # Force single_end and clear fastq_2 (pairing with a 2nd column
++                # is ambiguous when fastq_1 already contains multiple files).
++                needs_compress = False
++                for p in raw_paths:
++                    result = self._validate_fastq_format(p)
++                    if result:
++                        needs_compress = True
++                row[self._needscompressing] = True if needs_compress else None
++                row[self._first_col] = ';'.join(raw_paths)
++                if row.get(self._second_col):
++                    row[self._second_col] = None
++            else:
++                # Single FASTQ file — existing single/paired-end logic
++                self._validate_first(row)
++                self._validate_second(row)
++                self._validate_pair(row)
+             self._seen.add((row[self._sample_col], row[self._first_col]))
+         # for each attribute in row, strip spaces on either side
+         for key in row:
+@@ -229,7 +298,7 @@ def sniff_format(handle):
+ 
+ # Columns that belong to the pipeline infrastructure, not sample metadata
+ _PIPELINE_COLS = {"fastq_1", "fastq_2", "platform", "type", "sequencing_summary", "negative", "trim", "positive",
+-                  "single_end", "directory", "needscompressing"}
++                  "single_end", "directory", "needscompressing", "is_fasta", "minimap2_preset"}
+ 
+ 
+ def check_samplesheet(file_in, file_out, file_meta=None):
+@@ -281,6 +350,8 @@ def check_samplesheet(file_in, file_out, file_meta=None):
+     header.insert(1, "single_end")
+     header.insert(1, "directory")
+     header.insert(1, "needscompressing")
++    if "is_fasta" not in header:
++        header.insert(1, "is_fasta")
+     # remove any header that is empty string
+     header = [x for x in header if x != '']
+     # See https://docs.python.org/3.9/library/csv.html#id3 to read up on `newline=""`.
+diff --git a/examples/samplesheetfasta.csv b/examples/samplesheetfasta.csv
+new file mode 100644
+index 00000000..99097f35
+--- /dev/null
++++ b/examples/samplesheetfasta.csv
+@@ -0,0 +1,2 @@
++sample,platform,fastq_1,fastq_2,sequencing_summary,trim,type
++FASTA A,ILLUMINA,/Users/merribb1/Downloads/nanosim.fna.gz,,,TRUE,nasal
+diff --git a/modules/nf-core/kraken2/kraken2/main.nf b/modules/nf-core/kraken2/kraken2/main.nf
+index b11cd33e..881b11b2 100644
+--- a/modules/nf-core/kraken2/kraken2/main.nf
++++ b/modules/nf-core/kraken2/kraken2/main.nf
+@@ -27,7 +27,7 @@ process KRAKEN2_KRAKEN2 {
+     def args = task.ext.args ?: ''
+     def prefix = task.ext.prefix ?: "${meta.id}"
+     def paired       = meta.single_end ? "" : "--paired"
+-    // get basename of the db 
++    // get basename of the db
+     def db_basename = db.getName()
+ 
+     def classified   = meta.single_end ? "${prefix}.${db_basename}.classified.fastq"   : "${prefix}.${db_basename}.classified#.fastq"
+@@ -38,21 +38,29 @@ process KRAKEN2_KRAKEN2 {
+     def readclassification_command = save_reads_assignment ? "--output ${prefix}.kraken2.classifiedreads.txt" : ""
+     def compress_reads_command = save_output_fastqs ? "pigz -p $task.cpus *.fastq" : ""
+     def minimum_hit_groups = params.k2_minimum_hit_groups ? "--minimum-hit-groups ${params.k2_minimum_hit_groups}" : ""
+-    
++
++    // Only pass --gzip-compressed when ALL input files are actually gzip-compressed.
++    // Plain FASTA inputs (.fa / .fasta / .fna) must NOT have this flag or Kraken2
++    // will try to decompress a non-compressed stream and fail.
++    // Gzipped FASTA (.fa.gz / .fasta.gz) and the usual .fastq.gz both need it.
++    def read_list  = reads instanceof List ? reads : [reads]
++    def is_gzipped = read_list.every { it.name.endsWith('.gz') }
++    def gzip_cmd   = is_gzipped ? '--gzip-compressed' : ''
++
+     """
+     kraken2 \\
+         --db $db \\
+         --threads $task.cpus \\
+         --report ${prefix}.kraken2.report.txt \\
+-        --gzip-compressed \\
++        $gzip_cmd \\
+         $unclassified_command \\
+         $classified_command \\
+         $minimum_hit_groups \\
+         $readclassification_command \\
+         $paired $confidence \\
+         $args  \\
+-        $reads > /dev/null 
+-        
++        $reads > /dev/null
++
+     $compress_reads_command
+ 
+     cat <<-END_VERSIONS > versions.yml
+diff --git a/modules/nf-core/minimap2/align/main.nf b/modules/nf-core/minimap2/align/main.nf
+index 3d6623ee..21c0c03a 100644
+--- a/modules/nf-core/minimap2/align/main.nf
++++ b/modules/nf-core/minimap2/align/main.nf
+@@ -25,12 +25,23 @@ process MINIMAP2_ALIGN {
+     def args = task.ext.args ?: ''
+     def prefix = task.ext.prefix ?: "${meta.id}"
+ 
++    // Resolve the minimap2 preset.
++    // Priority: meta.minimap2_preset (user-supplied per-sample) >
++    //           meta.platform-derived default.
++    // Valid preset names (passed without the leading -ax):
++    //   map-ont, map-pb, map-pb (CLR), map-hifi (HiFi/CCS), lr:hq (ONT Q20),
++    //   sr (short reads), splice (spliced long reads), splice:hq (Iso-seq),
++    //   splice:sr (short-read RNA-seq), asm5/asm10/asm20 (assembly alignment),
++    //   ava-pb, ava-ont (read overlap).
+     def mapx = ''
+-    if (meta.platform =~ /(?i)illumina/) {
++    if (meta.minimap2_preset) {
++        mapx = "-ax ${meta.minimap2_preset}"
++    } else if (meta.platform =~ /(?i)illumina/) {
+         mapx = '-ax sr'
+     } else if (meta.platform =~ /(?i)pacbio/) {
+         mapx = '-ax map-hifi'
+     } else {
++        // Default: Oxford Nanopore (also used for unspecified / FASTA inputs)
+         mapx = '-ax map-ont'
+     }
+ 
+diff --git a/subworkflows/local/input_check.nf b/subworkflows/local/input_check.nf
+index e4c4809d..b5621c07 100644
+--- a/subworkflows/local/input_check.nf
++++ b/subworkflows/local/input_check.nf
+@@ -106,12 +106,16 @@ def create_fastq_channel(LinkedHashMap row) {
+     if (meta.aligner != 'minimap2' && meta.aligner != 'hisat2' && meta.aligner != 'bowtie2') {
+         exit 1, "ERROR: Please check input samplesheet -> aligner is not specified as minimap2, hisat2, or bowtie2 \n${meta.sample}"
+     }
+-    // Check if fastq_1 exists if not then error out and print error
+-    if (!file(meta.fastq_1).exists()) {
+-        exit 1, "ERROR: Please check input samplesheet -> Read 1 FastQ file does not exist!\n${meta.fastq_1}"
++    // fastq_1 may be a ';'-delimited list of paths (multi-file input).
++    // Check every path individually.
++    meta.fastq_1.split(';').each { rawPath ->
++        def p = rawPath.trim()
++        if (p && !file(p).exists()) {
++            exit 1, "ERROR: Please check input samplesheet -> sequence file does not exist!\n${p}"
++        }
+     }
+-    if (!meta.single_end && !file(meta.fastq_2).exists()) {
+-        exit 1, "ERROR: Please check input samplesheet -> Read 2 FastQ file does not exist!\n${meta.fastq_2}"
++    if (!meta.single_end && meta.fastq_2 && !file(meta.fastq_2).exists()) {
++        exit 1, "ERROR: Please check input samplesheet -> Read 2 sequence file (FASTQ) does not exist!\n${meta.fastq_2}"
+     }
+ 
+     if (row.trim && row.trim.toLowerCase() == "true"){
+@@ -122,6 +126,15 @@ def create_fastq_channel(LinkedHashMap row) {
+     meta.type = row.type
+     meta.directory = row.directory ?  row.directory.toBoolean() : null
+     meta.sequencing_summary = row.sequencing_summary ? file(row.sequencing_summary) : null
++    // FASTA input flag: set by check_samplesheet.py when fastq_1 is a FASTA file.
++    // Samples with is_fasta=true bypass all QC/trimming steps but still run
++    // through host removal, Kraken2, and alignment.
++    meta.is_fasta = (row.containsKey('is_fasta') && row.is_fasta != null && row.is_fasta.toString().toLowerCase() == 'true') ? true : false
++    // Optional minimap2 preset override (e.g. map-ont, map-pb, map-hifi, lr:hq,
++    // sr, splice, splice:hq, asm5, ava-pb, ava-ont …).  When set, overrides the
++    // platform-derived default in the MINIMAP2_ALIGN module for BOTH host removal
++    // and the main alignment step.  Leave blank to keep the existing behaviour.
++    meta.minimap2_preset = (row.containsKey('minimap2_preset') && row.minimap2_preset) ? row.minimap2_preset.trim() : null
+ 
+     // Control sample columns
+     meta.control = (row.control && row.control.toString().toUpperCase() == "TRUE") ? true : false
+@@ -138,25 +151,34 @@ def create_fastq_channel(LinkedHashMap row) {
+     meta.salinity        = (row.containsKey('salinity')        && row.salinity)        ? row.salinity.trim()        : null
+     meta.collection_time = (row.containsKey('collection_time') && row.collection_time) ? row.collection_time.trim() : null
+     meta.location        = (row.containsKey('location')        && row.location)        ? row.location.trim()        : null
+-    // add path(s) of the fastq file(s) to the meta map
++    // Build the [meta, reads] tuple.
++    // fastq_1 may be a ';'-delimited list of file paths for multi-file inputs
++    // (e.g. multiple FASTA assemblies fed to a single minimap2 splice run).
+     def fastq_meta = []
+-    if (meta.directory ){
+-        if (meta.platform == 'OXFORD' || meta.platform == "PACBIO"){
+-            fastq_meta = [ meta, [ file(meta.fastq_1) ]  ]
++    if (meta.directory) {
++        if (meta.platform == 'OXFORD' || meta.platform == 'PACBIO') {
++            fastq_meta = [ meta, [ file(meta.fastq_1) ] ]
+         } else {
+             exit 1, "ERROR: Please check input samplesheet -> the platform is not specified as OXFORD or PACBIO \n${meta.sample}"
+         }
+     } else {
+-        if (!file(meta.fastq_1).exists()) {
+-            exit 1, "ERROR: Please check input samplesheet -> Read 1 FastQ file does not exist!\n${meta.fastq_1}"
++        // Resolve all paths listed in fastq_1 (single path or ';'-separated list)
++        def read1_files = meta.fastq_1.split(';').collect { it.trim() }.findAll { it }.collect { p ->
++            if (!file(p).exists()) {
++                exit 1, "ERROR: Please check input samplesheet -> sequence file does not exist!\n${p}"
++            }
++            file(p)
+         }
+-        if (meta.single_end) {
+-            fastq_meta = [ meta, [ file(meta.fastq_1) ] ]
++
++        if (meta.single_end || read1_files.size() > 1) {
++            // Single-end OR multi-file: pass all read1 files as the reads list
++            fastq_meta = [ meta, read1_files ]
+         } else {
++            // Paired-end single file: combine read1 + read2
+             if (meta.fastq_2 && !file(meta.fastq_2).exists()) {
+-                exit 1, "ERROR: Please check input samplesheet -> Read 2 FastQ file does not exist!\n${meta.fastq_2}"
++                exit 1, "ERROR: Please check input samplesheet -> Read 2 sequence file (FASTQ) does not exist!\n${meta.fastq_2}"
+             }
+-            fastq_meta = [ meta, [ file(meta.fastq_1), file(meta.fastq_2) ] ]
++            fastq_meta = [ meta, [ read1_files[0], file(meta.fastq_2) ] ]
+         }
+     }
+ 
+diff --git a/workflows/taxtriage.nf b/workflows/taxtriage.nf
+index 8754cedb..79c1d69f 100644
+--- a/workflows/taxtriage.nf
++++ b/workflows/taxtriage.nf
+@@ -466,7 +466,20 @@ workflow TAXTRIAGE {
+         }
+     }
+ 
+-    ch_pass_files = ch_reads.map{ meta, reads -> {
++    // ── FASTA inputs: branch off before any QC / trimming / host-removal ────────
++    // Samples whose fastq_1 column contains a FASTA file (.fa/.fasta/.fna or .gz
++    // variants) set meta.is_fasta = true in input_check.nf.  They skip every
++    // read-quality step and are rejoined into the pipeline just before the
++    // classifier so that Kraken2 and alignment still run on them normally.
++    ch_reads.branch {
++        fasta: it[0].is_fasta == true
++        fastq: !(it[0].is_fasta == true)
++    }.set { reads_by_type }
++    ch_fasta_reads = reads_by_type.fasta
++    ch_reads       = reads_by_type.fastq
++
++    // ch_pass_files tracks every sample (FASTQ + FASTA) through to REPORT
++    ch_pass_files = ch_reads.mix(ch_fasta_reads).map{ meta, reads -> {
+             return [ meta ]
+         }
+     }
+@@ -563,6 +576,18 @@ workflow TAXTRIAGE {
+         params.include_singletons_removal = false
+     }
+ 
++    // Re-join FASTA inputs into the main read channel now so they benefit from
++    // host removal.  minimap2 handles FASTA queries natively; if host removal
++    // runs, REMOVE_HOSTREADS converts them to FASTQ via samtools-fastq (dummy
++    // quality scores).  If host removal is not configured, FASTA files pass
++    // through unchanged.  Either way, meta.is_fasta stays true and gates the
++    // QC visualisation steps below.
++    ch_fasta_reads = ch_fasta_reads.map { meta, reads ->
++        meta.read_count = 0   // COUNT_READS was skipped for these samples
++        [meta, reads]
++    }
++    ch_reads = ch_reads.mix(ch_fasta_reads)
++
+     HOST_REMOVAL(
+         ch_reads,
+         params.genome
+@@ -583,17 +608,23 @@ workflow TAXTRIAGE {
+     ch_multiqc_files = ch_multiqc_files.mix(HOST_REMOVAL.out.host_removal_stats)
+ 
+     //////////////////// RUN OPTIONAL FASTQC to get qc plots for multiqc  ////////////////////
++    // Skip QC plots for FASTA inputs: if host removal ran, those reads were
++    // converted to FASTQ with dummy quality scores by samtools-fastq, so the
++    // plots would be meaningless.  If host removal did not run, the files are
++    // still FASTA and FastQC / NanoPlot would error.
+     if (!params.skip_plots) {
+         FASTQC(
+-            ch_reads.filter { it[0].platform =~ /(?i)ILLUMINA/ }
++            ch_reads.filter { it[0].platform =~ /(?i)ILLUMINA/ && !it[0].is_fasta }
+         )
+         ch_versions = ch_versions.mix(FASTQC.out.versions.first())
+         NANOPLOT(
+-            ch_reads.filter { it[0].platform =~ /(?i)OXFORD/ || it[0].platform =~ /(?i)PACBIO/ }
++            ch_reads.filter { (it[0].platform =~ /(?i)OXFORD/ || it[0].platform =~ /(?i)PACBIO/) && !it[0].is_fasta }
+         )
+         ch_multiqc_files = ch_multiqc_files.mix(FASTQC.out.zip.collect { it[1] }.ifEmpty([]) )
+         ch_multiqc_files = ch_multiqc_files.mix(NANOPLOT.out.txt.collect { it[1] }.ifEmpty([]) )
+     }
++    // ch_reads now contains both processed FASTQ samples and FASTA samples
++    // (the latter having passed through host-removal but skipped all QC plots)
+     ch_filtered_reads = ch_reads
+     ch_profile = Channel.empty()
+     ch_preppedfiles = Channel.empty()

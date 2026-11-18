@@ -1,0 +1,201 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e7b4cfe26..77583a98d 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -126,6 +126,9 @@ jobs:
+       - name: BAM_FILTERING Run basic mapping pipeline with post-mapping length filtering
+         run: |
+           nextflow run ${GITHUB_WORKSPACE} -profile test_tsv,docker --clip_readlength 0 --run_bam_filtering --bam_filter_minreadlength 50
++      - name: PRESEQ Run basic mapping pipeline with different preseq mode
++        run: |
++          nextflow run ${GITHUB_WORKSPACE} -profile test_tsv,docker --preseq_mode 'lc_extrap' --preseq_maxextrap 10000 --preseq_bootstrap 10
+       - name: DEDUPLICATION Test with dedup
+         run: |
+           nextflow run ${GITHUB_WORKSPACE} -profile test_tsv,docker --dedupper 'dedup' --dedup_all_merged
+diff --git a/.github/workflows/linting.yml b/.github/workflows/linting.yml
+index fcde400ce..83a8bc100 100644
+--- a/.github/workflows/linting.yml
++++ b/.github/workflows/linting.yml
+@@ -107,7 +107,7 @@ jobs:
+       - name: Install dependencies
+         run: |
+           python -m pip install --upgrade pip
+-          pip install nf-core
++          pip install nf-core==1.14
+ 
+       - name: Run nf-core lint
+         env:
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9b7f01325..bd0abf3f7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
+ ### `Added`
+ 
+ - [#651](https://github.com/nf-core/eager/issues/651) - Adds removal of adapters specified in an AdapterRemoval adapter list file
++- [#769](https://github.com/nf-core/eager/issues/769) - Adds lc_extrap mode to preseq (requested by @roberta-davidson)
+ 
+ ### `Fixed`
+ 
+diff --git a/assets/multiqc_config.yaml b/assets/multiqc_config.yaml
+index 060c92028..021b86646 100644
+--- a/assets/multiqc_config.yaml
++++ b/assets/multiqc_config.yaml
+@@ -86,7 +86,9 @@ top_modules:
+             - '*_postfilterflagstat.stats'
+     - 'dedup'
+     - 'picard'
+-    - 'preseq'
++    - 'preseq':
++       path_filters:
++           - '*.preseq'
+     - 'damageprofiler'
+     - 'mtnucratio'
+     - 'qualimap'
+diff --git a/docs/output.md b/docs/output.md
+index 8a7bdadab..b39ab1568 100644
+--- a/docs/output.md
++++ b/docs/output.md
+@@ -653,7 +653,7 @@ Each module has it's own output directory which sit alongside the `MultiQC/` dir
+ * `samtools/`: this contains two sub-directories. `stats/` contain the raw mapping statistics files (ending in `.stats`) from directly after mapping. `filter/` contains BAM files that have had a mapping quality filter applied (set by the `--bam_mapping_quality_threshold` flag) and a corresponding index file. Furthermore, if you selected `--bam_discard_unmapped`, you will find your separate file with only unmapped reads in the format you selected. Note unmapped read BAM files will _not_ have an index file.
+ * `deduplication/`: this contains a sub-directory called `dedup/`, inside here are sample specific directories. Each directory contains a BAM file containing mapped reads but with PCR duplicates removed, a corresponding index file and two stats file. `.hist.` contains raw data for a deduplication histogram used for tools like preseq (see below), and the `.log` contains overall summary deduplication statistics.
+ * `endorSpy/`: this contains all JSON files exported from the endorSpy endogenous DNA calculation tool. The JSON files are generated specifically for display in the MultiQC general statistics table and is otherwise very likely not useful for you.
+-* `preseq/`: this contains a `.ccurve` file for every BAM file that had enough deduplication statistics to generate a complexity curve for estimating the amount unique reads that will be yield if the library is re-sequenced. You can use this file for plotting e.g. in `R` to find your sequencing target depth.
++* `preseq/`: this contains a `.preseq` file for every BAM file that had enough deduplication statistics to generate a complexity curve for estimating the amount unique reads that will be yield if the library is re-sequenced. You can use this file for plotting e.g. in `R` to find your sequencing target depth.
+ * `qualimap/`: this contains a sub-directory for every sample, which includes a qualimap report and associated raw statistic files. You can open the `.html` file in your internet browser to see the in-depth report (this will be more detailed than in MultiQC). This includes stuff like percent coverage, depth coverage, GC content and so on of your mapped reads.
+ * `damageprofiler/`: this contains sample specific directories containing raw statistics and damage plots from DamageProfiler. The `.pdf` files can be used to visualise C to T miscoding lesions or read length distributions of your mapped reads. All raw statistics used for the PDF plots are contained in the `.txt` files.
+ * `pmdtools/`: this contains raw output statistics of pmdtools (estimates of frequencies of substitutions), and BAM files which have been filtered to remove reads that do not have a Post-mortem damage (PMD) score of `--pmdtools_threshold`.
+diff --git a/main.nf b/main.nf
+index 8430c8f71..ee1db2bca 100644
+--- a/main.nf
++++ b/main.nf
+@@ -46,10 +46,15 @@ if ( params.skip_collapse && params.skip_trim ) {
+ }
+ 
+ // Bedtools validation
+-if(params.run_bedtools_coverage && !params.anno_file ){
++if( params.run_bedtools_coverage && !params.anno_file ){
+   exit 1, "[nf-core/eager] error: you have turned on bedtools coverage, but not specified a BED or GFF file with --anno_file. Please validate your parameters."
+ }
+ 
++// Bedtools validation
++if( !params.skip_preseq && !( params.preseq_mode == 'c_curve' || params.preseq_mode == 'lc_extrap' ) ) {
++  exit 1, "[nf-core/eager] error: you are running preseq with a unsupported mode. See documentation for more information. You gave: ${params.preseq_mode}."
++}
++
+ // BAM filtering validation
+ if (!params.run_bam_filtering && params.bam_mapping_quality_threshold != 0) {
+   exit 1, "[nf-core/eager] error: please turn on BAM filtering if you want to perform mapping quality filtering! Provide: --run_bam_filtering."
+@@ -1915,21 +1920,33 @@ process preseq {
+     tuple samplename, libraryid, lane, seqtype, organism, strandedness, udg, file(input) from ch_input_for_preseq
+ 
+     output:
+-    tuple samplename, libraryid, lane, seqtype, organism, strandedness, udg, path("${input.baseName}.ccurve") into ch_preseq_for_multiqc
++    tuple samplename, libraryid, lane, seqtype, organism, strandedness, udg, path("${input.baseName}.preseq") into ch_preseq_for_multiqc
+ 
+     script:
+     pe_mode = params.skip_collapse && seqtype == "PE" ? '-P' : ''
+-    if(!params.skip_deduplication && params.dedupper == "dedup"){
++    if(!params.skip_deduplication && params.preseq_mode == 'c_curve' && params.dedupper == "dedup"){
++    """
++    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.preseq -H ${input}
++    """
++    } else if( !params.skip_deduplication && params.preseq_mode == 'c_curve' && params.dedupper == "markduplicates"){
++    """
++    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.preseq -B ${input} ${pe_mode}
++    """
++    } else if ( params.skip_deduplication && params.preseq_mode == 'c_curve' ) {
++    """
++    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.preseq -B ${input} ${pe_mode}
++    """
++    } else if(!params.skip_deduplication && params.preseq_mode == 'lc_extrap' && params.dedupper == "dedup"){
+     """
+-    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.ccurve -H ${input}
++    preseq lc_extrap -s ${params.preseq_step_size} -o ${input.baseName}.preseq -H ${input} -n ${params.preseq_bootstrap} -e ${params.preseq_maxextrap} -cval ${params.preseq_cval} -x ${params.preseq_terms}
+     """
+-    } else if( !params.skip_deduplication && params.dedupper == "markduplicates"){
++    } else if( !params.skip_deduplication && params.preseq_mode == 'lc_extrap' && params.dedupper == "markduplicates"){
+     """
+-    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.ccurve -B ${input} ${pe_mode}
++    preseq lc_extrap -s ${params.preseq_step_size} -o ${input.baseName}.preseq -B ${input} ${pe_mode} -n ${params.preseq_bootstrap} -e ${params.preseq_maxextrap} -cval ${params.preseq_cval} -x ${params.preseq_terms}
+     """
+-    } else if ( params.skip_deduplication ) {
++    } else if ( params.skip_deduplication && params.preseq_mode == 'lc_extrap' ) {
+     """
+-    preseq c_curve -s ${params.preseq_step_size} -o ${input.baseName}.ccurve -B ${input} ${pe_mode}
++    preseq lc_extrap -s ${params.preseq_step_size} -o ${input.baseName}.preseq -B ${input} ${pe_mode} -n ${params.preseq_bootstrap} -e ${params.preseq_maxextrap} -cval ${params.preseq_cval} -x ${params.preseq_terms}
+     """
+     }
+ }
+diff --git a/nextflow.config b/nextflow.config
+index d5cf79f5e..92888f0de 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -109,6 +109,11 @@ params {
+ 
+   //Preseq settings
+   preseq_step_size = 1000
++  preseq_mode = 'c_curve'
++  preseq_bootstrap = 100
++  preseq_maxextrap = 10000000000
++  preseq_cval = 0.95
++  preseq_terms = 100
+ 
+   //DamageProfiler settings
+   damageprofiler_length = 100
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 835cccb68..6ad2e3070 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -767,12 +767,51 @@
+             "description": "Options for calculating library complexity (i.e. how many unique reads are present).",
+             "default": "",
+             "properties": {
++                "preseq_mode": {
++                    "type": "string",
++                    "default": "c_curve",
++                    "description": "Specify which mode of preseq to run.",
++                    "fa_icon": "fas fa-toggle-on",
++                    "help_text": "Specify which mode of preseq to run.\n\nFrom the [PreSeq documentation](http://smithlabresearch.org/wp-content/uploads/manual.pdf): \n\n`c curve` is used to compute the expected complexity curve of a mapped read file with a hypergeometric\nformula\n\n`lc extrap` is used to generate the expected yield for theoretical larger experiments and bounds on the\nnumber of distinct reads in the library and the associated confidence intervals, which is computed by\nbootstrapping the observed duplicate counts histogram",
++                    "enum": [
++                        "c_curve",
++                        "lc_extrap"
++                    ]
++                },
+                 "preseq_step_size": {
+                     "type": "integer",
+                     "default": 1000,
+                     "description": "Specify the step size of Preseq.",
+                     "fa_icon": "fas fa-shoe-prints",
+                     "help_text": "Can be used to configure the step size of Preseq's `c_curve` method. Can be useful when only few and thus shallow sequencing results are used for extrapolation.\n\n> Modifies preseq c_curve parameter: `-s`"
++                },
++                "preseq_maxextrap": {
++                    "type": "integer",
++                    "default": 10000000000,
++                    "description": "Specify the maximum extrapolation (lc_extrap mode only)",
++                    "fa_icon": "fas fa-ban",
++                    "help_text": "Specify the maximum extrapolation that `lc_extrap` mode will perform.\n\n> Modifies preseq lc_extrap parameter: `-e`"
++                },
++                "preseq_terms": {
++                    "type": "integer",
++                    "default": 100,
++                    "description": "Specify the maximum number of terms for extrapolation (lc_extrap mode only)",
++                    "fa_icon": "fas fa-sort-numeric-up-alt",
++                    "help_text": "Specify the maximum number of terms that `lc_extrap` mode will use.\n\n> Modifies preseq lc_extrap parameter: `-x`"
++                },
++                "preseq_bootstrap": {
++                    "type": "integer",
++                    "default": 100,
++                    "description": "Specify number of bootstraps to perform (lc_extrap mode only)",
++                    "fa_icon": "fab fa-bootstrap",
++                    "help_text": "Specify the number of bootstraps `lc_extrap` mode will perform to calculate confidence intervals.\n\n> Modifies preseq lc_extrap parameter: `-n`"
++                },
++                "preseq_cval": {
++                    "type": "number",
++                    "default": 0.95,
++                    "description": "Specify confidence interval level (lc_extrap mode only)",
++                    "fa_icon": "fas fa-check-circle",
++                    "help_text": "Specify the allowed level of confidence intervals used for `lc_extrap` mode.\n\n> Modifies preseq lc_extrap parameter: `-c`"
+                 }
+             },
+             "fa_icon": "fas fa-bezier-curve",

@@ -1,0 +1,291 @@
+diff --git a/docs/src/compute.md b/docs/src/compute.md
+index 284235d7..f418d678 100644
+--- a/docs/src/compute.md
++++ b/docs/src/compute.md
+@@ -46,6 +46,15 @@ awkward component does not abort a long run. The retry is logged as a warning;
+ if you see many of them, the grid probably has extreme resistance contrasts
+ worth examining.
+ 
++Single precision (`precision = single`) halves memory at a cost in accuracy
++that depends on the problem: on the largest raster in the test suite,
++effective resistances differ from the double precision run by about 1%, and
++the gap will be larger on bigger grids or with stronger resistance contrasts.
++The difference does not change when `residual_tolerance` is tightened, so it
++is a property of the Float32 arithmetic rather than of solver convergence;
++verify against a double precision run before relying on single precision
++results.
++
+ ## Default Solvers: CG+AMG and CHOLMOD
+ 
+ Circuitscape ships with two solvers that work out of the box with no additional
+diff --git a/ext/CircuitscapeAppleAccelerateExt.jl b/ext/CircuitscapeAppleAccelerateExt.jl
+index 1ae5550f..818b705e 100644
+--- a/ext/CircuitscapeAppleAccelerateExt.jl
++++ b/ext/CircuitscapeAppleAccelerateExt.jl
+@@ -3,7 +3,7 @@ module CircuitscapeAppleAccelerateExt
+ using AppleAccelerate
+ using SparseArrays
+ using LinearAlgebra
+-import Circuitscape: AccelerateSolver, construct_cholesky_factor, solve_linear_system
++import Circuitscape: AccelerateSolver, construct_cholesky_factor, solve_linear_system, refine_columns!
+ 
+ function construct_cholesky_factor(matrix, ::AccelerateSolver)
+     T = eltype(matrix)
+@@ -13,12 +13,7 @@ function construct_cholesky_factor(matrix, ::AccelerateSolver)
+ end
+ 
+ function solve_linear_system(factor::AppleAccelerate.AAFactorization, matrix, rhs; tol = 1e-4)
+-    lhs = factor \ rhs
+-    for col = 1:size(rhs, 2)
+-        residual = norm(matrix * lhs[:, col] .- rhs[:, col]) / norm(rhs[:, col])
+-        residual < tol || error("Apple Accelerate solver residual $residual exceeds tolerance $tol for column $col")
+-    end
+-    lhs
++    refine_columns!(factor \ rhs, factor, matrix, rhs, tol, "Apple Accelerate")
+ end
+ 
+ end # module CircuitscapeAppleAccelerateExt
+diff --git a/ext/CircuitscapePardisoExt.jl b/ext/CircuitscapePardisoExt.jl
+index 000e026c..6f439615 100644
+--- a/ext/CircuitscapePardisoExt.jl
++++ b/ext/CircuitscapePardisoExt.jl
+@@ -3,7 +3,7 @@ module CircuitscapePardisoExt
+ using Pardiso
+ using SparseArrays
+ using LinearAlgebra
+-import Circuitscape: PardisoSolver, construct_cholesky_factor, solve_linear_system
++import Circuitscape: PardisoSolver, construct_cholesky_factor, solve_linear_system, refine_columns!
+ 
+ mutable struct PardisoFactorize
+     const ps::Pardiso.MKLPardisoSolver
+@@ -31,17 +31,28 @@ end
+ construct_cholesky_factor(matrix, ::PardisoSolver) =
+     PardisoFactorize()
+ 
++# Lets refine_columns! use `\` on the Pardiso handle for a fixed matrix.
++struct PardisoOp
++    p::PardisoFactorize
++    A::SparseMatrixCSC
++end
++function Base.:\(o::PardisoOp, r::AbstractVector)
++    x = zeros(eltype(r), length(r))
++    o.p(x, o.A, Vector(r))
++    x
++end
++
+ function solve_linear_system(factor::PardisoFactorize, matrix, rhs; tol = 1e-4)
+-    lhs = similar(rhs)
+     mat = sparse(10eps(eltype(matrix)) * I, size(matrix)...) + matrix
+-    x = zeros(eltype(matrix), size(matrix, 1))
++    op = PardisoOp(factor, mat)
++    lhs = similar(rhs)
+     for i = 1:size(lhs, 2)
+-        factor(x, mat, rhs[:, i])
+-        residual = norm(mat * x .- rhs[:, i]) / norm(rhs[:, i])
+-        residual < tol || error("Pardiso solver residual $residual exceeds tolerance $tol for column $i")
+-        lhs[:, i] .= x
++        lhs[:, i] .= op \ rhs[:, i]
+     end
+-    lhs
++    # Pardiso already runs SOLVE_ITERATIVE_REFINE; this is the same
++    # residual-driven refinement the CHOLMOD and Accelerate backends apply,
++    # so all three direct solvers are held to the same standard.
++    refine_columns!(lhs, op, mat, rhs, tol, "Pardiso")
+ end
+ 
+ end # module CircuitscapePardisoExt
+diff --git a/src/core.jl b/src/core.jl
+index 09f9e15d..57e6d6a9 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -533,15 +533,37 @@ function solve_linear_system(
+           "after 3 attempts (last rtol = $(rtol * 100), $(stats.niter) iterations, $(stats.status))")
+ end
+ 
+-function solve_linear_system(factor::SuiteSparse.CHOLMOD.Factor, matrix, rhs; tol = TOL_DOUBLE)
+-    lhs = factor \ rhs
++"""
++    refine_columns!(lhs, factor, matrix, rhs, tol, name)
++
++Check every column of a direct solve against `tol`, applying iterative
++refinement with the existing factor where needed. In single precision a
++Cholesky solve of an ill-conditioned Laplacian lands at 1e-3..1e-2, well short
++of what CG reaches with its 1e-5 rtol; each step costs one triangular solve
++and recovers several digits. Double precision residuals are far below the
++target and take no steps. Shared by the CHOLMOD and Accelerate backends.
++"""
++function refine_columns!(lhs, factor, matrix, rhs, tol, name)
++    target = min(tol, 1e-5)
+     for col = 1:size(rhs, 2)
+-        residual = norm(matrix*lhs[:,col] .- rhs[:,col]) / norm(rhs[:,col])
+-        residual < tol || error("CHOLMOD solver residual $residual exceeds tolerance $tol for column $col")
++        x = view(lhs, :, col)
++        b = view(rhs, :, col)
++        residual = norm(matrix*x .- b) / norm(b)
++        steps = 0
++        while residual >= target && steps < 2
++            x .+= factor \ (b .- matrix*x)
++            residual = norm(matrix*x .- b) / norm(b)
++            steps += 1
++        end
++        residual < tol || error("$name solver residual $residual exceeds tolerance $tol for column $col after $steps refinement steps")
+     end
+     lhs
+ end
+ 
++function solve_linear_system(factor::SuiteSparse.CHOLMOD.Factor, matrix, rhs; tol = TOL_DOUBLE)
++    refine_columns!(factor \ rhs, factor, matrix, rhs, tol, "CHOLMOD")
++end
++
+ function postprocess(output, component_data, flags, shortcut, cfg)
+ 
+ 
+diff --git a/test/runtests.jl b/test/runtests.jl
+index 4959f18d..f89c1861 100644
+--- a/test/runtests.jl
++++ b/test/runtests.jl
+@@ -12,8 +12,10 @@ clean_output()
+     include("internal.jl")
+ end
+ 
+-runtests(solver="cg+amg", parallel=true)
+-runtests(solver="cholmod", parallel=true)
++runtests(solver="cg+amg", parallel=true, precision="double")
++runtests(solver="cg+amg", parallel=true, precision="single")
++runtests(solver="cholmod", parallel=true, precision="double")
++runtests(solver="cholmod", parallel=true, precision="single")
+ 
+ accelerate_available = try
+     @eval using AppleAccelerate
+@@ -22,7 +24,8 @@ catch
+     false
+ end
+ if accelerate_available
+-    runtests(solver="accelerate", parallel=true)
++    runtests(solver="accelerate", parallel=true, precision="double")
++    runtests(solver="accelerate", parallel=true, precision="single")
+ else
+     println("Skipping Apple Accelerate tests (not available)")
+ end
+@@ -35,7 +38,7 @@ catch
+     false
+ end
+ if pardiso_available
+-    runtests(solver="pardiso", parallel=true)
++    runtests(solver="pardiso", parallel=true, precision="double")
+ else
+     println("Skipping Pardiso tests (MKL not available)")
+ end
+diff --git a/test/test_utils.jl b/test/test_utils.jl
+index f8175f4f..b7575829 100644
+--- a/test/test_utils.jl
++++ b/test/test_utils.jl
+@@ -71,6 +71,12 @@ function runtests(; solver::String = "", precision::String = "",
+ 
+     is_single = precision == "single"
+     tol = is_single ? 1e-4 : 1e-6
++    # Single precision compares relatively: sgVerify17 (resistances up to
++    # ~2900) comes out 1.03% off in Float32, and that is unchanged by the CG
++    # residual gate, so it is Float32 arithmetic rather than convergence. An
++    # absolute threshold of sqrt(tol) is meaningless at that scale. 2% is
++    # calibrated on this test set, not a general bound.
++    rtol = is_single ? 2e-2 : 0.0
+     f(str) = compute_with(str; solver, precision, parallel)
+ 
+     @testset "$label" begin
+@@ -80,7 +86,7 @@ function runtests(; solver::String = "", precision::String = "",
+                 x = readdlm("output_verify/sgNetworkVerify$(i)_resistances.out")
+                 valx = x[2:end, 2:end]
+                 valr = r[2:end, 2:end]
+-                @test check_resistances(valx, valr, tol, label="sgNetworkVerify$(i)")
++                @test check_resistances(valx, valr, tol, rtol, label="sgNetworkVerify$(i)")
+                 pts_x = x[2:end,1]
+                 pts_r = r[2:end,1]
+                 @test pts_x .+ 1 == pts_r
+@@ -93,7 +99,7 @@ function runtests(; solver::String = "", precision::String = "",
+                 r = f("input/network/mgNetworkVerify$(i).ini")
+                 x = readdlm("output_verify/mgNetworkVerify$(i)_voltages.txt")
+                 @. x[:,1] = x[:,1] + 1
+-                @test check_resistances(x, r, tol, label="mgNetworkVerify$(i)")
++                @test check_resistances(x, r, tol, rtol, label="mgNetworkVerify$(i)")
+                 compare_all_output("mgNetworkVerify$(i)", is_single)
+             end
+         end
+@@ -107,8 +113,8 @@ function runtests(; solver::String = "", precision::String = "",
+                 r = f("input/raster/pairwise/$i/sgVerify$(i).ini")
+                 x = readdlm("output_verify/sgVerify$(i)_resistances.out")
+                 _x = readdlm("output/sgVerify$(i)_resistances.out")
+-                @test check_resistances(_x, r, tol, label="sgVerify$(i) (written)")
+-                @test check_resistances(x, r, tol, label="sgVerify$(i) (verify)")
++                @test check_resistances(_x, r, tol, rtol, label="sgVerify$(i) (written)")
++                @test check_resistances(x, r, tol, rtol, label="sgVerify$(i) (verify)")
+                 compare_all_output("sgVerify$(i)", is_single)
+             end
+         end
+@@ -116,7 +122,7 @@ function runtests(; solver::String = "", precision::String = "",
+         @testset "Raster Advanced" begin
+             for i in 1:6
+                 r = f("input/raster/advanced/$i/mgVerify$(i).ini")
+-                compare_all_output("mgVerify$(i)")
++                compare_all_output("mgVerify$(i)", is_single)
+             end
+         end
+ 
+@@ -124,7 +130,7 @@ function runtests(; solver::String = "", precision::String = "",
+             for i in 1:13
+                 r = f("input/raster/one_to_all/$i/oneToAllVerify$(i).ini")
+                 x = readdlm("output_verify/oneToAllVerify$(i)_resistances.out")
+-                @test check_resistances(x, r, tol, label="oneToAllVerify$(i)")
++                @test check_resistances(x, r, tol, rtol, label="oneToAllVerify$(i)")
+                 compare_all_output("oneToAllVerify$(i)", is_single)
+             end
+         end
+@@ -133,18 +139,19 @@ function runtests(; solver::String = "", precision::String = "",
+             for i in 1:12
+                 r = f("input/raster/all_to_one/$i/allToOneVerify$(i).ini")
+                 x = readdlm("output_verify/allToOneVerify$(i)_resistances.out")
+-                @test check_resistances(x, r, tol, label="allToOneVerify$(i)")
++                @test check_resistances(x, r, tol, rtol, label="allToOneVerify$(i)")
+                 compare_all_output("allToOneVerify$(i)", is_single)
+             end
+         end
+     end
+ end
+ 
+-"""Check resistance matrices element-wise and report which entries differ."""
+-function check_resistances(x, r, tol; label="")
++"""Check resistance matrices element-wise and report which entries differ.
++An entry passes if it is within `sqrt(tol)` absolutely or `rtol` relatively."""
++function check_resistances(x, r, tol, rtol = 0.0; label="")
+     nfail = 0
+     for j in axes(x, 2), i in axes(x, 1)
+-        if abs(x[i,j] - r[i,j]) > sqrt(tol)
++        if abs(x[i,j] - r[i,j]) > max(sqrt(tol), rtol * abs(x[i,j]))
+             nfail += 1
+             if nfail <= 10
+                 # Print row/col headers (focal point IDs) if available
+@@ -214,13 +221,15 @@ function get_network_comp(list_to_comp, f)
+     readdlm("output_verify/$f")
+ end
+ 
+-function compare_branch(r, x, tol = 1e-6)
+-    @. x[:,1] = x[:,1] + 1
+-    @. x[:,2] = x[:,2] + 1
+-    sum(abs2, sortslices(r, dims=1) - sortslices(x, dims=1)) < tol
+-end
+-
+-function compare_node(r, x, tol = 1e-6)
+-    @. x[:,1] = x[:,1] + 1
+-    sum(abs2, sortslices(r, dims=1) - sortslices(x, dims=1)) < tol
++# Branch and node current files omit zero-current entries. In single precision
++# a current that is ~1e-9 in the reference can round to exactly 0 and be
++# dropped, so the two files may differ in length; compare by node key,
++# treating a missing entry as 0. `r` is written by Circuitscape (1-based node
++# ids); `x` is the Python reference (0-based).
++function _compare_keyed(r, x, nkey, tol)
++    a = Dict(Tuple(Int.(r[i, 1:nkey]))      => r[i, nkey+1] for i in axes(r, 1))
++    b = Dict(Tuple(Int.(x[i, 1:nkey]) .+ 1) => x[i, nkey+1] for i in axes(x, 1))
++    sum(abs2, get(a, k, 0.0) - get(b, k, 0.0) for k in union(keys(a), keys(b))) < tol
+ end
++compare_branch(r, x, tol = 1e-6) = _compare_keyed(r, x, 2, tol)
++compare_node(r, x, tol = 1e-6) = _compare_keyed(r, x, 1, tol)

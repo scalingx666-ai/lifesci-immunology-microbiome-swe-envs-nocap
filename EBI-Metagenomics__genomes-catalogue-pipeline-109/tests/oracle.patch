@@ -1,0 +1,485 @@
+diff --git a/bin/annotate_gff.py b/bin/annotate_gff.py
+index e2f92dfe..f33f3fd7 100755
+--- a/bin/annotate_gff.py
++++ b/bin/annotate_gff.py
+@@ -212,13 +212,17 @@ def get_bgcs(bgc_file, prokka_gff, tool):
+                         if a.startswith("Type="):
+                             type_value = a.split("=")[1]
+                 elif tool == "antismash":
+-                    if feature != "CDS":
++                    if feature != "gene":
+                         continue
++                    type_value = ""
++                    as_product = ""
+                     for a in annotations.split(
+                         ";"
+                     ):  # go through all parts of the annotation field
+-                        if a.startswith("function="):
++                        if a.startswith("as_type="):
+                             type_value = a.split("=")[1]
++                        elif a.startswith("as_gene_clusters="):
++                            as_product = a.split("=")[1]
+                 # save cluster positions to a dictionary where key = contig name,
+                 # value = list of position pairs (list of lists)
+                 cluster_positions.setdefault(contig, list()).append(
+@@ -244,6 +248,8 @@ def get_bgcs(bgc_file, prokka_gff, tool):
+                         "_".join([start_pos, end_pos]),
+                         {"bgc_function": type_value},
+                     )
++                    if as_product:
++                        tool_result[contig]["_".join([start_pos, end_pos])]["bgc_product"] = as_product
+     # identify CDSs that fall into each of the clusters annotated by the BGC tool
+     with open(prokka_gff, "r") as gff_in:
+         for line in gff_in:
+@@ -300,6 +306,9 @@ def get_bgcs(bgc_file, prokka_gff, tool):
+                                 ]["bgc_function"],
+                             },
+                         )
++                        if "bgc_product" in tool_result[contig][matching_interval]:
++                            bgc_annotations[cds_id]["antismash_product"] = tool_result[contig][matching_interval][
++                                "bgc_product"]
+             elif line.startswith("##FASTA"):
+                 break
+     return bgc_annotations
+diff --git a/bin/antismash_gff_builder.py b/bin/antismash_gff_builder.py
+new file mode 100755
+index 00000000..9578f1cc
+--- /dev/null
++++ b/bin/antismash_gff_builder.py
+@@ -0,0 +1,145 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++# Copyright 2024 EMBL - European Bioinformatics Institute
++#
++# Licensed under the Apache License, Version 2.0 (the 'License');
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an 'AS IS' BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# The script is part of mgnify-pipelines-toolkit: https://github.com/EBI-Metagenomics/mgnify-pipelines-toolkit
++
++import argparse
++from collections import defaultdict
++import json
++
++import pandas as pd
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('-i', '--input', required=True, type=str, help='Input JSON from antiSMASH')
++    parser.add_argument('-o', '--output', required=True, type=str, help='Output GFF3 file name')
++    parser.add_argument('--cds_tag', default='ID', type=str,
++                        help='Type of CDS ID tag to use in the GFF3 (to account for CDS identifier changes between'
++                             'tools) (default: ID)')  
++    args = parser.parse_args()
++
++    return args.input, args.output, args.cds_tag
++
++
++def main():
++    """ Transform an antiSMASH JSON into a GFF3 with 'regions' and CDS within those regions
++    """
++
++    json_input, output_file, cds_tag = parse_args()
++
++    with open(json_input, 'r') as json_data:
++        antismash_analysis = json.load(json_data)
++
++    res_dict = defaultdict(list)
++    attributes_dict = defaultdict(dict)
++
++    antismash_ver = antismash_analysis['version']
++
++    for record in antismash_analysis['records']:
++        record_id = record['id']
++
++        iter_cds = 'antismash.detection.genefunctions' in record['modules'].keys()  # Flag to iterate CDS
++        region_name = None
++
++        for feature in record['features']:
++
++            if feature['type'] == 'region':
++                # Annotate region features
++                region_name = f"{record_id}_region{feature['qualifiers']['region_number'][0]}"
++                region_start = int(feature['location'].split(':')[0].split('[')[1])
++                region_end = int(feature['location'].split(':')[1].split(']')[0])
++
++                res_dict['contig'].append(record_id)
++                res_dict['version'].append(f"antiSMASH:{antismash_ver}")
++                res_dict['type'].append('region')
++                res_dict['start'].append(region_start + 1)
++                res_dict['end'].append(region_end)
++                res_dict['score'].append('.')
++                res_dict['strand'].append('.')
++                res_dict['phase'].append('.')
++
++                product = ','.join(feature['qualifiers'].get('product', []))
++
++                attributes_dict[region_name].update({'ID': region_name, 'product': product})
++
++            if iter_cds and feature['type'] == 'CDS':
++                # Annotate CDS features
++
++                start = int(feature['location'].split(':')[0][1:])
++                end = int(feature['location'].split(':')[1].split(']')[0])
++                strand = feature['location'].split('(')[1][0]  # + or -
++
++                if not region_name or not (region_start <= end and start <= region_end):
++                    continue
++
++                res_dict['contig'].append(record_id)
++                res_dict['version'].append(f"antiSMASH:{antismash_ver}")
++                res_dict['type'].append('gene')
++                res_dict['start'].append(start + 1)  # Correct for 1-based indexing
++                res_dict['end'].append(end)
++                res_dict['score'].append('.')
++                res_dict['strand'].append(strand)
++                res_dict['phase'].append('.')
++
++                locus_tag = feature['qualifiers'][cds_tag][0]
++                attributes_dict[locus_tag].update({
++                    'ID': locus_tag,
++                    'as_type': ','.join(feature['qualifiers'].get('gene_kind', ['other'])),
++                    'gene_functions': ','.join(feature['qualifiers'].get('gene_functions', [])).replace(' ',
++                                                                                                        '_').replace(
++                        ':_', ':').replace(';_', '%3B'),
++                    'Parent': region_name
++                })
++
++        # Extended CDS attributes 
++        if 'antismash.detection.hmm_detection' in record['modules'].keys():
++            cds_by_protocluster = record['modules']['antismash.detection.hmm_detection']['rule_results'][
++                'cds_by_protocluster']
++            if len(cds_by_protocluster) > 0:
++                for feature in cds_by_protocluster[0][1]:
++                    if 'cds_name' in feature.keys():
++                        locus_tag = feature['cds_name']
++                        as_clusters = ','.join(list(feature['definition_domains'].keys()))
++                        if locus_tag in attributes_dict.keys():
++                            attributes_dict[locus_tag].update({'as_gene_clusters': as_clusters})
++
++        if 'antismash.detection.genefunctions' in record['modules'].keys():
++            for tool in record['modules']['antismash.detection.genefunctions']['tools']:
++                if tool['tool'] == 'smcogs':
++                    for locus_tag in tool['best_hits']:
++                        hit_id = tool['best_hits'][locus_tag]['hit_id'].split(':')[0]
++                        hit_desc = tool['best_hits'][locus_tag]['hit_id'].split(':')[1].replace(' ', '_')
++                        score = tool['best_hits'][locus_tag]['bitscore']
++                        e_value = tool['best_hits'][locus_tag]['evalue']
++
++                        smcog_note = f"smCOG:{hit_id}:{hit_desc.replace(' ', '_')}(Score:{score}%3BE-value:{e_value})"
++                        if locus_tag in attributes_dict.keys():
++                            attributes_dict[locus_tag].update({'as_notes': smcog_note})
++                        break
++
++    attributes = [';'.join(f"{k}={v}" for k, v in attrib_data.items() if v) for attrib_data in attributes_dict.values()]
++    res_dict['attributes'] = attributes
++
++    res_df = pd.DataFrame.from_dict(res_dict)
++
++    with open(output_file, 'w') as f_out:
++        f_out.write('##gff-version 3\n')  # Save data to the GFF3 file with the proper header
++        res_df.to_csv(f_out, header=False, index=False, sep='\t')
++
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+diff --git a/bin/antismash_to_gff.py b/bin/antismash_to_gff.py
+deleted file mode 100755
+index 0a5b60a1..00000000
+--- a/bin/antismash_to_gff.py
++++ /dev/null
+@@ -1,159 +0,0 @@
+-#!/usr/bin/env python3
+-# -*- coding: utf-8 -*-
+-
+-# Copyright 2023 EMBL - European Bioinformatics Institute
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-import argparse
+-import json
+-from collections import namedtuple
+-
+-import logging
+-
+-logger = logging.getLogger(__name__)
+-
+-BGC = namedtuple("BGC", "contig_name bgc_name start end orfs")
+-ORF = namedtuple("ORF", "locus_tag start end strand type product")
+-
+-
+-def load_regions_json(json_file) -> list[BGC]:
+-    """Load the gene types from the json
+-    The structure of the json is:
+-    {
+-        "length": 4688977,
+-        "seq_id": "contig_4",
+-        "regions": [{
+-            "start": 1185393,
+-            "end": 1205746,
+-            "idx": 1,
+-            "orfs": [
+-                {
+-                "start": 1187624,
+-                "end": 1188664,
+-                "strand": 1,
+-                "locus_tag": "BU_ATCC8492_00951",
+-                "type": "biosynthetic-additional",
+-                "description": "<div class=\"focus-intro\">\n <strong><span class=\"serif\">BU_ATCC8492_00951</span></strong><br>... ",
+-                "dna": "ATGCAGAAACGACCTCT...",
+-                "translation": "MQKRPLLGLT...",
+-                "product": "Dual-specificity RNA methyltransferase RlmN"
+-            },...
+-        ],..
+-    }
+-    Note: this json file is build from the regions.js file of the html output of antiSMASH.
+-    To build the json file:
+-    echo ";var fs = require('fs'); fs.writeFileSync('./regions.json', JSON.stringify(recordData));" >> convert_to_json.js
+-    node geneclusters.js # this will generate the geneclusters.json file
+-    """
+-
+-    bgcs = []
+-
+-    with open(json_file) as json_handle:
+-        json_dict = json.load(json_handle)
+-        for bgc_entry in json_dict:
+-            regions = bgc_entry.get("regions")
+-            if not regions:
+-                # ignore this contig, no bgc found
+-                continue
+-            for region in regions:
+-                index = region["idx"]
+-                region_start = region["start"]
+-                region_end = region["end"]
+-                bgc_orfs = []
+-                for orf in region.get("orfs", []):
+-                    bgc_orfs.append(
+-                        ORF(
+-                            locus_tag=orf["locus_tag"],
+-                            start=orf["start"],
+-                            end=orf["end"],
+-                            strand=int(orf["strand"]),
+-                            product=orf["product"],
+-                            type=orf["type"],
+-                        )
+-                    )
+-                bgcs.append(
+-                    BGC(
+-                        contig_name=bgc_entry["seq_id"],
+-                        bgc_name=f"{bgc_entry['seq_id']}_bgc{index}",
+-                        start=region_start,
+-                        end=region_end,
+-                        orfs=bgc_orfs,
+-                    )
+-                )
+-
+-    return bgcs
+-
+-
+-def build_gff(regions_json, antismash_version):
+-    """Build the GFF from the geneclusters and the EMBL file"""
+-    bgc_regions: list[BGC] = load_regions_json(regions_json)
+-    for bgc in bgc_regions:
+-        # BGC region "parent"
+-        yield [
+-            bgc.contig_name,
+-            f"antiSMASH:{antismash_version}",
+-            "biosynthetic-gene-cluster",
+-            bgc.start,
+-            bgc.end,
+-            ".",
+-            ".",
+-            ".",
+-            f"ID={bgc.bgc_name}",
+-        ]
+-        orf: ORF
+-        for orf in bgc.orfs:
+-            ninth_column = [
+-                f"ID={orf.locus_tag}",
+-                f"Parent={bgc.bgc_name}",
+-            ]
+-            if orf.product:
+-                ninth_column.append(f"product={orf.product}")
+-            if orf.type:
+-                ninth_column.append(f"function={orf.type}")
+-
+-            yield [
+-                bgc.contig_name,
+-                f"antiSMASH:{antismash_version}",
+-                "CDS",
+-                orf.start,  # FIXME, shoud we correct offset (gff are +1)?
+-                orf.end,
+-                ".",  # TODO, it should be possible to get the confidence score from the antismash gbk result file
+-                "+" if orf.strand == 1 else "-",
+-                ".",
+-                ";".join(ninth_column),
+-            ]
+-
+-
+-if __name__ == "__main__":
+-    parser = argparse.ArgumentParser(
+-        description="Build an antiSMASH gff from the gbk and regionsjs json~fied file"
+-    )
+-    parser.add_argument(
+-        "-r",
+-        dest="regions",
+-        help="antiSMASH json-fied regions.js file (it should be regions.json not .js)",
+-        required=True,
+-    )
+-    parser.add_argument(
+-        "-a",
+-        dest="antismash_version",
+-        help="The version of antiSMASH",
+-        required=True,
+-    )
+-    parser.add_argument("-o", dest="out", help="Ouput GFF file name", required=True)
+-    args = parser.parse_args()
+-
+-    with open(args.out, "w") as out_handle:
+-        print("##gff-version 3", file=out_handle)
+-        for row in build_gff(args.regions, args.antismash_version):
+-            print("\t".join(map(str, row)), file=out_handle)
+diff --git a/modules/antismash.nf b/modules/antismash.nf
+index e5200ed0..a207592f 100644
+--- a/modules/antismash.nf
++++ b/modules/antismash.nf
+@@ -1,18 +1,6 @@
+ process ANTISMASH {
+ 
+     tag "${cluster_name}"
+-    
+-    publishDir(
+-        path: "${params.outdir}",
+-        saveAs: {
+-            filename -> {
+-                String cluster_prefix = cluster_name.substring(0, cluster_name.length() - 2);
+-                return "species_catalogue/${cluster_prefix}/${cluster_name}/genome/${cluster_name}_antismash.gff"
+-            }
+-        },
+-        mode: 'copy',
+-        failOnError: true
+-    )
+ 
+     container 'quay.io/microbiome-informatics/antismash:7.1.0.1_2'
+ 
+@@ -21,7 +9,7 @@ process ANTISMASH {
+     path(antismash_db)
+ 
+     output:
+-    tuple val(cluster_name), path("${cluster_name}_antismash.gff"), emit: antismash_gff
++    tuple val(cluster_name), path("${cluster_name}_results/${cluster_name}.json"), emit: antismash_json
+ 
+     script:
+     """
+@@ -33,19 +21,5 @@ process ANTISMASH {
+     --genefinding-tool none \\
+     --output-dir ${cluster_name}_results \\
+     ${gbk}
+-
+-    tar -czf ${cluster_name}_antismash.tar.gz ${cluster_name}_results
+-
+-    # To build the GFF3 file the scripts needs the regions.js file to be converted to json
+-    # In order to do that this process uses nodejs (using a patched version of the antismash container)
+-
+-    echo ";var fs = require('fs'); fs.writeFileSync('./regions.json', JSON.stringify(recordData));" >> ${cluster_name}_results/regions.js
+-
+-    node ${cluster_name}_results/regions.js
+-
+-    antismash_to_gff.py \\
+-        -r regions.json -a \$(echo \$(antismash --version | sed 's/^antiSMASH //' )) \\
+-        -o ${cluster_name}_antismash.gff
+-
+     """
+ }
+diff --git a/modules/antismash_make_gff.nf b/modules/antismash_make_gff.nf
+new file mode 100644
+index 00000000..6d01c1c8
+--- /dev/null
++++ b/modules/antismash_make_gff.nf
+@@ -0,0 +1,36 @@
++process ANTISMASH_MAKE_GFF {
++
++    tag "${cluster}"
++
++    publishDir(
++        path: "${params.outdir}",
++        saveAs: {
++            filename -> {
++                String cluster_rep_prefix = cluster.substring(0, cluster.length() - 2);
++                return "species_catalogue/${cluster_rep_prefix}/${cluster}/genome/${cluster}_antismash.gff";
++            }
++        },
++        mode: 'copy',
++        failOnError: true
++    )
++
++    label 'process_light'
++
++    container 'quay.io/microbiome-informatics/genomes-pipeline.python3base:v1.1'
++
++    input:
++    tuple val(cluster), file(antismash_json)
++    
++    output:
++    tuple val(cluster), path("*_antismash.gff"), emit: antismash_gff
++
++    script:
++    """
++    antismash_gff_builder.py -i ${antismash_json} -o ${cluster}_antismash.gff --cds_tag locus_tag
++    """
++
++    stub:
++    """
++    touch ${cluster}_antismash.gff
++    """
++}
+diff --git a/subworkflows/annotate.nf b/subworkflows/annotate.nf
+index 5cca886b..85cfc00a 100644
+--- a/subworkflows/annotate.nf
++++ b/subworkflows/annotate.nf
+@@ -8,6 +8,7 @@ include { EGGNOG_MAPPER as EGGNOG_MAPPER_ANNOTATIONS } from '../modules/eggnog'
+ include { PER_GENOME_ANNOTATION_GENERATOR } from '../modules/per_genome_annotations'
+ include { SANNTIS } from '../modules/sanntis'
+ include { ANTISMASH } from '../modules/antismash'
++include { ANTISMASH_MAKE_GFF } from '../modules/antismash_make_gff'
+ include { DEFENSE_FINDER } from '../modules/defense_finder'
+ include { DBCAN } from '../modules/dbcan'
+ include { GECCO_RUN } from '../modules/gecco'
+@@ -127,6 +128,10 @@ workflow ANNOTATE {
+         ANTISMASH(
+             prokka_gbk,
+             antismash_db
++        )
++        
++        ANTISMASH_MAKE_GFF(
++            ANTISMASH.out.antismash_json
+         )     
+         
+         GECCO_RUN(
+@@ -154,6 +159,6 @@ workflow ANNOTATE {
+         sanntis_annotation_gffs = SANNTIS.out.sanntis_gff
+         defense_finder_gffs = DEFENSE_FINDER.out.gff
+         dbcan_gffs = DBCAN.out.dbcan_gff
+-        antismash_gffs = ANTISMASH.out.antismash_gff
++        antismash_gffs = ANTISMASH_MAKE_GFF.out.antismash_gff
+         gecco_gffs = GECCO_RUN.out.gecco_gff
+ }

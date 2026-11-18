@@ -1,0 +1,762 @@
+diff --git a/.gitignore b/.gitignore
+index 41805b90bb..973e9beff5 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,6 +33,7 @@ anvio/data/misc/KEGG/
+ anvio/data/misc/Pfam/
+ anvio/data/misc/PDB.db
+ anvio/data/misc/CAZyme/
++anvio/data/misc/AMRFinder/
+ anvio/data/misc/GlobDB/
+ anvio/data/misc/ModelSEED/
+ anvio/data/misc/Interacdome/
+diff --git a/anvio/__init__.py b/anvio/__init__.py
+index 55c1d3fd4c..e859715022 100644
+--- a/anvio/__init__.py
++++ b/anvio/__init__.py
+@@ -1053,6 +1053,24 @@ def TABULATE(table, header, numalign="right", max_width=0):
+              'help': "The directory path for your Pfam setup. Anvi'o will try to use the default path "
+                      "if you do not specify anything."}
+                 ),
++    'amrfinder-data-dir': (
++            ['--amrfinder-data-dir'],
++            {'default': None,
++             'type': str,
++             'metavar': 'DIR_PATH',
++             'help': "This is optional and allows you to specify a directory path for your AMRFinderPlus database. "
++                     "Anvi'o will use the default path if you do not specify anything."}
++                ),
++    'full-amrfinder-report': (
++            ['--full-amrfinder-report'],
++            {'metavar': 'FILE',
++             'default': None,
++             'help': "The contigs database only stores the gene, its classification, and the HMM e-value of each "
++                     "AMRFinderPlus hit. Using this flag, you can generate a table that includes everything "
++                     "AMRFinderPlus knows about each hit, including the percent identity to and the coverage of the "
++                     "closest reference protein, the HMM e-value, the HMM bit score, and the curated HMM cutoff. The "
++                     "protein ids in this file are identical to the gene caller ids in the contigs-db."}
++                ),
+     'antismash-dir': (
+             ['--antismash-dir'],
+             {'default': None,
+diff --git a/anvio/amrfinder.py b/anvio/amrfinder.py
+new file mode 100644
+index 0000000000..a0e580a167
+--- /dev/null
++++ b/anvio/amrfinder.py
+@@ -0,0 +1,391 @@
++#!/usr/bin/env python
++"""Classes to set up and run NCBI's AMRFinderPlus on anvi'o contigs databases."""
++
++import os
++import glob
++import shutil
++
++import anvio
++import anvio.dbops as dbops
++import anvio.utils as utils
++import anvio.terminal as terminal
++import anvio.filesnpaths as filesnpaths
++
++from anvio.errors import ConfigError
++from anvio.tables.genefunctions import TableForGeneFunctions
++
++
++__copyright__ = "Copyleft 2015-2026, The Anvi'o Project (http://anvio.org/)"
++__license__ = "GPL 3.0"
++__version__ = anvio.__version__
++__authors__ = ['jessika-fuessel']
++
++
++run = terminal.Run()
++progress = terminal.Progress()
++
++DEFAULT_AMRFINDER_DATA_DIR = os.path.join(os.path.dirname(anvio.__file__), 'data/misc/AMRFinder')
++
++INSTALL_ADVICE = ("If you want to annotate your genes using AMRFinderPlus, you need to install the program on your "
++                  "computer as it is not a part of the standard anvi'o installation. Just run `conda install -c "
++                  "conda-forge -c bioconda ncbi-amrfinderplus` in your terminal and try again.")
++
++# each functional annotation source, and the AMRFinderPlus output columns for its accession and function
++AMRFINDER_SOURCES = {'AMRFinder': ('Hierarchy node', 'Element name'),
++                     'AMRFinder_CLASS': ('Class', 'Class'),
++                     'AMRFinder_SUBCLASS': ('Subclass', 'Subclass'),
++                     'AMRFinder_SUBTYPE': ('Subtype', 'Subtype'),
++                     'AMRFinder_SCOPE': ('Scope', 'Scope'),
++                     'AMRFinder_METHOD': ('Method', 'Method')}
++
++
++class AMRFinderSetup(object):
++    """Download the AMRFinderPlus database with NCBI's own `amrfinder_update`.
++
++    Parameters
++    ==========
++    args : argparse.Namespace
++        See `anvio/cli/setup_amrfinder.py` for available arguments
++        - amrfinder_data_dir : str, optional
++            The directory where the database should be stored. The anvi'o data directory is used if not provided.
++        - reset : bool, optional
++            If True, the default data directory will be deleted and set up from scratch.
++    run : terminal.Run, optional
++        An object for printing messages to the console.
++    progress : terminal.Progress, optional
++        An object for printing progress bars to the console.
++    """
++
++    def __init__(self, args, run=run, progress=progress):
++        self.run = run
++        self.progress = progress
++
++        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
++        self.amrfinder_data_dir = A('amrfinder_data_dir')
++        self.reset = A('reset')
++
++        filesnpaths.is_program_exists('amrfinder_update', advice_if_not_exists=INSTALL_ADVICE)
++
++        if self.amrfinder_data_dir and self.reset:
++            raise ConfigError(f"You are attempting to use the `--reset` flag on a data directory you chose yourself "
++                              f"('{self.amrfinder_data_dir}'). Anvi'o wants to avoid deleting a directory that may "
++                              f"contain important data and the `--reset` flag only works for the default directory. "
++                              f"If you want to remove the contents of this directory and re-download AMRFinderPlus's "
++                              f"database there you need to remove the directory manually with `rm -r "
++                              f"{self.amrfinder_data_dir}`, then you can store the AMRFinderPlus database by creating "
++                              f"the directory again with the program `anvi-setup-amrfinder` and the flag "
++                              f"`--amrfinder-data-dir`.")
++
++        if not self.amrfinder_data_dir:
++            self.amrfinder_data_dir = DEFAULT_AMRFINDER_DATA_DIR
++
++
++    def setup(self):
++        """Run `amrfinder_update` to download the latest AMRFinderPlus database."""
++
++        if os.path.exists(os.path.join(self.amrfinder_data_dir, 'latest')) and not self.reset:
++            raise ConfigError(f"It seems there already is an AMRFinderPlus database in '{self.amrfinder_data_dir}'. You "
++                              f"can use the flag `--reset` to instruct anvi'o to set everything up from scratch at the "
++                              f"default location, or you can use the parameter `--amrfinder-data-dir` to set up the "
++                              f"database in a different directory.")
++
++        filesnpaths.gen_output_directory(self.amrfinder_data_dir, delete_if_exists=self.reset, dont_warn=True)
++
++        log_file_path = filesnpaths.get_temp_file_path()
++
++        self.run.info('AMRFinderPlus data directory', self.amrfinder_data_dir)
++        self.run.info('Log file', log_file_path)
++
++        self.progress.new('AMRFinderPlus database setup')
++        self.progress.update('Running `amrfinder_update` (this may take a few minutes) ...')
++        ret_val = utils.run_command(['amrfinder_update', '--database', self.amrfinder_data_dir], log_file_path)
++        self.progress.end()
++
++        if ret_val:
++            raise ConfigError(f"Something went wrong while `amrfinder_update` was downloading the AMRFinderPlus "
++                              f"database :/ The log file may tell you more about what went wrong: '{log_file_path}'.")
++
++        os.remove(log_file_path)
++
++        db_version = open(os.path.join(self.amrfinder_data_dir, 'latest', 'version.txt')).read().strip()
++
++        self.run.info_single(f"Success! AMRFinderPlus database {db_version} is now available on your computer for "
++                             f"anvi'o to use. Now you can run `anvi-run-amrfinder` on any contigs-db to annotate "
++                             f"genes with AMRFinderPlus.", nl_before=1, nl_after=1, mc='green')
++
++
++class AMRFinder(object):
++    """Annotate genes in a contigs-db with NCBI's AMRFinderPlus.
++
++    Parameters
++    ==========
++    args : argparse.Namespace
++        See `anvio/cli/run_amrfinder.py` for available arguments
++        - contigs_db : str
++            Path to contigs-db
++        - amrfinder_data_dir : str, optional
++            Path to the AMRFinderPlus data directory. The anvi'o data directory is used if not provided.
++        - num_threads : int, optional
++            Number of threads for AMRFinderPlus to use
++        - skip_amrfinder_e_values : bool, optional
++            If True, do not read e-values from the hmmsearch table of AMRFinderPlus, and store 0 instead.
++        - full_amrfinder_report : str, optional
++            Output file path for the AMRFinderPlus output table, with HMM e-values, bit scores, and cutoffs
++        - just_do_it : bool, optional
++            If True, annotate a contigs-db again even if it was annotated with AMRFinderPlus before.
++    run : terminal.Run, optional
++        An object for printing messages to the console.
++    progress : terminal.Progress, optional
++        An object for printing progress bars to the console.
++    """
++
++    def __init__(self, args, run=run, progress=progress):
++        self.args = args
++        self.run = run
++        self.progress = progress
++
++        A = lambda x: args.__dict__[x] if x in args.__dict__ else None
++        self.contigs_db_path = A('contigs_db')
++        self.amrfinder_data_dir = A('amrfinder_data_dir') or DEFAULT_AMRFINDER_DATA_DIR
++        self.num_threads = A('num_threads') or 1
++        self.skip_amrfinder_e_values = A('skip_amrfinder_e_values')
++        self.full_report_path = A('full_amrfinder_report')
++        self.just_do_it = A('just_do_it')
++
++        filesnpaths.is_program_exists('amrfinder', advice_if_not_exists=INSTALL_ADVICE)
++        utils.is_contigs_db(self.contigs_db_path)
++
++        if self.full_report_path:
++            filesnpaths.is_output_file_writable(self.full_report_path)
++
++        # the data directory can be a single database version, or the directory in which `amrfinder_update` keeps
++        # each database version in its own directory, and links the newest one as 'latest'
++        if os.path.exists(os.path.join(self.amrfinder_data_dir, 'version.txt')):
++            self.database_path = self.amrfinder_data_dir
++        else:
++            self.database_path = os.path.join(self.amrfinder_data_dir, 'latest')
++
++        version_file_path = os.path.join(self.database_path, 'version.txt')
++
++        if not os.path.exists(version_file_path):
++            raise ConfigError(f"There doesn't seem to be an AMRFinderPlus database in '{self.amrfinder_data_dir}' :/ "
++                              f"To download the database please run the program `anvi-setup-amrfinder`. If you "
++                              f"downloaded the database to another location than the default directory, make sure to "
++                              f"provide the correct path to this location using the flag `--amrfinder-data-dir` "
++                              f"followed by the directory's path.")
++
++        self.db_version = open(version_file_path).read().strip()
++
++        # reminder to be a good citizen
++        self.run.warning("Anvi'o will annotate genes in your contigs-db with NCBI's AMRFinderPlus. Please do not "
++                         "forget to cite it when you publish your science :) Here is the best way to cite this "
++                         "resource: https://doi.org/10.1038/s41598-021-91456-0", lc='green', header="CITATION")
++
++
++    def process(self):
++        """Run AMRFinderPlus on all genes in the contigs-db, and store its hits as functions."""
++
++        # safety check so that people don't overwrite previous annotations by accident
++        contigs_db = dbops.ContigsDatabase(self.contigs_db_path, run=self.run, progress=self.progress)
++        previous_db_version = contigs_db.db.get_meta_value('amrfinder_db_version', return_none_if_not_in_table=True)
++        contigs_db.disconnect()
++
++        if previous_db_version and not self.just_do_it:
++            raise ConfigError(f"Your contigs database '{self.contigs_db_path}' has already been annotated with the "
++                              f"AMRFinderPlus database {previous_db_version}. If you would like to replace those "
++                              f"annotations with new ones, please run the command again with the flag `--just-do-it`.")
++
++        self.run.info('AMRFinderPlus database', f"{self.db_version} ({self.database_path})")
++        self.run.info('Number of threads', self.num_threads)
++
++        temp_dir_path = filesnpaths.get_temp_directory_path()
++        amrfinder_output_path = self.run_amrfinder(temp_dir_path)
++
++        expected_fields = ['Protein id', 'HMM accession'] + [field for fields in AMRFINDER_SOURCES.values() for field in fields]
++        amrfinder_hits = utils.get_TAB_delimited_file_as_dictionary(amrfinder_output_path, indexing_field=-1, expected_fields=expected_fields)
++
++        hmm_hits = {} if self.skip_amrfinder_e_values else self.get_hmm_hits(temp_dir_path)
++
++        self.store_hits(amrfinder_hits, hmm_hits)
++
++        if self.full_report_path:
++            self.write_full_report(amrfinder_output_path, amrfinder_hits, hmm_hits)
++
++        if anvio.DEBUG:
++            self.run.warning(f"You included the `--debug` flag and anvi'o will keep the temporary directory "
++                             f"'{temp_dir_path}'. Please don't forget to clean it up later.", header="Debug")
++        else:
++            shutil.rmtree(temp_dir_path)
++
++
++    def run_amrfinder(self, temp_dir_path):
++        """Export the amino acid sequences of all genes in the contigs-db, and run AMRFinderPlus on them.
++
++        Parameters
++        ==========
++        temp_dir_path : str
++            Path to a temporary directory for the input, output, and log files, which also becomes $TMPDIR for AMRFinderPlus
++
++        Returns
++        =======
++        amrfinder_output_path : str
++            Path to the AMRFinderPlus output table
++        """
++
++        aa_sequences_path = os.path.join(temp_dir_path, 'AA_gene_sequences.fa')
++        amrfinder_output_path = os.path.join(temp_dir_path, 'AMRFinder_output.txt')
++        log_file_path = os.path.join(temp_dir_path, 'AMRFinder_log.txt')
++
++        contigs_db = dbops.ContigsSuperclass(self.args, r=self.run, p=self.progress)
++        contigs_db.get_sequences_for_gene_callers_ids(gene_caller_ids_list=list(contigs_db.genes_in_contigs_dict.keys()),
++                                                      output_file_path=aa_sequences_path,
++                                                      report_aa_sequences=True,
++                                                      simple_headers=True)
++
++        cmd_line = ['amrfinder',
++                    '--protein', aa_sequences_path,
++                    '--database', self.database_path,
++                    '--plus',
++                    '--print_node',
++                    '--threads', self.num_threads,
++                    '--log', log_file_path,
++                    '--output', amrfinder_output_path]
++
++        # AMRFinderPlus creates its temporary directory under $TMPDIR, and keeps it when it runs with `--log`. we
++        # point $TMPDIR to our own temporary directory, so we know where to find its hmmsearch table later
++        tmpdir_env = os.environ.get('TMPDIR')
++        os.environ['TMPDIR'] = temp_dir_path
++
++        self.progress.new('AMRFinderPlus')
++        self.progress.update('Searching genes (this may take a while) ...')
++        try:
++            ret_val = utils.run_command(cmd_line, log_file_path)
++        finally:
++            self.progress.end()
++
++            if tmpdir_env is None:
++                del os.environ['TMPDIR']
++            else:
++                os.environ['TMPDIR'] = tmpdir_env
++
++        if ret_val:
++            raise ConfigError(f"AMRFinderPlus did not finish successfully :/ Its log file may tell you more about "
++                              f"what went wrong: '{log_file_path}'.")
++
++        return amrfinder_output_path
++
++
++    def get_hmm_hits(self, temp_dir_path):
++        """Read the e-values and bit scores of HMM hits from the hmmsearch table AMRFinderPlus left behind.
++
++        AMRFinderPlus does not report e-values for HMM hits, but its own hmmsearch table has them.
++
++        Parameters
++        ==========
++        temp_dir_path : str
++            Path to the temporary directory AMRFinderPlus ran in
++
++        Returns
++        =======
++        hmm_hits : dict
++            Maps (gene caller id, HMM accession) to the 'e_value' and 'bit_score' of that hit
++        """
++
++        hmmsearch_table_paths = glob.glob(os.path.join(temp_dir_path, 'amrfinder.*', 'hmmsearch'))
++
++        if not hmmsearch_table_paths:
++            # the files AMRFinderPlus left behind are of no use without the hmmsearch table
++            if not anvio.DEBUG:
++                shutil.rmtree(temp_dir_path)
++
++            raise ConfigError("Anvi'o tried to extract the e-values of your HMM hits from the temporary hmmsearch "
++                              "table AMRFinderPlus usually leaves behind but could not find it :/ That's not a big "
++                              "problem if you can live without these e-values. The AMRFinderPlus database contains "
++                              "manually curated thresholds for reliable identification and you shouldn't need to "
++                              "worry about that. We don't know why anvi'o couldn't find the file, but maybe there "
++                              "was a recent AMRFinderPlus update and the program no longer generates the temporary "
++                              "directory with this information. To nevertheless annotate your genes with "
++                              "AMRFinderPlus, simply run the program again with the flag `--skip-amrfinder-e-values` to store "
++                              "all AMRFinderPlus annotations with an e-value of 0.")
++
++        hmm_hits = {}
++        with open(hmmsearch_table_paths[0]) as hmmsearch_table:
++            for line in hmmsearch_table:
++                if not line.startswith('#'):
++                    fields = line.split()
++                    hmm_hits[(fields[0], fields[3])] = {'e_value': float(fields[4]), 'bit_score': float(fields[5])}
++
++        return hmm_hits
++
++
++    def store_hits(self, amrfinder_hits, hmm_hits):
++        """Store AMRFinderPlus hits as functions in the contigs-db, and record the database version.
++
++        Parameters
++        ==========
++        amrfinder_hits : dict
++            The AMRFinderPlus output table, one entry per hit
++        hmm_hits : dict
++            E-values and bit scores of HMM hits (see `get_hmm_hits`)
++        """
++
++        functions_dict = {}
++        for hit in amrfinder_hits.values():
++            hmm_hit = hmm_hits.get((hit['Protein id'], hit['HMM accession']))
++
++            for source, (accession_field, function_field) in AMRFINDER_SOURCES.items():
++                # AMRFinderPlus reports 'NA' when there is nothing to report (e.g., there is no class for virulence genes)
++                if hit[function_field] == 'NA':
++                    continue
++
++                functions_dict[len(functions_dict)] = {'gene_callers_id': int(hit['Protein id']),
++                                                       'source': source,
++                                                       'accession': hit[accession_field],
++                                                       'function': hit[function_field],
++                                                       'e_value': hmm_hit['e_value'] if hmm_hit else 0}
++
++        gene_function_calls_table = TableForGeneFunctions(self.contigs_db_path, self.run, self.progress)
++
++        if functions_dict:
++            gene_function_calls_table.create(functions_dict)
++        else:
++            self.run.warning("None of the genes in your contigs-db passed the curated cutoffs of the AMRFinderPlus "
++                             "database. Anvi'o will still add the AMRFinderPlus annotation sources to your contigs-db, "
++                             "so you know that you used this annotation source already.")
++
++        # sources without hits are registered as empty ones (which also removes their annotations from a previous run)
++        sources_without_hits = set(AMRFINDER_SOURCES) - set([entry['source'] for entry in functions_dict.values()])
++        if sources_without_hits:
++            gene_function_calls_table.add_empty_sources_to_functional_sources(sources_without_hits)
++
++        contigs_db = dbops.ContigsDatabase(self.contigs_db_path, run=self.run, progress=self.progress)
++        contigs_db.db.set_meta_value('amrfinder_db_version', self.db_version)
++        contigs_db.disconnect()
++
++
++    def write_full_report(self, amrfinder_output_path, amrfinder_hits, hmm_hits):
++        """Write the AMRFinderPlus output table with the HMM e-value, bit score, and curated cutoff of each hit.
++
++        Parameters
++        ==========
++        amrfinder_output_path : str
++            Path to the AMRFinderPlus output table, which gives the column order
++        amrfinder_hits : dict
++            The AMRFinderPlus output table, one entry per hit
++        hmm_hits : dict
++            E-values and bit scores of HMM hits (see `get_hmm_hits`)
++        """
++
++        # the curated HMM cutoffs (the full sequence bit score thresholds, TC1) are in the AMRFinderPlus database
++        families = utils.get_TAB_delimited_file_as_dictionary(os.path.join(self.database_path, 'fam.tsv'))
++        hmm_cutoffs = {family['hmm_id']: family['hmm_tc1'] for family in families.values()}
++
++        for hit in amrfinder_hits.values():
++            hmm_hit = hmm_hits.get((hit['Protein id'], hit['HMM accession']))
++            hit['HMM e-value'] = hmm_hit['e_value'] if hmm_hit else 'NA'
++            hit['HMM bit score'] = hmm_hit['bit_score'] if hmm_hit else 'NA'
++            hit['HMM cutoff'] = hmm_cutoffs.get(hit['HMM accession'], 'NA')
++
++        headers = utils.get_columns_of_TAB_delim_file(amrfinder_output_path, include_first_column=True) + ['HMM e-value', 'HMM bit score', 'HMM cutoff']
++        utils.store_dict_as_TAB_delimited_file(amrfinder_hits, self.full_report_path, headers=['entry'] + headers, do_not_write_key_column=True)
++        self.run.info('Full AMRFinderPlus report', self.full_report_path)
+diff --git a/anvio/cli/run_amrfinder.py b/anvio/cli/run_amrfinder.py
+new file mode 100644
+index 0000000000..73b59a0cbc
+--- /dev/null
++++ b/anvio/cli/run_amrfinder.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python
++
++import sys
++
++import anvio
++
++from anvio.amrfinder import AMRFinder
++from anvio.terminal import time_program
++from anvio.argparse import ArgumentParser
++from anvio.errors import ConfigError, FilesNPathsError
++
++
++__copyright__ = "Copyleft 2015-2026, The Anvi'o Project (http://anvio.org/)"
++__license__ = "GPL 3.0"
++__version__ = anvio.__version__
++__authors__ = ['jessika-fuessel']
++__requires__ = ['contigs-db', 'amrfinder-data']
++__provides__ = ['functions']
++__description__ = ("You can use this to annotate genes in a contigs-db with NCBI's AMRFinderPlus to find antimicrobial "
++                   "resistance genes, stress response genes (such as metal and biocide resistance), and virulence genes.")
++
++
++@time_program
++def main():
++    args = get_args()
++
++    try:
++        amrfinder = AMRFinder(args)
++        amrfinder.process()
++    except ConfigError as e:
++        print(e)
++        sys.exit(-1)
++    except FilesNPathsError as e:
++        print(e)
++        sys.exit(-1)
++
++
++def get_args():
++    parser = ArgumentParser(description=__description__)
++
++    parser.add_argument(*anvio.A('contigs-db'), **anvio.K('contigs-db'))
++    parser.add_argument(*anvio.A('amrfinder-data-dir'), **anvio.K('amrfinder-data-dir'))
++    parser.add_argument(*anvio.A('full-amrfinder-report'), **anvio.K('full-amrfinder-report'))
++    parser.add_argument('--skip-amrfinder-e-values', default=False, action='store_true', help="By default, AMRFinderPlus "
++                        "does not report e-values for its HMM hits because each model is manually curated and has its own "
++                        "threshold. However, because it's nice to know, anvi'o recovers them from the hmmsearch table "
++                        "AMRFinderPlus leaves behind in its temporary directory. We can't see into the future and it is "
++                        "possible that future versions of AMRFinderPlus won't produce that temporary file anymore. In that "
++                        "case anvi'o would be confused and tell you so. You can use this flag to tell anvi'o to go on with "
++                        "annotating genes with AMRFinderPlus without snatching the e-values, in which case they will all be 0.")
++    parser.add_argument(*anvio.A('num-threads'), **anvio.K('num-threads'))
++    parser.add_argument(*anvio.A('just-do-it'), **anvio.K('just-do-it', {'help': "Using this flag, anvi'o will overwrite "
++                        "previous AMRFinderPlus annotations in your contigs db."}))
++
++    return parser.get_args(parser)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/anvio/cli/setup_amrfinder.py b/anvio/cli/setup_amrfinder.py
+new file mode 100644
+index 0000000000..015ced5e92
+--- /dev/null
++++ b/anvio/cli/setup_amrfinder.py
+@@ -0,0 +1,45 @@
++#!/usr/bin/env python
++
++import sys
++
++import anvio
++
++from anvio.amrfinder import AMRFinderSetup
++from anvio.argparse import ArgumentParser
++from anvio.errors import ConfigError, FilesNPathsError
++
++
++__copyright__ = "Copyleft 2015-2026, The Anvi'o Project (http://anvio.org/)"
++__license__ = "GPL 3.0"
++__version__ = anvio.__version__
++__authors__ = ['jessika-fuessel']
++__provides__ = ['amrfinder-data']
++__description__ = "Downloads and sets up NCBI's AMRFinderPlus database for `anvi-run-amrfinder`"
++
++
++def main():
++    args = get_args()
++
++    try:
++        setup = AMRFinderSetup(args)
++        setup.setup()
++    except ConfigError as e:
++        print(e)
++        sys.exit(-1)
++    except FilesNPathsError as e:
++        print(e)
++        sys.exit(-1)
++
++
++def get_args():
++    parser = ArgumentParser(description=__description__)
++
++    parser.add_argument(*anvio.A('amrfinder-data-dir'), **anvio.K('amrfinder-data-dir'))
++    parser.add_argument(*anvio.A('reset'), **anvio.K('reset', {'help': "Use this flag if you want to re-download the "
++                        "AMRFinderPlus database if you already have a version on your computer."}))
++
++    return parser.get_args(parser)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/anvio/docs/artifacts/amrfinder-data.md b/anvio/docs/artifacts/amrfinder-data.md
+new file mode 100644
+index 0000000000..e9277c5f1a
+--- /dev/null
++++ b/anvio/docs/artifacts/amrfinder-data.md
+@@ -0,0 +1,3 @@
++This is a local copy of NCBI's [AMRFinderPlus](https://github.com/ncbi/amr/wiki) database, which describes antimicrobial resistance genes, stress response genes, and virulence genes.
++
++To set it up on your computer you need to run the program %(anvi-setup-amrfinder)s, and it is required to run %(anvi-run-amrfinder)s.
+diff --git a/anvio/docs/artifacts/functions.md b/anvio/docs/artifacts/functions.md
+index d70069c74f..160ee78640 100644
+--- a/anvio/docs/artifacts/functions.md
++++ b/anvio/docs/artifacts/functions.md
+@@ -7,6 +7,7 @@ To populate a given %(contigs-db)s with functions, anvi'o includes multiple prog
+ * %(anvi-run-ncbi-cogs)s, which uses NCBI's [COGs database](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC102395/),
+ * %(anvi-run-pfams)s, which uses EBI's [Pfam database](https://pfam.xfam.org/),
+ * %(anvi-run-cazymes)s, which uses the dbCAN [CAZyme HMMs](https://bcb.unl.edu/dbCAN2/download/Databases/)
++* %(anvi-run-amrfinder)s, which uses NCBI's [AMRFinderPlus](https://github.com/ncbi/amr/wiki) to find antimicrobial resistance, stress response, and virulence genes,
+ * %(anvi-run-kegg-kofams)s, which uses the [Kyoto Encyclopedia of Genes and Genomes](https://www.genome.jp/kegg/) (KEGG) database and produces %(kegg-functions)s, which is the necessary annotation information that can be used by the program %(anvi-estimate-metabolism)s.
+ 
+ In addition, you can use the program %(anvi-import-functions)s with a simple %(functions-txt)s to import functions from any other annotation source, or to import any ad hoc, user-defined function to later access through anvi'o interfaces or programs.
+diff --git a/anvio/docs/programs/anvi-run-amrfinder.md b/anvio/docs/programs/anvi-run-amrfinder.md
+new file mode 100644
+index 0000000000..775acfddba
+--- /dev/null
++++ b/anvio/docs/programs/anvi-run-amrfinder.md
+@@ -0,0 +1,100 @@
++This program **annotates genes in your %(contigs-db)s with NCBI's [AMRFinderPlus](https://github.com/ncbi/amr/wiki)**, which identifies antimicrobial resistance genes, stress response genes (such as metal, biocide, heat, and acid resistance), and virulence genes. The output is a %(functions)s artifact.
++
++{:.notice}
++Keep in mind that AMRs are difficult to annotate and AMRFinderPlus's database is mostly built from AMRs in host associated microbes. To get a comprehensive picture of AMRs in environmental populations you would need to dive much deeper than using this tool only.
++
++Before you can run this program, you will need to install AMRFinderPlus and set up its database with %(anvi-setup-amrfinder)s.
++
++### How does it work?
++
++1. AMRFinderPlus requires the amino acid sequences of the genes in your %(contigs-db)s. The first thing %(anvi-run-amrfinder)s does is to **export the amino acid sequences** of all genes in your %(contigs-db)s into a temporary FASTA file while using their gene caller ids as names.
++2. Anvi'o then **runs AMRFinderPlus** which compares the exported amino acid sequences to NCBI's curated reference proteins with BLASTP and to its curated protein families with HMMs. Whether a gene is identified or not depends on NCBI's curated cutoffs. Anvi'o always includes all genes in AMRFinderPlus's database, which also includes stress response genes, virulence genes, and resistance genes with uncertain effects.
++3. Anvi'o then **stores the hits** in your %(contigs-db)s including six levels of information for each gene that are available in the AMRFinderPlus database (see below).
++
++Since AMRFinderPlus works with the gene sequences that anvi'o has already identified, the program does not search the contig sequences themselves, and it does not screen for the organism-specific point mutations that the AMRFinderPlus database contains for some known pathogens.
++
++### Running it
++
++{{ codestart }}
++anvi-run-amrfinder -c %(contigs-db)s \
++                   --num-threads 4
++{{ codestop }}
++
++If you set up the %(amrfinder-data)s in a non-default location, you will need to provide that path as well:
++
++{{ codestart }}
++anvi-run-amrfinder -c %(contigs-db)s \
++                   --amrfinder-data-dir path/to/directory
++{{ codestop }}
++
++### What goes into the contigs database
++
++Each positive hit is associated with six levels of information that are contained in the AMRFinderPlus database:
++
++|Annotation source|Accession|Function|Examples|
++|:--|:--|:--|:--|
++|`AMRFinder`|AMRFinderPlus hierarchy node|gene name|`bla-B3`: subclass B3 metallo-beta-lactamase|
++|`AMRFinder_CLASS`|class|class|BETA-LACTAM, MERCURY|
++|`AMRFinder_SUBCLASS`|subclass|subclass|CARBAPENEM, ARSENITE|
++|`AMRFinder_SUBTYPE`|subtype|subtype|AMR, METAL, BIOCIDE, VIRULENCE|
++|`AMRFinder_SCOPE`|scope|scope|core, plus|
++|`AMRFinder_METHOD`|method|method|HMM, BLASTP, EXACTP|
++
++AMRFinderPlus annotates each gene following an annotation hierarchy that is built like a family tree of genes, and assigns each hit to the most specific entry (node) of this tree based on the curated similarity cutoffs. Each node in this hierarchy has a unique identifier in the AMRFinderPlus database, which is more specific than gene symbols or names (several different entries share the name 'class A beta-lactamase', for instance).
++
++Genes for which AMRFinderPlus reports no class or subclass, which includes most virulence genes, heat and acid resistance genes, and a few metal resistance genes, have no annotation at the `AMRFinder_CLASS` and `AMRFinder_SUBCLASS` level.
++
++### E-values
++
++Running HMMs to annotate genes generates e-values, but these are not included in the output of AMRFinderPlus because the database uses manually curated cutoff values. When you run the program in anvi'o it recovers the e-values from the hmmsearch table AMRFinderPlus leaves behind in its temporary directory, and stores them with every HMM based gene annotation. Hits without an HMM match that were identified with BLASTP only have no e-value and receive a placeholder e-value of 0. Because AMRFinderPlus calculates e-values for a fixed search space of 10,000 proteins, they are not directly comparable to the e-values of other anvi'o annotation programs.
++
++If for some reason anvi'o cannot find the hmmsearch table (for instance, because a future version of AMRFinderPlus works differently), it will stop with an error. In that case, you can use the flag `--skip-amrfinder-e-values` to store all annotations with an e-value of 0 but still get your annotations. That does not make the annotations less reliable, the same curated cutoffs are still applied during the annotation process:
++
++{{ codestart }}
++anvi-run-amrfinder -c %(contigs-db)s \
++                   --skip-amrfinder-e-values
++{{ codestop }}
++
++### The full AMRFinderPlus report
++
++The %(contigs-db)s stores the essentials of every hit. If you would like to generate an output tab-delimited table that includes all available information for each annotation, you can use this flag:
++
++{{ codestart }}
++anvi-run-amrfinder -c %(contigs-db)s \
++                   --full-amrfinder-report AMRFinder-report.txt
++{{ codestop }}
++
++In addition to what AMRFinderPlus reports for each annotated gene, anvi'o adds the HMM e-value, the HMM bit score, and NCBI's curated bit score cutoff for that HMM (`NA` where there is no HMM information).
++
++### Re-annotating a contigs database
++
++When you run %(anvi-run-amrfinder)s, the AMRFinderPlus database version is recorded in your %(contigs-db)s. To re-annotate the %(contigs-db)s, for example with a newer database version, you need to use the flag `--just-do-it`.
++
++### What can you do next?
++
++AMRFinderPlus annotations are stored as %(functions)s in your %(contigs-db)s and several other anvi'o programs can use them. Here are two examples that are useful when you are working with metagenomic assemblies rather than genomes or MAGs.
++
++If you want to get an idea about the prevalence of specific genes in your metagenomic assemblies you can calculate the **per-population copy number** using %(anvi-gen-function-matrix)s with the `--add-per-population-copy-number` flag:
++
++{{ codestart }}
++anvi-gen-function-matrix -e %(external-genomes)s \
++                         --annotation-source AMRFinder_CLASS \
++                         --add-per-population-copy-number \
++                         -O AMR-CLASS
++{{ codestop }}
++
++You can also look at the **coverage and detection of genes across samples** if you recruited reads to your genomes, MAGs or assemblies creating a %(profile-db)s. You need to first export the genes with the AMRFinderPlus annotations with %(anvi-export-functions)s to be able to export a file with their coverage and detection with %(anvi-export-gene-coverage-and-detection)s:
++
++{{ codestart }}
++anvi-export-functions -c %(contigs-db)s \
++                      --annotation-sources AMRFinder,AMRFinder_CLASS,AMRFinder_SUBTYPE \
++                      --matrix-format \
++                      -o amr-genes.txt
++cut -f1 amr-genes.txt | tail -n +2 > amr-gene-ids.txt
++anvi-export-gene-coverage-and-detection -c %(contigs-db)s \
++                                        -p %(profile-db)s \
++                                        --genes-of-interest amr-gene-ids.txt \
++                                        -O AMR
++{{ codestop }}
++
++Please note that genes on contigs that were too short to be profiled by %(anvi-profile)s will not have coverage values. The default cutoff is 1000 bp, but you can adjust that value when generating the %(profile-db)s.
+diff --git a/anvio/docs/programs/anvi-setup-amrfinder.md b/anvio/docs/programs/anvi-setup-amrfinder.md
+new file mode 100644
+index 0000000000..89cf1f75d9
+--- /dev/null
++++ b/anvio/docs/programs/anvi-setup-amrfinder.md
+@@ -0,0 +1,38 @@
++This program **downloads and sets up NCBI's [AMRFinderPlus](https://github.com/ncbi/amr/wiki) database** for use with %(anvi-run-amrfinder)s. It produces an %(amrfinder-data)s artifact.
++
++We have not included AMRFinderPlus as a part of the standard anvi'o installation, so if you want to use it you first need to install it into your anvi'o environment:
++
++{{ codestart }}
++conda install -c conda-forge -c bioconda ncbi-amrfinderplus
++{{ codestop }}
++
++### Basic usage
++
++anvi'o uses AMRFinderPlus's own program, `amrfinder_update`, to download the newest version of the database from NCBI:
++
++{{ codestart }}
++anvi-setup-amrfinder
++{{ codestop }}
++
++### Custom data directory
++
++By default, anvi'o stores the database at `anvio/data/misc/AMRFinder/`. If you want to store it in a different location you can use:
++
++{{ codestart }}
++anvi-setup-amrfinder --amrfinder-data-dir path/to/directory
++{{ codestop }}
++
++In case you already have an AMRFinderPlus database on your computer or your computer cluster, you can direct anvi'o to it using %(anvi-run-amrfinder)s with `--amrfinder-data-dir`.
++
++### Updating the database
++
++There are regular updates by NCBI to the AMRFinderPlus database and if you want to make sure that you are using the latest one you can replace the 'old' database in the default location with the newest version by running:
++
++{{ codestart }}
++anvi-setup-amrfinder --reset
++{{ codestop }}
++
++Anvi'o wants to avoid deleting valuable data in a non-default directory or to reset a database that may be shared with others, therefore you can only use the `--reset` flag for the default directory location. If you set up the database with `--amrfinder-data-dir`, you need to remove that directory yourself before setting it up again.
++
++{:.notice}
++%(anvi-run-amrfinder)s records the database version in every %(contigs-db)s it annotates, so you can always find out which version you used with %(anvi-db-info)s.
+diff --git a/anvio/programsdata.py b/anvio/programsdata.py
+index c4067bf948..6e559896dc 100644
+--- a/anvio/programsdata.py
++++ b/anvio/programsdata.py
+@@ -498,6 +498,12 @@
+         "provided_by_anvio": True,
+         "provided_by_user": False
+     },
++    "amrfinder-data": {
++        "name": "AMRFinderPlus DATA",
++        "type": "DATA",
++        "provided_by_anvio": True,
++        "provided_by_user": False
++    },
+     "misc-data-items-txt": {
+         "name": "ITEMS DATA",
+         "type": "TXT",
+diff --git a/pyproject.toml b/pyproject.toml
+index 93a5ad6321..1af73a701b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -215,6 +215,7 @@ Contact = "https://anvio.org/people"
+ "anvi-report-circularity"                           = "anvio.cli.report_circularity:main"
+ "anvi-report-inversions"                            = "anvio.cli.report_inversions:main"
+ "anvi-report-linkmers"                              = "anvio.cli.report_linkmers:main"
++"anvi-run-amrfinder"                                = "anvio.cli.run_amrfinder:main"
+ "anvi-run-cazymes"                                  = "anvio.cli.run_cazymes:main"
+ "anvi-run-hmms"                                     = "anvio.cli.run_hmms:main"
+ "anvi-run-interacdome"                              = "anvio.cli.run_interacdome:main"
+@@ -232,6 +233,7 @@ Contact = "https://anvio.org/people"
+ "anvi-search-primers"                               = "anvio.cli.search_primers:main"
+ "anvi-search-sequence-motifs"                       = "anvio.cli.search_sequence_motifs:main"
+ "anvi-self-test"                                    = "anvio.cli.self_test:main"
++"anvi-setup-amrfinder"                              = "anvio.cli.setup_amrfinder:main"
+ "anvi-setup-cazymes"                                = "anvio.cli.setup_cazymes:main"
+ "anvi-setup-interacdome"                            = "anvio.cli.setup_interacdome:main"
+ "anvi-setup-kegg-data"                              = "anvio.cli.setup_kegg_data:main"

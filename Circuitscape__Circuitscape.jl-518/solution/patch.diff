@@ -1,0 +1,504 @@
+diff --git a/src/config.jl b/src/config.jl
+index c140072e..99c8d623 100644
+--- a/src/config.jl
++++ b/src/config.jl
+@@ -314,8 +314,23 @@ policy(cfg::CSConfig) = _remove_policy_symbol(cfg.remove_src_or_gnd)
+ 
+ Copy of `cfg` with the given fields replaced.
+ """
+-CSConfig(cfg::CSConfig; kwargs...) =
+-    CSConfig(; (f => getfield(cfg, f) for f in fieldnames(CSConfig))..., kwargs...)
++CSConfig(cfg::CSConfig; kwargs...) = _copy_with(cfg, values(kwargs))
++
++# The field names to override are part of the NamedTuple's type, so the copy
++# is emitted as one positional call with every argument's type known to
++# inference: 0 bytes, instead of building a 46-entry NamedTuple at run time
++# and dispatching the keyword constructor on it (~10 us and 17 KB per copy,
++# once per moving window in `compute_omniscape_current`). The positional
++# constructor converts each value to its field type, as the keyword one does.
++@generated function _copy_with(cfg::CSConfig, kw::NamedTuple{names}) where {names}
++    for n in names
++        n in fieldnames(CSConfig) ||
++            return :(throw(ArgumentError($("CSConfig has no field $n"))))
++    end
++    args = [n in names ? :(kw.$n) : :(getfield(cfg, $(QuoteNode(n))))
++            for n in fieldnames(CSConfig)]
++    :(CSConfig($(args...)))
++end
+ 
+ function Base.Dict{String,String}(cfg::CSConfig)
+     a = Dict{String,String}()
+diff --git a/src/core.jl b/src/core.jl
+index 520ab450..d1920cdd 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -39,7 +39,7 @@ struct GraphProblem{T,V,W,Geom<:Geometry}
+     user_points::Vector{V}
+     exclude_pairs::Vector{Tuple{V,V}}
+     geometry::Geom
+-    cum::Cumulative{T}
++    cum::Cumulative{T,V}
+     solver::W
+ end
+ 
+@@ -62,7 +62,7 @@ struct Output{T,V}
+     comp_idx::Tuple{V,V}
+     resistance::T
+     col::V
+-    cum::Cumulative{T}
++    cum::Cumulative{T,V}
+ end
+ 
+ # The pairwise kernel hands `write_cur_maps` / `write_volt_maps` an `Output`
+@@ -278,23 +278,29 @@ function solve(prob::GraphProblem{T,V}, solver::Solver, cfg, log)::Matrix{T} whe
+ 
+     @info("Graph has $(size(a,1)) nodes, $numpoints focal points and $(length(cc)) connected components")
+ 
+-    num_pairs, pair_numbers = get_num_pairs(cc, points, exclude, orig_pts)
+-    log && @info("Total number of pair solves = $num_pairs")
++    # Decide the shortcut before counting pairs so that `num_pairs` and
++    # `pair_numbers` are assigned once: they are captured by `pair_label`
++    # and `handle_pair` below, and a captured variable that is reassigned
++    # is boxed, which made every per-pair call dynamic.
++    get_shortcut_resistances = is_raster(geometry) && !write_volt_maps &&
++        !write_cur_maps && !write_cum_cur_map_only && !write_max_cur_maps &&
++        isempty(exclude)
++    num_pairs, pair_numbers = if get_shortcut_resistances
++        np, pn = get_num_pairs_shortcut(cc, points, exclude, orig_pts)
++        log && @info("Triggering resistance calculation shortcut")
++        log && @info("Total number of pair solves has been reduced to $np")
++        np, pn
++    else
++        np, pn = get_num_pairs(cc, points, exclude, orig_pts)
++        log && @info("Total number of pair solves = $np")
++        np, pn
++    end
+ 
+     # Initialize pairwise resistance
+     resistances = -1 * ones(T, numpoints, numpoints)
+     voltmatrix = zeros(T, size(resistances))
+     shortcut_res = -1 * ones(T, size(resistances))
+ 
+-    get_shortcut_resistances = false
+-    if is_raster(geometry) && !write_volt_maps && !write_cur_maps &&
+-            !write_cum_cur_map_only && !write_max_cur_maps &&
+-            isempty(exclude)
+-        get_shortcut_resistances = true
+-        log && @info("Triggering resistance calculation shortcut")
+-        num_pairs, pair_numbers = get_num_pairs_shortcut(cc, points, exclude, orig_pts)
+-        log && @info("Total number of pair solves has been reduced to $num_pairs")
+-    end
+     shortcut = Shortcut(get_shortcut_resistances, voltmatrix, shortcut_res)
+ 
+     pair_label(job) = haskey(pair_numbers, (job.src_node, job.dst_node)) ?
+@@ -353,16 +359,16 @@ function solve(prob::GraphProblem{T,V}, solver::Solver, cfg, log)::Matrix{T} whe
+         end
+     end
+ 
+-    if get_shortcut_resistances
+-        resistances = shortcut.shortcut_res
+-    end
++    # A new binding rather than reassigning `resistances`, which is captured
++    # by `handle_pair` and would otherwise be boxed.
++    final_res = get_shortcut_resistances ? shortcut.shortcut_res : resistances
+ 
+-    for i = 1:size(resistances,1)
+-        resistances[i,i] = 0
++    for i = 1:size(final_res,1)
++        final_res[i,i] = 0
+     end
+ 
+     # Pad it with the user points
+-    r = vcat(vcat(0,orig_pts)', hcat(orig_pts, resistances))
++    r = vcat(vcat(0,orig_pts)', hcat(orig_pts, final_res))
+ 
+     # Save resistances
+     save_resistances(r, cfg)
+diff --git a/src/out.jl b/src/out.jl
+index d3551849..173c07fe 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -45,7 +45,8 @@ end
+ # kernel keeps cumulative node and branch currents.
+ accumulate_currents!(::AbstractVector, node_currents_array, branch_currents_array) = nothing
+ 
+-function accumulate_currents!(output::Output, node_currents_array, branch_currents_array)
++function accumulate_currents!(output::Output{T,V}, node_currents_array,
++                              branch_currents_array) where {T,V}
+     cum_branch_curr = output.cum.cum_branch_curr
+     cum_node_curr = output.cum.cum_node_curr
+ 
+@@ -53,7 +54,6 @@ function accumulate_currents!(output::Output, node_currents_array, branch_curren
+     # critical section is just the adds.
+     bca = branch_currents_array
+     bidx = output.cum.branch_index
+-    V = keytype(bidx).parameters[1]
+     slots = [bidx[(V(bca[i,1]), V(bca[i,2]))] for i in 1:size(bca, 1)]
+ 
+     lock(output.cum.lock) do
+@@ -521,14 +521,22 @@ function write_raster(fn_prefix::String,
+     end
+ end
+ 
+-function write_asc(fn_prefix::String, array::AbstractMatrix, wkt::String, transform)
+-    nrows, ncols = size(array)
++# Lower-left corner and cell size of an `nrows`-row grid from a GDAL-style
++# geotransform; unit cells at the origin without one. A helper so that the
++# values are bound once before `write_asc` captures them (a captured
++# variable assigned on two branches is boxed).
++function _asc_origin(transform, nrows)
+     if length(transform) >= 6
+         xll, dx, dy = transform[1], transform[2], -transform[6]
+         yll = transform[4] - nrows * dy
+-    else
+-        xll, yll, dx, dy = 0.0, 0.0, 1.0, 1.0
++        return xll, yll, dx, dy
+     end
++    0.0, 0.0, 1.0, 1.0
++end
++
++function write_asc(fn_prefix::String, array::AbstractMatrix, wkt::String, transform)
++    nrows, ncols = size(array)
++    xll, yll, dx, dy = _asc_origin(transform, nrows)
+     open(fn_prefix * ".asc", "w") do io
+         println(io, "ncols         ", ncols)
+         println(io, "nrows         ", nrows)
+diff --git a/src/raster/graph.jl b/src/raster/graph.jl
+index 62d7a748..e8cbd739 100644
+--- a/src/raster/graph.jl
++++ b/src/raster/graph.jl
+@@ -211,8 +211,11 @@ function create_new_polymap(gmap, polymap::Matrix{V}, points_rc,
+         newpoly = zeros(V, size(gmap)...)
+         id1 = findall(x -> x == pt1, points_rc[3])
+         id2 = findall(x -> x == pt2, points_rc[3])
+-        map(x -> newpoly[f(x)...] = pt1, id1)
+-        map(x -> newpoly[f(x)...] = pt2, id2)
++        # Plain loops rather than `map` over closures: `newpoly` is assigned
++        # on several branches, and a captured variable that is reassigned is
++        # boxed, which made the return type `Any` for every caller.
++        for x in id1; newpoly[f(x)...] = pt1; end
++        for x in id2; newpoly[f(x)...] = pt2; end
+         return newpoly
+     else
+         newpoly = deepcopy(polymap)
+@@ -226,12 +229,12 @@ function create_new_polymap(gmap, polymap::Matrix{V}, points_rc,
+             end
+             allzero = mapreduce(x -> polymap[f(x)...] == 0, &, idx)
+             if allzero
+-                map(x -> newpoly[f(x)...] = k + 1, idx)
++                for x in idx; newpoly[f(x)...] = k + 1; end
+                 k += 1
+             else
+                 nz = filter(x -> polymap[f(x)...]!= 0, idx)
+                 if length(nz) == 1
+-                    map(x -> newpoly[f(x)...] = polymap[overlap[1]], idx)
++                    for x in idx; newpoly[f(x)...] = polymap[overlap[1]]; end
+                 else
+                     coords = map(x -> f(x), nz)
+                     vals = map(x -> polymap[x...], coords)
+diff --git a/src/raster/onetoall.jl b/src/raster/onetoall.jl
+index 49ce2c35..dd991839 100644
+--- a/src/raster/onetoall.jl
++++ b/src/raster/onetoall.jl
+@@ -11,7 +11,6 @@ effective resistance of each.
+ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+ 
+     # Data
+-    strengths = data.strengths
+     included_pairs = data.included_pairs
+     points_rc = data.points_rc
+     gmap = data.cellmap
+@@ -19,23 +18,21 @@ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+     hbmeta = data.hbmeta
+ 
+     # Options
+-    use_variable_strengths = !isempty(strengths)
++    use_variable_strengths = !isempty(data.strengths)
+     use_included_pairs = !isempty(included_pairs)
+     mode = included_pairs.mode == :include ? 0 : 1
+     one_to_all = is_onetoall(cfg)
+ 
+-    if use_included_pairs
+-        prune_points!(points_rc, included_pairs.point_ids)
+-        if use_variable_strengths
+-            strengths = prune_strengths(strengths, included_pairs.point_ids)
+-        end
+-    end
++    use_included_pairs && prune_points!(points_rc, included_pairs.point_ids)
++    # Assigned once: `strengths` is captured by `solve_point` below.
++    strengths = use_included_pairs && use_variable_strengths ?
++        prune_strengths(data.strengths, included_pairs.point_ids) : data.strengths
+ 
+     # Construct point map
+     point_map = zeros(V, size(gmap))
+-    f(i, x) = points_rc[i][x]
++    _pt(i, x) = points_rc[i][x]
+     for x = 1:size(points_rc[1], 1)
+-        point_map[f(1,x), f(2,x)] = f(3, x)
++        point_map[_pt(1,x), _pt(2,x)] = _pt(3, x)
+     end
+ 
+     points_unique = unique(points_rc[3])
+@@ -46,9 +43,8 @@ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+     nodemap = geometry.nodemap
+     @info("There are $(size(G, 1)) points and $(length(cc)) connected components")
+ 
+-    cum = initialize_cum_maps(gmap, cfg.write_max_cur_maps)
++    cum = initialize_cum_maps(V, gmap, cfg.write_max_cur_maps)
+ 
+-    point_ids = included_pairs.point_ids
+     res = zeros(T, size(points_unique, 1))
+     num_points_to_solve = size(points_unique, 1)
+     original_point_map = copy(point_map)
+@@ -57,7 +53,7 @@ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+ 
+     for i in points_unique
+         ind = findfirst(x -> x == i, points_rc[3])
+-        unique_point_map[f(1,ind), f(2,ind)] = f(3,ind)
++        unique_point_map[_pt(1,ind), _pt(2,ind)] = _pt(3,ind)
+     end
+ 
+     # With an include/exclude file the set of focal points that act as
+@@ -71,85 +67,20 @@ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+     # test as `has_focal_regions`.)
+     point_file_no_polygons = length(points_rc[1]) == length(points_unique)
+ 
+-    # Solve focal point `i`; returns its current map, or nothing if skipped
+-    function f(i)
+-        let point_map = copy(original_point_map), strength_map = copy(strength_map), newpoly = newpoly, nodemap = nodemap, G = G, cc = cc
+-        str = use_variable_strengths ? strengths[i,2] : 1
+-        @info("Solving point $i of $num_points_to_solve")
+-        n = points_unique[i]
+-        if use_included_pairs
+-            # `i` indexes the focal points present in the raster, but the
+-            # include matrix is indexed by position in `point_ids`. These differ
+-            # whenever the file names an ID the point raster does not contain,
+-            # so look the row up by node ID rather than reusing `i` (issue #341).
+-            row = findfirst(isequal(n), point_ids)
+-            for j = 1:size(point_ids,1)
+-                if j != row && included_pairs.include_pairs[row,j] == mode
+-                    exclude = point_ids[j]
+-                    map!(x -> x == exclude ? 0 : x, point_map, point_map)
+-                end
+-            end
+-            if !point_file_no_polygons
+-                # Focal regions: excluded regions must not be merged into a
+-                # single node for this solve, so rebuild the graph from the
+-                # pruned point map.
+-                newpoly = create_new_polymap(gmap, polymap, points_rc, 0, 0, point_map)
+-                G, cc, point_geometry = build_graph(data, cfg, newpoly)
+-                nodemap = point_geometry.nodemap
+-            end
+-        end
+-        if use_variable_strengths
+-            _tmp = [point_map[points_rc[1][x], points_rc[2][x]] for x = 1:size(points_rc[1], 1)]
+-            idx = findall(x -> x == 0, _tmp)
+-            _strengths = deepcopy(strengths)
+-            _strengths[idx, 2] .= 1
+-            for x = 1:size(points_rc[1], 1)
+-                strength_map[points_rc[1][x], points_rc[2][x]] = _strengths[x,2]
+-            end
+-        end
+-        if sum(point_map) == n
+-            res[i] = -1
+-            return nothing
+-        end
+-        if one_to_all
+-            source_map = map(x -> x == n ? T(str) : T(0), unique_point_map)
+-            ground_map = map(x -> x == n ? T(0) : T(x), point_map)
+-            map!(x -> x > 0 ? Inf : x, ground_map, ground_map)
+-        else
+-            if use_variable_strengths
+-                source_map = map((x,y) -> x == n ? T(0) : T(y), unique_point_map, strength_map)
+-            else
+-                source_map = map(x -> x != 0 ? T(1) : T(0), unique_point_map)
+-                source_map = map((x,y) -> x == n ? T(0) : y, point_map, source_map)
+-            end
+-            ground_map = map(x -> x == n ? Inf : T(0), point_map)
+-        end
+-
+-        # Only the component holding this focal node is solved. `i` indexes
+-        # `points_unique`, not the rows of `points_rc`; look the cell up by id
+-        # so focal regions get the right node.
+-        ind = findfirst(isequal(n), points_rc[3])
+-        check_node = nodemap[points_rc[1][ind], points_rc[2][ind]]
+-
+-        point_geometry = RasterGeometry(nodemap, newpoly, hbmeta, gmap)
+-        policy = one_to_all ? :rmvgnd : :rmvsrc
+-        sources, grounds, finite_grounds =
+-                    sources_and_grounds(point_geometry, source_map, ground_map, G, cfg, policy)
+-
+-        prob = AdvancedProblem(G, cc, point_geometry, sources, grounds, finite_grounds, get_solver(cfg))
+-        voltages, curr, solver_called = advanced_kernel(prob, cfg; check_node, name = "_$(V(n))")
+-
+-        res[i] = onetoall_resistance(voltages, solver_called, one_to_all, n, str,
+-                                     unique_point_map, nodemap)
+-        return curr
+-        end
+-    end
++    # Solve focal point `i`; returns its current map, or nothing if skipped.
++    # A top-level function rather than a closure: the per-point body rebuilds
++    # the graph for focal regions, and a closure that reassigns captured
++    # variables boxes them, which made the whole body dynamically typed.
++    solve_point(i) = solve_onetoall_point(i, data, cfg, G, cc, nodemap, newpoly,
++        original_point_map, strength_map, unique_point_map, points_unique,
++        strengths, res, mode, use_variable_strengths, use_included_pairs,
++        point_file_no_polygons, one_to_all)
+ 
+     is_parallel = cfg.parallelize
+     if is_parallel
+-        results = fetch.(map(x -> Threads.@spawn(f(x)), 1:num_points_to_solve))
++        results = fetch.(map(x -> Threads.@spawn(solve_point(x)), 1:num_points_to_solve))
+     else
+-        results = map(f, 1:num_points_to_solve)
++        results = map(solve_point, 1:num_points_to_solve)
+     end
+ 
+     # Reduce: accumulate current maps on main thread
+@@ -164,6 +95,98 @@ function run_onetoall(data::RasterData{T,V}, cfg)::Matrix{T} where {T,V}
+     hcat(points_unique, res)
+ end
+ 
++# One focal point of `run_onetoall`: build its source and ground maps (and,
++# for focal regions with an include/exclude file, its own graph), solve its
++# component with the advanced kernel, record its effective resistance in
++# `res[i]` and return its current map, or nothing if the point was skipped.
++# `point_map` and `strength_map` are copied because the include/exclude
++# handling edits them per point; every other argument is read only, so the
++# function is safe to run on several threads at once.
++function solve_onetoall_point(i, data::RasterData{T,V}, cfg, G, cc, nodemap, newpoly,
++                              original_point_map, strength_map, unique_point_map,
++                              points_unique, strengths, res, mode,
++                              use_variable_strengths, use_included_pairs,
++                              point_file_no_polygons, one_to_all) where {T,V}
++    included_pairs = data.included_pairs
++    point_ids = included_pairs.point_ids
++    points_rc = data.points_rc
++    gmap = data.cellmap
++    polymap = data.polymap
++    hbmeta = data.hbmeta
++    num_points_to_solve = length(points_unique)
++
++    point_map = copy(original_point_map)
++    strength_map = copy(strength_map)
++    str = use_variable_strengths ? strengths[i,2] : 1
++    @info("Solving point $i of $num_points_to_solve")
++    n = points_unique[i]
++    if use_included_pairs
++        # `i` indexes the focal points present in the raster, but the
++        # include matrix is indexed by position in `point_ids`. These differ
++        # whenever the file names an ID the point raster does not contain,
++        # so look the row up by node ID rather than reusing `i` (issue #341).
++        row = findfirst(isequal(n), point_ids)
++        for j = 1:size(point_ids,1)
++            if j != row && included_pairs.include_pairs[row,j] == mode
++                exclude = point_ids[j]
++                map!(x -> x == exclude ? 0 : x, point_map, point_map)
++            end
++        end
++        if !point_file_no_polygons
++            # Focal regions: excluded regions must not be merged into a
++            # single node for this solve, so rebuild the graph from the
++            # pruned point map.
++            newpoly = create_new_polymap(gmap, polymap, points_rc, 0, 0, point_map)
++            G, cc, point_geometry = build_graph(data, cfg, newpoly)
++            nodemap = point_geometry.nodemap
++        end
++    end
++    if use_variable_strengths
++        _tmp = [point_map[points_rc[1][x], points_rc[2][x]] for x = 1:size(points_rc[1], 1)]
++        idx = findall(x -> x == 0, _tmp)
++        _strengths = deepcopy(strengths)
++        _strengths[idx, 2] .= 1
++        for x = 1:size(points_rc[1], 1)
++            strength_map[points_rc[1][x], points_rc[2][x]] = _strengths[x,2]
++        end
++    end
++    if sum(point_map) == n
++        res[i] = -1
++        return nothing
++    end
++    if one_to_all
++        source_map = map(x -> x == n ? T(str) : T(0), unique_point_map)
++        ground_map = map(x -> x == n ? T(0) : T(x), point_map)
++        map!(x -> x > 0 ? Inf : x, ground_map, ground_map)
++    else
++        if use_variable_strengths
++            source_map = map((x,y) -> x == n ? T(0) : T(y), unique_point_map, strength_map)
++        else
++            source_map = map(x -> x != 0 ? T(1) : T(0), unique_point_map)
++            source_map = map((x,y) -> x == n ? T(0) : y, point_map, source_map)
++        end
++        ground_map = map(x -> x == n ? Inf : T(0), point_map)
++    end
++
++    # Only the component holding this focal node is solved. `i` indexes
++    # `points_unique`, not the rows of `points_rc`; look the cell up by id
++    # so focal regions get the right node.
++    ind = findfirst(isequal(n), points_rc[3])
++    check_node = nodemap[points_rc[1][ind], points_rc[2][ind]]
++
++    point_geometry = RasterGeometry(nodemap, newpoly, hbmeta, gmap)
++    policy = one_to_all ? :rmvgnd : :rmvsrc
++    sources, grounds, finite_grounds =
++                sources_and_grounds(point_geometry, source_map, ground_map, G, cfg, policy)
++
++    prob = AdvancedProblem(G, cc, point_geometry, sources, grounds, finite_grounds, get_solver(cfg))
++    voltages, curr, solver_called = advanced_kernel(prob, cfg; check_node, name = "_$(V(n))")
++
++    res[i] = onetoall_resistance(voltages, solver_called, one_to_all, n, str,
++                                 unique_point_map, nodemap)
++    return curr
++end
++
+ # The effective resistance of focal node `n` from one solve: in one-to-all its
+ # voltage over the injected strength, -1 if nothing was solved or the voltage
+ # is zero; all-to-one only writes maps and reports 0 for a solved node.
+diff --git a/src/raster/problem.jl b/src/raster/problem.jl
+index eac62358..56ae2c6c 100644
+--- a/src/raster/problem.jl
++++ b/src/raster/problem.jl
+@@ -32,8 +32,8 @@ function focal_nodes(data::RasterData{T,V}, geometry::RasterGeometry) where {T,V
+     points, points_rc[3], exclude_pairs
+ end
+ 
+-initialize_cum(data::RasterData, cfg, num_nodes) =
+-    initialize_cum_maps(data.cellmap, cfg.write_max_cur_maps)
++initialize_cum(data::RasterData{T,V}, cfg, num_nodes) where {T,V} =
++    initialize_cum_maps(V, data.cellmap, cfg.write_max_cur_maps)
+ 
+ # A point file that names one id in several cells describes focal regions.
+ has_focal_regions(data::RasterData) =
+@@ -66,7 +66,7 @@ function pairwise_regions(rasterdata::RasterData{T,V}, cfg)::Matrix{T} where {T,
+ 						generate_exclude_pairs(points_rc, included_pairs)
+ 
+     # Cumulative maps
+-    cum = initialize_cum_maps(gmap, cfg.write_max_cur_maps)
++    cum = initialize_cum_maps(V, gmap, cfg.write_max_cur_maps)
+ 
+     pts = unique(points_rc[3])
+     resistances = -1 * ones(length(pts), length(pts))
+diff --git a/src/utils.jl b/src/utils.jl
+index f224287b..e153c33b 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -147,14 +147,17 @@ function postprocess_cum_curmap!(accum)
+     end
+ end
+ 
+-function initialize_cum_maps(cellmap::Matrix{T}, max = false) where T
++# `V` is the problem's index type, so the result is the `Cumulative{T,V}` that
++# `GraphProblem{T,V}` and `Output{T,V}` hold; the branch vectors stay empty for
++# rasters.
++function initialize_cum_maps(::Type{V}, cellmap::Matrix{T}, max = false) where {T,V}
+     cum_curr = zeros(T, size(cellmap)...)
+     max_curr = max ? fill(T(-9999), size(cellmap)...) : zeros(T, 0, 0)
+     cum_branch_curr = Vector{T}()
+     cum_node_curr = Vector{T}()
+ 
+     Cumulative(cum_curr, max_curr, cum_branch_curr, cum_node_curr,
+-               Vector{Tuple{Int,Int}}(), Dict{Tuple{Int,Int},Int}(), ReentrantLock())
++               Vector{Tuple{V,V}}(), Dict{Tuple{V,V},Int}(), ReentrantLock())
+ end
+ 
+ function initialize_cum_vectors(coords::Tuple{Vector{V},Vector{V},Vector{T}}, num_nodes::Int64) where {T,V}

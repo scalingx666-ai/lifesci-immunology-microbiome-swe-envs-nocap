@@ -1,0 +1,353 @@
+diff --git a/doc/user_guide/diffusion.md b/doc/user_guide/diffusion.md
+index 9a1c0c443..7bbe7688e 100644
+--- a/doc/user_guide/diffusion.md
++++ b/doc/user_guide/diffusion.md
+@@ -143,7 +143,7 @@ Then click the Play button at the top of the screen to run the simulation visual
+ ### Boundary conditions
+ 
+ For a numerical solution, we need to specify the equation, the boundary
+-conditions, and the domain. BioDynaMo supports Neumann and Dirichlet boundaries 
++conditions, and the domain. BioDynaMo supports Neumann, Dirichlet and Periodic boundaries 
+ with constant coefficients on a cube domain. For instance, you may specify 
+ no-flux boundaries (homogeneous Neumann) via
+ ``` cpp
+@@ -157,6 +157,11 @@ ModelInitializer::AddBoundaryConditions(
+     kKalium, BoundaryConditionType::kDirichlet,
+     std::make_unique<ConstantBoundaryCondition>(1.0));
+ ```
++or Periodic boundaries via
++``` cpp
++ModelInitializer::AddBoundaryConditions(
++    kKalium, BoundaryConditionType::kPeriodic);
++```
+ 
+ The `ModelInitializer` conveniently wraps the access to the `ResourceManager`
+ and sets the boundaries. You can also set the boundaries directly by calling
+diff --git a/src/core/diffusion/diffusion_grid.cc b/src/core/diffusion/diffusion_grid.cc
+index 272bb9f54..065c173e2 100644
+--- a/src/core/diffusion/diffusion_grid.cc
++++ b/src/core/diffusion/diffusion_grid.cc
+@@ -33,6 +33,8 @@ std::string BoundaryTypeToString(const BoundaryConditionType& type) {
+       return "closed";
+     case BoundaryConditionType::kDirichlet:
+       return "Dirichlet";
++    case BoundaryConditionType::kPeriodic:
++      return "Periodic";
+     default:
+       return "unknown";
+   }
+@@ -48,6 +50,8 @@ BoundaryConditionType StringToBoundaryType(const std::string& type) {
+     return BoundaryConditionType::kClosedBoundaries;
+   } else if (type == "Dirichlet") {
+     return BoundaryConditionType::kDirichlet;
++  } else if (type == "Periodic") {
++    return BoundaryConditionType::kPeriodic;
+   } else {
+     Log::Fatal("StringToBoundaryType", "Unknown boundary type: ", type);
+     return BoundaryConditionType::kNeumann;
+@@ -139,6 +143,8 @@ void DiffusionGrid::Diffuse(real_t dt) {
+     DiffuseWithDirichlet(dt);
+   } else if (bc_type_ == BoundaryConditionType::kNeumann) {
+     DiffuseWithNeumann(dt);
++  } else if (bc_type_ == BoundaryConditionType::kPeriodic) {
++    DiffuseWithPeriodic(dt);
+   } else {
+     Log::Error(
+         "EulerGrid::Diffuse", "Boundary condition of type '",
+diff --git a/src/core/diffusion/diffusion_grid.h b/src/core/diffusion/diffusion_grid.h
+index 598119eac..0b5e74c18 100644
+--- a/src/core/diffusion/diffusion_grid.h
++++ b/src/core/diffusion/diffusion_grid.h
+@@ -36,7 +36,8 @@ enum class BoundaryConditionType {
+   kDirichlet,
+   kNeumann,
+   kOpenBoundaries,
+-  kClosedBoundaries
++  kClosedBoundaries,
++  kPeriodic
+ };
+ 
+ enum class InteractionMode { kAdditive = 0, kExponential = 1, kLogistic = 2 };
+@@ -117,6 +118,9 @@ class DiffusionGrid : public ScalarField {
+   /// Compute the diffusion of the substance with Neumann boundary conditions
+   /// (du/dn = const on the boundary) for a given time step dt.
+   virtual void DiffuseWithNeumann(real_t dt) = 0;
++  /// Compute the diffusion of the substance with Periodic boundary conditions
++  /// (u_{-1} = {u_N-1}, u_{N} = u_{0}) for a given time step dt.
++  virtual void DiffuseWithPeriodic(real_t dt) = 0;
+ 
+   /// Calculates the gradient for each box in the diffusion grid.
+   /// The gradient is calculated in each direction (x, y, z) as following:
+diff --git a/src/core/diffusion/euler_depletion_grid.cc b/src/core/diffusion/euler_depletion_grid.cc
+index 9fd99fb5c..6cd816f1b 100644
+--- a/src/core/diffusion/euler_depletion_grid.cc
++++ b/src/core/diffusion/euler_depletion_grid.cc
+@@ -88,4 +88,11 @@ void EulerDepletionGrid::DiffuseWithNeumann(real_t dt) {
+   ApplyDepletion(dt);
+ }
+ 
++void EulerDepletionGrid::DiffuseWithPeriodic(real_t dt) {
++  // Update concentration without depletion (c1 is modified)
++  EulerGrid::DiffuseWithPeriodic(dt);
++
++  ApplyDepletion(dt);
++}
++
+ }  // namespace bdm
+diff --git a/src/core/diffusion/euler_depletion_grid.h b/src/core/diffusion/euler_depletion_grid.h
+index 45fc1c6a7..181b99e65 100644
+--- a/src/core/diffusion/euler_depletion_grid.h
++++ b/src/core/diffusion/euler_depletion_grid.h
+@@ -58,6 +58,10 @@ class EulerDepletionGrid : public EulerGrid {
+   /// subsequently depletes the substance according to binding_substances_ and
+   /// binding_coefficients_. See ApplyDepletion for details.
+   void DiffuseWithNeumann(real_t dt) override;
++  /// Simulates the Diffusion with EulerGrid::DiffuseWithPeriodic and
++  /// subsequently depletes the substance according to binding_substances_ and
++  /// binding_coefficients_. See ApplyDepletion for details.
++  void DiffuseWithPeriodic(real_t dt) override;
+ 
+   // To avoid missing substances or coefficients, name of the sub and binding
+   // coefficient must be set at the same time
+diff --git a/src/core/diffusion/euler_grid.cc b/src/core/diffusion/euler_grid.cc
+index a58905323..f8ac1b722 100644
+--- a/src/core/diffusion/euler_grid.cc
++++ b/src/core/diffusion/euler_grid.cc
+@@ -18,18 +18,6 @@
+ 
+ namespace bdm {
+ 
+-// Function to move <val> into the range [<min>, <max>]. If it is in the range
+-// already, it is returned unchanged. Else, the closest boundary is returned.
+-inline size_t Clamp(size_t val, size_t min, size_t max) {
+-  if (val < min) {
+-    return min;
+-  }
+-  if (val > max) {
+-    return max;
+-  }
+-  return val;
+-}
+-
+ void EulerGrid::DiffuseWithClosedEdge(real_t dt) {
+   const auto nx = resolution_;
+   const auto ny = resolution_;
+@@ -223,10 +211,10 @@ void EulerGrid::DiffuseWithDirichlet(real_t dt) {
+ }
+ 
+ void EulerGrid::DiffuseWithNeumann(real_t dt) {
+-  const auto nx = resolution_;
+-  const auto ny = resolution_;
+-  const auto nz = resolution_;
+-  const auto num_boxes = nx * ny * nz;
++  const size_t nx = resolution_;
++  const size_t ny = resolution_;
++  const size_t nz = resolution_;
++  const size_t num_boxes = nx * ny * nz;
+ 
+   const real_t ibl2 = 1 / (box_length_ * box_length_);
+   const real_t d = 1 - dc_[0];
+@@ -259,12 +247,12 @@ void EulerGrid::DiffuseWithNeumann(real_t dt) {
+           // Clamp to avoid out of bounds access. Clamped values are initialized
+           // to a wrong value but will be overwritten by the boundary condition
+           // evaluation. All other values are correct.
+-          real_t left{c1_[Clamp(c - 1, 0, num_boxes - 1)]};
+-          real_t right{c1_[Clamp(c + 1, 0, num_boxes - 1)]};
+-          real_t bottom{c1_[Clamp(b, 0, num_boxes - 1)]};
+-          real_t top{c1_[Clamp(t, 0, num_boxes - 1)]};
+-          real_t north{c1_[Clamp(n, 0, num_boxes - 1)]};
+-          real_t south{c1_[Clamp(s, 0, num_boxes - 1)]};
++          real_t left{c1_[std::clamp(c - 1, size_t{0}, num_boxes - 1)]};
++          real_t right{c1_[std::clamp(c + 1, size_t{0}, num_boxes - 1)]};
++          real_t bottom{c1_[std::clamp(b, size_t{0}, num_boxes - 1)]};
++          real_t top{c1_[std::clamp(t, size_t{0}, num_boxes - 1)]};
++          real_t north{c1_[std::clamp(n, size_t{0}, num_boxes - 1)]};
++          real_t south{c1_[std::clamp(s, size_t{0}, num_boxes - 1)]};
+           real_t center_factor{6.0};
+ 
+           if (x == 0 || x == (nx - 1) || y == 0 || y == (ny - 1) || z == 0 ||
+@@ -313,4 +301,69 @@ void EulerGrid::DiffuseWithNeumann(real_t dt) {
+   c1_.swap(c2_);
+ }
+ 
++void EulerGrid::DiffuseWithPeriodic(real_t dt) {
++  const size_t nx = resolution_;
++  const size_t ny = resolution_;
++  const size_t nz = resolution_;
++
++  const real_t dx = box_length_;
++  const real_t d = 1 - dc_[0];
++
++  constexpr size_t YBF = 16;
++#pragma omp parallel for collapse(2)
++  for (size_t yy = 0; yy < ny; yy += YBF) {
++    for (size_t z = 0; z < nz; z++) {
++      size_t ymax = yy + YBF;
++      if (ymax >= ny) {
++        ymax = ny;
++      }
++      for (size_t y = yy; y < ymax; y++) {
++        size_t l{0};
++        size_t r{0};
++        size_t n{0};
++        size_t s{0};
++        size_t b{0};
++        size_t t{0};
++        size_t c = y * nx + z * nx * ny;
++#pragma omp simd
++        for (size_t x = 0; x < nx; x++) {
++          l = c - 1;
++          r = c + 1;
++          n = c - nx;
++          s = c + nx;
++          b = c - nx * ny;
++          t = c + nx * ny;
++
++          // Adapt neighbor indices for boundary boxes for periodic boundary
++          if (x == 0) {
++            l = nx - 1 + y * nx + z * nx * ny;
++          } else if (x == (nx - 1)) {
++            r = 0 + y * nx + z * nx * ny;
++          }
++
++          if (y == 0) {
++            n = x + (ny - 1) * nx + z * nx * ny;
++          } else if (y == (ny - 1)) {
++            s = x + 0 * nx + z * nx * ny;
++          }
++
++          if (z == 0) {
++            b = x + y * nx + (nz - 1) * nx * ny;
++          } else if (z == (nz - 1)) {
++            t = x + y * nx + 0 * nx * ny;
++          }
++
++          // Stencil update
++          c2_[c] = c1_[c] * (1 - (mu_ * dt)) +
++                   ((d * dt / (dx * dx)) * (c1_[l] + c1_[r] + c1_[n] + c1_[s] +
++                                            c1_[t] + c1_[b] - 6.0 * c1_[c]));
++
++          ++c;
++        }
++      }  // tile ny
++    }    // tile nz
++  }      // block ny
++  c1_.swap(c2_);
++}
++
+ }  // namespace bdm
+diff --git a/src/core/diffusion/euler_grid.h b/src/core/diffusion/euler_grid.h
+index b3e56be57..5052ae49d 100644
+--- a/src/core/diffusion/euler_grid.h
++++ b/src/core/diffusion/euler_grid.h
+@@ -52,6 +52,7 @@ class EulerGrid : public DiffusionGrid {
+   void DiffuseWithOpenEdge(real_t dt) override;
+   void DiffuseWithDirichlet(real_t dt) override;
+   void DiffuseWithNeumann(real_t dt) override;
++  void DiffuseWithPeriodic(real_t dt) override;
+ 
+  private:
+   BDM_CLASS_DEF_OVERRIDE(EulerGrid, 1);
+diff --git a/src/core/param/param.h b/src/core/param/param.h
+index c064bd282..f1d394ede 100644
+--- a/src/core/param/param.h
++++ b/src/core/param/param.h
+@@ -236,7 +236,7 @@ struct Param {
+   real_t max_bound = 100;
+ 
+   /// Define the boundary condition of the diffusion grid [open, closed,
+-  /// Neumann, Dirichlet]\n
++  /// Neumann, Dirichlet, Periodic]\n
+   /// Default value: `"Neumann"`\n TOML config file:
+   ///
+   ///     [simulation]
+diff --git a/test/unit/core/diffusion_init_test.h b/test/unit/core/diffusion_init_test.h
+index 85e596785..7ac3bec88 100644
+--- a/test/unit/core/diffusion_init_test.h
++++ b/test/unit/core/diffusion_init_test.h
+@@ -31,6 +31,7 @@ class TestGrid : public DiffusionGrid {
+   void DiffuseWithOpenEdge(real_t dt) override { return; };
+   void DiffuseWithDirichlet(real_t dt) override { return; };
+   void DiffuseWithNeumann(real_t dt) override { return; };
++  void DiffuseWithPeriodic(real_t dt) override { return; };
+ 
+   void Swap() { c1_.swap(c2_); }
+ 
+diff --git a/test/unit/core/diffusion_test.cc b/test/unit/core/diffusion_test.cc
+index 1da466a8a..7a9d78fe8 100644
+--- a/test/unit/core/diffusion_test.cc
++++ b/test/unit/core/diffusion_test.cc
+@@ -1132,6 +1132,73 @@ TEST(DiffusionTest, EulerNeumannNonZeroBoundaries) {
+   rm->RemoveContinuum(0);
+ }
+ 
++TEST(DiffusionTest, EulerPeriodicBoundaries) {
++  double simulation_time_step{0.1};
++  auto set_param = [&](Param* param) {
++    param->bound_space = Param::BoundSpaceMode::kClosed;
++    param->min_bound = -50;
++    param->max_bound = 50;
++    param->diffusion_boundary_condition = "Periodic";
++  };
++  Simulation simulation(TEST_NAME, set_param);
++
++  simulation.GetEnvironment()->Update();
++  auto* rm = simulation.GetResourceManager();
++
++  double decay_coef = 0.0;
++  double diff_coef = 100.0;
++  int res = 10;
++  double init = 1e5;
++
++  // Place source at u0 and measure concentration in u1 and un-1.
++  // Concentration should be identical.
++  //    |                          |
++  //    |u0  u1  u2 .... un-2  un-1|
++  //    |                          |
++  //
++  // Repeat for all 6 sides of simulation.
++
++  std::vector<Real3> sources;
++  sources.push_back({45, 5, 5});
++  sources.push_back({-45, 5, 5});
++  sources.push_back({5, 45, 5});
++  sources.push_back({5, -45, 0});
++  sources.push_back({5, 5, 45});
++  sources.push_back({5, 5, -45});
++
++  std::vector<Real3> inside;
++  inside.push_back({35, 5, 5});
++  inside.push_back({-35, 5, 5});
++  inside.push_back({5, 35, 5});
++  inside.push_back({5, -35, 5});
++  inside.push_back({5, 5, 35});
++  inside.push_back({5, 5, -35});
++
++  std::vector<Real3> outside;
++  outside.push_back({-45, 5, 0});
++  outside.push_back({45, 5, 5});
++  outside.push_back({5, -45, 5});
++  outside.push_back({5, 45, 5});
++  outside.push_back({5, 5, -45});
++  outside.push_back({5, 5, 45});
++
++  for (size_t s = 0; s < sources.size(); s++) {
++    auto* dgrid = new EulerGrid(0, "Kalium", diff_coef, decay_coef, res);
++    dgrid->Initialize();
++    dgrid->SetUpperThreshold(1e15);
++    dgrid->ChangeConcentrationBy(sources[s], init);
++    rm->AddContinuum(dgrid);
++
++    // Concententration measured at both positions should be identical.
++    int tot = 20;
++    for (int t = 0; t < tot; t++) {
++      dgrid->Diffuse(simulation_time_step);
++      EXPECT_FLOAT_EQ(dgrid->GetValue(inside[s]), dgrid->GetValue(outside[s]));
++    }
++    rm->RemoveContinuum(0);
++  }
++}
++
+ TEST(DiffusionTest, DynamicTimeStepping) {
+   auto set_param = [](auto* param) {
+     param->bound_space = Param::BoundSpaceMode::kClosed;

@@ -1,0 +1,151 @@
+diff --git a/metagraph/docs/source/release_notes.rst b/metagraph/docs/source/release_notes.rst
+index e359138385..29414fc3c5 100644
+--- a/metagraph/docs/source/release_notes.rst
++++ b/metagraph/docs/source/release_notes.rst
+@@ -4,6 +4,11 @@ Release notes
+ Unreleased
+ ----------
+ 
++SSHash protein graphs with ``k=12`` now use 64-bit k-mer keys instead of 128-bit
++keys. Rebuild existing SSHash protein graphs with ``k=12`` and their dependent
++annotations before using this version. Other k-mer lengths retain their existing
++storage width.
++
+ ``metagraph build`` now chooses its default k-mer length at compile time from
+ the alphabet's packed 64-bit encoding, rounding down to an odd length for
+ nucleotide alphabets:
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index 0d24f8ea65..c3847d5010 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -30,13 +30,6 @@
+ namespace mtg {
+ namespace graph {
+ 
+-#if _PROTEIN_GRAPH
+-static constexpr uint16_t bits_per_char = sshash::aa_uint_kmer_t<uint64_t>::bits_per_char;
+-#else
+-static constexpr uint16_t bits_per_char = sshash::dna_uint_kmer_t<uint64_t>::bits_per_char;
+-#endif
+-
+-
+ const std::string DBGSSHash::alphabet_ = kmer::KmerExtractor2Bit().alphabet;
+ 
+ constexpr DeBruijnGraph::node_index sshash_to_graph_index(uint64_t idx) {
+@@ -54,16 +47,14 @@ DBGSSHash::DBGSSHash(size_t k, Mode mode) : k_(k), num_nodes_(0), mode_(mode) {
+     if (mode == PRIMARY)
+         mode_ = CANONICAL;
+ 
+-    size_t odd_k = (k_ | 1);
+-
+-    if (odd_k * bits_per_char <= 64) {
++    if (k_ <= kmer_t<KmerInt64>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt64>, sshash::decoded_offsets>>();
+-    } else if (odd_k * bits_per_char <= 128) {
++    } else if (k_ <= kmer_t<KmerInt128>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt128>, sshash::decoded_offsets>>();
+-    } else if (odd_k * bits_per_char <= 256) {
++    } else if (k_ <= kmer_t<KmerInt256>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt256>, sshash::decoded_offsets>>();
+     } else {
+-        common::logger->error("k too big: {} > {}", odd_k, 256 / bits_per_char);
++        common::logger->error("k too big: {} > {}", k_, kmer_t<KmerInt256>::max_k);
+         throw std::length_error("k fail");
+     }
+ }
+diff --git a/metagraph/tests/graph/test_dbg_sshash.cpp b/metagraph/tests/graph/test_dbg_sshash.cpp
+index e33a543f6e..e042655ac3 100644
+--- a/metagraph/tests/graph/test_dbg_sshash.cpp
++++ b/metagraph/tests/graph/test_dbg_sshash.cpp
+@@ -1,5 +1,6 @@
+ #include <fstream>
+ #include <random>
++#include <sstream>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -63,6 +64,84 @@ void expect_rejected(const std::string &contents,
+ 
+ const std::string seq_30 = "ACGTTGCAAGGCTTACCATGGTACCAGTTA";
+ 
++TEST_F(DBGSSHashInput, ChoosesSmallestPackedWord) {
++    constexpr auto k64 = DBGSSHash::kmer_t<uint64_t>::max_k;
++    constexpr auto k128 = DBGSSHash::kmer_t<__uint128_t>::max_k;
++    constexpr auto k256 = DBGSSHash::kmer_t<sdsl::uint256_t>::max_k;
++    EXPECT_EQ(0u, DBGSSHash(k64).data().index());
++    EXPECT_EQ(1u, DBGSSHash(k64 + 1).data().index());
++    EXPECT_EQ(1u, DBGSSHash(k128).data().index());
++    EXPECT_EQ(2u, DBGSSHash(k128 + 1).data().index());
++    EXPECT_EQ(2u, DBGSSHash(k256).data().index());
++    EXPECT_THROW(DBGSSHash(k256 + 1), std::length_error);
++}
++
++#if _PROTEIN_GRAPH
++const std::string protein_sequence = "MKWVTFISRLDPQEAHNYCG";
++
++void check_protein_nodes(const DBGSSHash &graph, const std::string &sequence,
++                         const std::vector<uint64_t> &expected_nodes) {
++    const size_t k = graph.get_k();
++    EXPECT_EQ(sequence.size() - k + 1, graph.num_nodes());
++    std::vector<uint64_t> nodes;
++    graph.map_to_nodes_sequentially(sequence, [&](auto node) { nodes.push_back(node); });
++    ASSERT_EQ(expected_nodes, nodes);
++    for (size_t i = 0; i < nodes.size(); ++i) {
++        ASSERT_NE(0u, nodes[i]);
++        EXPECT_EQ(sequence.substr(i, k), graph.get_node_sequence(nodes[i]));
++        EXPECT_EQ(nodes[i], graph.kmer_to_node(sequence.substr(i, k)));
++        if (i + 1 < nodes.size()) {
++            EXPECT_EQ(nodes[i + 1], graph.traverse(nodes[i], sequence[i + k]));
++            EXPECT_EQ(nodes[i], graph.traverse_back(nodes[i + 1], sequence[i]));
++        }
++    }
++    EXPECT_EQ(0u, graph.kmer_to_node(std::string(k, 'A')));
++}
++
++TEST_F(DBGSSHashInput, ProteinPackedWordConstructionAndRoundTrip) {
++    const std::string sequence = protein_sequence + "STVQKMDF";
++    for (size_t k : {11, 12, 13, 25, 26}) {
++        SCOPED_TRACE(k);
++        write_input(">a\n" + sequence + "\n");
++        DBGSSHash graph(test_input, k);
++        const size_t expected_width = k <= 12 ? 0 : k <= 25 ? 1 : 2;
++        EXPECT_EQ(expected_width, graph.data().index());
++        std::vector<uint64_t> nodes;
++        graph.map_to_nodes_sequentially(sequence, [&](auto node) { nodes.push_back(node); });
++        check_protein_nodes(graph, sequence, nodes);
++
++        std::stringstream bytes;
++        graph.serialize(bytes);
++        DBGSSHash restored(3);
++        ASSERT_TRUE(restored.load(bytes));
++        EXPECT_EQ(k, restored.get_k());
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++
++        graph.serialize(test_input + ".graph");
++        ASSERT_TRUE(restored.load(test_input + ".graph"));
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++
++        auto mapped = utils::open_ifstream(test_input + ".graph.sshashdbg", true);
++        ASSERT_TRUE(restored.load(*mapped));
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++    }
++}
++
++TEST_F(DBGSSHashInput, Protein12EmptyGraphRoundTrip) {
++    DBGSSHash graph(12);
++    std::stringstream bytes;
++    graph.serialize(bytes);
++    DBGSSHash restored(3);
++    ASSERT_TRUE(restored.load(bytes));
++    EXPECT_EQ(12u, restored.get_k());
++    EXPECT_EQ(0u, restored.num_nodes());
++    EXPECT_EQ(0u, restored.data().index());
++}
++#endif
++
+ TEST_F(DBGSSHashInput, RejectsSequenceShorterThanK) {
+     expect_rejected(">a\n" + seq_30 + "\n>b\nACGTA\n",
+                     "sequence 2 has length 5, shorter than k = 21");

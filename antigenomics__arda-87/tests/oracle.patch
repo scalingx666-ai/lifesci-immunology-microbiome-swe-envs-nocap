@@ -1,0 +1,147 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 12147d80..b4317ed3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,23 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.6.2
++
++### Fixed — auto-fetch staged its download in the system temp dir, and died on a cluster
++
++Both auto-fetches unpacked into `tempfile.TemporaryDirectory()`, i.e. `/tmp`. On a cluster `/tmp`
++is routinely a small node-local disk: aldan3's is **2.0 GB with 29 MB free**, and the IgBLAST
++fetch — a ~400 MB archive that extracts to more — died there on the first real run with
++`OSError: [Errno 28] No space left on device`.
++
++Both now stage on the **destination filesystem** (`dir=dest.parent`), which also makes the
++download → extract → lay out → `os.replace` sequence single-filesystem by construction rather
++than by assumption. MMseqs2 is fixed the same way; it had the identical bug and would have hit
++it next.
++
++Invisible on any developer machine with a roomy `/tmp`, so a test asserts *where the archive is
++written*, not merely that the install succeeded.
++
+ ## 2.6.1
+ 
+ ### Fixed — `arda igblast` did not work from a `pip install`, at all
+diff --git a/docs/conf.py b/docs/conf.py
+index 95685b05..ee054ced 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -8,7 +8,7 @@
+ project = "arda"
+ author = "Mikhail Shugay"
+ copyright = "2026, Mikhail Shugay"
+-release = "2.6.1"
++release = "2.6.2"
+ 
+ extensions = [
+     "sphinx.ext.autodoc",
+diff --git a/pyproject.toml b/pyproject.toml
+index d9e78deb..772a4e47 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.6.1"
++version = "2.6.2"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index 6b45bf7d..cf5f5570 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.6.1"
++__version__ = "2.6.2"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/_igblast_fetch.py b/src/arda/_igblast_fetch.py
+index a933155d..dbd4b5a8 100644
+--- a/src/arda/_igblast_fetch.py
++++ b/src/arda/_igblast_fetch.py
+@@ -155,7 +155,13 @@ def fetch(dest: Path, *, force: bool = False) -> Path:
+         staging = dest.parent / f".{dest.name}.staging.{os.getpid()}"
+         shutil.rmtree(staging, ignore_errors=True)
+         try:
+-            with tempfile.TemporaryDirectory(prefix="arda_igblast_") as td:
++            # Scratch next to the destination, NOT in the system temp dir. The release is a
++            # ~400 MB download that extracts to more, and on a cluster /tmp is routinely a small
++            # node-local filesystem -- aldan3's is 2.0 GB with 29 MB free, where this died on
++            # `OSError: [Errno 28] No space left on device`. Putting it here also means the whole
++            # download-extract-lay out-replace sequence happens on one filesystem, so the final
++            # move is a rename by construction rather than by assumption.
++            with tempfile.TemporaryDirectory(prefix=".arda_igblast_", dir=dest.parent) as td:
+                 tmp = Path(td)
+                 tar_path = tmp / tarball
+                 _download(LATEST_URL + tarball, tar_path)
+diff --git a/src/arda/_mmseqs_fetch.py b/src/arda/_mmseqs_fetch.py
+index b2f4fc9b..2c333b5d 100644
+--- a/src/arda/_mmseqs_fetch.py
++++ b/src/arda/_mmseqs_fetch.py
+@@ -78,7 +78,10 @@ def fetch(bin_dir: Path, *, force: bool = False) -> Path:
+     asset = default_asset()
+     url = RELEASE_URL.format(asset=asset)
+     print(f"[arda] fetching mmseqs: {url}", file=sys.stderr)
+-    with tempfile.TemporaryDirectory(prefix="arda_mmseqs_") as td:
++    # Scratch next to the destination, NOT in the system temp dir: on a cluster /tmp is routinely
++    # a small node-local filesystem (aldan3's is 2.0 GB with 29 MB free) and this archive plus its
++    # extraction does not fit. The IgBLAST fetch died there first, with ENOSPC.
++    with tempfile.TemporaryDirectory(prefix=".arda_mmseqs_", dir=bin_dir) as td:
+         tmp = Path(td)
+         tarball = tmp / asset
+         _download(url, tarball)
+diff --git a/tests/unit/test_igblast_fetch.py b/tests/unit/test_igblast_fetch.py
+index 8dbc337e..19ad19c4 100644
+--- a/tests/unit/test_igblast_fetch.py
++++ b/tests/unit/test_igblast_fetch.py
+@@ -5,6 +5,8 @@
+ would have skipped on exactly the installation where the bug lives.
+ """
+ 
++from pathlib import Path
++
+ import pytest
+ 
+ from arda import _igblast_fetch, igblast
+@@ -118,3 +120,31 @@ def fake_lay_out(release_root, staging):
+     assert _igblast_fetch.is_complete(dest)
+     assert _igblast_fetch.installed_version(dest) == "1.22.0"
+     assert not seen["staging"].exists(), "staging must not survive a successful install"
++
++
++def test_the_download_does_not_land_in_the_system_temp_dir(tmp_path, monkeypatch):
++    """The ~400 MB archive must be staged on the DESTINATION filesystem.
++
++    On a cluster /tmp is routinely a small node-local disk — aldan3's is 2.0 GB with 29 MB free,
++    where this failed with `OSError: [Errno 28] No space left on device` on the first real run.
++    Invisible on any developer machine with a roomy /tmp, so it is asserted rather than assumed.
++    """
++    dest = tmp_path / "cache" / "igblast"
++    downloaded_to = {}
++
++    monkeypatch.setattr(_igblast_fetch, "find_tarball", lambda s: "ncbi-igblast-1.22.0-x64-linux.tar.gz")
++    monkeypatch.setattr(_igblast_fetch, "_safe_extract", lambda t, i: i)
++    monkeypatch.setattr(_igblast_fetch, "lay_out", lambda r, s: _fake_release(s, complete=False))
++
++    def fake_download(url, path, **kw):
++        downloaded_to["path"] = path
++        path.write_bytes(b"")
++
++    monkeypatch.setattr(_igblast_fetch, "_download", fake_download)
++    _igblast_fetch.fetch(dest)
++
++    # "not under the system temp dir" is not assertable here — pytest's tmp_path IS under it.
++    # Being under the destination is the invariant that actually prevents the failure, and it
++    # is decisive: the default `TemporaryDirectory()` cannot land there.
++    got = downloaded_to["path"].resolve()
++    assert dest.parent.resolve() in got.parents, f"archive staged outside the cache: {got}"

@@ -1,0 +1,168 @@
+diff --git a/gtdbtk/classify.py b/gtdbtk/classify.py
+index af269ac8..9a5f0b90 100644
+--- a/gtdbtk/classify.py
++++ b/gtdbtk/classify.py
+@@ -339,9 +339,10 @@ def run(self,
+             mash_max_dist=CONFIG.MASH_MAX_DISTANCE,
+             mash_db=None,
+             ani_summary_files=None,
+-            all_classified_ani=False):
++            all_classified_ani=False,
++            all_failed_prodigal=False):
+         """Classify genomes based on position in reference tree."""
+-        if not all_classified_ani:
++        if not all_classified_ani and not all_failed_prodigal:
+             _bac_gids, _ar_gids, bac_ar_diff = Markers().genome_domain(align_dir, prefix)
+ 
+ 
+@@ -416,7 +417,7 @@ def run(self,
+                                   os.path.join(out_dir, os.path.basename(PATH_AR53_SUMMARY_OUT.format(prefix=prefix))))
+                     output_files.setdefault(marker_set_id, []).append(summary_file.path)
+             return output_files
+-        else:
++        elif not all_failed_prodigal:
+             for marker_set_id in ('ar53', 'bac120'):
+                 warning_counter, prodigal_failed_counter = 0, 0
+                 if marker_set_id == 'ar53':
+@@ -752,6 +753,27 @@ def run(self,
+                     output_files.setdefault(marker_set_id, []).append(disappearing_genomes_file.path)
+                 summary_file.write()
+                 output_files.setdefault(marker_set_id, []).append(summary_file.path)
++        elif all_failed_prodigal:
++            marker_set_id ='bac120'
++            summary_file = ClassifySummaryFileBAC120(out_dir, prefix)
++
++            # Add failed genomes from prodigal and genomes with no markers in the bac120 summary file
++            # This is an executive direction: failed prodigal and genomes with no markers are not bacterial or archaeal
++            # but they need to be included in one of the summary file
++            prodigal_failed_counter = self.add_failed_genomes_to_summary(align_dir, summary_file, prefix)
++
++            if summary_file.has_row():
++                summary_file.write()
++                output_files.setdefault(marker_set_id, []).append(summary_file.path)
++                # Symlink to the summary file from the root
++                symlink_f(PATH_BAC120_SUMMARY_OUT.format(prefix=prefix),
++                              os.path.join(out_dir, os.path.basename(PATH_BAC120_SUMMARY_OUT.format(prefix=prefix))))
++                if prodigal_failed_counter > 0:
++                    self.logger.warning(f"{prodigal_failed_counter} of {len(genomes)} "
++                                        f"genome{'' if prodigal_failed_counter == 1 else 's'} "
++                                        f"ha{'s' if prodigal_failed_counter == 1 else 've'} been labeled as 'Unclassified'.")
++
++
+         return output_files
+ 
+     def _add_warning_to_row(self,row,msa_dict,
+diff --git a/gtdbtk/main.py b/gtdbtk/main.py
+index 7db638e9..a19859ca 100644
+--- a/gtdbtk/main.py
++++ b/gtdbtk/main.py
+@@ -364,7 +364,7 @@ def align(self, options):
+         make_sure_path_exists(options.out_dir)
+ 
+         markers = Markers(options.cpus, options.debug)
+-        reports = markers.align(options.identify_dir,
++        reports,all_failed_prodigal = markers.align(options.identify_dir,
+                       options.skip_gtdb_refs,
+                       options.taxa_filter,
+                       options.min_perc_aa,
+@@ -390,7 +390,7 @@ def align(self, options):
+         self.stage_logger.steps.append(align_step)
+ 
+         self.logger.info('Done.')
+-
++        return all_failed_prodigal
+ 
+     def infer(self, options):
+         """Infer a tree from a user specified MSA.
+@@ -536,7 +536,7 @@ def run_test(self, options):
+         self.logger.info('Test has successfully finished.')
+         return True
+ 
+-    def classify(self, options,all_classified_ani=False):
++    def classify(self, options,all_classified_ani=False,all_failed_prodigal=False):
+         """Determine taxonomic classification of genomes.
+ 
+         Parameters
+@@ -600,7 +600,8 @@ def classify(self, options,all_classified_ani=False):
+                      mash_db=options.mash_db,
+                      mash_max_dist=options.mash_max_distance,
+                      ani_summary_files=ani_summary_files,
+-                     all_classified_ani=all_classified_ani
++                     all_classified_ani=all_classified_ani,
++                     all_failed_prodigal=all_failed_prodigal
+                      )
+ 
+         classify_step.ends_at = datetime.now()
+@@ -1162,6 +1163,7 @@ def parse_options(self, options):
+             # if all genomes have been classified by the ani_screen step, we do not need to run the identify step
+             options.identify_dir = options.out_dir
+             options.align_dir = options.out_dir
++            all_failed_prodigal = False
+             if all_classified_ani:
+                 self.logger.info('All genomes have been classified by the ANI screening step, Identify and Align steps will be skipped.')
+             else:
+@@ -1178,13 +1180,13 @@ def parse_options(self, options):
+                 options.rnd_seed = None
+                 options.skip_trimming = False
+ 
+-                self.align(options)
++                all_failed_prodigal = self.align(options)
+ 
+             # because we run ani_screen before the identify step, we do not need to rerun the
+             #ani step again, so we set the skip_aniscreen to True
+             options.skip_ani_screen = True
+ 
+-            self.classify(options,all_classified_ani= all_classified_ani)
++            self.classify(options,all_classified_ani= all_classified_ani,all_failed_prodigal=all_failed_prodigal)
+             if not options.keep_intermediates:
+                 self.remove_intermediate_files(options.out_dir,'classify_wf')
+ 
+diff --git a/gtdbtk/markers.py b/gtdbtk/markers.py
+index fd9ad6cd..5698db38 100644
+--- a/gtdbtk/markers.py
++++ b/gtdbtk/markers.py
+@@ -221,11 +221,17 @@ def identify(self, genomes, tln_tables, out_dir, prefix, force, genes, write_sin
+                 make_sure_path_exists(symlink_protein_dir)
+                 symlink_f(os.path.abspath(gpath), os.path.join(symlink_protein_dir,gid+self.protein_file_suffix))
+ 
++        gene_files = [(db_genome_id, genome_dictionary[db_genome_id]['aa_gene_path'])
++                      for db_genome_id in genome_dictionary.keys()]
++        # if gene_files is empty, we have no genomes to process
++        # we still need to write all the genomes failing the identify step to the bac120_summary file
++        if len(gene_files) == 0:
++            self.logger.warning('All genomes failed the identify step.')
++            return reports
++
+         # annotated genes against TIGRFAM and Pfam databases
+         self.logger.log(CONFIG.LOG_TASK,
+                         'Identifying TIGRFAM protein families.')
+-        gene_files = [(db_genome_id, genome_dictionary[db_genome_id]['aa_gene_path'])
+-                      for db_genome_id in genome_dictionary.keys()]
+         tigr_search = TigrfamSearch(self.cpus,
+                                     self.tigrfam_hmms,
+                                     self.protein_file_suffix,
+@@ -481,6 +487,15 @@ def align(self,
+         else:
+             failed_genomes = list()
+ 
++        if failed_genomes and not os.path.isfile(TlnTableSummaryFile(identify_dir, prefix).path):
++            self.logger.warning(
++                f'Skipping align step.')
++            if identify_dir != out_dir and os.path.isfile(failed_genomes_file):
++                identify_path = os.path.join(out_dir, DIR_IDENTIFY)
++                make_sure_path_exists(identify_path)
++                copy(failed_genomes_file, identify_path)
++            return reports,True
++
+         # If the user is re-running this step, check if the identify step is consistent.
+         genomic_files = self._path_to_identify_data(
+             identify_dir, identify_dir != out_dir)
+@@ -700,7 +715,7 @@ def align(self,
+                     fout.write(f'{no_marker_gid}\tNo bacterial or archaeal marker\n')
+             reports.setdefault('all', []).append(no_marker_filtered_genomes)
+ 
+-        return reports
++        return reports,False
+ 
+     def _write_individual_markers(self, user_msa, marker_set_id, marker_list, out_dir, prefix):
+         marker_dir = join(out_dir, DIR_ALIGN_MARKERS)

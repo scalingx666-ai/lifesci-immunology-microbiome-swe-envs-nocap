@@ -1,0 +1,132 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 8fd85794..88229b37 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -98,6 +98,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ * {func}`ep.ml.calibrate <ehrapy.ml.calibrate>` defaults to `method="platt"` instead of `"isotonic"`, because isotonic regression overfits tuning sets of typical size, such as on PhysioNet 2012 with a calibration slope of 0.54 against 0.95 with Platt scaling ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+ * {func}`ep.ml.evaluate <ehrapy.ml.evaluate>` and {func}`ep.pl.subgroup_performance <ehrapy.plot.subgroup_performance>` keep the subgroups of `groupby` in the order of its categories, or of their appearance, instead of sorting them ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+ * {func}`ep.pp.summarize_measurements <ehrapy.preprocessing.summarize_measurements>` returns NaN without RuntimeWarnings for variables without values in a window of longitudinal data ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
++* {func}`ep.pp.gradient_boosting_impute <ehrapy.preprocessing.gradient_boosting_impute>` leaves out predictors observed too rarely to split on instead of crashing when their few values all fall into the validation split of a model trained on more than 10,000 rows, and warns for variables that stay missing because they have no observed values in the training observations ([#1174](https://github.com/theislab/ehrapy/pull/1174)) @Zethson
+ * {func}`ep.pp.winsorize <ehrapy.preprocessing.winsorize>` and {func}`ep.pp.clip_quantile <ehrapy.preprocessing.clip_quantile>` without `var_names` and `obs_cols` apply to all numeric variables instead of silently changing nothing ([#1173](https://github.com/theislab/ehrapy/pull/1173)) @Zethson
+ * Matplotlib figures in notebooks display inline after a holoviews-based ehrapy plot that runs before the first matplotlib figure, without `%matplotlib inline` ([#1168](https://github.com/theislab/ehrapy/pull/1168)) @Zethson
+ * {func}`ep.tl.ols <ehrapy.tools.ols>` and {func}`ep.tl.glm <ehrapy.tools.glm>` find the `obs` columns and variables quoted as `Q('...')` in a formula, so that names with spaces work again, by requiring formulaic 1.2.2 ([#1165](https://github.com/theislab/ehrapy/pull/1165)) @Zethson
+diff --git a/ehrapy/preprocessing/_imputation.py b/ehrapy/preprocessing/_imputation.py
+index 1dad0c03..9a1eb753 100644
+--- a/ehrapy/preprocessing/_imputation.py
++++ b/ehrapy/preprocessing/_imputation.py
+@@ -806,25 +806,31 @@ def _hide_like(predictors: np.ndarray, missing_rate: np.ndarray, rng: np.random.
+ 
+ 
+ @singledispatch
+-def _fit_boosting(sample: np.ndarray, categorical: np.ndarray, random_state: int) -> list[Model | None]:
++def _fit_boosting(
++    sample: np.ndarray, categorical: np.ndarray, var_names: Sequence[str], random_state: int
++) -> list[Model | None]:
+     """A gradient boosting model per variable with the predictors it uses and the range of its observed values, `None` for variables without observed values."""
+     from sklearn.dummy import DummyClassifier, DummyRegressor
+     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+ 
++    min_samples_leaf = HistGradientBoostingRegressor().min_samples_leaf
+     rng = np.random.default_rng(random_state)
+     rows, context = _rows_and_context(sample)
+     models: list[Model | None] = []
+     for var in range(rows.shape[1]):
+         observed = ~np.isnan(rows[:, var])
+         if not observed.any():
++            logger.warning(
++                f"Variable '{var_names[var]}' has no observed values in the training observations and stays missing."
++            )
+             models.append(None)
+             continue
+         predictors = _predictors(rows[observed], [values[observed] for values in context], var)
+         if not observed.all():
+             to_impute = _predictors(rows[~observed], [values[~observed] for values in context], var)
+             _hide_like(predictors, np.isnan(to_impute).mean(axis=0), rng)
+-        # scikit-learn cannot bin a predictor without values
+-        used = ~np.isnan(predictors).all(axis=0)
++        # predictors observed in fewer rows than a leaf can never be split on, and may have no values left to bin after the validation split
++        used = (~np.isnan(predictors)).sum(axis=0) >= min_samples_leaf
+         if not used.any():
+             model = DummyClassifier(strategy="most_frequent") if categorical[var] else DummyRegressor()
+         else:
+@@ -837,15 +843,15 @@ def _fit_boosting(sample: np.ndarray, categorical: np.ndarray, random_state: int
+ 
+ 
+ @_fit_boosting.register(CSBase)
+-def _(sample: CSBase, categorical: np.ndarray, random_state: int) -> list[Model | None]:
+-    return _fit_boosting(to_dense(sample), categorical, random_state)
++def _(sample: CSBase, categorical: np.ndarray, var_names: Sequence[str], random_state: int) -> list[Model | None]:
++    return _fit_boosting(to_dense(sample), categorical, var_names, random_state)
+ 
+ 
+ @_fit_boosting.register(DaskArray)
+-def _(sample: DaskArray, categorical: np.ndarray, random_state: int) -> Delayed:
++def _(sample: DaskArray, categorical: np.ndarray, var_names: Sequence[str], random_state: int) -> Delayed:
+     import dask
+ 
+-    return dask.delayed(_fit_boosting)(sample, categorical, random_state)
++    return dask.delayed(_fit_boosting)(sample, categorical, var_names, random_state)
+ 
+ 
+ def _batch_size(X: np.ndarray | CSBase) -> int:
+@@ -906,7 +912,8 @@ def gradient_boosting_impute(
+     Every variable is predicted from the other variables of the same observation, missing values included, with :class:`~sklearn.ensemble.HistGradientBoostingRegressor`, or :class:`~sklearn.ensemble.HistGradientBoostingClassifier` for categorical variables.
+     For 3D data, every timepoint is predicted, and the predictors also include the timepoint and the closest observed values of the variable before and after it with their distance in timepoints.
+     During training, every predictor is hidden as often as it is missing where the variable is imputed, so that variables measured together cannot stand in for each other.
+-    Imputed values stay within the range of the observed values of their variable, and variables without any observed value stay missing.
++    Imputed values stay within the range of the observed values of their variable, and variables without any observed value in the training observations stay missing with a warning.
++    Predictors observed too rarely to split on are left out.
+ 
+     Args:
+         edata: Central data object.
+@@ -945,7 +952,7 @@ def gradient_boosting_impute(
+     train = np.arange(X.shape[0])
+     if max_train_obs is not None and X.shape[0] > max_train_obs:
+         train = np.sort(np.random.default_rng(random_state).choice(X.shape[0], max_train_obs, replace=False))
+-    models = _fit_boosting(values[train], categorical, random_state)
++    models = _fit_boosting(values[train], categorical, var_names, random_state)
+     X = _set_columns(X, var_indices, _impute_boosting(values, models))
+ 
+     if layer is None:
+diff --git a/tests/preprocessing/test_imputation.py b/tests/preprocessing/test_imputation.py
+index ce6bae6e..0d9aa61f 100644
+--- a/tests/preprocessing/test_imputation.py
++++ b/tests/preprocessing/test_imputation.py
+@@ -8,6 +8,7 @@
+ import numpy as np
+ import pytest
+ from ehrdata import EHRData
++from ehrdata._logger import logger
+ from ehrdata.core.constants import CATEGORICAL_TAG, DEFAULT_TEM_LAYER_NAME, FEATURE_TYPE_KEY, NUMERIC_TAG
+ from fast_array_utils.conv import to_dense
+ from fast_array_utils.types import CSBase, DaskArray
+@@ -1024,6 +1025,29 @@ def error(imputed):
+     assert error(imputed) < error(locf) / 2
+ 
+ 
++def test_gradient_boosting_impute_skips_rarely_observed_predictors(rng):
++    X = rng.normal(size=(11_000, 6))
++    X[:, 1:5] = np.nan
++    X[np.arange(4), np.arange(1, 5)] = 1.0
++    X[rng.random(11_000) < 0.1, 5] = np.nan
++
++    imputed = gradient_boosting_impute(_numeric_edata(X), max_train_obs=None, random_state=3, copy=True).X
++
++    assert not np.isnan(imputed[:, 5]).any()
++
++
++def test_gradient_boosting_impute_warns_for_variables_without_observed_values(rng, monkeypatch):
++    messages = []
++    monkeypatch.setattr(logger, "warning", lambda msg, **kwargs: messages.append(msg))
++    X = rng.normal(size=(50, 2))
++    X[:, 1] = np.nan
++
++    imputed = gradient_boosting_impute(_numeric_edata(X), copy=True).X
++
++    assert np.isnan(imputed[:, 1]).all()
++    assert any("Variable '1' has no observed values" in message for message in messages)
++
++
+ def test_gradient_boosting_impute_categorical(rng):
+     X = rng.normal(size=(200, 2))
+     X[:, 1] = X[:, 0] > 0

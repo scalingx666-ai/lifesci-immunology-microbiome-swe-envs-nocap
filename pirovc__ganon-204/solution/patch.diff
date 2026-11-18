@@ -1,0 +1,741 @@
+diff --git a/src/ganon-build/CommandLineParser.cpp b/src/ganon-build/CommandLineParser.cpp
+index 9856b5e2..bff1c87f 100644
+--- a/src/ganon-build/CommandLineParser.cpp
++++ b/src/ganon-build/CommandLineParser.cpp
+@@ -30,7 +30,6 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         ( "k,kmer-size", "k-mer size to build filter (only forward strand). Default: 19", cxxopts::value< uint8_t >() )
+         ( "w,window-size", "Window size. If set, filter is built with minimizers. ", cxxopts::value< uint32_t >() )
+         ( "n,hash-functions", "Number of hash functions to build filter. Default: 3", cxxopts::value< uint16_t >() )
+-        ( "i,correction-ratio", "Correction ratio for split bins. Used to calculate correct filter size base on --false-positive. Default: 1.0", cxxopts::value< double >() )
+         ( "a,count-hashes", "Iterate over input to count the exact number of elements to insert into the filter", cxxopts::value<bool>())
+         
+         ( "t,threads", "Number of threads", cxxopts::value< uint16_t >())
+@@ -95,8 +94,6 @@ std::optional< Config > CommandLineParser::parse( int argc, char** argv )
+         config.window_size = args["window-size"].as< uint32_t >();
+     if ( args.count( "hash-functions" ) )
+         config.hash_functions = args["hash-functions"].as< uint16_t >();
+-    if ( args.count( "correction-ratio" ) )
+-        config.correction_ratio = args["correction-ratio"].as< double >();
+     if ( args.count( "count-hashes" ) )
+         config.count_hashes = args["count-hashes"].as< bool >();
+ 
+diff --git a/src/ganon-build/GanonBuild.cpp b/src/ganon-build/GanonBuild.cpp
+index f0a0df87..de12336a 100644
+--- a/src/ganon-build/GanonBuild.cpp
++++ b/src/ganon-build/GanonBuild.cpp
+@@ -56,6 +56,10 @@ struct Stats
+     , totalBinsFile{ 0 }
+     , invalidSeqs{ 0 }
+     , newBins{ 0 }
++    , filterSizeMB{ 0 }
++    , filterMaxFP{ 0 }
++    , filterAvgFP{ 0 }
++    , totalTargets{ 0 }
+     {
+     }
+ 
+@@ -66,7 +70,9 @@ struct Stats
+     uint64_t invalidSeqs;
+     uint64_t newBins;
+     double   filterSizeMB;
+-    double   filterFalsePositive;
++    double   filterMaxFP;
++    double   filterAvgFP;
++    uint64_t totalTargets;
+ };
+ 
+ typedef robin_hood::unordered_map< std::string, std::vector< FragmentBin > > TSeqBin;
+@@ -271,13 +277,15 @@ void print_ibf_stats( Stats&   stats,
+                       double   correction_ratio )
+ {
+     std::cerr << "IBF: " << std::endl;
+-    std::cerr << "max hashes: " << max_hashes << std::endl;
+-    std::cerr << "bin count/optimal: " << bin_count << "/" << optimal_bin_count << std::endl;
+-    std::cerr << "bin size bits: " << bin_size << std::endl;
+-    std::cerr << "filter size bits: " << ( optimal_bin_count * bin_size ) << std::endl;
+-    std::cerr << "filter size MB: " << std::fixed << stats.filterSizeMB << std::endl;
+-    std::cerr << "filter max false positive: " << stats.filterFalsePositive << std::endl;
++    std::cerr << "max. elements: " << max_hashes << std::endl;
++    std::cerr << "n. bins/optimal: " << bin_count << "/" << optimal_bin_count << std::endl;
++    std::cerr << "bin size (bits): " << bin_size << std::endl;
++    std::cerr << "filter size (bits): " << ( optimal_bin_count * bin_size ) << std::endl;
++    std::cerr << "filter size (MB): " << std::fixed << stats.filterSizeMB << std::endl;
+     std::cerr << "correction ratio: " << correction_ratio << std::endl;
++    std::cerr << "max. fp: " << stats.filterMaxFP << std::endl;
++    std::cerr << "avg. fp: " << stats.filterAvgFP << std::endl;
++
+     std::cerr << std::endl;
+ }
+ 
+@@ -322,19 +330,36 @@ uint64_t get_hashes( GanonBuild::Config&                              config,
+ 
+ double cal_correction_ratio( double prod_fpr, double false_positive, uint16_t hash_functions )
+ {
+-    return std::log( 1 - std::exp( std::log( 1.0 - prod_fpr ) / hash_functions ) )
+-           / std::log( 1 - std::exp( std::log( false_positive ) / hash_functions ) );
++    return std::log( 1.0 - std::exp( std::log( prod_fpr ) / hash_functions ) )
++           / std::log( 1.0 - std::exp( std::log( false_positive ) / hash_functions ) );
+ }
+ 
+ 
+-double correction_map( std::string                                      map_file,
+-                       robin_hood::unordered_map< uint64_t, uint64_t >& hashes_count,
+-                       uint64_t                                         bin_size,
+-                       double                                           false_positive,
+-                       uint16_t                                         hash_functions )
++std::tuple< double, double > get_true_fp( robin_hood::unordered_map< uint64_t, uint64_t >& hashes_count,
++                                          uint64_t                                         bin_size,
++                                          uint16_t                                         hash_functions )
+ {
++    double fp         = 0;
++    double highest_fp = 0;
++    double average_fp = 0;
++    for ( auto const& [bin_n, hashes] : hashes_count )
++    {
++        fp = get_fp( bin_size, hash_functions, hashes );
++        if ( fp > highest_fp )
++        {
++            highest_fp = fp;
++        }
++        average_fp += fp;
++    }
++    average_fp = average_fp / static_cast< double >( hashes_count.size() );
++    return std::make_tuple( highest_fp, average_fp );
++}
+ 
+-    TMap map = load_map( map_file );
++std::tuple< double, double > get_true_fp( TMap&                                            map,
++                                          robin_hood::unordered_map< uint64_t, uint64_t >& hashes_count,
++                                          uint64_t                                         bin_size,
++                                          uint16_t                                         hash_functions )
++{
+ 
+     // Calculate product of FPR for each target (instead of naive (1-fp)**max_split)
+     std::map< std::string, double > prod_fpr_target;
+@@ -345,66 +370,75 @@ double correction_map( std::string                                      map_file
+             prod_fpr_target[target] = 1.0;
+         }
+         prod_fpr_target[target] =
+-            prod_fpr_target[target] * ( 1.0 - detail::get_fp( bin_size, hash_functions, hashes_count[binid] ) );
++            prod_fpr_target[target] * ( 1.0 - get_fp( bin_size, hash_functions, hashes_count[binid] ) );
+     }
+ 
+-    // get lowest fpr produce (= highest fpr (1-prod_fpr))
+-    double lowest_prod = 1 - false_positive;
++    double highest_fp = 0;
++    double average_fp = 0;
+     for ( auto const& [target, prod_fpr] : prod_fpr_target )
+     {
+-        if ( prod_fpr_target[target] < lowest_prod )
++        if ( ( 1.0 - prod_fpr ) > highest_fp )
+         {
+-            lowest_prod = prod_fpr_target[target];
++            highest_fp = 1.0 - prod_fpr;
+         }
++        average_fp += ( 1.0 - prod_fpr );
+     }
++    average_fp = average_fp / static_cast< double >( prod_fpr_target.size() );
+ 
+-    return cal_correction_ratio( lowest_prod, false_positive, hash_functions );
++    return std::make_tuple( highest_fp, average_fp );
+ }
+ 
+ TFilter create_filter( GanonBuild::Config&                              config,
+                        Stats&                                           stats,
++                       TMap&                                            map,
+                        uint64_t                                         bin_count,
+                        uint64_t                                         max_hashes,
+                        robin_hood::unordered_map< uint64_t, uint64_t >& hashes_count )
+ {
+ 
+-    double   false_positive    = 0;
++    // Calculate bin size
+     uint64_t bin_size          = 0;
+     uint64_t optimal_bin_count = get_optimal_bins( bin_count );
+-
+-    // filter size is either given or calculated based on elements and fpr
+-    double correction_ratio{ config.correction_ratio };
+     if ( config.false_positive )
+     {
+-        false_positive = config.false_positive;
+-        bin_size       = get_bin_size( false_positive, config.hash_functions, max_hashes );
+-
+-        // Adjust filter size to achieve requested false positive rate
+-        // this is necessary due to split of targets in several bins (multiple testing)
+-        // Parameter can be manually given or optimally calculated from the map with target information and the
+-        // hashes_count
+-        if ( !config.map.empty() )
+-        {
+-            correction_ratio =
+-                correction_map( config.map, hashes_count, bin_size, false_positive, config.hash_functions );
+-        }
+-        bin_size = bin_size * correction_ratio;
++        bin_size = get_bin_size( config.false_positive, config.hash_functions, max_hashes );
+     }
+     else
+     {
+         if ( config.filter_size_mb > 0 )
+-        {
+             bin_size = ( config.filter_size_mb / static_cast< double >( optimal_bin_count ) ) * 8388608u;
+-        }
+         else
+-        {
+             bin_size = config.bin_size_bits;
++    }
++
++    // Calculate max fp, avg fp and correction ratio
++    double max_fp           = 0;
++    double avg_fp           = 0;
++    double correction_ratio = 1.0;
++    if ( !map.empty() )
++    {
++        // if map is provided, calculate true fpr for each target
++        std::tie( max_fp, avg_fp ) = get_true_fp( map, hashes_count, bin_size, config.hash_functions );
++        if ( config.false_positive )
++        {
++            // Adjust filter size to achieve requested false positive rate
++            // this is necessary due to split of targets in several bins (multiple testing)
++            correction_ratio = cal_correction_ratio( max_fp, config.false_positive, config.hash_functions );
++            // Adjust bin size
++            bin_size = bin_size * correction_ratio;
++            // Recalculate max and avg fp
++            std::tie( max_fp, avg_fp ) = get_true_fp( map, hashes_count, bin_size, config.hash_functions );
+         }
+-        false_positive = get_fp( bin_size, config.hash_functions, max_hashes );
++    }
++    else
++    {
++        // Calculate fpr for each bin
++        std::tie( max_fp, avg_fp ) = get_true_fp( hashes_count, bin_size, config.hash_functions );
+     }
+ 
+-    stats.filterSizeMB        = ( optimal_bin_count * bin_size ) / static_cast< double >( 8388608u );
+-    stats.filterFalsePositive = false_positive;
++    stats.filterSizeMB = ( optimal_bin_count * bin_size ) / static_cast< double >( 8388608u );
++    stats.filterMaxFP  = max_fp;
++    stats.filterAvgFP  = avg_fp;
+ 
+     if ( config.verbose )
+         detail::print_ibf_stats( stats, max_hashes, bin_size, bin_count, optimal_bin_count, correction_ratio );
+@@ -441,18 +475,37 @@ void clear_filter( TFilter& filter, const TBinLen& bin_len )
+     filter.clear( updated_bins );
+ }
+ 
+-void increase_filter( Config& config, Stats& stats, TFilter& filter, uint64_t bin_count, uint64_t max_hashes )
++void increase_filter( Config&                                          config,
++                      Stats&                                           stats,
++                      TMap&                                            map,
++                      TFilter&                                         filter,
++                      uint64_t                                         bin_count,
++                      uint64_t                                         max_hashes,
++                      robin_hood::unordered_map< uint64_t, uint64_t >& hashes_count )
+ {
+     // Calculate false positive
+     uint64_t bin_size          = filter.bin_size();
+     uint64_t optimal_bin_count = get_optimal_bins( bin_count );
+-    double   false_positive    = get_fp( bin_size, config.hash_functions, max_hashes );
++    // double   false_positive    = get_fp( bin_size, config.hash_functions, max_hashes );
++    double max_fp = 0;
++    double avg_fp = 0;
++    if ( !map.empty() )
++    {
++        // if map is provided, calculate true fpr for each target
++        std::tie( max_fp, avg_fp ) = get_true_fp( map, hashes_count, bin_size, config.hash_functions );
++    }
++    else
++    {
++        // Calculate fpr for each bin
++        std::tie( max_fp, avg_fp ) = get_true_fp( hashes_count, bin_size, config.hash_functions );
++    }
+ 
+-    stats.filterSizeMB        = ( optimal_bin_count * bin_size ) / static_cast< double >( 8388608u );
+-    stats.filterFalsePositive = false_positive;
++    stats.filterSizeMB = ( optimal_bin_count * bin_size ) / static_cast< double >( 8388608u );
++    stats.filterMaxFP  = max_fp;
++    stats.filterAvgFP  = avg_fp;
+ 
+     if ( config.verbose )
+-        detail::print_ibf_stats( stats, max_hashes, bin_size, bin_count, optimal_bin_count, config.correction_ratio );
++        detail::print_ibf_stats( stats, max_hashes, bin_size, bin_count, optimal_bin_count, 1 );
+ 
+     // If new bins were added
+     uint64_t old_total_bins = filter.bin_count();
+@@ -533,23 +586,31 @@ void print_time( const StopClock& timeGanon,
+     std::cerr << std::endl;
+ }
+ 
+-void print_stats( Stats& stats, const StopClock& timeGanon )
++void print_stats( Stats& stats, const StopClock& timeGanon, bool is_update )
+ {
+     double   elapsed   = timeGanon.elapsed();
+     uint64_t validSeqs = stats.totalSeqsFile - stats.invalidSeqs;
+     std::cerr << "ganon-build processed " << validSeqs << " sequences (" << stats.sumSeqLen / 1000000.0 << " Mbp) in "
+               << elapsed << " seconds (" << ( validSeqs / 1000.0 ) / ( elapsed / 60.0 ) << " Kseq/m, "
+               << ( stats.sumSeqLen / 1000000.0 ) / ( elapsed / 60.0 ) << " Mbp/m)" << std::endl;
+-
+     if ( stats.newBins > 0 )
+-        std::cerr << " - " << stats.newBins << " bins added to the IBF" << std::endl;
++        std::cerr << " - " << stats.newBins << " new bins" << std::endl;
+     if ( stats.invalidSeqs > 0 )
+         std::cerr << " - " << stats.invalidSeqs << " invalid sequence(s) skipped" << std::endl;
+-
+-    std::cerr << " - " << validSeqs << " sequences / " << stats.totalBinsFile << " bins written to the IBF ("
+-              << std::setprecision( 2 ) << std::fixed << stats.filterSizeMB << "MB)" << std::endl;
+-    std::cerr << " - " << std::setprecision( 3 ) << std::fixed << stats.filterFalsePositive
+-              << " max. false positive (only added sequences)" << std::endl;
++    std::cerr << " - " << validSeqs << " sequences / " << stats.totalBinsFile << " bins";
++    if ( stats.totalTargets > 0 )
++        std::cerr << " / " << stats.totalTargets << " targets";
++    std::cerr << std::endl;
++    std::cerr << " - Size: " << std::setprecision( 2 ) << std::fixed << stats.filterSizeMB << "MB" << std::endl;
++    std::cerr << " - Max. FP: " << std::setprecision( 5 ) << std::fixed << stats.filterMaxFP
++              << " / Avg. FP: " << stats.filterAvgFP;
++    if ( stats.totalTargets > 0 )
++        std::cerr << " (targets)";
++    else
++        std::cerr << " (bins)";
++    if ( is_update )
++        std::cerr << " (only added/updated sequences)";
++    std::cerr << std::endl;
+ }
+ 
+ } // namespace detail
+@@ -586,9 +647,10 @@ bool run( Config config )
+     // config.n_batches*config.n_refs = max. amount of references in memory
+     SafeQueue< detail::Seqs > queue_refs( config.n_batches );
+ 
++    bool is_update = !config.update_filter_file.empty();
+     // load filter if provided
+     timeLoadFilter.start();
+-    if ( !config.update_filter_file.empty() )
++    if ( is_update )
+     {
+         filter = detail::load_filter( config.update_filter_file );
+     }
+@@ -604,7 +666,7 @@ bool run( Config config )
+     {
+         // Iterate over sequences to get their bins and total bin lenghts
+         // if updating, create additional bins starting from the last
+-        uint64_t start_bin = !config.update_filter_file.empty() ? filter.bin_count() : 0;
++        uint64_t start_bin = is_update ? filter.bin_count() : 0;
+         detail::parse_sequences( config.reference_files, seq_bin, bin_len, start_bin );
+     }
+     timeLoadFiles.stop();
+@@ -619,14 +681,24 @@ bool run( Config config )
+ 
+     // If updating: extend and clear filter
+     timeLoadFilter.start();
+-    if ( config.update_filter_file.empty() )
++    TMap map;
++    if ( !config.map.empty() )
++    {
++        map = load_map( config.map );
++        robin_hood::unordered_set< std::string > targets;
++        for ( auto const& [binid, target] : map )
++            targets.insert( target );
++        stats.totalTargets = targets.size();
++    }
++
++    if ( !is_update )
+     {
+         // create new filter:
+-        filter = detail::create_filter( config, stats, last_bin, max_hashes, hashes_count );
++        filter = detail::create_filter( config, stats, map, last_bin, max_hashes, hashes_count );
+     }
+     else
+     {
+-        detail::increase_filter( config, stats, filter, last_bin, max_hashes );
++        detail::increase_filter( config, stats, map, filter, last_bin, max_hashes, hashes_count );
+         if ( config.update_complete )
+         {
+             detail::clear_filter( filter, bin_len );
+@@ -699,7 +771,7 @@ bool run( Config config )
+             detail::print_time(
+                 timeGanon, timeLoadFiles, timeCountHashes, timeLoadSeq, timeLoadFiles, timeLoadFilter, timeSaveFilter );
+         }
+-        detail::print_stats( stats, timeGanon );
++        detail::print_stats( stats, timeGanon, is_update );
+     }
+     return true;
+ }
+diff --git a/src/ganon-build/include/ganon-build/Config.hpp b/src/ganon-build/include/ganon-build/Config.hpp
+index 4d6e6406..5d6f28cb 100644
+--- a/src/ganon-build/include/ganon-build/Config.hpp
++++ b/src/ganon-build/include/ganon-build/Config.hpp
+@@ -32,11 +32,10 @@ struct Config
+     double   filter_size_mb = 0;
+     uint64_t bin_size_bits  = 0;
+ 
+-    uint8_t  kmer_size        = 19;
+-    uint32_t window_size      = 0;
+-    uint16_t hash_functions   = 3;
+-    double   correction_ratio = 1.0;
+-    bool     count_hashes     = false;
++    uint8_t  kmer_size      = 19;
++    uint32_t window_size    = 0;
++    uint16_t hash_functions = 3;
++    bool     count_hashes   = false;
+ 
+     uint16_t threads   = 2;
+     uint32_t n_refs    = 400;
+@@ -206,7 +205,6 @@ inline std::ostream& operator<<( std::ostream& stream, const Config& config )
+     stream << "--kmer-size           " << unsigned( config.kmer_size ) << newl;
+     stream << "--window-size         " << config.window_size << newl;
+     stream << "--hash-functions      " << config.hash_functions << newl;
+-    stream << "--correction-ratio    " << config.correction_ratio << newl;
+     stream << "--count-hashes        " << config.count_hashes << newl;
+     stream << "--threads             " << config.threads << newl;
+     stream << "--n-refs              " << config.n_refs << newl;
+diff --git a/src/ganon/build_update.py b/src/ganon/build_update.py
+index 1b9a38a8..25060e05 100644
+--- a/src/ganon/build_update.py
++++ b/src/ganon/build_update.py
+@@ -68,6 +68,8 @@ def build(cfg):
+         tx = time.time()
+         print_log("Simulating parameters", cfg.quiet)
+         bin_length = estimate_bin_length(cfg, seqinfo, tax)
++        if cfg.verbose:
++            print_log(" - --bin-length " + str(bin_length), cfg.quiet)
+         print_log(" - done in " + str("%.2f" % (time.time() - tx)) + "s.\n", cfg.quiet)
+ 
+     # Set fragment length
+@@ -87,34 +89,36 @@ def build(cfg):
+     max_length_bin = bins.get_max_bin_length()
+     max_kmer_count = estimate_elements(max_length_bin, cfg.kmer_size, cfg.window_size)
+     max_split_bins = bins.get_max_split_bins(use_specialization=True if cfg.specialization else False)
+-    print_log(" - " + str(actual_number_of_bins) + " bins created", cfg.quiet)
++    if cfg.verbose:
++        print_log(" - " + str(actual_number_of_bins) + " bins created", cfg.quiet)
+     print_log(" - done in " + str("%.2f" % (time.time() - tx)) + "s.\n", cfg.quiet)
+ 
+-    # Get optimal parameters from user input and taxsbp result
+-    if cfg.filter_size:
+-        optimal_params = derive_bf_params(max_kmer_count, 0, math.ceil(mb2bits(cfg.filter_size) / optimal_number_of_bins), cfg.hash_functions)
+-    else:
+-        optimal_params = derive_bf_params(max_kmer_count, cfg.max_fp, 0, cfg.hash_functions)
++    # Get approximate optimal parameters from user input and taxsbp result
++    optimal_params = derive_bf_params(max_kmer_count, cfg.max_fp, 0, cfg.hash_functions)
+ 
+     # When fixed size is too small
+     if optimal_params["hash_functions"] == 0:
+         optimal_params["hash_functions"] = 3
+ 
+     if cfg.verbose:
++        print_log("IBF params:", cfg.quiet)
+         try:
+             correction_ratio = split_correction_ratio(optimal_params["false_positive"], optimal_params["hash_functions"], max_split_bins)
+         except:
+             correction_ratio = 1
+ 
+-        print_log("Hash functions: " + str(optimal_params["hash_functions"]), cfg.quiet)
+-        print_log("Targets: " + str(len(bins.get_specialization() if cfg.specialization else bins.get_taxids())), cfg.quiet)
+-        print_log("Optimal bins: " + str(optimal_number_of_bins), cfg.quiet)
+-        print_log("Max. split bin: " + str(max_split_bins), cfg.quiet)
+-        print_log("Max. correction ratio: " + str("{0:.5f}".format(correction_ratio)) , cfg.quiet)
+-        print_log("Max. hashes/bin: " + str(max_kmer_count), cfg.quiet)
+-        print_log("Max. filter size: " + str("{0:.2f}".format(bits2mb(optimal_params["size_bits"] * optimal_number_of_bins * correction_ratio))) + "MB", cfg.quiet)
+-        print_log("Max. false positive: " + str("{0:.5f}".format(optimal_params["false_positive"])), cfg.quiet)
+-
++        print_log(" - # hash functions: " + str(optimal_params["hash_functions"]), cfg.quiet)
++        print_log(" - # targets: " + str(len(bins.get_specialization() if cfg.specialization else bins.get_taxids())), cfg.quiet)
++        print_log(" - # bins/optimal bins: " + str(actual_number_of_bins) + "/" + str(optimal_number_of_bins), cfg.quiet)
++        print_log(" - target with most splits/bin: " + str(max_split_bins), cfg.quiet)
++        print_log(" - max. correction ratio: " + str("{0:.5f}".format(correction_ratio)) , cfg.quiet)
++        if cfg.filter_size:
++            print_log(" - fixed filter size: " + str("{0:.2f}".format(cfg.filter_size)) + "MB" , cfg.quiet)
++        else:
++            print_log(" - max. false positive: " + str("{0:.5f}".format(cfg.max_fp)), cfg.quiet)
++            print_log(" - upper limit filter size: " + str("{0:.2f}".format(bits2mb(optimal_params["size_bits"] * optimal_number_of_bins * correction_ratio))) + "MB", cfg.quiet)
++            if(cfg.window_size>0):
++                print_log(" ** real filter size should be considerably smaller", cfg.quiet)
+         print_log("")
+ 
+     # Build database files (map, tax, gnn)
+@@ -134,9 +138,10 @@ def build(cfg):
+     tax.write(db_prefix["tax"])
+ 
+     if cfg.specialization and cfg.rank != "leaves":
+-        print_log(" - --rank is set to leaves when using specialization values", cfg.quiet)
+         cfg.rank = "leaves"
+-
++        if cfg.verbose:
++            print_log(" - --rank is set to leaves when using specialization values", cfg.quiet)
++        
+     # Write .gnn file
+     print_log(" - " + db_prefix["gnn"], cfg.quiet)
+     gnn = Gnn(kmer_size=cfg.kmer_size,
+@@ -165,7 +170,7 @@ def build(cfg):
+ 
+     run_ganon_build_cmd = " ".join([cfg.path_exec['build'],
+                                     "--seqid-bin-file " + acc_bin_file,
+-                                    "--bin-size-bits " + str(optimal_params["size_bits"]) if cfg.filter_size else "--false-positive " + str(cfg.max_fp),
++                                    "--filter-size-mb " + str(cfg.filter_size) if cfg.filter_size else "--false-positive " + str(cfg.max_fp),
+                                     "--kmer-size " + str(cfg.kmer_size),
+                                     "--window-size " + str(cfg.window_size) if cfg.window_size else "",
+                                     "--count-hashes " if cfg.window_size else "",
+@@ -210,8 +215,10 @@ def update(cfg):
+     # If specialization was set on database
+     if gnn.specialization:
+         # if not provided by user, use defition of database
+-        if not cfg.specialization: cfg.specialization=gnn.specialization
++        if not cfg.specialization:
++            cfg.specialization=gnn.specialization
+         print_log("Using --specialization " + cfg.specialization, cfg.quiet)
++        print_log("")
+     else:
+         if cfg.specialization: 
+             # If user defined specialization on update but database has none
+@@ -278,7 +285,8 @@ def update(cfg):
+     removed_binids = previous_binids.difference(kept_binids | taxsbp_binids)
+     new_binids = taxsbp_binids.difference(previous_binids)
+     updated_binids = taxsbp_binids.intersection(previous_binids)
+-    print_log(" - " + str(len(new_binids)) + " bins added, " + str(len(updated_binids)) + " bins updated, " + str(len(removed_binids)) + " bins removed", cfg.quiet)
++    if cfg.verbose:
++        print_log(" - " + str(len(new_binids)) + " bins added, " + str(len(updated_binids)) + " bins updated, " + str(len(removed_binids)) + " bins removed", cfg.quiet)
+     print_log(" - done in " + str("%.2f" % (time.time() - tx)) + "s.\n", cfg.quiet)
+ 
+     tx = time.time()
+@@ -355,6 +363,7 @@ def update(cfg):
+                                     "--kmer-size " + str(kmer_size),
+                                     "--window-size " + str(window_size) if window_size else "",
+                                     "--count-hashes " if window_size else "",
++                                    "--map " + cfg.output_db_prefix + ".map" if cfg.output_db_prefix else db_prefix["map"],
+                                     "--hash-functions " + str(hash_functions),
+                                     "--seqid-bin-file " + acc_bin_file,
+                                     "--output-filter-file " + tmp_db_prefix_ibf,
+@@ -579,9 +588,10 @@ def optimal_bins(n):
+ 
+ def estimate_n_bins(bin_len, overlap_len, groups_len):
+     # Estimate an approximate number of bins give the parameters
+-    frag_len = bin_len - overlap_len
+-    if frag_len > overlap_len:
+-        bins = [math.ceil(math.ceil(l/(frag_len-overlap_len))/(bin_len/(frag_len+overlap_len))) for l in groups_len.values()]
++    if bin_len > overlap_len:
++        bins=[]
++        for l in groups_len.values():
++            bins.append(math.ceil(l/(bin_len-overlap_len)) if l > bin_len else 1)
+         return sum(bins), max(bins)
+     else:
+         return 0, 0
+@@ -614,25 +624,27 @@ def estimate_params(cfg, simulated_bin_lens, groups_len):
+ 
+         # Estimate number of bins based on ranks and sequence sizes
+         n_bins, max_split_bins = estimate_n_bins(bin_length, cfg.overlap_length, groups_len)
+-        
+         n_bins = optimal_bins(n_bins)
+         
+         if n_bins <= 0:
+             continue  # invalid bin_len
+ 
+-        bf_params = derive_bf_params(estimate_elements(bin_length, cfg.kmer_size, cfg.window_size),
++        max_elements = estimate_elements(bin_length, cfg.kmer_size, cfg.window_size)
++        # Derive Bloom filter values from max_fp
++        bf_params = derive_bf_params(max_elements,
+                                      cfg.max_fp,
+                                      0,
+                                      cfg.hash_functions)
+ 
+-        if bf_params["hash_functions"] == 0 or bf_params["false_positive"] == 1:
++        if bf_params["hash_functions"] == 0:
+             continue  # filter too small
+ 
++        # Calculate correction ratio
+         try:
+             ratio = split_correction_ratio(bf_params["false_positive"], bf_params["hash_functions"], max_split_bins)
+         except:
+             # too many splits, ratio too high
+-            continue
++            break
+ 
+         params[bin_length] = bf_params
+         params[bin_length]["n_bins"] = n_bins
+@@ -640,15 +652,17 @@ def estimate_params(cfg, simulated_bin_lens, groups_len):
+         params[bin_length]["max_split_bins"] = max_split_bins
+         params[bin_length]["corr_ratio"] = ratio
+         params[bin_length]["corr_filter_size_bits"] = bf_params["size_bits"] * n_bins * ratio
+-
++ 
+     return params
+ 
+ 
+ def estimate_bin_length(cfg, seqinfo, tax):
+-    # default bin len if simulation fails
+-    default_bin_len = 1000000
++    """
++    Estimate best size of bin_length to split sequences. Always use --max-fp to estimate, even when --filter-size is provided
++    """
++
+     # number of simulations
+-    nsim = 1000
++    nsim = 2000
+ 
+     # Generate dict with target groups and their total length to estimate params
+     groups_len = {}
+@@ -659,78 +673,39 @@ def estimate_bin_length(cfg, seqinfo, tax):
+     else:
+         groups_len = pd.concat([seqinfo.seqinfo['taxid'].apply(lambda x: tax.get_rank(x, cfg.rank)), seqinfo.seqinfo['length']], axis=1).groupby('taxid').sum().to_dict()['length']
+ 
+-    # Set limits
+-    # fixed start size (too low generates few possible cases for analysis)
+-    if cfg.overlap_length > 0:
+-        min_bin_len = cfg.overlap_length * 2
+-    else:
+-        min_bin_len = 500
+-    # Biggest group as max
+-    max_bin_len = max(groups_len.values()) + min_bin_len
+-    # Try to find min. size by simulating points in geometric space
+-    # between min. and max. bin length. Use geometric to have more simulations on smaller sizes
+-    # Necessary to calculate instead of getting first lowest since it may be a local minimum
+-    simulated_bin_lens = map(round, np.geomspace(min_bin_len, max_bin_len, num=nsim))
++    # Biggest target group as max possible bin_len
++    max_bin_len = max(groups_len.values())
++
++    # Simulate possible ibf outcomes from biggest target group (max. bin len) by generating bin lenghts in rev. geometric space
++    # Use geometric to have more simulations on bigger sizes
++    simulated_bin_lens = map(round, np.geomspace(max_bin_len, 1, num=nsim, dtype=int))
+ 
+     # simulated parameters
++    # values are very different from true values with minimizers but proportions are a good measure
+     params = estimate_params(cfg, simulated_bin_lens, groups_len)
+ 
+-    # print("params")
+-    # for p, v in params.items():
+-    #     print(p, v, sep="\t")
+-    # print("")
+-
+     if not params:
+-        print_log(" - could not estimate --bin-length, using default value (" + str(default_bin_len) + ")", cfg.quiet)
+-        return default_bin_len
+-
+-    # Select smallest possible bin_len based on generated corrected filter sizes
+-    selected_min_bin_len = min(params, key=lambda k: params[k]["corr_filter_size_bits"])
+-    min_filter_size = params[selected_min_bin_len]["corr_filter_size_bits"]
+-    print_log(" - Approx. minimal size with --max-fp " + str(cfg.max_fp) + ": " + str("{0:.2f}".format(bits2mb(min_filter_size))) + "MB", cfg.quiet)
+-
+-    # try to find best bin_length considering max given size
+-    if cfg.max_filter_size is None:
+-        max_filter_size = min_filter_size * 1.5
+-        print_log(" - --max-bloom-size not set, using default (1.5x min. size): " + str("{0:.2f}".format(bits2mb(max_filter_size))) + "MB", cfg.quiet)
+-    elif cfg.max_filter_size < bits2mb(min_filter_size):
+-        max_filter_size = min_filter_size * 1.5
+-        print_log(" - --max-bloom-size " + str(cfg.max_filter_size) + "MB is too small, using default (1.5x min. size): " + str("{0:.2f}".format(bits2mb(max_filter_size))) + "MB", cfg.quiet)
+-    else:
+-        max_filter_size = mb2bits(cfg.max_filter_size)
+-
+-    # Keep only valid params below max_filter_size
+-    filtered_params = dict(filter(lambda v: v[1]["corr_filter_size_bits"] <= max_filter_size, params.items()))
+-
+-    # print("filtered_params")
+-    # for p, v in filtered_params.items():
+-    #     print(p, v, sep="\t")
+-    # print("")
+-
+-    # if there are valids params after filtering
+-    if len(filtered_params):
+-        # reduce space in between min. and max. bin lens to get better estimation
+-        simulated_bin_lens2 = map(round, np.linspace(min(filtered_params.keys()), max(filtered_params.keys()), num=nsim))
+-        # simulated parameters (second time)
+-        params2 = estimate_params(cfg, simulated_bin_lens2, groups_len)
+-
+-        # print("params2")
+-        # for p, v in params2.items():
+-        #     print(p, v, sep="\t")
+-        # print("")
+-
+-        # select top param with least number of bins (and smallest generated filter as second filter)
+-        #selected_best_bin_len = sorted(params2, key=lambda k: (params2[k]["n_bins"], params2[k]["corr_filter_size_bits"]))[0]
+-        # select top param with smallest filter size, since correction will avoid extreme fragmentation of bins
+-        selected_min_bin_len2 = sorted(params2, key=lambda k: params2[k]["corr_filter_size_bits"])[0]
+-
+-        print_log(" - estimated --bin-length: " + str(selected_min_bin_len2) + "bp", cfg.quiet)
+-        if cfg.verbose:
+-            print_log(" - Further estimated parameters: " + str(params2[selected_min_bin_len2]), cfg.quiet)
+-        return selected_min_bin_len2
+-    else:
+-        print_log(" - could not estimate --bin-length, using default value (" + str(default_bin_len) + ")", cfg.quiet)
+-        return default_bin_len
++        #could not estimate --bin-length, using max_bin_len
++        return max_bin_len
++    
++    # Filter params for entires with 1.5x times the number of min. bins
++    if cfg.faster:
++        min_n_bins = min([v["n_bins"] for v in params.values()])
++        params = dict(filter(lambda v: v[1]["n_bins"] <= optimal_bins(min_n_bins*1.5), params.items()))
++
++    # Select best final corrected filter size
++    # This value is just an approx. since it considers all possible kmers (minimizers will be way smaller and different)
++    # When estimating with fixed filter_size, also use this as an trade-off metric for best parameters
++    selected_bin_len = sorted(params, key=lambda k: params[k]["corr_filter_size_bits"])[0]
++
++    #print('bin_length', 'hash_functions', 'n_bins', 'max_split_bins', 'corr_ratio', 'corr_filter_size_bits', sep="\t")
++    #for p, v in params.items():
++        #print(p, v)
++        #print(p, v['hash_functions'], v['n_bins'], v['max_split_bins'], str("{0:.5f}".format(v['corr_ratio'])), str("{0:.2f}".format(bits2mb(v['corr_filter_size_bits']))), sep="\t")
++    #print("")
++    #print(params[sorted(params, key=lambda k: params[k]["corr_filter_size_bits"])[0]])
++
++    return selected_bin_len
+ 
+ 
+ def run_taxsbp(seqinfo, bin_length, fragment_length, overlap_length, rank, specialization, ncbi_nodes_file, ncbi_merged_file, verbose, bins: Bins=None):
+@@ -755,8 +730,7 @@ def run_taxsbp(seqinfo, bin_length, fragment_length, overlap_length, rank, speci
+     else:  # either species,genus ... or "leaves"
+         taxsbp_params["bin_exclusive"] = rank
+ 
+-    #if verbose:
+-    taxsbp_params["silent"] = False
++    taxsbp_params["silent"] = False if verbose else True
+ 
+     return Bins(taxsbp_ret=taxsbp.taxsbp.pack(**taxsbp_params), use_specialization=True if specialization else False)
+ 
+diff --git a/src/ganon/config.py b/src/ganon/config.py
+index 137af839..d8d02315 100644
+--- a/src/ganon/config.py
++++ b/src/ganon/config.py
+@@ -20,24 +20,23 @@ def __init__(self, which: str=None, **kwargs):
+         build_group_required.add_argument('-d', '--db-prefix',   type=str,            required=True,  help='Database output prefix (.ibf, .map, .tax, .gnn will be created)')
+         build_group_required.add_argument('-i', '--input-files', type=str, nargs="*", required=False, help='Input reference sequence fasta files [.gz]')
+ 
+-        # Defaults
+         build_group_important = build_parser.add_argument_group('important arguments')
+-        build_group_important.add_argument('-t', '--threads',         type=int,            metavar='', default=2,         help='Number of sub-processes/threads to use. Default: 2')
+         build_group_important.add_argument('-r', '--rank',            type=str,            metavar='', default='species', help='Target taxonomic rank for classification [species,genus,...]. use "leaves" to use the leaf taxonomic node assigned to each sequence as targets. To use assembly, strain or further specializations, check --specialization. Default: species')
+-        build_group_important.add_argument('-m', '--max-filter-size', type=float,          metavar='',                    help='Given an approx. upper limit in Megabytes (MB) for filter/memory usage. When using --window-size, filter may be significantly smaller after build depending on the level of similarity of your input sequences. [Mutually exclusive --bin-length]')
+-        build_group_important.add_argument('-f', '--max-fp',          type=float,          metavar='', default=0.05,      help='Max. false positive rate for bloom filters [Mutually exclusive --filter-size]. Default: 0.05')
++        build_group_important.add_argument('-s', '--specialization',  type=str,            metavar='', default="",        help='Add extra specialized "rank" as target for classification after taxonomic leaves. If set, --rank is defaulted to leaves. Options: [sequence,file,assembly,custom]. "sequence" will use sequence accession as target. "file" uses the filename as target. "assembly" will use assembly info from NCBI as target. "custom" uses the 4th column of the file provided in --seq-info-file as target.')
++        build_group_important.add_argument('-f', '--max-fp',          type=float,          metavar='', default=0.05,      help='Max. false positive for classification [Mutually exclusive --filter-size]. Default: 0.05')
++        build_group_important.add_argument('-t', '--threads',         type=int,            metavar='', default=2,         help='Number of sub-processes/threads to use. Default: 2')
+ 
+         build_group_filter = build_parser.add_argument_group('filter arguments')
+         build_group_filter.add_argument('-k', '--kmer-size',             type=int,      metavar='', default=19,        help='The k-mer size to split sequences. Default: 19')
+         build_group_filter.add_argument('-w', '--window-size',           type=int,      metavar='', default=0,         help='The window-size to build filter with minimizers. 0 to turn it off. Default: 0')
+-        build_group_filter.add_argument('--hash-functions',        type=int,            metavar='', default=0,         help='The number of hash functions for the interleaved bloom filter [0-5]. 0 to detect optimal value. Default: 0')
+-        build_group_filter.add_argument('--filter-size',           type=float,          metavar='', default=0,         help='Fixed size for filter in Megabytes (MB) [Mutually exclusive --max-fp]')
+-        build_group_filter.add_argument('--bin-length',            type=int,            metavar='', default=0,         help='Maximum length (in bp) for each bin [Mutually exclusive --max-filter-size]')
++        build_group_filter.add_argument('-a', '--hash-functions',        type=int,      metavar='', default=0,         help='The number of hash functions for the interleaved bloom filter [0-5]. 0 to detect optimal value. Default: 0')
++        build_group_filter.add_argument('-z', '--filter-size',           type=float,    metavar='', default=0,         help='Fixed size for the filter in Megabytes (MB). If provided, --max-fp cannot be guaranteed.')
++        build_group_filter.add_argument('--faster',                action='store_true',                                help='Attemp to build filter with best performance on classification. Filter may be significantly bigger.')
++        build_group_filter.add_argument('--bin-length',            type=int,            metavar='', default=0,         help='Maximum length (in bp) for each bin')
+         build_group_filter.add_argument('--fragment-length',       type=int,            metavar='', default=-1,        help='Fragment sequences into specified length (in bp). Set to 0 to not fragment sequences. Default: bin-length - overlap-length')
+         build_group_filter.add_argument('--overlap-length',        type=int,            metavar='', default=300,       help='Fragment overlap length (in bp). Should be bigger than the read length used for classification. Default: 300')
+-
++        
+         build_group_other = build_parser.add_argument_group('other arguments')
+-        build_group_other.add_argument('-s', '--specialization',  type=str,            metavar='', default="",        help='Add extra specialized "rank" as target for classification after taxonomic leaves. If set, --rank is defaulted to leaves. Options: [sequence,file,assembly,custom]. "sequence" will use sequence accession as target. "file" uses the filename as target. "assembly" will use assembly info from NCBI as target. "custom" uses the 4th column of the file provided in --seq-info-file as target.')
+         build_group_other.add_argument('--seq-info-mode',         type=str, nargs="*", metavar='', default=["auto"],  help='Automatic mode to retrieve tax. info and seq. length. [auto,eutils] or one or more accession2taxid files from NCBI [nucl_gb nucl_wgs nucl_est nucl_gss pdb prot dead_nucl dead_wgs dead_prot]. auto will either use eutils for less than 50000 input sequences or nucl_gb nucl_wgs. Alternatively a file can be directly provided (see --seq-info-file). Default: auto')
+         build_group_other.add_argument('--seq-info-file',         type=str,            metavar='',                    help='Tab-separated file with sequence information (seqid <tab> seq.len <tab> taxid [<tab> specialization]) [Mutually exclusive --seq-info-mode].')
+         build_group_other.add_argument('--taxdump-file',          type=str, nargs="*", metavar='',                    help='Force use of a specific version of the (taxdump.tar.gz) or (nodes.dmp names.dmp [merged.dmp]) file(s) from NCBI Taxonomy (otherwise it will be automatically downloaded).')
+@@ -255,13 +254,6 @@ def validate(self):
+                 print_log("--max-fp has to be set between 0 and 1")
+                 return False
+ 
+-            if self.filter_size > 0 and self.bin_length == 0:
+-                print_log("--bin-length should be set with --filter-size")
+-                return False
+-
+-            if self.filter_size > 0:
+-                self.max_fp = 0
+-
+             if self.specialization:
+                 valid_spec = self.validate_specialization()
+                 if not valid_spec:

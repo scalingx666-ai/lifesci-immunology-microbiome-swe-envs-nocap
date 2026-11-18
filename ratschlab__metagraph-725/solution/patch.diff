@@ -1,0 +1,83 @@
+diff --git a/metagraph/docs/source/release_notes.rst b/metagraph/docs/source/release_notes.rst
+index 3f7b844d51..c0c8ff789f 100644
+--- a/metagraph/docs/source/release_notes.rst
++++ b/metagraph/docs/source/release_notes.rst
+@@ -4,6 +4,13 @@ Release notes
+ Unreleased
+ ----------
+ 
++Annotations now load correctly with any build. Earlier versions saved the hash
++table of label names as the writing build made it, and that hash differs between
++C++ standard libraries (for example, libstdc++ on Linux and libc++ on macOS).
++Label lookups then failed when a build with another standard library loaded the
++annotation. This version rebuilds the table on load, which takes about 0.1
++seconds per million labels. The file format is unchanged.
++
+ The HTTP ``/align`` endpoint now rejects invalid ``max_alternative_alignments``
+ values with status 400. Use a positive integer. Zero previously selected one
+ alignment; negative values could become very large unsigned counts.
+diff --git a/metagraph/src/annotation/representation/base/annotation.cpp b/metagraph/src/annotation/representation/base/annotation.cpp
+index 4cae5c7108..93083e5b05 100644
+--- a/metagraph/src/annotation/representation/base/annotation.cpp
++++ b/metagraph/src/annotation/representation/base/annotation.cpp
+@@ -54,7 +54,11 @@ bool LabelEncoder<std::string>::load(std::istream &instream) {
+         std::string version(7, '\0');
+         if (instream.read(version.data(), 7) && version == "LE-v2.0") {
+             Deserializer deserializer(instream);
+-            encode_label_ = VectorSet<std::string>::deserialize(deserializer, true);
++            // Read the saved buckets to consume the entire record, then rebuild them:
++            // std::hash values can differ between the writer's and reader's toolchains.
++            auto labels = to_vector(VectorSet<std::string>::deserialize(deserializer, true));
++            encode_label_ = VectorSet<std::string>(std::make_move_iterator(labels.begin()),
++                                                   std::make_move_iterator(labels.end()));
+             return instream.good();
+         }
+         // backward compatibility
+diff --git a/metagraph/tests/annotation/test_label_encoder.cpp b/metagraph/tests/annotation/test_label_encoder.cpp
+index 2c70a7db0a..b927b51553 100644
+--- a/metagraph/tests/annotation/test_label_encoder.cpp
++++ b/metagraph/tests/annotation/test_label_encoder.cpp
+@@ -135,4 +135,43 @@ TEST(LabelEncoderBackwardCompatibility, LoadNewFormat) {
+     ASSERT_EQ(std::vector<std::string>({"label1", "label2", "label3"}), encoder.get_labels());
+ }
+ 
++// A string hash that differs from std::hash, standing in for another
++// toolchain's std::hash (e.g. libc++ vs libstdc++).
++struct OtherToolchainHash {
++    size_t operator()(const std::string &s) const {
++        return std::hash<std::string>()(s) * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull;
++    }
++};
++
++TEST(LabelEncoder, LoadBucketsWrittenWithAnotherHash) {
++    std::vector<std::string> labels;
++    for (size_t i = 0; i < 1000; ++i) {
++        labels.push_back("label" + std::to_string(i));
++    }
++    tsl::ordered_set<std::string, OtherToolchainHash, std::equal_to<std::string>,
++                     std::allocator<std::string>, std::vector<std::string>, uint64_t>
++            written(labels.begin(), labels.end());
++
++    std::stringstream stream;
++    stream.write("LE-v2.0", 7);
++    Serializer serializer(stream);
++    written.serialize(serializer);
++    // a second record after the first one must still be readable
++    LabelEncoder<std::string> second;
++    second.insert_and_encode("next");
++    second.serialize(stream);
++    stream.seekg(0);
++
++    LabelEncoder<std::string> encoder;
++    ASSERT_TRUE(encoder.load(stream));
++    ASSERT_EQ(labels, encoder.get_labels());
++    for (size_t i = 0; i < labels.size(); ++i) {
++        ASSERT_TRUE(encoder.label_exists(labels[i])) << labels[i];
++        ASSERT_EQ(i, encoder.encode(labels[i]));
++    }
++
++    ASSERT_TRUE(encoder.load(stream));
++    EXPECT_EQ(std::vector<std::string>({ "next" }), encoder.get_labels());
++}
++
+ } // namespace

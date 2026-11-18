@@ -1,0 +1,524 @@
+diff --git a/bin/conflict_regions.py b/bin/conflict_regions.py
+index a528f326..5458a25d 100644
+--- a/bin/conflict_regions.py
++++ b/bin/conflict_regions.py
+@@ -9,7 +9,7 @@
+ import statistics
+ from typing import List, Tuple, Optional, Dict
+ import numpy as np
+-
++import math
+ import concurrent.futures
+ from collections import defaultdict
+ from functools import partial
+@@ -1484,116 +1484,136 @@ def merge_bedgraph_regions(
+     max_group_size: int = 20000,
+     max_length: Optional[int] = None,
+     value_diff_tolerance: Optional[float] = None,
+-    jump_threshold: Optional[float] = None
++    jump_threshold: Optional[int] = None,
++    breadth_allowance: Optional[int] = 1000,
++    prop_gap_accepted: Optional[int] = 0.1,
++    reflengths: Optional[Dict[str, int]] = None,
+ ) -> pd.DataFrame:
+     """
+     Merges consecutive regions in a BEDGRAPH-like DataFrame based on the specified merging method.
+ 
+     :param intervals: pandas DataFrame with columns ['chrom', 'start', 'end', 'depth']
+     :param merging_method: 'variance', 'gini', or 'jump'
+-    :param max_stat_threshold: Threshold for the statistic or median jump
++    :param max_stat_threshold: Threshold for the statistic (or for the jump method, it can be used as a jump threshold)
+     :param max_group_size: Maximum number of intervals to merge at once
+     :param max_length: (Optional) Maximum length of merged interval
+     :param value_diff_tolerance: (Optional) Maximum allowed difference in average values
+-    :param jump_threshold: (Optional) Threshold for 'jump' method; if None, median jump is used
++    :param jump_threshold: (Optional) For 'jump' method; if None and max_stat_threshold not provided, the median jump is computed.
++    :param breadth_allowance: Allowable gap (in bp) between intervals to consider merging.
++                              This applies only to the gap between the current buffer's end and the new interval's start.
+     :return: pandas DataFrame with merged intervals and mean depth
+     """
+     if intervals.empty:
+         return pd.DataFrame(columns=['chrom', 'start', 'end', 'mean_depth'])
+ 
+-    # Ensure DataFrame is sorted by chrom and start
++    # Ensure the DataFrame is sorted by chromosome and start position.
+     intervals = intervals.sort_values(['chrom', 'start']).reset_index(drop=True)
+-    import math
+-    # Precompute jump_threshold if using 'jump' method and not provided
++    # add the reference length from reflengths dict as new column
++    if reflengths:
++        intervals['ref_length'] = intervals['chrom'].map(reflengths)
++    else:
++        intervals['ref_length'] = -1
++    percent_dict = {}
++    # get unique ref_lenths and chroms, get 1% reflength and assing to dict as chrom = 1% of ref_length
++    for chrom in intervals['chrom'].unique():
++        ref_length = intervals[intervals['chrom'] == chrom]['ref_length'].iloc[0]
++        percent_dict[chrom] = ref_length * prop_gap_accepted
++
++    # Precompute jump_threshold for the 'jump' method if not provided.
+     if merging_method == 'jump':
+-        jump_threshold = max_stat_threshold
+-        if max_stat_threshold is None:
+-            # Compute median absolute difference between consecutive depths within each chromosome
+-            # drop na depths
+-            # convert na depth to 0
+-            intervals['depth'] = intervals['depth'].fillna(0)
+-
+-            jump_threshold = intervals.groupby('chrom', observed=True)['depth'].apply(
+-                lambda x: x[x != 0].diff().abs().dropna().median()
+-            ).median()
+-            jump_threshold = math.ceil(jump_threshold)
+-
+-
+-        # If max_stat_threshold is provided, use it as jump_threshold
+-        elif max_stat_threshold is not None:
++        if max_stat_threshold is not None:
+             jump_threshold = max_stat_threshold
+         else:
+-            # Default jump_threshold if not provided
+-            jump_threshold = 200  # Example default value
++            # Fill NA depths with 0 and compute the median absolute difference per chromosome
++            intervals['depth'] = intervals['depth'].fillna(0)
++            # jump_threshold = intervals.groupby('chrom', observed=True)['depth'].apply(
++            #     lambda x: x[x != 0].diff().abs().dropna().mean()
++            # ).mean()
++            # jump_threshold = math.ceil(jump_threshold) + 1
++            # get mean of depths for chrom
++            # jump_threshold_mean = intervals.groupby('chrom', observed=True)['depth'].mean().mean()
++            # # get 75th percentil of depths for chrom
++            try:
++                jump_threshold_sevfive = intervals.groupby('chrom', observed=True)['depth'].quantile(0.975).mean()
++                jump_threshold = math.ceil(jump_threshold_sevfive) + 1
++            except Exception as ex:
++                print(ex)
++                jump_threshold = 200
++        # Fallback default if still None
++        if jump_threshold is None:
++            jump_threshold = 200
+     else:
+         jump_threshold = None
+-
++    # jump_threshold = 200
+     merged_regions = []
+-
+-    # Group by chromosome
++    # Group intervals by chromosome.
+     grouped = intervals.groupby('chrom', observed=True)
+-
+     for chrom, group in grouped:
+         group = group.reset_index(drop=True)
+-        n = len(group)
+-        if n == 0:
++        if group.empty:
+             continue
+ 
++        # Initialize a buffer with the first interval.
+         buffer = {
+             'chrom': chrom,
+             'start': group.at[0, 'start'],
+             'end': group.at[0, 'end'],
+             'depths': [group.at[0, 'depth']],
+         }
++        per_ref = percent_dict.get(chrom, breadth_allowance)
++
++        for i, row in enumerate(group.itertuples(index=False)):
++            if i == 0:
++                continue  # first row is already in the buffer
+ 
+-        for row in group.itertuples(index=False):
+-            if row.index == 0:
+-                continue  # Skip the first row as it's already in the buffer
++            new_start, new_end, new_depth = row.start, row.end, row.depth
++            prev_end = buffer['end']
++            gap = new_start - prev_end  # gap between intervals
+ 
++            # Start with merging allowed.
+             can_merge = True
+ 
+-            # Check max_group_size
++            # Check maximum group size.
+             if len(buffer['depths']) >= max_group_size:
+                 can_merge = False
+ 
+-            # Check max_length
+-            if can_merge and max_length is not None:
+-                new_end = row.end
++            # Check maximum merged region length.
++            if max_length is not None:
+                 total_length = new_end - buffer['start']
+                 if total_length > max_length:
+                     can_merge = False
+ 
+-            # Check merging_method
++            # Apply method-specific merging criteria.
+             if can_merge:
+-                if merging_method in ['variance', 'gini']:
+-                    current_depths = buffer['depths'] + [row.depth]
++                if merging_method == 'jump':
++                    # Calculate the jump based on the last depth in the current buffer.
++                    last_depth = buffer['depths'][-1]
++                    jump = abs(new_depth - last_depth)
++                    # Merge only if the gap is within the per_ref AND the jump is within the jump_threshold.
++                    if gap > per_ref or jump > jump_threshold:
++                        can_merge = False
++                elif merging_method in ['variance', 'gini']:
++                    current_depths = buffer['depths'] + [new_depth]
+                     if merging_method == 'variance':
+                         stat_val = statistics.pvariance([float(x) for x in current_depths])
+                     elif merging_method == 'gini':
+                         stat_val = compute_gini(current_depths)
+-                    if stat_val > max_stat_threshold:
+-                        can_merge = False
+-                elif merging_method == 'jump':
+-                    jump_threshold=20
+-                    last_depth = buffer['depths'][-1]
+-                    jump = abs(row.depth - last_depth)
+-                    if jump > jump_threshold:
++                    if max_stat_threshold is not None and stat_val > max_stat_threshold:
+                         can_merge = False
++                    # Optional: Check average value difference tolerance.
++                    if value_diff_tolerance is not None:
++                        current_avg = np.mean(buffer['depths'])
++                        if abs(new_depth - current_avg) > value_diff_tolerance:
++                            can_merge = False
+                 else:
+                     raise ValueError(f"Unknown merging method: {merging_method}")
+ 
+-            # Check value_diff_tolerance
+-            if can_merge and value_diff_tolerance is not None and merging_method in ['variance', 'gini']:
+-                current_avg = sum(buffer['depths']) / len(buffer['depths'])
+-                if abs(row.depth - current_avg) > value_diff_tolerance:
+-                    can_merge = False
+-
+             if can_merge:
+-                # Merge the current row into the buffer
+-                buffer['end'] = row.end
+-                buffer['depths'].append(row.depth)
++                # Merge the current interval into the buffer.
++                buffer['end'] = new_end
++                buffer['depths'].append(new_depth)
+             else:
+-                # Finalize the current buffer
++                # Finalize the current buffer.
+                 mean_depth = np.mean(buffer['depths'])
+                 merged_regions.append({
+                     'chrom': buffer['chrom'],
+@@ -1601,15 +1621,15 @@ def merge_bedgraph_regions(
+                     'end': buffer['end'],
+                     'mean_depth': mean_depth
+                 })
+-                # Start a new buffer with the current row
++                # Start a new buffer with the current interval.
+                 buffer = {
+                     'chrom': chrom,
+-                    'start': row.start,
+-                    'end': row.end,
+-                    'depths': [row.depth],
++                    'start': new_start,
++                    'end': new_end,
++                    'depths': [new_depth],
+                 }
+ 
+-        # Finalize the last buffer
++        # Finalize the last buffer for this chromosome.
+         if buffer['depths']:
+             mean_depth = np.mean(buffer['depths'])
+             merged_regions.append({
+@@ -1623,6 +1643,7 @@ def merge_bedgraph_regions(
+     return merged_df
+ 
+ 
++
+ def determine_conflicts(
+         output_dir = None,
+         input_bam = None,
+@@ -1641,6 +1662,7 @@ def determine_conflicts(
+         filtered_bam_create=False,
+         FAST_MODE=True,
+         sensitive=False,
++        cpu_count=None
+ ):
+     # parser = argparse.ArgumentParser(description="Use bedtools to define coverage-based regions and compare read signatures using sourmash MinHash.")
+     # parser.add_argument("--input_bam", required=True, help="Input BAM file.")
+@@ -1697,20 +1719,24 @@ def determine_conflicts(
+     elif use_jump:
+         statistic_func = lambda vals: max(vals) - min(vals)
+         stat_name="jump"
+-        threshold=200
+-        # threshold=None
++        threshold=None
+     else:
+         statistic_func = compute_gini
+         stat_name = "gini"
+         threshold=0.8
+     # 3. Merge
++    bam_fs = pysam.AlignmentFile(input_bam, "rb")
++    reflengths = {ref: bam_fs.get_reference_length(ref) for ref in bam_fs.references}
++
+     print(f"Merging regions (using {stat_name} <= {threshold})...")
+     start_time = time.time()
++
+     merged_regions = merge_bedgraph_regions(
+         regions,
+         max_stat_threshold=threshold,
+-        max_group_size=200_000, # Limit merges to x intervals
+-        merging_method=stat_name
++        max_group_size=2_000, # Limit merges to x intervals
++        merging_method=stat_name,
++        reflengths=reflengths,
+     )
+     print(f"Regions merged in {time.time() - start_time:.2f} seconds.")
+ 
+@@ -1727,9 +1753,10 @@ def determine_conflicts(
+     if not sigfile or not os.path.exists(sigfile):
+         # Step 9: Create signatures for each region
+         # get cpu count / 2, only if it is > 1, round down
+-        num_workers = max(1, int(os.cpu_count() / 2))
+-        # if num_workers > 10:
+-        #     num_workers = 10
++        if cpu_count:
++            num_workers = cpu_count
++        else:
++            num_workers = max(1, int(os.cpu_count() / 2))
+         # print("Creating signatures for regions...", f"parallelized across {num_workers} workers")
+ 
+         start_time = time.time()
+@@ -1754,8 +1781,6 @@ def determine_conflicts(
+         loaded_sigs = load_signatures_sourmash(sigfile)
+         signatures = rebuild_sig_dict(loaded_sigs)
+ 
+-    bam_fs = pysam.AlignmentFile(input_bam, "rb")
+-    reflengths = {ref: bam_fs.get_reference_length(ref) for ref in bam_fs.references}
+ 
+ 
+     if matrix:
+diff --git a/bin/create_report.py b/bin/create_report.py
+index acd3261f..0c99688c 100755
+--- a/bin/create_report.py
++++ b/bin/create_report.py
+@@ -178,12 +178,14 @@ def import_data(inputfiles ):
+         12814: "human respiratory syncytial virus A",
+     }
+     # df['Organism'] = df["Detected Organism"]
+-    for row_idx, row in df.iterrows():
+-        if row['Status'] == 'putative':
+-            #  update index of row to change organism name to bold
+-            df.at[row_idx, "Detected Organism"] = f'{row["Detected Organism"]}*'
++    # set if putative to it with *  in Detected organism using lambda x
++    df['Detected Organism'] = df.apply(lambda x: f'{x["Detected Organism"]}*' if x['Status'] == 'putative' else x["Detected Organism"], axis=1)
++    # for row_idx, row in df.iterrows():
++    #     if row['Status'] == 'putative':
++    #         #  update index of row to change organism name to bold
++    #         df.at[row_idx, "Detected Organism"] = f'{row["Detected Organism"]}*'
+         # change the Name column if the mapnames for taxid is in the dict
+-        df["Detected Organism"] = df[["Detected Organism", 'Taxonomic ID #']].apply(lambda x: dictnames[x['Taxonomic ID #']] if x['Taxonomic ID #'] in dictnames else x["Detected Organism"], axis=1)
++    df["Detected Organism"] = df[["Detected Organism", 'Taxonomic ID #']].apply(lambda x: dictnames[x['Taxonomic ID #']] if x['Taxonomic ID #'] in dictnames else x["Detected Organism"], axis=1)
+     # replace all NaN with ""
+     df = df.fillna("")
+     return df
+@@ -714,12 +716,14 @@ def main():
+         taxdump_dict = load_taxdump(args.taxdump)
+     df_full = import_data(args.input)
+     df_full["Group"] = df_full["Taxonomic ID #"].apply(lambda x: get_group_for_taxid(x, args.rank, taxdump_dict))
+-
++    # print rows where "Monkeypox" in "organism" column
++    # df_full = df_full[df_full['Detected Organism'].str.contains("Monkeypox")]
++    # print(df_full)
+     if args.output_txt:
+         # write out the data to a txt file
+         # sort df_full on "TASS Score"
+         df_full = df_full.sort_values(by=["TASS Score"], ascending=False)
+-        df_full = df_full.reset_index(drop=True)
++        df_full = df_full.reset_index(drop=False)
+         df_full.to_csv(args.output_txt, sep="\t", index=True, index_label="Index")
+     # change column "id" in avbundance_data to "tax_id" if args.type is "Detected Organism"
+     df_full = df_full.rename(columns={args.id_col: args.type})
+diff --git a/bin/match_paths.py b/bin/match_paths.py
+index b3e96dc2..7734e8c5 100755
+--- a/bin/match_paths.py
++++ b/bin/match_paths.py
+@@ -212,6 +212,14 @@ def parse_args(argv=None):
+         default=1.2,
+         help="alpha value for lorenz curve with gini calculation",
+     )
++    parser.add_argument(
++        "-X",
++        '--cpu_count',
++        metavar="CPUCOUNT",
++        type=int,
++        default=None,
++        help="Overwrite the number of CPUs to use.",
++    )
+     parser.add_argument(
+         "--hmp",
+         metavar="HMP",
+@@ -1524,6 +1532,7 @@ def main():
+                 FAST_MODE=args.fast,
+                 filtered_bam_create=args.filtered_bam,
+                 sensitive=args.sensitive,
++                cpu_count=args.cpu_count,
+ 
+             )
+         if args.failed_reads:
+diff --git a/docs/usage.md b/docs/usage.md
+index 1307f05e..792f723e 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -91,63 +91,63 @@ work                # Directory containing the nextflow working files
+ 
+ | Parameter                                             | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+ | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `--input <samplesheet.csv_path>`                      | CSV file containing samplesheet information for each sample. See [Samplesheet section](#samplesheet-information)     |
+-| `--outdir <path_to_output_to_be_made>`                | Output folder.    |
+-| `--use_denovo`                                       |  Performing the de-novo assembly process. Currently this is recommmended as MEGAHIT for short reads and FLYE for long reads. Disabled by default     |
+-| `--reference_assembly`                                | Perform the reference-based assembly on reads against top hit assemblies or assemblies provided as a local file. Performes variant analysis by default. Disabled by default   |
+-| `--skip_fastp`                                        | TRUE/FALSE, do not filter with fastp   |
+-| `--skip_plots`                                        | TRUE/FALSE, do not make any plots    |
+-| `--remove_taxids  <numbers[]>`                        | "taxidA taxidB..." a list of one or more taxids to remove from the kraken report prior to downstream analysis. Use "9606" for human reads     |
+-| `--show_commensals`                                   | TRUE/FALSE, Do/Don't (default: Don't) show commensals in the final report                  |
+-| `--show_potentials`                                   | TRUE/FALSE, Do/Don't (default: Don't) show potential pathogens in the final report     |
+-| `--show_unidentified`                                 | TRUE/FALSE, Do/Don't (default: Don't) show unknown or unannotated pathogens in the final report      |
+-| `--k2_confidence  <numbers[]>`                        | Minimum confidence to classify a read using KRAKEN2 only. See [here](https://github.com/DerrickWood/kraken2/blob/master/docs/MANUAL.markdown#confidence-scoring) for more information. |
+-| `--organisms  <numbers[] or strings[]>`               | Organisms list (names or taxids) you want to pull from to get a reference. Used if you are skipping kraken2 only. Separate by a list of spaces like "1254 573"  |
+-| `--fuzzy`                                             | TRUE/FALSE, Match names of organisms by their names (enabled) rather than taxids          |
+-| `--get_pathogens`                                     | TRUE/FALSE, Use the pathogens sheet FASTA file instead of k2's top hits. Default is FALSE      |
+-| `--skip_realignment`                                  | TRUE/FALSE, Skip realignment step. You will not get a metrics report as a result  |
+-| `--skip_kraken2`                                      | TRUE/FALSE, Skip kraken2. If you do not provide a --reference_fasta value and you enable this skip then your pipeline will fail. |
+-| `--pathogens`                                         | OPTIONAL. Enable pathogen discovery mode. See assets/pathogen_sheet.txt for the default sheet. You can ue your own designation so long as it is in the same format as the provided example. This is an ongoing list of annotated known human-pathogens that are mapped to your alignments. Requires alignment to be performed. The "test" config profile automatically uses this.     |
+-| `--distributions`                                     | This is set, by default to use this [file](https://github.com/jhuapl-bio/taxtriage/blob/main/assets/taxid_abundance_stats.hmp.tsv.gz). However, if you have your own set of distributions for any number of species and their abundances, please specify it here. For example, run `--distributions assets/taxid_abundance_stats.hmp.tsv.gz` for the default. The file can be either in the `.tsv.gz` format or a decompressed `.tsv` |
+-| `--add_irregular_top_hits`                            | Adds irregular distributions (outside percentile zscore) to top hits. Default is fale and only pathogens and top abu hits are considered     |
+-| `--skip_multiqc`                                      | TRUE/FALSE, Skip multiqc final report  |
+-| `--minq <number>`                                     | What minimum quality would you want in your samples. Disabled if you run --skip_fastp. Default is 7 for Oxford Nanopore, 20 for Illumina   |
+-| `--minmapq <number>`                                  | What minimum mapping quality would you want in your sample alignments. Default is 5 |
+-| `--mmap2_window <number>`                             | What window size to use for alignment with minimap2. Default is 10 for minimap2 if disabled.    |
+-| `--mmap2_fraction_filter <number>`                    | filter out top FLOAT fraction of repetitive minimizers. Default is 0.0009 if disabled.   |
+-| `--organisms_file <file>`                             | A single file that contains what organisms (name or taxid) you want to pull. You can enable this if you are skipping kraken2 as well   |
+-| `--subsample <number>`                                | Take a subsample of n reads from each sample. Useful if your data size is very large and you want a quick triage analysis  |
++| `--input <samplesheet.csv_path>`                      | CSV file containing samplesheet information for each sample. See [Samplesheet section](#samplesheet-information)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--outdir <path_to_output_to_be_made>`                | Output folder.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
++| `--use_denovo`                                        | Performing the de-novo assembly process. Currently this is recommmended as MEGAHIT for short reads and FLYE for long reads. Disabled by default                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
++| `--reference_assembly`                                | Perform the reference-based assembly on reads against top hit assemblies or assemblies provided as a local file. Performes variant analysis by default. Disabled by default                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
++| `--skip_fastp`                                        | TRUE/FALSE, do not filter with fastp                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
++| `--skip_plots`                                        | TRUE/FALSE, do not make any plots                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `--remove_taxids  <numbers[]>`                        | "taxidA taxidB..." a list of one or more taxids to remove from the kraken report prior to downstream analysis. Use "9606" for human reads                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
++| `--show_commensals`                                   | TRUE/FALSE, Do/Don't (default: Don't) show commensals in the final report                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
++| `--show_potentials`                                   | TRUE/FALSE, Do/Don't (default: Don't) show potential pathogens in the final report                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
++| `--show_unidentified`                                 | TRUE/FALSE, Do/Don't (default: Don't) show unknown or unannotated pathogens in the final report                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
++| `--k2_confidence  <numbers[]>`                        | Minimum confidence to classify a read using KRAKEN2 only. See [here](https://github.com/DerrickWood/kraken2/blob/master/docs/MANUAL.markdown#confidence-scoring) for more information.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
++| `--organisms  <numbers[] or strings[]>`               | Organisms list (names or taxids) you want to pull from to get a reference. Used if you are skipping kraken2 only. Separate by a list of spaces like "1254 573"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
++| `--fuzzy`                                             | TRUE/FALSE, Match names of organisms by their names (enabled) rather than taxids                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--get_pathogens`                                     | TRUE/FALSE, Use the pathogens sheet FASTA file instead of k2's top hits. Default is FALSE                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
++| `--skip_realignment`                                  | TRUE/FALSE, Skip realignment step. You will not get a metrics report as a result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--skip_kraken2`                                      | TRUE/FALSE, Skip kraken2. If you do not provide a --reference_fasta value and you enable this skip then your pipeline will fail.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--pathogens`                                         | OPTIONAL. Enable pathogen discovery mode. See assets/pathogen_sheet.txt for the default sheet. You can ue your own designation so long as it is in the same format as the provided example. This is an ongoing list of annotated known human-pathogens that are mapped to your alignments. Requires alignment to be performed. The "test" config profile automatically uses this.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `--distributions`                                     | This is set, by default to use this [file](https://github.com/jhuapl-bio/taxtriage/blob/main/assets/taxid_abundance_stats.hmp.tsv.gz). However, if you have your own set of distributions for any number of species and their abundances, please specify it here. For example, run `--distributions assets/taxid_abundance_stats.hmp.tsv.gz` for the default. The file can be either in the `.tsv.gz` format or a decompressed `.tsv`                                                                                                                                                                                                                                                                                                                                                                                                                 |
++| `--add_irregular_top_hits`                            | Adds irregular distributions (outside percentile zscore) to top hits. Default is fale and only pathogens and top abu hits are considered                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
++| `--skip_multiqc`                                      | TRUE/FALSE, Skip multiqc final report                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++| `--minq <number>`                                     | What minimum quality would you want in your samples. Disabled if you run --skip_fastp. Default is 7 for Oxford Nanopore, 20 for Illumina                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
++| `--minmapq <number>`                                  | What minimum mapping quality would you want in your sample alignments. Default is 5                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
++| `--mmap2_window <number>`                             | What window size to use for alignment with minimap2. Default is 10 for minimap2 if disabled.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
++| `--mmap2_fraction_filter <number>`                    | filter out top FLOAT fraction of repetitive minimizers. Default is 0.0009 if disabled.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
++| `--organisms_file <file>`                             | A single file that contains what organisms (name or taxid) you want to pull. You can enable this if you are skipping kraken2 as well                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
++| `--subsample <number>`                                | Take a subsample of n reads from each sample. Useful if your data size is very large and you want a quick triage analysis                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+ | `--reference_fasta <filepath>`                        | Location of a single reference fasta, multiple files (separate by space and within quotations ""), or a directory of fasta files to run alignment on RATHER than (or in addition to) downloading references from NCBI from post K2 or manual organism taxids/names. Useful if you know what you're looking for or have no internet connection to pull said references. Header format must be in the "all" format from NCBI's ftp [assembly site](https://ftp.ncbi.nlm.nih.gov/genomes/all/) and should be ">accession description" where there is a **space** following the accession with the organism chr/contig description of the sequence. Technically, the accession does not matter as the pipeline only needs to match the organism space that follows the first space in the header. Example: **>NC_003663.2 Cowpox virus, complete genome** |
+-| `--recursive_reference`                               | TRUE/FALSE (default). Search recursively through a directory provided in the `--reference_fasta` parameter   |
+-| `--db <path_to_kraken2_database>`                     | Database to be used. IF `--low_memory` is called it will read the database from the fileystem. If not called, it will load it all into memory first so ensure that the memory available (limited as well by `--max_memory` is enough to hold the database). If using with --download-db, choose from download options {minikraken2, flukraken2} instead of using a path. [See here for a full list](#supported-default-databases) |
+-| `--download_db`                                       | Download the preset database indicated in `--db` to `--outdir` |
+-| `--sensitive`    | Sensitive mode for confidence metrics. Uses all BAM query alignments rather than the reference from the alignment. Considered I/O intensive and much slower. Useful if there are a lot of variants present in the alignments, otherwise keep disabled     |
+-| `--metaphlan`    | Use Metaphlan. Must specify a database path that contains .pkl and .btl2 (bowtie2 index) files          |
+-| `--max_memory <number>GB`                             | Max RAM you want to dedicate to the pipeline. Most of it will be used during Kraken2 steps so ensure you have more memory than the size of the `--db` called  |
+-| `-latest`                                             | Use the latest revision (-r). If you want to autopull the latest commit for a branch from https://github.com/jhuapl-bio/taxtriage, specify this. Used in Basestack and the Cloud (default toggle)  |
+-| `--low_memory <number>`                               | If you don't have enough memory to load the kraken2 db, call this to read it from the filesystem for each read. THIS IS MUCH SLOWER THAN THE DEFAULT METHOD |
+-| `--max_cpus <number>`                                 | Max CPUs you want to dedicate to the pipeline   |
+-| `--gini_weight <number>`                    | Gini Weight to the TASS Score. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score. |
+-| `--breadth_weight <number>`                    | Minimum Log-based breadth weight for TASS Score calculation |
+-| `--minhash_weight <number>`                    | Weight for minhash filtering. It is the combination of % of reads removed + % of breadth new  / 2 |
+-| `--mapq_weight <number>`                    | MapQ Weight to the TASS Score. If filtering on 20+, this will likely all be 1 or close to 1. Disabled by default |
+-| `--hmp_weight <number>`                    | TASS Score weight for HMP percentile, recommend disabling if sample is unknown |
+-| `--disparity_score_weight <number>`                    | The weight for giving more of a bonus for more prevalent organisms. Unused by default |
+-| `--dispersion_factor <number>`                    | TASS Score Dispersion factor. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score. |
+-| `--reward_factor <number>`                    | TASS Score Reward factor. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score. |
+-| `--top_per_taxa "<taxid:amount:rank>"]`               | One or more 3 element values for the minimum taxa at a rank. Example "10239:20:S 2:20:S" is minimum 20 virus species (10239 is Virus) AND (separated by space for a new definition) 20 Bacteria (2) species. Possible Rank codes to use are the single alphabet letter: G(enus),S(pecies),P(hylum),F(amily),O(rder),C(lass)    |
+-| `--genome`                                            | Pull one of the pre-made igenomes databases for host removal. Available list at [here](https://github.com/nf-core/rnaseq/blob/e049f51f0214b2aef7624b9dd496a404a7c34d14/conf/igenomes.config#L22) or [here](https://ewels.github.io/AWS-iGenomes/) (aws cli or curl command) to download them locally         |
+-| `--remove_reference_file`                             | Remove all reads that align to a set of accessions in a single fasta file                 |
+-| `--demux`                                             | If your Samplesheet contains a folder (rather than 1-2 fastq files), you MUST call this flag                 |
+-| `--use_megahit_longreads`                             | If running denovo assembly, use MEGAHIT for longreads. Default is disabled = FLYE         |
+-| `--decompress_pre_megahit`                            | Some HPC envs cant use megahit with gz files, enable if this is the case or you experience INPUT/OUTPUT errors at this step.     |
+-| `--top_hits_count`                                    | Minimum taxa to filter out per rank level. If top_per_taxa specified, whatever is the larger of the 2 values for the results takes priority.    |
+-| `--get_features`                                      | Pull Features (CDS) for each assembly present. Performs Coverage on each feature        |
+-| `--min_conf <number>`               | Minimum confidence to appear within the pdf report (ODR)   |
+-| `--use_bt2`                                           | Use Bowtie2 instead of minimap2 for Illumina reads    |
+-| `--get_variants`                                      | Perform mpileup on your assemblies against your reads. Disabled by default. Auto-called if you are doing a reference-based assembly    |
+-| `-resume`                                             | Resume the run from where it left off. IF not called the pipeline will restart from the Samplesheet check each time     |
+-| `-r [main, stable, etc.]`                             | Specify the branch/revision name to use if pulling from github (not local main.nf file)  |
++| `--recursive_reference`                               | TRUE/FALSE (default). Search recursively through a directory provided in the `--reference_fasta` parameter                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
++| `--db <path_to_kraken2_database>`                     | Database to be used. IF `--low_memory` is called it will read the database from the fileystem. If not called, it will load it all into memory first so ensure that the memory available (limited as well by `--max_memory` is enough to hold the database). If using with --download-db, choose from download options {minikraken2, flukraken2} instead of using a path. [See here for a full list](#supported-default-databases)                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `--download_db`                                       | Download the preset database indicated in `--db` to `--outdir`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
++| `--sensitive`                                         | Sensitive mode for confidence metrics. Uses all BAM query alignments rather than the reference from the alignment. Considered I/O intensive and much slower. Useful if there are a lot of variants present in the alignments, otherwise keep disabled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++| `--metaphlan`                                         | Use Metaphlan. Must specify a database path that contains .pkl and .btl2 (bowtie2 index) files                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
++| `--max_memory <number>GB`                             | Max RAM you want to dedicate to the pipeline. Most of it will be used during Kraken2 steps so ensure you have more memory than the size of the `--db` called                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
++| `-latest`                                             | Use the latest revision (-r). If you want to autopull the latest commit for a branch from https://github.com/jhuapl-bio/taxtriage, specify this. Used in Basestack and the Cloud (default toggle)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `--low_memory <number>`                               | If you don't have enough memory to load the kraken2 db, call this to read it from the filesystem for each read. THIS IS MUCH SLOWER THAN THE DEFAULT METHOD                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
++| `--max_cpus <number>`                                 | Max CPUs you want to dedicate to the pipeline                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
++| `--gini_weight <number>`                              | Gini Weight to the TASS Score. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
++| `--breadth_weight <number>`                           | Minimum Log-based breadth weight for TASS Score calculation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
++| `--minhash_weight <number>`                           | Weight for minhash filtering. It is the combination of % of reads removed + % of breadth new / 2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--mapq_weight <number>`                              | MapQ Weight to the TASS Score. If filtering on 20+, this will likely all be 1 or close to 1. Disabled by default                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--hmp_weight <number>`                               | TASS Score weight for HMP percentile, recommend disabling if sample is unknown                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
++| `--disparity_score_weight <number>`                   | The weight for giving more of a bonus for more prevalent organisms. Unused by default                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++| `--dispersion_factor <number>`                        | TASS Score Dispersion factor. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
++| `--reward_factor <number>`                            | TASS Score Reward factor. This is the measure of how spread out the depths/coverages are in an alignment to an organism. The more spread out or evenly distributed the regions, the higher the score.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++| `--top_per_taxa "<taxid:amount:rank>"]`               | One or more 3 element values for the minimum taxa at a rank. Example "10239:20:S 2:20:S" is minimum 20 virus species (10239 is Virus) AND (separated by space for a new definition) 20 Bacteria (2) species. Possible Rank codes to use are the single alphabet letter: G(enus),S(pecies),P(hylum),F(amily),O(rder),C(lass)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
++| `--genome`                                            | Pull one of the pre-made igenomes databases for host removal. Available list at [here](https://github.com/nf-core/rnaseq/blob/e049f51f0214b2aef7624b9dd496a404a7c34d14/conf/igenomes.config#L22) or [here](https://ewels.github.io/AWS-iGenomes/) (aws cli or curl command) to download them locally                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
++| `--remove_reference_file`                             | Remove all reads that align to a set of accessions in a single fasta file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
++| `--demux`                                             | If your Samplesheet contains a folder (rather than 1-2 fastq files), you MUST call this flag                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
++| `--use_megahit_longreads`                             | If running denovo assembly, use MEGAHIT for longreads. Default is disabled = FLYE                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `--decompress_pre_megahit`                            | Some HPC envs cant use megahit with gz files, enable if this is the case or you experience INPUT/OUTPUT errors at this step.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
++| `--top_hits_count`                                    | Minimum taxa to filter out per rank level. If top_per_taxa specified, whatever is the larger of the 2 values for the results takes priority.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
++| `--get_features`                                      | Pull Features (CDS) for each assembly present. Performs Coverage on each feature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
++| `--min_conf <number>`                                 | Minimum confidence to appear within the pdf report (ODR)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
++| `--use_bt2`                                           | Use Bowtie2 instead of minimap2 for Illumina reads                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
++| `--get_variants`                                      | Perform mpileup on your assemblies against your reads. Disabled by default. Auto-called if you are doing a reference-based assembly                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
++| `-resume`                                             | Resume the run from where it left off. IF not called the pipeline will restart from the Samplesheet check each time                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
++| `-r [main, stable, etc.]`                             | Specify the branch/revision name to use if pulling from github (not local main.nf file)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+ | `-profile [local,test,test_viral,docker,singularity]` | Default profile, 2 tests, Docker, or Singularity for execution reasons                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+ 
+ ⚠️ Please note that for the `--reference_fasta` parameter, you MUST use the designated header format from the FTP site that NCBI hosts for assemblies at [here](https://ftp.ncbi.nlm.nih.gov/genomes/all/). This format should looke like:
+diff --git a/modules/local/alignment_per_sample.nf b/modules/local/alignment_per_sample.nf
+index 1c76004d..30caabb5 100644
+--- a/modules/local/alignment_per_sample.nf
++++ b/modules/local/alignment_per_sample.nf
+@@ -42,6 +42,7 @@ process ALIGNMENT_PER_SAMPLE {
+     def min_reads_align = params.min_reads_align  ? " -r ${params.min_reads_align} " : " -r 3 "
+     def assemblyi = assembly ? " -j ${assembly} " : " "
+     def read_count = meta.read_count && meta.read_count > 0 ? " --readcount ${meta.read_count} " : " "
++    def cpu_count = task.cpus ? " -X ${task.cpus} "  : ""
+     // if k2_report exists and is not null add --k2 flag
+     // if k2_report != NO_FILE, add --k2 flag
+     def k2 = k2_report.name == "NO_FILE" ? " " : " --k2 ${k2_report} "
+@@ -70,7 +71,7 @@ process ALIGNMENT_PER_SAMPLE {
+         -o $output $bedgraph \\
+         -s $id $assemblyi \\
+         $type $read_count \\
+-        --output_dir $output_dir $fastas \\
++        --output_dir $output_dir $fastas $cpu_count \\
+         --scaled 8000 \\
+         --alpha 1.5 \\
+         --min_threshold 0.002 \\
+diff --git a/subworkflows/local/input_check.nf b/subworkflows/local/input_check.nf
+index 1e33aecb..edba2f07 100644
+--- a/subworkflows/local/input_check.nf
++++ b/subworkflows/local/input_check.nf
+@@ -53,6 +53,11 @@ def create_fastq_channel(LinkedHashMap row) {
+         meta.fastq_2 = null
+     }
+     meta.needscompressing = row.needscompressing ? row.needscompressing : null
++
++    // if meta.needscompressing is null or false AND the filename ends with .fastq or .fq then set to true
++    // if (!meta.needscompressing && (meta.fastq_1.endsWith('.fastq') || meta.fastq_1.endsWith('.fq'))) {
++    //     meta.needscompressing = true
++    // }
+     // if meta.fastq_2 it is not single end, set meta.single_end as true else meta.single_end is false
+     meta.single_end = row.fastq_2  ? false : true
+     meta.aligner  = row.aligner ? row.aligner : 'minimap2'

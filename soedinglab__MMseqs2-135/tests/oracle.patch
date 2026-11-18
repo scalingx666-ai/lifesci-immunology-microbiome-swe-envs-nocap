@@ -1,0 +1,246 @@
+diff --git a/src/multihit/Aggregation.cpp b/src/multihit/Aggregation.cpp
+index 346bb5bcc..b3468b384 100644
+--- a/src/multihit/Aggregation.cpp
++++ b/src/multihit/Aggregation.cpp
+@@ -32,14 +32,14 @@ void Aggregation::buildMap(char *data, std::map<unsigned int, std::vector<std::v
+         }
+ 
+         std::vector<std::string> columns = Util::split(line, "\t");
+-        unsigned int targetKey = (unsigned int) strtoull(columns[0].c_str(), NULL, 10);
++        unsigned int targetKey = Util::fast_atoi<unsigned int>(columns[0].c_str());
+         size_t setId = targetSetReader->getId(targetKey);
+         if (setId == UINT_MAX) {
+             Debug(Debug::ERROR) << "Invalid target database key " << columns[0] << ".\n";
+             EXIT(EXIT_FAILURE);
+         }
+         char *data = targetSetReader->getData(setId);
+-        unsigned int setKey = (unsigned int) strtoull(data, NULL, 10);
++        unsigned int setKey = Util::fast_atoi<unsigned int>(data);
+         dataToAggregate[setKey].push_back(columns);
+     }
+ }
+@@ -70,11 +70,13 @@ int Aggregation::run() {
+ 
+             unsigned int key = reader.getDbKey(i);
+             buildMap(reader.getData(i), dataToMerge);
++            prepareInput(key, thread_idx);
++            
+             for (std::map<unsigned int, std::vector<std::vector<std::string>>>::const_iterator it = dataToMerge.begin();
+                  it != dataToMerge.end(); ++it) {
+                 unsigned int targetKey = it->first;
+                 std::vector<std::vector<std::string>> columns = it->second;
+-                buffer.append(aggregateEntry(columns, key, targetKey));
++                buffer.append(aggregateEntry(columns, key, targetKey, thread_idx));
+                 buffer.append("\n");
+             }
+             writer.writeData(buffer.c_str(), buffer.length(), key, thread_idx);
+diff --git a/src/multihit/Aggregation.h b/src/multihit/Aggregation.h
+index ffec938c5..89ffe9d64 100644
+--- a/src/multihit/Aggregation.h
++++ b/src/multihit/Aggregation.h
+@@ -15,8 +15,9 @@ class Aggregation {
+     virtual ~Aggregation();
+ 
+     int run();
++    virtual void prepareInput(unsigned int querySetKey, unsigned int thread_idx) = 0;
++    virtual std::string aggregateEntry(std::vector<std::vector<std::string>> &dataToAggregate, unsigned int querySetKey, unsigned int targetSetKey, unsigned int thread_idx) = 0;
+ 
+-    virtual std::string aggregateEntry(std::vector<std::vector<std::string>> &dataToAggregate, unsigned int querySetKey, unsigned int targetSetKey) = 0;
+ protected:
+     std::string resultDbName;
+     std::string outputDbName;
+diff --git a/src/multihit/besthitperset.cpp b/src/multihit/besthitperset.cpp
+index c219dddf6..feb68f921 100644
+--- a/src/multihit/besthitperset.cpp
++++ b/src/multihit/besthitperset.cpp
+@@ -23,7 +23,10 @@ public :
+         delete targetSizeReader;
+     }
+ 
+-    std::string aggregateEntry(std::vector<std::vector<std::string>> &dataToAggregate, unsigned int, unsigned int targetSetKey)  {
++
++    void prepareInput(unsigned int, unsigned int) {}
++
++    std::string aggregateEntry(std::vector<std::vector<std::string>> &dataToAggregate, unsigned int, unsigned int targetSetKey, unsigned int)  {
+         std::string buffer;
+         buffer.reserve(1024);
+ 
+@@ -60,7 +63,7 @@ public :
+             EXIT(EXIT_FAILURE);
+         }
+         char *data = targetSizeReader->getData(targetId);
+-        unsigned int nbrGenes = (unsigned int) std::strtoull(data, NULL, 10);
++        unsigned int nbrGenes = Util::fast_atoi<unsigned int>(data);
+ 
+         if (simpleBestHitMode) {
+             correctedPval = bestEval / nbrGenes;
+diff --git a/src/multihit/combinepvalperset.cpp b/src/multihit/combinepvalperset.cpp
+index ed33ebba8..9085fe477 100644
+--- a/src/multihit/combinepvalperset.cpp
++++ b/src/multihit/combinepvalperset.cpp
+@@ -8,10 +8,24 @@
+ #include <omp.h>
+ #endif
+ 
+-double LBinCoeff(int M, int k) {
+-    return lgamma(M + 1) - lgamma(M - k + 1) - lgamma(k + 1);
++
++double LBinCoeff(double* lookup, int M, int k) {
++    return lookup[M + 1] - lookup[M - k + 1] - lookup[k + 1];
++}
++
++// Precompute coefficients logB[i] = log(B[i])
++void precomputeLogB(const unsigned int orfCount, const double pvalThreshold, double* lGammaLookup, double *logB) { 
++    double logPvalThr = log(pvalThreshold);
++    double log1MinusPvalThr = log(1 - pvalThreshold);
++    logB[orfCount - 1] = orfCount * logPvalThr;
++    for (int i = (orfCount - 2); i >= 0; i--){
++        int k = i + 1;
++        double log_newTerm = LBinCoeff(lGammaLookup, orfCount, k) + k * logPvalThr + (orfCount - k) * log1MinusPvalThr;
++        logB[i] = logB[i + 1] + log(1 + exp(log_newTerm - logB[i+1]));
++    }
+ }
+ 
++
+ class PvalueAggregator : public Aggregation {
+ public:
+     PvalueAggregator(std::string queryDbName, std::string targetDbName, const std::string &resultDbName,
+@@ -27,9 +41,34 @@ class PvalueAggregator : public Aggregation {
+         sizeDBIndex = targetDbName + "_set_size.index";
+         targetSizeReader = new DBReader<unsigned int>(sizeDBName.c_str(), sizeDBIndex.c_str());
+         targetSizeReader->open(DBReader<unsigned int>::NOSORT);
++
++        unsigned int maxOrfCount = 0;
++        for (size_t i = 0; i < querySizeReader->getSize(); ++i) { 
++            unsigned int currentCount = Util::fast_atoi<unsigned int>(querySizeReader->getData(i));
++            if (currentCount > maxOrfCount) {
++                maxOrfCount = currentCount;
++            };
++        }
++
++        lGammaLookup = new double[maxOrfCount + 2];
++        for (size_t i = 0; i < maxOrfCount + 2; ++i) { 
++            lGammaLookup[i] = lgamma(i);
++        }
++
++        logBiLookup = new double*[threads];
++        for (size_t i = 0; i < threads; ++i) {
++            logBiLookup[i] = new double[maxOrfCount];
++        }
+     }
+ 
+     ~PvalueAggregator() {
++        for (size_t i = 0; i < threads; ++i) {
++            delete[] logBiLookup[i];
++        }
++        delete[] logBiLookup;
++
++        delete[] lGammaLookup;
++
+         targetSizeReader->close();
+         delete targetSizeReader;
+ 
+@@ -37,13 +76,17 @@ class PvalueAggregator : public Aggregation {
+         delete querySizeReader;
+     }
+ 
++    void prepareInput(unsigned int querySetKey, unsigned int thread_idx) {
++        unsigned int orfCount = Util::fast_atoi<unsigned int>(querySizeReader->getDataByDBKey(querySetKey));
++        precomputeLogB(orfCount, alpha/(orfCount + 1), lGammaLookup, logBiLookup[thread_idx]);
++    }
++
+     //Get all result of a single Query Set VS a Single Target Set and return the multiple-match p-value for it
+     std::string aggregateEntry(std::vector<std::vector<std::string> > &dataToAggregate, unsigned int querySetKey,
+-                               unsigned int targetSetKey) {
+-        unsigned int targetGeneCount = (unsigned int) strtoull(targetSizeReader->getDataByDBKey(targetSetKey), NULL, 10);
+-
+-        double pvalThreshold = alpha / targetGeneCount;
+-        const size_t numSets = targetSizeReader->getSize();
++                               unsigned int targetSetKey, unsigned int thread_idx) {
++        unsigned int orfCount = Util::fast_atoi<unsigned int>(querySizeReader->getDataByDBKey(querySetKey)); 
++        double pvalThreshold = alpha / (orfCount + 1);
++        const size_t numTargetSets = targetSizeReader->getSize();
+ 
+         std::string buffer;
+         char keyBuffer[255];
+@@ -53,7 +96,7 @@ class PvalueAggregator : public Aggregation {
+ 
+         //edge case p0 = 0
+         if (pvalThreshold == 0.0) {
+-            buffer.append(SSTR(numSets));
++            buffer.append(SSTR(numTargetSets));
+             return buffer;
+         }
+ 
+@@ -69,7 +112,7 @@ class PvalueAggregator : public Aggregation {
+         }
+ 
+         if (r == 0) {
+-            buffer.append(SSTR(numSets));
++            buffer.append(SSTR(numTargetSets));
+             return buffer;
+         }
+ 
+@@ -82,33 +125,19 @@ class PvalueAggregator : public Aggregation {
+         
+         //edge case p0 = 1
+         if (pvalThreshold == 1.0) {
+-            buffer.append(SSTR(expMinusR * numSets));
++            buffer.append(SSTR(expMinusR * numTargetSets));
+             return buffer;
+         }
+ 
+ 
+-        unsigned int orfCount = (unsigned int) strtoull(querySizeReader->getDataByDBKey(querySetKey), NULL, 10); 
+         double truncatedFisherPval = 0;
+-        double logRatioRToFactorial = 0;
+         const double logR = log(r);
+-        const double log1MinusPvalThr = log(1.0 - pvalThreshold);
+         for (size_t i = 0; i < orfCount; ++i) { 
+-            double logProbKGoodHits = 1;
+-            double firstFactor = (LBinCoeff(orfCount, (i + 1)) + (i + 1) * logPvalThr + (orfCount - (i +1)) * log1MinusPvalThr); 
+-            for (size_t j = i + 2; j < orfCount + 1; ++j) { 
+-                logProbKGoodHits += exp(LBinCoeff(orfCount, j) + j * logPvalThr + (orfCount - j) * log1MinusPvalThr - firstFactor);
+-            }
+-            logProbKGoodHits = firstFactor + log(logProbKGoodHits);
+-            if (i > 0) {
+-                logRatioRToFactorial = logRatioRToFactorial + logR - log(i);
+-            }
+-            truncatedFisherPval += exp(logRatioRToFactorial + logProbKGoodHits);
++            truncatedFisherPval += exp(i*logR - lGammaLookup[i+1] + logBiLookup[thread_idx][i]);
+         }
+-
+-
+         
+         double updatedPval = expMinusR * truncatedFisherPval;
+-        double updatedEval = updatedPval * numSets;
++        double updatedEval = updatedPval * numTargetSets;
+         buffer.append(SSTR(updatedEval));
+         return buffer;
+     }
+@@ -117,6 +146,8 @@ class PvalueAggregator : public Aggregation {
+     double alpha;
+     DBReader<unsigned int> *querySizeReader;
+     DBReader<unsigned int> *targetSizeReader;
++    double* lGammaLookup;
++    double** logBiLookup;
+ };
+ 
+ int combinepvalperset(int argc, const char **argv, const Command &command) {
+diff --git a/src/multihit/resultsbyset.cpp b/src/multihit/resultsbyset.cpp
+index 9c65676a6..daf2ab2af 100644
+--- a/src/multihit/resultsbyset.cpp
++++ b/src/multihit/resultsbyset.cpp
+@@ -84,8 +84,11 @@ class SetSummaryAggregator : public Aggregation {
+         delete querySizeReader;
+     }
+ 
++
++    void prepareInput(unsigned int, unsigned int) {}
++
+     std::string aggregateEntry(std::vector<std::vector<std::string> > &dataToAggregate, unsigned int querySetKey,
+-                               unsigned int targetSetKey) {
++                               unsigned int targetSetKey, unsigned int) {
+         double targetGeneCount = std::strtod(targetSizeReader->getDataByDBKey(targetSetKey), NULL);
+         double pvalThreshold = this->alpha / targetGeneCount;
+         std::vector<std::pair<long, long>> genesPositions;

@@ -1,0 +1,280 @@
+diff --git a/Project.toml b/Project.toml
+index 2012a592..7750079d 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -2,7 +2,7 @@ name = "AlgebraicPetri"
+ uuid = "4f99eebe-17bf-4e98-b6a1-2c4f205a959b"
+ license = "MIT"
+ authors = ["Micah Halter <micah@mehalter.com>"]
+-version = "0.8.2"
++version = "0.8.3"
+ 
+ [deps]
+ Catlab = "134e5e36-593f-5add-ad60-77f754baafbe"
+@@ -12,7 +12,7 @@ Requires = "ae029012-a4dd-5104-9daa-d747884805df"
+ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+ 
+ [compat]
+-Catlab = "0.13, 0.14"
++Catlab = "^0.14.13"
+ LabelledArrays = "^1"
+ Requires = "^1"
+ StatsBase = "^0.33"
+diff --git a/src/AlgebraicPetri.jl b/src/AlgebraicPetri.jl
+index 97db30dc..1629c88b 100644
+--- a/src/AlgebraicPetri.jl
++++ b/src/AlgebraicPetri.jl
+@@ -547,4 +547,5 @@ include("Epidemiology.jl")
+ include("BilayerNetworks.jl")
+ include("ModelComparison.jl")
+ include("SubACSets.jl")
++include("TypedPetri.jl")
+ end
+diff --git a/src/TypedPetri.jl b/src/TypedPetri.jl
+new file mode 100644
+index 00000000..35bfc2ac
+--- /dev/null
++++ b/src/TypedPetri.jl
+@@ -0,0 +1,163 @@
++module TypedPetri
++export prim_petri, strip_names, prim_cospan, oapply_typed, add_reflexives, typed_product
++
++using Catlab
++using Catlab.CategoricalAlgebra
++using Catlab.WiringDiagrams
++using AlgebraicPetri
++using AlgebraicPetri: LabelledPetriNetUntyped, OpenLabelledPetriNetUntyped
++
++
++"""
++Takes in a petri net and a transition in that petri net,
++constructs a petri net with just that transition, returns
++the acsettransformation from that into the type system.
++"""
++function prim_petri(type_system, transition)
++  prim = typeof(type_system)()
++  t = add_transition!(prim)
++  s_map = Int[]
++  for i in inputs(type_system, transition)
++    s = is(type_system, i)
++    s′ = add_species!(prim)
++    push!(s_map, s)
++    add_input!(prim, 1, s′)
++  end
++  for i in outputs(type_system, transition)
++    s = os(type_system, i)
++    s′ = add_species!(prim)
++    push!(s_map, s)
++    add_output!(prim, 1, s′)
++  end
++  ACSetTransformation(
++    prim,
++    type_system,
++    S=s_map,
++    T=[transition],
++    O=incident(type_system, transition, :ot),
++    I=incident(type_system, transition, :it),
++  )
++end
++
++"""
++Produces the structured cospan of the transition over
++different species.
++"""
++function prim_cospan(type_system, transition)
++  prim = prim_petri(type_system, transition)
++  p = dom(prim)
++  feet = [FinSet(1) for s in 1:ns(p)]
++  structured_feet = [PetriNet(1) for s in 1:ns(p)]
++  legs = [
++    ACSetTransformation(
++      structured_feet[s],
++      p,
++      S = [s],
++      T = Int[],
++      I = Int[],
++      O = Int[],
++    )
++    for s in 1:ns(p)
++  ]
++  (OpenPetriNet(Multicospan(p, legs), feet), prim)
++end
++
++"""
++Takes in a labelled petri net and an undirected wiring diagram,
++where each of the boxes is labeled by a symbol that matches the label
++of a transition in the petri net. Then produces a petri net given by
++colimiting the transitions together, and returns the ACSetTransformation
++from that Petri net to the type system.
++"""
++function oapply_typed(type_system::LabelledPetriNet, uwd, tnames::Vector{Symbol})
++  type_system′ = PetriNet(type_system)
++  prim_cospan_data = Dict(
++    tname(type_system, t) => prim_cospan(type_system′, t)
++    for t in 1:nt(type_system)
++  )
++  prim_cospans = Dict(t => prim_cospan_data[t][1] for t in keys(prim_cospan_data))
++  petri, colim = oapply(uwd, prim_cospans; return_colimit=true)
++  unlabelled_map = universal(
++    colim,
++    Multicospan(
++      type_system′,
++      [prim_cospan_data[subpart(uwd, b, :name)][2] for b in 1:nboxes(uwd)]
++    )
++  )
++  labelled_petri = LabelledPetriNet(unlabelled_map.dom, uwd[:variable], tnames)
++  ACSetTransformation(
++    labelled_petri,
++    type_system;
++    unlabelled_map.components...,
++    Name=name->nothing
++  )
++end
++
++r"""
++Modify a typed petri net to add "reflexive transitions". These are transitions which go from one species to itself, so they don't change the mass action semantics, but they are important for stratification.
++
++The idea behind this is similar to the fact that the product of the graph *----* with itself is
++
++*    *
++    /
++   /
++  /
++ /
++*    *
++
++One needs to add self-edges to each of the vertices in *----* to get
++
++*----*
++|   /|
++|  / |
++| /  |
++|/   |
++*----*
++
++Example:
++```julia
++add_reflexives(sird_typed, [[:strata], [:strata], [:strata], []], infectious_ontology)
++```
++"""
++function add_reflexives(
++  typed_petri::ACSetTransformation,
++  reflexive_transitions,
++  type_system::AbstractPetriNet
++)
++  petri = deepcopy(dom(typed_petri))
++  type_comps = Dict([k=>collect(v) for (k,v) in pairs(deepcopy(components(typed_petri)))])
++  for (s_i,cts) in enumerate(reflexive_transitions)
++    for ct in cts
++      type_ind = findfirst(==(ct), type_system[:tname])
++      is, os = [incident(type_system, type_ind, f) for f in [:it, :ot]]
++      new_t = add_part!(petri, :T; tname=ct)
++      add_parts!(petri, :I, length(is); is=s_i, it=new_t)
++      add_parts!(petri, :O, length(os); os=s_i, ot=new_t)
++      push!(type_comps[:T], type_ind)
++      append!(type_comps[:I], is); append!(type_comps[:O], os);
++    end
++  end
++  ACSetTransformation(
++    petri,
++    codom(typed_petri);
++    type_comps...,
++    Name=x->nothing
++  )
++end
++
++"""
++This takes the "typed product" of two typed Petri nets p1 and p2, which has
++
++- a species for every pair of a species in p1 and a species in p2 with the same type
++- a transition for every pair of a transitions in p1 and a species in p2 with the same type
++
++This is the "workhorse" of stratification; this is what actually does the stratification, though you may have to "prepare" the petri nets first with `add_reflexives`
++
++Returns a typed model, i.e. a map in Petri.
++"""
++function typed_product(p1, p2)
++  pb = pullback(p1, p2; product_attrs=true)
++  return first(legs(pb)) ⋅ p1
++end
++
++end
+diff --git a/test/runtests.jl b/test/runtests.jl
+index f46ce6be..a104841c 100644
+--- a/test/runtests.jl
++++ b/test/runtests.jl
+@@ -25,6 +25,10 @@ end
+     include("epidemiology.jl")
+ end
+ 
++@testset "TypedPetris" begin
++  include("typed_petri.jl")
++end
++
+ @testset "BilayerNetworks" begin
+   include("bilayernetworks.jl")
+ end
+@@ -33,10 +37,10 @@ end
+   include("modelcomparison.jl")
+ end
+ 
+-@testset "Catalyst Tooling" begin
++@testset "Catalyst Interop" begin
+   include("CatalystInterop.jl")
+ end
+ 
+-@testset "ModelingToolkit Tooling" begin
++@testset "ModelingToolkit Interop" begin
+   include("ModelingToolkitInterop.jl")
+ end
+diff --git a/test/typed_petri.jl b/test/typed_petri.jl
+new file mode 100644
+index 00000000..e9ad6822
+--- /dev/null
++++ b/test/typed_petri.jl
+@@ -0,0 +1,45 @@
++using Test
++
++using Catlab.Programs, AlgebraicPetri, AlgebraicPetri.TypedPetri
++
++const infectious_ontology = LabelledPetriNet(
++  [:Pop],
++  :infect=>((:Pop, :Pop)=>(:Pop, :Pop)),
++  :disease=>(:Pop=>:Pop),
++  :strata=>(:Pop=>:Pop)
++)
++
++sird_uwd = @relation () where (S::Pop, I::Pop, R::Pop, D::Pop) begin
++  infect(S,I,I,I) # inf
++  disease(I,R) # recover
++  disease(I,D) # die
++end
++
++typed_sird = oapply_typed(infectious_ontology, sird_uwd, [:inf, :recover, :die])
++
++@test ns(typed_sird.dom) == 4
++@test nt(typed_sird.dom) == 3
++
++quarantine_uwd = @relation () where (Q::Pop, NQ::Pop) begin
++  strata(Q,NQ) # enter quarantine
++  strata(NQ,Q) # exit quarantine
++end
++
++typed_quarantine = oapply_typed(infectious_ontology, quarantine_uwd, [:exit_Q, :enter_Q])
++
++typed_quarantine_aug = add_reflexives(
++  typed_quarantine,
++  [[:disease], [:disease, :infect]],
++  infectious_ontology
++)
++
++typed_sird_aug = add_reflexives(
++  typed_sird,
++  [[:strata], [:strata], [:strata], []],
++  infectious_ontology
++)
++
++stratified = typed_product(typed_quarantine_aug, typed_sird_aug)
++
++@test ns(stratified.dom) == 8
++@test nt(stratified.dom) == 6 + 4 + 1

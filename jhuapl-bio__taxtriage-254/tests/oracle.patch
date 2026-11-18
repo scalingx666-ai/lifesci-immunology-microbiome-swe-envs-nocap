@@ -1,0 +1,451 @@
+diff --git a/bin/make_report.py b/bin/make_report.py
+index 63db55a5..6afead2a 100755
+--- a/bin/make_report.py
++++ b/bin/make_report.py
+@@ -82,6 +82,19 @@ def parse_args(argv=None):
+         metavar="TEMPLATE", default="heatmap.html",
+         help="Input HTML template file (default: heatmap.html).",
+     )
++    parser.add_argument(
++        "--offline_report", action="store_true",
++        help="Download the report's CDN libraries (d3, xlsx, jspdf, Leaflet, "
++             "Font Awesome) at build time and embed them inline so the report "
++             "opens with no internet access. Requires network at build time.",
++    )
++    parser.add_argument(
++        "--offline_report_files", default=None, metavar="DIR",
++        help="Directory containing local copies of the CDN libraries (and any "
++             "fonts/marker images they reference). When given, those files are "
++             "embedded inline instead of downloading — a fully offline build. "
++             "Takes precedence over --offline_report.",
++    )
+     parser.add_argument(
+         "-pident", '--pident', default=0.0, type=float,
+         help="Minimum percent identity (0-100) for inclusion in the report (default: 0.0, i.e. include all). Only used if you have VF/AMR results"
+@@ -1194,8 +1207,14 @@ def _first_val(vals, exclude_upper=("NA", "NULL", "NONE", "")):
+     # heatmap.html is a thin shell that references its CSS/JS as external parts
+     # under assets/src/. inline_template() folds those back in so the report is
+     # one self-contained file. (See bin/report_template.py.)
++    # offline_report / offline_report_files fold the CDN libraries inline so the
++    # report opens with no internet access. Default leaves them as CDN links.
+     from report_template import inline_template
+-    tpl = inline_template(args.template)
++    tpl = inline_template(
++        args.template,
++        offline=args.offline_report,
++        offline_dir=args.offline_report_files,
++    )
+ 
+     # Use a function replacement (not a plain string) so backslashes / `\g`-like
+     # sequences inside the JSON payload are inserted verbatim and never treated
+diff --git a/bin/report_template.py b/bin/report_template.py
+index 14219f30..adf4f8a3 100755
+--- a/bin/report_template.py
++++ b/bin/report_template.py
+@@ -29,10 +29,13 @@
+     python bin/report_template.py -o out.html
+ """
+ import argparse
++import base64
+ import os
+ import re
+ import sys
+ from pathlib import Path
++from urllib.parse import urljoin, urlparse
++from urllib.request import Request, urlopen
+ 
+ _LINK_RE = re.compile(
+     r'[ \t]*<link\b[^>]*\bhref="(?P<href>src/[^"]+\.css)"[^>]*>[ \t]*\n?',
+@@ -44,13 +47,111 @@
+ )
+ _STYLE_ID_RE = re.compile(r'\bdata-style-id="([^"]+)"')
+ 
++# ── CDN parts (http/https) — inlined only in offline builds ───────────────────
++# Left untouched by default so the report still loads libraries from the CDN at
++# view time (the historical behaviour). When --offline_report /
++# --offline_report_files is requested, these are folded inline instead.
++_CDN_LINK_RE = re.compile(
++    r'[ \t]*<link\b[^>]*\bhref="(?P<href>https?://[^"]+\.css)"[^>]*>[ \t]*\n?',
++    re.IGNORECASE,
++)
++_CDN_SCRIPT_RE = re.compile(
++    r'[ \t]*<script\b[^>]*\bsrc="(?P<src>https?://[^"]+)"[^>]*>\s*</script>[ \t]*\n?',
++    re.IGNORECASE,
++)
++# url(...) references inside CSS (fonts, marker images). Skips data: URIs.
++_CSS_URL_RE = re.compile(r'url\(\s*(?P<q>["\']?)(?P<u>[^"\')]+)(?P=q)\s*\)')
++
++# Extensions -> MIME for data-URI embedding of CSS-referenced assets.
++_ASSET_MIME = {
++    ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf",
++    ".otf": "font/otf", ".eot": "application/vnd.ms-fontobject",
++    ".svg": "image/svg+xml", ".png": "image/png", ".gif": "image/gif",
++    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
++}
++
++
++def _fetch_bytes(url, offline_dir):
++    """Return the raw bytes for a CDN asset.
++
++    offline_dir set  -> resolve by basename under that directory (fully offline,
++                        no network). Searched recursively so fonts/images placed
++                        anywhere inside the directory are found.
++    offline_dir None -> download the URL at build time.
++    """
++    if offline_dir:
++        name = os.path.basename(urlparse(url).path)
++        for root, _dirs, files in os.walk(offline_dir):
++            if name in files:
++                with open(os.path.join(root, name), "rb") as fh:
++                    return fh.read()
++        raise FileNotFoundError(
++            f"offline asset '{name}' not found under {offline_dir} (for {url})"
++        )
++    req = Request(url, headers={"User-Agent": "taxtriage-offline-report"})
++    with urlopen(req, timeout=60) as resp:  # nosec B310 - fixed https CDN URLs
++        return resp.read()
++
++
++def _inline_css_urls(css_text, base_url, offline_dir):
++    """Replace url(...) refs in a stylesheet with base64 data URIs.
++
++    Fonts (Font Awesome) and marker images (Leaflet) are pulled the same way as
++    the stylesheet itself. Unresolvable refs are left as-is so a partial offline
++    bundle still produces a working (if icon-less) report.
++    """
++    def repl(m):
++        raw = m.group("u").strip()
++        if not raw or raw.startswith("data:"):
++            return m.group(0)
++        clean = raw.split("?", 1)[0].split("#", 1)[0]
++        try:
++            data = _fetch_bytes(
++                clean if offline_dir else urljoin(base_url, clean), offline_dir
++            )
++        except Exception:  # noqa: BLE001 - best effort, keep original ref
++            return m.group(0)
++        ext = os.path.splitext(urlparse(clean).path)[1].lower()
++        mime = _ASSET_MIME.get(ext, "application/octet-stream")
++        b64 = base64.b64encode(data).decode("ascii")
++        return f"url(data:{mime};base64,{b64})"
++
++    return _CSS_URL_RE.sub(repl, css_text)
++
++
++def inline_cdn_assets(html, offline_dir=None) -> str:
++    """Fold CDN <script src>/<link href> tags inline for an offline report.
++
++    offline_dir None -> download each library at build time.
++    offline_dir set  -> read local copies (by basename) from that directory.
++    """
++    def _script(m):
++        body = _fetch_bytes(m.group("src"), offline_dir).decode("utf-8", "replace")
++        return f"    <script>\n{body}\n    </script>\n"
++
++    def _css(m):
++        text = _fetch_bytes(m.group("href"), offline_dir).decode("utf-8", "replace")
++        text = _inline_css_urls(text, m.group("href"), offline_dir)
++        return f"    <style>\n{text}\n    </style>\n"
++
++    html = _CDN_SCRIPT_RE.sub(_script, html)
++    html = _CDN_LINK_RE.sub(_css, html)
++    return html
++
+ 
+ def _default_template():
+     return Path(__file__).resolve().parent.parent / "assets" / "heatmap.html"
+ 
+ 
+-def inline_template(template_path=None) -> str:
+-    """Return the fully self-contained report HTML as a string."""
++def inline_template(template_path=None, offline=False, offline_dir=None) -> str:
++    """Return the fully self-contained report HTML as a string.
++
++    Local parts under src/ are always folded inline. CDN parts (d3, xlsx, jspdf,
++    Leaflet, Font Awesome) are left as external links by default so the report
++    loads them at view time. Set offline=True to download and embed them, or
++    offline_dir=<path> to embed local copies without any network access
++    (offline_dir takes precedence over offline).
++    """
+     template_path = Path(template_path) if template_path else _default_template()
+     with open(template_path, "r", encoding="utf-8", newline="") as fh:
+         html = fh.read()
+@@ -86,6 +187,13 @@ def _js(m):
+     leftover = re.search(r'(?:href|src)="src/[^"]+"', html)
+     if leftover:
+         sys.exit(f"ERROR: un-inlined local reference remains: {leftover.group(0)}")
++
++    # Offline builds: fold the CDN libraries inline too. Default leaves them as
++    # external links (loaded from the CDN when the report is opened).
++    if offline_dir is not None:
++        html = inline_cdn_assets(html, offline_dir=offline_dir)
++    elif offline:
++        html = inline_cdn_assets(html, offline_dir=None)
+     return html
+ 
+ 
+@@ -94,8 +202,14 @@ def main():
+     ap.add_argument("-t", "--template", default=None,
+                     help="thin template to assemble (default: assets/heatmap.html)")
+     ap.add_argument("-o", "--output", help="write here (default: stdout)")
++    ap.add_argument("--offline_report", action="store_true",
++                    help="download the CDN libraries and embed them inline")
++    ap.add_argument("--offline_report_files", default=None, metavar="DIR",
++                    help="directory of local CDN library copies to embed inline "
++                         "(no network; takes precedence over --offline_report)")
+     args = ap.parse_args()
+-    html = inline_template(args.template)
++    html = inline_template(args.template, offline=args.offline_report,
++                           offline_dir=args.offline_report_files)
+     if args.output:
+         with open(args.output, "w", encoding="utf-8", newline="") as fh:
+             fh.write(html)
+diff --git a/modules/local/create_comparison_report.nf b/modules/local/create_comparison_report.nf
+index 57d48711..58d0b720 100644
+--- a/modules/local/create_comparison_report.nf
++++ b/modules/local/create_comparison_report.nf
+@@ -53,6 +53,13 @@ process CREATE_COMPARISON_REPORT {
+     // unaligned VF-AMR hits for samples with NO reference alignment, whose annotation is otherwise
+     // dropped from the merged XLSX. Pass a NO_FILE placeholder to disable. Single collected channel.
+     path(annotate_reports)
++    // Optional directory of local CDN library copies (d3, xlsx, jspdf, Leaflet,
++    // Font Awesome + their fonts/images) for a fully offline report build. When a
++    // real directory is staged (params.offline_report_files set) make_report.py
++    // embeds those files inline; otherwise a NO_FILE placeholder is passed and the
++    // report either downloads the libs at build time (params.offline_report) or
++    // leaves them as CDN links (default). Single input.
++    path(offline_report_files)
+ 
+     output:
+         path "versions.yml"           , emit: versions
+@@ -134,12 +141,23 @@ process CREATE_COMPARISON_REPORT {
+         }
+     }
+ 
++    // ── Offline report embedding ──────────────────────────────────────────────
++    // A staged directory (not a NO_FILE placeholder) -> embed those local library
++    // copies inline. Else if params.offline_report -> download + embed at build
++    // time. Else (default) -> leave CDN links so the report fetches libs on load.
++    def offline_arg = ''
++    if (offline_report_files && !offline_report_files.name.startsWith('NO_FILE')) {
++        offline_arg = "--offline_report_files ${offline_report_files}"
++    } else if (params.offline_report) {
++        offline_arg = "--offline_report"
++    }
++
+     """
+     make_report.py -i ${json_inputs} \\
+         -t ${template} \\
+         -o ${output_html} \\
+         ${prot_arg} ${pident} ${mintass} \\
+-        ${nov_arg} ${nov_dl_arg} ${path_arg} ${vfamr_tax_arg} ${annot_arg}
++        ${nov_arg} ${nov_dl_arg} ${path_arg} ${vfamr_tax_arg} ${annot_arg} ${offline_arg}
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/nextflow.config b/nextflow.config
+index 08744de0..79e6a214 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -23,6 +23,8 @@ params {
+ 
+     unknown_sample = null
+     skip_report = null
++    offline_report = false          // download the report's CDN libs (d3, xlsx, jspdf, Leaflet, Font Awesome) at build time and embed them inline so the report opens offline
++    offline_report_files = null     // path to a directory of local CDN lib copies (+ referenced fonts/images) to embed inline instead of downloading — fully offline build; takes precedence over offline_report
+     use_bt2 = null
+     use_denovo = null
+     pathogenicity = false
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 336a1e7e..8181bb9f 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -329,6 +329,18 @@
+                     "description": "Skip the pathogen report",
+                     "fa_icon": "fas fa-file-signature"
+                 },
++                "offline_report": {
++                    "type": "boolean",
++                    "default": false,
++                    "description": "Download the report's CDN libraries (d3, xlsx, jspdf, Leaflet, Font Awesome) at build time and embed them inline so the report opens without internet access. Requires network connectivity during the build step.",
++                    "fa_icon": "fas fa-wifi"
++                },
++                "offline_report_files": {
++                    "type": "string",
++                    "format": "directory-path",
++                    "description": "Path to a directory of local copies of the report's CDN libraries (and any fonts/marker images they reference). When set, these files are embedded inline instead of being downloaded — a fully offline build. Takes precedence over --offline_report.",
++                    "fa_icon": "fas fa-folder-open"
++                },
+                 "skip_consensus": {
+                     "type": "boolean",
+                     "description": "Skip the consensus report",
+diff --git a/scripts/fetch_offline_report_libs.py b/scripts/fetch_offline_report_libs.py
+new file mode 100755
+index 00000000..3dd59e36
+--- /dev/null
++++ b/scripts/fetch_offline_report_libs.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""
++Download the CDN libraries that assets/heatmap.html references into a local
++folder, so the report can be built fully offline with --offline_report_files.
++
++The CDN URLs are read straight out of assets/heatmap.html, so this stays in
++sync if a library version is bumped in the template. For each stylesheet, the
++fonts / marker images it references via url(...) are downloaded too, so Font
++Awesome icons and Leaflet markers work with no network access.
++
++Usage:
++    python scripts/fetch_offline_report_libs.py
++    python scripts/fetch_offline_report_libs.py -o /path/to/libs
++    python scripts/fetch_offline_report_libs.py -t assets/heatmap.html
++
++Then build an offline report with the downloaded folder:
++    nextflow run . ... --offline_report_files assets/offline_report_libs
++    # or, to test the embedding directly:
++    python bin/report_template.py -t assets/heatmap.html \\
++        -o report_offline.html --offline_report_files assets/offline_report_libs
++"""
++import argparse
++import os
++import re
++import sys
++from pathlib import Path
++from urllib.parse import urljoin, urlparse
++from urllib.request import Request, urlopen
++
++_REPO_ROOT = Path(__file__).resolve().parent.parent
++_DEFAULT_TEMPLATE = _REPO_ROOT / "assets" / "heatmap.html"
++_DEFAULT_OUTDIR = _REPO_ROOT / "assets" / "offline_report_libs"
++
++# CDN <script src> and <link href> tags in the template head.
++_CDN_SCRIPT_RE = re.compile(
++    r'<script\b[^>]*\bsrc="(?P<url>https?://[^"]+)"', re.IGNORECASE)
++_CDN_LINK_RE = re.compile(
++    r'<link\b[^>]*\bhref="(?P<url>https?://[^"]+\.css)"', re.IGNORECASE)
++# url(...) references inside CSS (fonts, marker images); skips data: URIs.
++_CSS_URL_RE = re.compile(r'url\(\s*["\']?(?P<u>[^"\')]+)["\']?\s*\)')
++
++
++def _download(url):
++    req = Request(url, headers={"User-Agent": "taxtriage-offline-report"})
++    with urlopen(req, timeout=60) as resp:  # nosec B310 - fixed https CDN URLs
++        return resp.read()
++
++
++def _save(data, outdir, name):
++    dest = outdir / name
++    dest.parent.mkdir(parents=True, exist_ok=True)
++    with open(dest, "wb") as fh:
++        fh.write(data)
++    return dest
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("-t", "--template", default=str(_DEFAULT_TEMPLATE),
++                    help="report template to read CDN URLs from "
++                         "(default: assets/heatmap.html)")
++    ap.add_argument("-o", "--outdir", default=str(_DEFAULT_OUTDIR),
++                    help="directory to download into "
++                         "(default: assets/offline_report_libs)")
++    args = ap.parse_args(argv)
++
++    template = Path(args.template)
++    outdir = Path(args.outdir)
++    if not template.is_file():
++        sys.exit(f"ERROR: template not found: {template}")
++
++    html = template.read_text(encoding="utf-8", newline="")
++    scripts = [m.group("url") for m in _CDN_SCRIPT_RE.finditer(html)]
++    stylesheets = [m.group("url") for m in _CDN_LINK_RE.finditer(html)]
++
++    if not scripts and not stylesheets:
++        sys.exit(f"ERROR: no CDN <script>/<link> references found in {template}")
++
++    outdir.mkdir(parents=True, exist_ok=True)
++    print(f"Reading CDN references from : {template}")
++    print(f"Downloading into           : {outdir.resolve()}\n")
++
++    n_files = 0
++    n_assets = 0
++
++    for url in scripts:
++        name = os.path.basename(urlparse(url).path)
++        print(f"  JS  {name:<30} <- {url}")
++        _save(_download(url), outdir, name)
++        n_files += 1
++
++    for url in stylesheets:
++        name = os.path.basename(urlparse(url).path)
++        print(f"  CSS {name:<30} <- {url}")
++        data = _download(url)
++        _save(data, outdir, name)
++        n_files += 1
++        # Pull the fonts / images the stylesheet references via url(...).
++        css_text = data.decode("utf-8", "replace")
++        seen = set()
++        for m in _CSS_URL_RE.finditer(css_text):
++            raw = m.group("u").strip()
++            if not raw or raw.startswith("data:"):
++                continue
++            clean = raw.split("?", 1)[0].split("#", 1)[0]
++            asset_url = urljoin(url, clean)
++            asset_name = os.path.basename(urlparse(asset_url).path)
++            if not asset_name or asset_name in seen:
++                continue
++            seen.add(asset_name)
++            try:
++                _save(_download(asset_url), outdir, asset_name)
++            except Exception as exc:  # noqa: BLE001 - report and continue
++                print(f"      ! skipped {asset_name}: {exc}")
++                continue
++            print(f"      asset {asset_name}")
++            n_assets += 1
++
++    rel = os.path.relpath(outdir.resolve(), Path.cwd())
++    print(f"\nDone. {n_files} libraries + {n_assets} referenced assets saved to:")
++    print(f"  {outdir.resolve()}")
++    print("\nBuild a fully offline report by pointing --offline_report_files at it:")
++    print(f"  nextflow run . ... --offline_report_files {rel}")
++    print("\nOr test the embedding directly, without running the pipeline:")
++    print(f"  python bin/report_template.py -t {args.template} \\")
++    print(f"      -o report_offline.html --offline_report_files {rel}")
++    print("\n(Note: --offline_report_files embeds these local copies with no "
++          "network.\n --offline_report instead downloads the same libraries at "
++          "build time.)")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/subworkflows/local/report.nf b/subworkflows/local/report.nf
+index 64a80c2d..b787df09 100644
+--- a/subworkflows/local/report.nf
++++ b/subworkflows/local/report.nf
+@@ -325,6 +325,15 @@ workflow REPORT {
+                 .collect()
+                 .ifEmpty { file("$projectDir/assets/NO_FILE_annotate_report") }
+ 
++            // ── Offline report libraries ─────────────────────────────────────────
++            // --offline_report_files <dir> stages a directory of local CDN library
++            // copies to embed inline. Otherwise a NO_FILE placeholder is staged and
++            // the report either downloads the libs at build time (--offline_report)
++            // or leaves them as CDN links (default).
++            ch_offline_report_files = params.offline_report_files
++                ? Channel.fromPath(params.offline_report_files, checkIfExists: true)
++                : Channel.value(file("$projectDir/assets/NO_FILE_embedding"))
++
+             CREATE_COMPARISON_REPORT(
+                 ch_comparison_jsons,
+                 ch_template,
+@@ -333,7 +342,8 @@ workflow REPORT {
+                 ch_novelty_files,
+                 pathogens_list.first(),
+                 ch_vfamr_taxids.first(),
+-                ch_annotate_report_files
++                ch_annotate_report_files,
++                ch_offline_report_files
+             )
+ 
+             ch_pathogens_report = ORGANISM_MERGE_REPORT.out.report

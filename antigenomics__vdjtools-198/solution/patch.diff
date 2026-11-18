@@ -1,0 +1,157 @@
+diff --git a/docs/features.rst b/docs/features.rst
+index be10e296..16985ff1 100644
+--- a/docs/features.rst
++++ b/docs/features.rst
+@@ -25,8 +25,8 @@ The shared implementation is ``vdjtools.signature.corpus.TablePCA``. Its saved
+ NumPy artifact stores imputation values, scaling, centering, feature order and PCA
+ components. This optional StandardScaler/PCA workflow is distinct from the existing
+ robust, winsorized ``Corpus`` rotation used by ``vsig`` and mirpy ``rsig``. Existing
+-rsig is not RFF. Corpus refits and distributed rotations for raw statistical
+-features and sample RFF are planned separately. Raw outputs remain available.
++rsig is not RFF. Raw feature rotations and mirpy sample RFF rotations are separate outputs.
++Raw outputs remain available independently of either rotation.
+ 
+ Choosing feature columns
+ ------------------------
+@@ -84,3 +84,41 @@ grows with sample count and selected feature width. Table PCA needs a dense fitt
+ matrix and its numerical workspace; known large allocations check available
+ container memory before allocation. These checks cannot bound an arbitrarily deep
+ input frame. See :ref:`cpu-container-limits` for CPU allocation and import order.
++
++Reference rotation bundles
++--------------------------
++
++A reference bundle's ``features-pca.npz`` projects the unrotated statistical
++measurements, using its saved feature order and the same shared coverage target.
++The fitting recipe uses human gene vocabularies and ``log2p1`` weighting; its
++default coverage is ``0.8``. The RFF rotation in that bundle is a different file
++and requires the bundled mirpy bases. Neither file is a vsig/rsig corpus.
++
++.. code-block:: bash
++
++   vdjtools features samples/*.tsv --coverage 0.8 --threads 2 -o features.tsv
++   vdjtools pca features.tsv --rotation reference/features-pca.npz -o pcs.tsv
++
++The `mirpy reference recipe
++<https://docs.isalgo.dev/mirpy/embeddings.html#reference-rotation-bundles>`_
++freshly generates each reference table, fits with the existing ``TablePCA``,
++checks save/load equivalence, and exports rotations and coordinate parameters.
++Reference rotations store up to 1024 PCs and their
++``explained_variance_ratio`` arrays. The bundle reports cumulative fractions at
++256, 512 and 1024 PCs, along with the actual number stored. Fractions refer to
++imputed, standardized coordinates; they do not measure variance of the unscaled
++features. Older rotations without variance statistics remain loadable.
++Input membership and fit diagnostics remain private. ``bundle.json`` records
++parameters and file checksums; it contains no sample identities or raw input paths.
++
++Extract a reference bundle separately from the library installation and verify
++its recorded hashes before use. Choose the blood/tissue RNA-seq, synthetic or
++deep TRA/TRB reference appropriate to your analysis; keep the chosen rotation
++checksum with your results. The deep reference selects TRA/TRB measurements and
++cross-locus channels rather than fitting the other loci. Unselected measurements
++and channels pass through the projection.
++
++The first command keeps the unprojected feature table. Applying a rotation does
++not recompute those measurements or turn them into a corpus signature. Target
++and control tables must use the same vocabulary, weighting and coverage target.
++A shared vocabulary alone does not make PCs from different rotations comparable.
+diff --git a/pyproject.toml b/pyproject.toml
+index b3ccee96..e66dc7e6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "vdjtools"  # if the PyPI name is taken, fall back to a distinct dist name (cf. arda -> arda-mapper)
+-version = "5.0.2"
++version = "5.1.0"
+ description = "TCR/BCR repertoire analysis — Pgen/generation/inference, diversity, overlap, biomarkers (Python + C++)"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/python/vdjtools/signature/corpus.py b/python/vdjtools/signature/corpus.py
+index f1dd1e6d..fccb3e49 100644
+--- a/python/vdjtools/signature/corpus.py
++++ b/python/vdjtools/signature/corpus.py
+@@ -1841,6 +1841,7 @@ class TablePCA:
+     scale: np.ndarray
+     center: np.ndarray
+     components: np.ndarray
++    explained_variance_ratio: np.ndarray | None = None
+ 
+     @classmethod
+     def fit(cls, table: pl.DataFrame, *, n_components: int = 256, seed: int = 0,
+@@ -1868,7 +1869,8 @@ def fit(cls, table: pl.DataFrame, *, n_components: int = 256, seed: int = 0,
+         del missing
+         reducer = fit_pca(X, min(n_components, *X.shape), seed=seed, copy=False)
+         scaler, pca = reducer.steps[0][1], reducer.steps[1][1]
+-        return cls(cols, space, fill, scaler.mean_, scaler.scale_, pca.mean_, pca.components_)
++        return cls(cols, space, fill, scaler.mean_, scaler.scale_, pca.mean_, pca.components_,
++                   np.nan_to_num(pca.explained_variance_ratio_, nan=0.0))
+ 
+     def transform(self, table: pl.DataFrame) -> pl.DataFrame:
+         """Apply this exact rotation; preserve sample IDs and metadata in input order."""
+@@ -1890,10 +1892,12 @@ def transform(self, table: pl.DataFrame) -> pl.DataFrame:
+ 
+     def save(self, path) -> None:
+         """Write an explicit NumPy artifact (no pickle or executable model payload)."""
++        variance = ({'explained_variance_ratio': self.explained_variance_ratio}
++                    if self.explained_variance_ratio is not None else {})
+         with open(path, 'wb') as f:
+             np.savez_compressed(f, columns=np.array(self.columns), space=np.array(self.space),
+                                 fill=self.fill, mean=self.mean, scale=self.scale,
+-                                center=self.center, components=self.components)
++                                center=self.center, components=self.components, **variance)
+ 
+     @classmethod
+     def load(cls, path):
+@@ -1902,7 +1906,9 @@ def load(cls, path):
+             if z['columns'].ndim != 1 or z['space'].ndim != 0:
+                 raise ValueError('invalid PCA artifact metadata')
+             result = cls(z['columns'].tolist(), str(z['space']),
+-                         *(z[key].copy() for key in ('fill','mean','scale','center','components')))
++                         *(z[key].copy() for key in ('fill','mean','scale','center','components')),
++                         z['explained_variance_ratio'].copy()
++                         if 'explained_variance_ratio' in z else None)
+         n = len(result.columns)
+         if (not n or not result.space or len(set(result.columns)) != n
+                 or result.components.ndim != 2 or result.components.shape[0] < 1
+@@ -1912,4 +1918,9 @@ def load(cls, path):
+                            (result.fill,result.mean,result.scale,result.center,result.components))
+                 or (result.scale <= 0).any()):
+             raise ValueError('invalid PCA artifact dimensions or numerical values')
++        ratios = result.explained_variance_ratio
++        if ratios is not None and (ratios.shape != (result.components.shape[0],)
++                or not np.isfinite(ratios).all() or (ratios < 0).any()
++                or ratios.sum() > 1 + 1e-12):
++            raise ValueError('invalid PCA explained variance ratios')
+         return result
+diff --git a/tests/python/test_projection.py b/tests/python/test_projection.py
+index 44d70af7..2831f568 100644
+--- a/tests/python/test_projection.py
++++ b/tests/python/test_projection.py
+@@ -103,3 +103,25 @@ def read():
+     print(f'Raw feature cohort: samples={count}, columns={out.width}, workers={workers}, '
+           f'wall_s={time.perf_counter()-start:.3f}, peak_RSS_GiB={gib:.3f}',flush=True)
+     assert gib < 16
++
++
++def test_table_pca_saves_variance_and_loads_legacy(tmp_path):
++    from vdjtools.signature.corpus import fit_pca
++    cols = [f'phi:{i}' for i in range(6)]
++    values = np.random.default_rng(17).normal(size=(20,6))
++    table = pl.from_numpy(values,schema=cols).with_columns(pl.lit('test').alias('embedding_space'))
++    expected = fit_pca(values.copy(),4).steps[1][1].explained_variance_ratio_
++    rotation = TablePCA.fit(table,n_components=4)
++    np.testing.assert_array_equal(rotation.explained_variance_ratio,expected)
++    path = tmp_path/'rotation.npz'
++    rotation.save(path)
++    restored = TablePCA.load(path)
++    np.testing.assert_array_equal(restored.explained_variance_ratio,expected)
++    with np.load(path,allow_pickle=False) as z:
++        legacy = {key:z[key] for key in z.files if key != 'explained_variance_ratio'}
++    np.savez(tmp_path/'legacy.npz',**legacy)
++    assert TablePCA.load(tmp_path/'legacy.npz').explained_variance_ratio is None
++    legacy['explained_variance_ratio'] = np.array([0.5,-0.1,0.4,0.2])
++    np.savez(tmp_path/'invalid.npz',**legacy)
++    with pytest.raises(ValueError,match='variance'):
++        TablePCA.load(tmp_path/'invalid.npz')

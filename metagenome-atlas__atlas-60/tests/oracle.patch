@@ -1,0 +1,646 @@
+diff --git a/atlas/Snakefile b/atlas/Snakefile
+index 310b8756..76b6290f 100644
+--- a/atlas/Snakefile
++++ b/atlas/Snakefile
+@@ -63,8 +63,7 @@ def update_config_file_paths(config):
+ CONDAENV = get_conda_envs_dir()
+ 
+ localrules: all
+-
+-if config.get("workflow", "complete") == "complete":
++if config.get("workflow") != "download":
+     config = update_config_file_paths(config)
+     SHPFXM = get_shell_prefix(config)
+     SHPFXS = get_shell_prefix(config, {"threads": "1"})
+@@ -75,13 +74,27 @@ if config.get("workflow", "complete") == "complete":
+ 
+     SAMPLES = [i for i in config["samples"].keys()]
+ 
++
++if config.get("workflow", "complete") == "qc":
+     wildcard_constraints:
+         sample = "[\w-]+"
+ 
+     rule all:
+         input:
+             expand("{sample}/sequence_quality_control/finished_QC",sample=SAMPLES),
+-            "Combined_read_stats.tsv",
++            "finished_QC"
++            
++    include: "rules/assemble.snakefile"
++
++
++elif config.get("workflow", "complete") == "complete":
++    wildcard_constraints:
++        sample = "[\w-]+"
++
++    rule all:
++        input:
++            expand("{sample}/sequence_quality_control/finished_QC",sample=SAMPLES),
++            "finished_QC",
+             expand("{sample}/assembly/contig_stats/prefilter_contig_stats.txt",
+                 sample=SAMPLES),
+             expand("{sample}/assembly/contig_stats/final_contig_stats.txt",
+@@ -107,12 +120,7 @@ elif config.get("workflow") == "download":
+     include: "rules/download.snakefile"
+ 
+ elif config.get("workflow") == "annotate":
+-    config = update_config_file_paths(config)
+-    SAMPLES = list(config["samples"].keys())
+-    TMPDIR = get_temp_dir(config)
+-    SHPFXM = get_shell_prefix(config)
+-    SHPFXS = get_shell_prefix(config, {"threads": "1"})
+-    CHECKMDIR = os.path.join(os.path.dirname(os.path.realpath(config.get("diamond_db", "."))), "checkm")
++
+ 
+     rule all:
+         input:
+diff --git a/atlas/conf.py b/atlas/conf.py
+index c543a6ad..aaa03a82 100644
+--- a/atlas/conf.py
++++ b/atlas/conf.py
+@@ -86,7 +86,7 @@ def make_config(config, path, data_type, database_dir, threads, assembler):
+ 
+     conf["deduplicate"] = True
+     conf["error_correction_overlapping_pairs"] = True
+-    conf["assembly_preprocessing_steps"]=['normalized','errorcorr','merged']
++    conf["merge_pairs_before_assembly"]=True
+ 
+     conf["contaminant_references"] = {"rRNA":os.path.join(database_dir, RRNA),
+                                       "PhiX":os.path.join(database_dir, PHIX)}
+@@ -96,6 +96,9 @@ def make_config(config, path, data_type, database_dir, threads, assembler):
+     conf["contaminant_minimum_hits"] = CONTAMINANT_MINIMUM_HITS
+     conf["contaminant_ambiguous"] = CONTAMINANT_AMBIGUOUS
+ 
++    conf["duplicates_only_optical"] = DUPLICATES_ONLY_OPTICAL
++    conf["duplicates_allow_substitutions"] = DUPLICATES_ALLOW_SUBSTITUTIONS
++
+     conf["normalization_kmer_length"] = NORMALIZATION_KMER_LENGTH
+     conf["normalization_target_depth"] = NORMALIZATION_TARGET_DEPTH
+     conf["normalization_minimum_kmers"] = NORMALIZATION_MINIMUM_KMERS
+diff --git a/atlas/default_values.py b/atlas/default_values.py
+index 91b526ec..6b04e083 100644
+--- a/atlas/default_values.py
++++ b/atlas/default_values.py
+@@ -18,6 +18,9 @@
+ CONTAMINANT_AMBIGUOUS = "best"
+ CONTAMINANT_KMER_LENGTH = 13
+ 
++DUPLICATES_ONLY_OPTICAL=False
++DUPLICATES_ALLOW_SUBSTITUTIONS=2
++
+ NORMALIZATION_KMER_LENGTH = 21
+ NORMALIZATION_TARGET_DEPTH = 100
+ NORMALIZATION_MINIMUM_KMERS = 15
+diff --git a/atlas/rules/assemble.snakefile b/atlas/rules/assemble.snakefile
+index 21ef79f6..da3ec340 100644
+--- a/atlas/rules/assemble.snakefile
++++ b/atlas/rules/assemble.snakefile
+@@ -33,6 +33,45 @@ def bb_cov_stats_to_maxbin(tsv_in, tsv_out):
+             print(toks[0], toks[1], sep="\t", file=fo)
+ 
+ 
++def get_line_from_file(file, line_start):
++    "function to extract line after string name, eg in datafile with average in comments #Avg: 123"
++
++    with open(file) as f:
++        for line in f:
++            if line.startswith(line_start):
++                break
++
++    if not line.startswith(line_start):
++        raise Exception("Didn't find {name} in file ({file}):\n\n".format(name=name,file=file))
++    else:
++        return line[len(line_start):].strip()
++
++
++def parse_comments(file, comment='#',sep='\t',expect_one_value=True):
++    "parse comments at begin of file #Avg: 123"
++    Parsed = {}
++    with open(file) as f:
++        line = f.readline()
++
++        while line.startswith(comment):
++            line_values = line[1:].strip().split(sep)
++            name = line_values[0]
++            if name[-1] == ':':
++                name = name[:-1]
++            values = line_values[1:]
++
++            if len(values) == 1:
++                Parsed[name]=values[0]
++            elif not expect_one_value:
++                Parsed[name]=values
++
++            line= f.readline()
++
++    if len(Parsed)==0:
++        raise Exception("Couldn't parse values from file {} with comment char {} and sep '{}' ".format(file,comment,sep))
++    return Parsed
++
++
+ paired_end=all([config["samples"][s].get("paired", False) or (len(config["samples"][s]["fastq"]) >1) for s in config["samples"]])
+ 
+ interleaved_fractions= ['pe','se'] if paired_end else ['se']
+@@ -76,7 +115,6 @@ rule init_QC:
+         -Xmx{resources.mem}G 2> {log}
+         """
+ 
+-
+ rule read_stats:
+     # TODO: remove run block in favor of script or alternate cli
+     # see http://snakemake.readthedocs.io/en/stable/snakefiles/rules.html#snakefiles-external-scripts
+@@ -112,8 +150,6 @@ rule read_stats:
+             shell("""
+                     mkdir -p {subfolder}
+ 
+-                    readlength.sh {params_in} out={subfolder}/read_length_hist.txt 2> >(tee {log})
+-
+                     reformat.sh {params_in} \
+                     bhist={subfolder}/base_hist.txt \
+                     qhist={subfolder}/quality_by_pos.txt \
+@@ -171,6 +207,46 @@ rule read_stats:
+ 
+ 
+ 
++if config.get('deduplicate', True):
++    processed_steps += ['deduplicated']
++    rule deduplicate:
++        input:
++            expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
++                step=processed_steps[-2], fraction=raw_input_fractions)
++        output:
++            temp(expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
++                fraction=raw_input_fractions, step=processed_steps[-1]))
++        benchmark:
++            "logs/benchmarks/deduplicate/{sample}.txt"
++        params:
++            inputs = lambda wc, input: "in=%s in2=%s" % (input[0], input[1]) if paired_end else "in=%s" % input[0],
++            outputs = lambda wc,output: "out1={0} out2={1}".format(*output) if paired_end else "out={0}".format(*output),
++            dupesubs= config.get('duplicates_allow_substitutions', DUPLICATES_ALLOW_SUBSTITUTIONS),
++            only_optical = 't' if config.get('duplicates_only_optical',DUPLICATES_ONLY_OPTICAL) else 'f'
++        log:
++            "{sample}/logs/{sample}_deduplicate.log"
++        conda:
++            "%s/required_packages.yaml" % CONDAENV
++        threads:
++            config.get("threads", 1)
++        resources:
++            mem = config.get("java_mem", JAVA_MEM)
++        shell:
++            """
++
++            {SHPFXM} clumpify.sh \
++            {params.inputs} \
++            {params.outputs} \
++            overwrite=true\
++            dedupe=t \
++            dupesubs={params.dupesubs} \
++            optical={params.only_optical}\
++            threads={threads} \
++            -Xmx{resources.mem}G 2> {log}
++
++            """
++
++
+ 
+ processed_steps += ['filtered']
+ 
+@@ -224,6 +300,8 @@ rule quality_filter:
+ 
+ if len(config.get("contaminant_references", {}).keys()) > 0:
+ 
++    processed_steps += ['clean']
++
+     rule build_decontamination_db:
+         output:
+             "ref/genome/1/summary.txt"
+@@ -245,11 +323,11 @@ if len(config.get("contaminant_references", {}).keys()) > 0:
+     rule decontamination:
+         input:
+             expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
+-                step=processed_steps[-1], fraction=multifile_fractions),
++                step=processed_steps[-2], fraction=multifile_fractions),
+             db = "ref/genome/1/summary.txt"
+         output:
+             temp(expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
+-                fraction=multifile_fractions, step='decontamined')),
++                fraction=multifile_fractions, step=processed_steps[-1])),
+             contaminants = expand("{{sample}}/sequence_quality_control/contaminants/{db}_{fraction}.fastq.gz",
+                     db=list(config["contaminant_references"].keys()),
+                     fraction=multifile_fractions),
+@@ -297,101 +375,36 @@ if len(config.get("contaminant_references", {}).keys()) > 0:
+ 
+             """
+ 
+-    processed_steps += ['clean']
+-
+-    def get_ribosomal_rna_input(wildcards):
+-
+-        inputs = []
+-        data_type = config["samples"][wildcards.sample].get("type", "metagenome").lower()
+-
+-        clean_reads = "{sample}/sequence_quality_control/{sample}_{step}_{fraction}.fastq.gz".format(step='decontamined',**wildcards)
+-        rrna_reads = "{sample}/sequence_quality_control/contaminants/rRNA_{fraction}.fastq.gz".format(**wildcards)
+-
+-        if data_type == "metagenome" and os.path.exists(rrna_reads):
+-            return [clean_reads, rrna_reads]
+-        else:
+-            return [clean_reads]
+-
+-
+-    rule postprocess_after_decontamination:
+-        input:
+-            get_ribosomal_rna_input
+-        output:
+-            "{{sample}}/sequence_quality_control/{{sample}}_{step}_{{fraction}}.fastq.gz".format(step=processed_steps[-1])
+-        threads:
+-            1
+-        shell:
+-            "{SHPFXS} cat {input} > {output}"
+-
+-
+-if config.get('deduplicate', False):
+-    processed_steps += ['deduplicated']
+-    rule deduplicate:
+-        input:
+-            expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
+-                step=processed_steps[-2], fraction=multifile_fractions)
+-        output:
+-            temp(expand("{{sample}}/sequence_quality_control/{{sample}}_{step}_{fraction}.fastq.gz",
+-                fraction=multifile_fractions, step=processed_steps[-1]))
+-        benchmark:
+-            "logs/benchmarks/deduplicate/{sample}.txt"
+-        params:
+-            has_paired_end_files= lambda wc, input: "t" if paired_end else "f",
+-            input_single = lambda wc, input: "in=%s" % input[2] if paired_end else "in=%s" % input[0],
+-            input_paired = lambda wc, input: "in=%s in2=%s" % (input[0], input[1]) if paired_end else "null",
+-            output_single = lambda wc,output,input: "out=%s" % output[2] if paired_end else "out=%s" % output[0],
+-            output_paired = lambda wc,output: "out=%s out2=%s" % (output[0],output[1]) if paired_end else "null",
+-            dupesubs= config.get('DUPLICATES_ALLOW_SUBSTITUTIONS', 0)
+-        log:
+-            "{sample}/logs/{sample}_deduplicate.log"
+-        conda:
+-            "%s/required_packages.yaml" % CONDAENV
+-        threads:
+-            config.get("threads", 1)
+-        resources:
+-            mem = config.get("java_mem", JAVA_MEM)
+-        shell:
+-            """
+-
+-            {SHPFXM} clumpify.sh \
+-            {params.input_single} \
+-            {params.output_single} \
+-            overwrite=true\
+-            dedupe=t \
+-            dupesubs={params.dupesubs} \
+-            threads={threads} \
+-            -Xmx{resources.mem}G 2> {log}
+ 
+ 
++processed_steps += ['QC']
+ 
+-            if [ {params.has_paired_end_files} = "t" ];
+-            then
++def get_ribosomal_rna_input(wildcards):
+ 
+-            {SHPFXM} clumpify.sh \
+-            {params.input_paired} \
+-            {params.output_paired} \
+-            overwrite=true\
+-            dedupe=t \
+-            dupesubs={params.dupesubs} \
+-            threads={threads} \
+-            -Xmx{resources.mem}G 2>> {log}
++    inputs = []
++    data_type = config["samples"][wildcards.sample].get("type", "metagenome").lower()
+ 
+-            fi
+-
+-            """
++    clean_reads = "{sample}/sequence_quality_control/{sample}_{step}_{fraction}.fastq.gz".format(step=processed_steps[-2],**wildcards)
++    rrna_reads = "{sample}/sequence_quality_control/contaminants/rRNA_{fraction}.fastq.gz".format(**wildcards)
+ 
++    if data_type == "metagenome" and os.path.exists(rrna_reads):
++        return [clean_reads, rrna_reads]
++    else:
++        return [clean_reads]
+ 
+-processed_steps += ['QC']
+ 
+-rule get_QC_reads:
++rule postprocess_after_decontamination:
+     input:
+-        "{{sample}}/sequence_quality_control/{{sample}}_{step}_{{fraction}}.fastq.gz".format(step=processed_steps[-2])
++        get_ribosomal_rna_input
+     output:
+         "{{sample}}/sequence_quality_control/{{sample}}_{step}_{{fraction}}.fastq.gz".format(step=processed_steps[-1])
+     threads:
+         1
+     shell:
+-        "{SHPFXS} cp {input} {output}"
++        "{SHPFXS} cat {input} > {output}"
++
++
++
+ 
+ 
+ def get_quality_controlled_reads(wildcards):
+@@ -419,6 +432,150 @@ def get_quality_controlled_reads(wildcards):
+     return fastq
+ 
+ 
++if paired_end:
++    rule calculate_insert_size:
++        input:
++            unpack(get_quality_controlled_reads)
++        output:
++            ihist = "{sample}/sequence_quality_control/read_stats/QC_insert_size_hist.txt",
++            cardinality= temp("{sample}/sequence_quality_control/read_stats/QC_cardinality.txt"),
++            read_length= "{sample}/sequence_quality_control/read_stats/QC_read_length_hist.txt"
++        threads:
++            config.get("threads", 1)
++        resources:
++            mem = config.get("java_mem", JAVA_MEM)
++        conda:
++            "%s/required_packages.yaml" % CONDAENV
++        log:
++            "{sample}/logs/{sample}_calculate_insert_size.log"
++        benchmark:
++            "logs/benchmarks/merge_pairs/{sample}_insert_size.txt"
++        params:
++            kmer = config.get("merging_k", MERGING_K),
++            extend2 = config.get("merging_extend2", MERGING_EXTEND2),
++            flags = 'loose ecct'
++        shell:
++            """bbmerge.sh -Xmx{resources.mem}G threads={threads} \
++                   in1={input.R1} in2={input.R2} \
++                   {params.flags} k={params.kmer} \
++                   extend2={params.extend2} \
++                   ihist={output.ihist} outc={output.cardinality} merge=f \
++                   mininsert0=35 minoverlap0=8 2> >(tee {log})
++                
++                readlength.sh in={input.R1} in2={input.R2} out={output.read_length} 2> >(tee {log})
++            """
++else:
++
++    rule calculate_read_length_hist:
++        input:
++            unpack(get_quality_controlled_reads)
++        output:
++            read_length= "{sample}/sequence_quality_control/read_stats/QC_read_length_hist.txt",
++            cardinality= temp("{sample}/sequence_quality_control/read_stats/QC_cardinality.txt")
++        params:
++            kmer = config.get("merging_k", MERGING_K),
++        threads:
++            config.get("threads", 1)
++        resources:
++            mem = config.get("java_mem", JAVA_MEM)
++        conda:
++            "%s/required_packages.yaml" % CONDAENV
++        log:
++            "{sample}/logs/{sample}_calculate_read_length.log"
++        shell:
++            """ 
++                readlength.sh in={input.se} out={output.read_length} 2> >(tee {log})
++                loglog.sh in={input.se} k={params.kmer} > {output.cardinality} 2> >(tee {log})
++            """
++
++localrules: combine_read_length_stats, combine_insert_stats, combine_cardinality, combine_read_counts
++
++
++rule combine_read_length_stats:
++    input:
++        expand("{sample}/sequence_quality_control/read_stats/QC_read_length_hist.txt",sample=SAMPLES),
++    output:
++        'stats/read_length_stats.tsv'
++    run:
++        import pandas as pd
++        import os
++
++
++
++        Stats= pd.DataFrame()
++
++        for length_file in input:
++            sample= length_file.split(os.path.sep)[0]
++
++            data = parse_comments(length_file)
++            data = pd.Series(data)[['Reads','Bases','Max','Min','Avg','Median','Mode','Std_Dev']]
++
++            Stats[sample]=data
++
++        Stats.to_csv(output[0],sep='\t')   
++
++             
++rule combine_cardinality:
++    input:
++        expand("{sample}/sequence_quality_control/read_stats/QC_cardinality.txt",sample=SAMPLES),
++    output:
++        'stats/cardinality.tsv'
++    run:
++        import pandas as pd
++        import os
++
++        Stats= pd.Series()
++
++        for file in input:
++            sample= file.split(os.path.sep)[0]
++            with open(file) as f:
++                cardinality= int(f.read().strip())
++
++            Stats.loc[sample]=cardinality
++
++        Stats.to_csv(output[0],sep='\t')
++
++
++
++if paired_end:
++    rule combine_insert_stats:
++        input:
++            expand("{sample}/sequence_quality_control/read_stats/QC_insert_size_hist.txt",sample=SAMPLES),
++        output:
++            'stats/insert_stats.tsv'
++        run:
++            import pandas as pd
++            import os
++            Stats= pd.DataFrame()
++
++            for insert_file in input:
++                sample= insert_file.split(os.path.sep)[0]
++
++                data = parse_comments(insert_file)
++                data = pd.Series(data)[['Avg','Median','Mode','STDev','PercentOfPairs']]
++
++                Stats[sample]=data
++
++            Stats.T.to_csv(output[0],sep='\t')  
++
++
++rule combine_read_counts:
++    input:
++        expand("{sample}/sequence_quality_control/read_stats/read_counts.tsv",sample=SAMPLES)
++    output:
++        "stats/read_counts.tsv"
++    run:
++        import pandas as pd
++
++        Read_stats=pd.DataFrame()
++
++        for f in input:
++            d= pd.read_table(f,index_col=[0,1])
++            Read_stats=Read_stats.append(d)
++
++        Read_stats.T.to_csv(output[0],sep='\t')
++
++
+ rule finalize_QC:
+     input:
+         unpack(get_quality_controlled_reads),
+@@ -426,7 +583,8 @@ rule finalize_QC:
+             "{sample}/sequence_quality_control/{sample}_decontamination_reference_stats.txt",
+             "{sample}/logs/{sample}_quality_filtering_stats.txt",
+             expand("{{sample}}/sequence_quality_control/read_stats/{step}.zip", step=processed_steps),
+-            read_count_files= expand("{{sample}}/sequence_quality_control/read_stats/{step}_read_counts.tsv", step=processed_steps)
++            read_count_files= expand("{{sample}}/sequence_quality_control/read_stats/{step}_read_counts.tsv", step=processed_steps),
++            read_length_hist="{sample}/sequence_quality_control/read_stats/QC_read_length_hist.txt"
+ 
+     output:
+         touch("{sample}/sequence_quality_control/finished_QC"),
+@@ -441,30 +599,21 @@ rule finalize_QC:
+         All_read_counts.to_csv(output.read_stats,sep='\t')
+ 
+ 
+-
++# 
+ rule QC_report:
+     input:
+         expand("{sample}/sequence_quality_control/finished_QC",sample=SAMPLES),
+-        read_stats=expand("{sample}/sequence_quality_control/read_stats/read_counts.tsv",sample=SAMPLES)
++        "stats/read_counts.tsv",
++        'stats/cardinality.tsv',
++        read_length_stats= ['stats/insert_stats.tsv','stats/read_length_stats.tsv'] if paired_end else 'stats/read_length_stats.tsv'
+     output:
+-        Combined_read_stats="Combined_read_stats.tsv"
+-    run:
+-        shell(
++        touch("finished_QC")
++    shell:
+         """
+         if [ -d ref ]; then
+             rm -r ref
+         fi
+-        """)
+-
+-        import pandas as pd
+-
+-        Read_stats=pd.DataFrame()
+-
+-        for f in input.read_stats:
+-            d= pd.read_table(f,index_col=[0,1])
+-            Read_stats=Read_stats.append(d)
+-
+-        Read_stats.to_csv(output.Combined_read_stats,sep='\t')
++        """
+ 
+ 
+     # aggregate stats reports ...
+@@ -495,19 +644,13 @@ got: {n} files:\n{}
+ 
+ # define which steps are defined before assembly and in which order
+ 
+-possible_assembly_preprocessing_steps=['normalized','errorcorr','merged']
++assembly_preprocessing_steps=['normalized','errorcorr','merged']
+ 
+-requested_steps= list(config['assembly_preprocessing_steps'])
++if not (config.get('merge_pairs_before_assembly',True) or paired_end ):
++    assembly_preprocessing_steps.remove('merged')
++assembly_preprocessing_steps=".".join(assembly_preprocessing_steps)
+ 
+-for step in requested_steps:
+-	if not step in possible_assembly_preprocessing_steps:
+-		raise Exception("Requesting unknown step, {} before assembly. Choose only steps from {}".format(step,possible_assembly_preprocessing_steps))
+-	if step=='merged' and not paired_end:
+-		warnings.warn("""Skip: merging of pairs before assembly, because reads are single-ended.
+-			You can remove the "merge" from assembly_preprocessing_steps  in the config file""")
+-		requested_steps.remove(step)
+ 
+-assembly_preprocessing_steps=".".join(requested_steps)
+ 
+ 
+ 
+diff --git a/example_data/config.yaml b/example_data/config.yaml
+deleted file mode 100644
+index 924b0471..00000000
+--- a/example_data/config.yaml
++++ /dev/null
+@@ -1,68 +0,0 @@
+-samples:
+-  SAMN01915213:
+-    fastq:
+-    - /raid/user2/kieser/Metagenomics/coding/test_data/SAMN01915213_gut_metagenome_R1.fastq.gz
+-    - /raid/user2/kieser/Metagenomics/coding/test_data/SAMN01915213_gut_metagenome_R2.fastq.gz
+-    type: metagenome
+-tmpdir: /tmp
+-threads: 8
+-java_mem: 50g
+-preprocess_adapters: /raid/user2/kieser/Metagenomics/Atlas/databases/adapters.fa
+-preprocess_adapter_min_k: 8
+-preprocess_minimum_base_quality: 10
+-preprocess_allowable_kmer_mismatches: 1
+-preprocess_reference_kmer_match_length: 27
+-preprocess_minimum_passing_read_length: 51
+-preprocess_minimum_base_frequency: 0.05
+-perform_error_correction: 'true'
+-contaminant_references:
+-  PhiX: /raid/user2/kieser/Metagenomics/Atlas/databases/phiX174_virus.fa
+-  rRNA: /raid/user2/kieser/Metagenomics/Atlas/databases/silva_rfam_all_rRNAs.fa
+-contaminant_max_indel: 20
+-contaminant_min_ratio: 0.65
+-contaminant_kmer_length: 13
+-contaminant_minimum_hits: 1
+-contaminant_ambiguous: best
+-normalization_kmer_length: 21
+-normalization_target_depth: 100
+-normalization_minimum_kmers: 15
+-assembler: megahit
+-megahit_memory: 50000000000
+-megahit_min_count: 2
+-megahit_k_min: 21
+-megahit_k_max: 121
+-megahit_k_step: 20
+-megahit_merge_level: 20,0.98
+-megahit_prune_level: 2
+-megahit_low_local_ratio: 0.2
+-minimum_contig_length: 1000
+-spades_k: auto
+-minimum_average_coverage: 5
+-minimum_percent_covered_bases: 40
+-minimum_mapped_reads: 0
+-contig_trim_bp: 0
+-translation_table: 11
+-minimum_region_overlap: 1
+-primary_only: 'false'
+-count_multi_mapped_reads: 'true'
+-maximum_counted_map_sites: 10
+-perform_genome_binning: 'true'
+-maxbin_max_iteration: 50
+-maxbin_min_contig_length: 200
+-maxbin_prob_threshold: 0.9
+-refseq_namemap: /raid/user2/kieser/Metagenomics/Atlas/databases/refseq.db
+-refseq_tree: /raid/user2/kieser/Metagenomics/Atlas/databases/refseq.tree
+-diamond_db: /raid/user2/kieser/Metagenomics/Atlas/databases/refseq.dmnd
+-diamond_run_mode: fast
+-diamond_top_seqs: 2
+-diamond_e_value: 1.0e-06
+-diamond_min_identity: 50
+-diamond_query_coverage: 60
+-diamond_gap_open: 11
+-diamond_gap_extend: 1
+-diamond_block_size: 2
+-diamond_index_chunks: 4
+-summary_method: lca
+-aggregation_method: lca-majority
+-majority_threshold: 0.51
+-

@@ -1,0 +1,1313 @@
+diff --git a/metagraph/integration_tests/test_query.py b/metagraph/integration_tests/test_query.py
+index a5a9ad0246..7624ad3e5a 100644
+--- a/metagraph/integration_tests/test_query.py
++++ b/metagraph/integration_tests/test_query.py
+@@ -1327,5 +1327,471 @@ def test_batch_query_with_tiny_batch(self):
+         self.assertEqual(len(res.stdout), 137093)
+ 
+ 
++@parameterized_class(('graph_repr', 'anno_repr'),
++    input_values=product(
++        [repr for repr in GRAPH_TYPES if not (repr == 'bitmap' and PROTEIN_MODE)],
++        [anno for anno in ANNO_TYPES if anno.endswith('_coord')],
++    ),
++    class_name_func=get_test_class_name
++)
++class TestCoordToHeader(TestingBase):
++    def setUp(self):
++        self.tempdir = TemporaryDirectory()
++
++        # Create test FASTA file with multiple sequences
++        self.test_fa = self.tempdir.name + '/test_sequences.fa'
++        with open(self.test_fa, 'w') as f:
++            f.write('>seq1\n')
++            f.write('GTATCGATCG\n')
++            f.write('>short\n')
++            f.write('AAA\n')
++            f.write('>bad\n')
++            f.write('!A2AA\n')
++            f.write('>seq2\n')
++            f.write('GCTAGCTAGCTAGCTA\n')
++            f.write('>seq3\n')
++            f.write('ATCGATCGAAAAACCCCCGGGGGTTTTT\n')
++
++        self.query_fa = self.tempdir.name + '/query.fa'
++        with open(self.query_fa, 'w') as f:
++            f.write('>query1\n')
++            f.write('TATCGATCG\n')
++            f.write('>query2\n')
++            f.write('GCTAGCTA\n')
++
++    def index_headers(self, graph, anno_base, input = None, extra_flags = ''):
++        columns = None
++        if input is None:
++            # The order of the columns may be arbitrary, thus we run stats to get the final order
++            anno = anno_base + anno_file_extension[self.anno_repr]
++            res = subprocess.run([f"{METAGRAPH} stats {anno} --print-col-names"],
++                                 shell=True, stdout=PIPE, stderr=PIPE)
++            self.assertEqual(res.returncode, 0)
++            columns = [line.strip() for line in res.stdout.decode().split('\n')[2:] if line.strip()]
++            input = ' '.join(columns)
++
++        res = subprocess.run([f"{METAGRAPH} annotate --anno-filename --index-header-coords \
++                                    -v -i {graph} -o {anno_base} {input} {extra_flags}" + MMAP_FLAG],
++                              shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0, f"Indexing headers failed: {res.stderr.decode()}")
++        self.assertTrue(os.path.exists(anno_base + '.seqs'))
++        return columns
++
++    @parameterized.expand(['header', 'filename'])
++    def test_query_coords_without_mapping(self, anno_type):
++        # Construct graph and annotation without CoordToHeader
++        self._build_graph(self.test_fa, self.tempdir.name + '/graph', k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(self.test_fa, self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr],
++                             self.tempdir.name + '/annotation', self.anno_repr, anno_type=anno_type)
++        if anno_type == 'header':
++            expected_output = '0\tquery1\t<seq1>:0-1-5\t<seq3>:1-4:1-0-3\n1\tquery2\t<seq2>:0-0-3:0-4-7:0-8-11\n'
++        elif anno_type == 'filename':
++            expected_output = (
++                f'0\tquery1\t<{self.tempdir.name}/test_sequences.fa>:1-23:0-1-5:1-19-22\n'
++                f'1\tquery2\t<{self.tempdir.name}/test_sequences.fa>:0-7-10:0-11-14:0-15-18\n'
++            )
++        else:
++            raise ValueError(f'Invalid annotation type: {anno_type}')
++
++        # Query with coordinates mode - this should map coordinates to sequence headers
++        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords \
++                         -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} \
++                         -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} \
++                         --min-kmers-fraction-label 0.0 \
++                         {self.query_fa}' + MMAP_FLAG
++
++        res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        self.assertEqual(res.stdout.decode(), expected_output)
++
++    def test_query_coords(self):
++        anno_type = 'filename'
++        graph_base = self.tempdir.name + '/graph'
++        graph = self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++        self._build_graph(self.test_fa, graph_base, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(self.test_fa, graph, anno_base, self.anno_repr, anno_type=anno_type)
++        self.index_headers(graph, anno_base, self.test_fa)
++
++        # Query coordinates
++        # The mapping index was created, hence coords must be mapped to the headers
++        query_command = f'{METAGRAPH} query --batch-size 0 --query-mode coords \
++                         -i {graph} -a {anno} --min-kmers-fraction-label 0.0 \
++                         {self.query_fa}' + MMAP_FLAG
++
++        res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        self.assertEqual(res.stdout.decode(),
++                         '0\tquery1\t<seq1>:0-1-5\t<seq3>:1-4:1-0-3\n1\tquery2\t<seq2>:0-0-3:0-4-7:0-8-11\n')
++
++        # Query in the basic mode, without mapping to headers
++        res = subprocess.run([query_command + ' --no-coord-mapping'], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        expected_output = (
++            f'0\tquery1\t<{self.tempdir.name}/test_sequences.fa>:1-23:0-1-5:1-19-22\n'
++            f'1\tquery2\t<{self.tempdir.name}/test_sequences.fa>:0-7-10:0-11-14:0-15-18\n'
++        )
++        self.assertEqual(res.stdout.decode(), expected_output)
++
++    @parameterized.expand(['', '-p 4', '--separately', '-p 4 --separately'])
++    def test_multiple_files(self, extra_flags):
++        # Create multiple test FASTA files (simulating different annotation columns)
++        anno_type = 'filename'
++        file1 = self.tempdir.name + '/file1.fa'
++        with open(file1, 'w') as f:
++            f.write('>seq1\n')
++            f.write('GTATCGATCG\n')
++            f.write('>seq2\n')
++            f.write('GCTAGCTAGCTAGCTA\n')
++
++        file2 = self.tempdir.name + '/file2.fa'  # file with no valid k-mers
++        with open(file2, 'w') as f:
++            f.write('>short\n')
++            f.write('AAA\n')
++
++        file3 = self.tempdir.name + '/file3.fa'  # empty file (no sequences)
++        with open(file3, 'w') as f:
++            f.write('\n')
++
++        file4 = self.tempdir.name + '/file4.fa'
++        with open(file4, 'w') as f:
++            f.write('>seq3\n')
++            f.write('ATCGATCGAAAAACCCCCGGGGGTTTTTGCTAGC\n')
++            f.write('>short\n')
++            f.write('AAA\n')
++            f.write('>bad\n')
++            f.write('!A2AA\n')
++            f.write('>seq4\n')
++            f.write('TATCGATCGATCGATCG\n')
++
++        # Query file that matches sequences from multiple files
++        query_fa = self.tempdir.name + '/query_multi.fa'
++        with open(query_fa, 'w') as f:
++            f.write('>query1\n')
++            f.write('TATCGATCG\n')  # Matches seq1 from file1 and seq4 from file4
++            f.write('>query2\n')
++            f.write('GCTAGCTA\n')   # Matches seq2 from file1
++
++        graph_base = self.tempdir.name + '/graph_multi'
++        graph = self.tempdir.name + '/graph_multi' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++
++        # Index all files
++        self._build_graph(f'{file1} {file2} {file3} {file4}', graph_base, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(f'{file1} {file2} {file3} {file4}', graph, anno_base, self.anno_repr, anno_type=anno_type)
++
++        columns = self.index_headers(graph, anno_base, extra_flags=extra_flags)
++
++        res = subprocess.run([f"{METAGRAPH} stats {anno_base}.seqs" + MMAP_FLAG], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        lines = res.stdout.decode().strip().split('\n')
++        self.assertEqual(lines[2], "columns: 2")
++        self.assertEqual(lines[3], "total sequences: 5")  # file3 is included, even though has no valid k-mers
++        self.assertEqual(lines[4], "total k-mers: 62")
++
++        res = subprocess.run([f"{METAGRAPH} stats {anno_base}.seqs -v" + MMAP_FLAG], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        lines = res.stdout.decode().strip().split('\n')
++        self.assertEqual(lines[1], '================ COORD-TO-HEADER STATS =================')
++        self.assertEqual(lines[2], 'columns: 2')
++        self.assertEqual(lines[3], 'total sequences: 5')
++        self.assertEqual(lines[4], 'total k-mers: 62')
++        self.assertEqual(lines[5], '=================== PER-COLUMN STATS ===================')
++        # The order of the columns may be arbitrary
++        if not columns[0].endswith('file1.fa'):
++            lines[7:10], lines[11:14] = lines[11:14], lines[7:10]
++        self.assertEqual(lines[6], 'column 0:')
++        self.assertEqual(lines[7], '  sequences: 2 (seq1\tseq2)')
++        self.assertEqual(lines[8], '  k-mers: 18')
++        self.assertEqual(lines[9], '  k-mers per sequence: 9.0')
++        self.assertEqual(lines[10], 'column 1:')
++        self.assertEqual(lines[11], '  sequences: 3 (seq3\tbad\tseq4)')
++        self.assertEqual(lines[12], '  k-mers: 44')
++        self.assertEqual(lines[13], '  k-mers per sequence: 14.7')
++        self.assertEqual(lines[14], '========================================================')
++
++        # Expected: coordinates should map to sequence headers (seq1, seq2, seq3, seq4)
++        query_command = f'{METAGRAPH} query --query-mode coords -i {graph} -a {anno} \
++                         --min-kmers-fraction-label 0.0 {query_fa}' + MMAP_FLAG
++
++        res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0, f"Query failed: {res.stderr.decode()}")
++
++        output = res.stdout.decode()
++        output = output.split('\n')
++        self.assertEqual(len(output), 3, "Output should contain two query results")
++        self.assertEqual(output[-1], "", "Output should contain two query results")
++        self.assertEqual(output[0].split('\t')[:2], ["0", "query1"])
++        self.assertEqual(set(output[0].split('\t')[2:]), {"<seq1>:0-1-5", "<seq3>:1-4:1-0-3", "<seq4>:0-0-4:1-5-8:1-9-12"})
++        self.assertEqual(output[1].split('\t')[:2], ["1", "query2"])
++        self.assertEqual(set(output[1].split('\t')[2:]), {"<seq2>:0-0-3:0-4-7:0-8-11", "<seq3>:0-28-29"})
++
++    def test_multiple_files_bad(self):
++        # Check that query fails when Annotation and CoordToHeaders are incompatible
++        anno_type = 'filename'
++        file1 = self.tempdir.name + '/file1.fa'
++        with open(file1, 'w') as f:
++            f.write('>seq1\n')
++            f.write('GTATCGATCG\n')
++            f.write('>seq2\n')
++            f.write('GCTAGCTAGCTAGCTA\n')
++
++        file2 = self.tempdir.name + '/file2.fa'
++        with open(file2, 'w') as f:
++            f.write('>seq3\n')
++            f.write('ATCGATCGAAAAACCCCCGGGGGTTTTTGCTAGC\n')
++            f.write('>seq4\n')
++            f.write('TATCGATCGATCGATCG\n')
++
++        graph_base = self.tempdir.name + '/graph_multi'
++        graph = self.tempdir.name + '/graph_multi' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++
++        # Build graph from all files
++        self._build_graph(f'{file1} {file2}', graph_base, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(f'{file1} {file2}', graph, anno_base, self.anno_repr, anno_type=anno_type)
++        # Index only the headers from the first file
++        self.index_headers(graph, anno_base, file1)
++
++        res = subprocess.run([f"{METAGRAPH} stats {anno_base}.seqs" + MMAP_FLAG], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++        lines = res.stdout.decode().strip().split('\n')
++        self.assertEqual(lines[2], "columns: 1")
++        # The query is expected to fail because the mapping file is incompatible with the annotation
++        query_command = f'{METAGRAPH} query --query-mode coords -i {graph} -a {anno} \
++                         --min-kmers-fraction-label 0.0 {file1}' + MMAP_FLAG
++        res = subprocess.run([query_command], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertNotEqual(res.returncode, 0, f"Query with incompatible .seq mapping must fail")
++        self.assertIn("[error] Incompatible number of columns", res.stderr.decode())
++
++    def test_query_with_filters(self):
++        """Test that --num-top-labels and --min-kmers-fraction-label work correctly with mapping"""
++        anno_type = 'filename'
++        graph_base = self.tempdir.name + '/graph'
++        graph = self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++
++        # Create test FASTA with sequences that will have different numbers of k-mer matches
++        test_fa = self.tempdir.name + '/test_filter.fa'
++        with open(test_fa, 'w') as f:
++            f.write('>seq1\n')
++            f.write('TATCGATC\n')
++            f.write('>seq2\n')
++            f.write('GTATCGATCGATCGATCG\n')
++            f.write('>seq3\n')
++            f.write('ATCGATCG\n')
++
++        query_fa = self.tempdir.name + '/query_filter.fa'
++        with open(query_fa, 'w') as f:
++            f.write('>query1\n')
++            f.write('TATCGATCGATCGATCG\n')
++
++        self._build_graph(test_fa, graph_base, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(test_fa, graph, anno_base, self.anno_repr, anno_type=anno_type)
++
++        self.index_headers(graph, anno_base, test_fa)
++
++        def test_stdout(filter_flags: str, expected_output: str | set[str], mode: str = 'coords', extra_split_by = None):
++            res = subprocess.run([f'{METAGRAPH} query --batch-size 0 --query-mode {mode} \
++                                    -i {graph} -a {anno} {filter_flags} {query_fa}' + MMAP_FLAG],
++                                 shell=True, stdout=PIPE, stderr=PIPE)
++            self.assertEqual(res.returncode, 0, f"Query failed: {res.stderr.decode()}")
++            if isinstance(expected_output, str):
++                self.assertEqual(res.stdout.decode().strip(), expected_output)
++            else:
++                out = res.stdout.decode().strip().split('\t')
++                if extra_split_by:
++                    out = sum((part.split(extra_split_by) for part in out), [])
++                self.assertEqual(set(out), expected_output)
++
++        test_stdout('--num-top-labels 1',
++            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
++        test_stdout('--num-top-labels 2',
++            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13\t<seq3>:1-0-3:5-0-3:9-0-3')
++        # Without filtering by --num-top-labels, the matches are not sorted
++        test_stdout('--min-kmers-fraction-label 0.5',
++            {'0', 'query1', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3', '<seq1>:0-0-3:5-1-3:9-1-3'})
++        test_stdout('--min-kmers-fraction-label 1.0',
++            '0\tquery1\t<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13')
++        test_stdout('--min-kmers-fraction-label 0.0',
++            {'0', 'query1', '<seq1>:0-0-3:5-1-3:9-1-3', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3'})
++        test_stdout('',
++            {'0', 'query1', '<seq1>:0-0-3:5-1-3:9-1-3', '<seq2>:1-10-13:1-6-13:9-2-5:5-2-9:0-1-13', '<seq3>:1-0-3:5-0-3:9-0-3'})
++
++        # --num-top-labels is not used in the labels mode
++        test_stdout('--num-top-labels 1', {'0', 'query1', 'seq2', 'seq3', 'seq1'}, mode='labels', extra_split_by=':')
++        test_stdout('--min-kmers-fraction-label 0.5', {'0', 'query1', 'seq2', 'seq3', 'seq1'}, mode='labels', extra_split_by=':')
++        test_stdout('--min-kmers-fraction-label 1.0', {'0', 'query1', 'seq2'}, mode='labels')
++        test_stdout('', {'0', 'query1', 'seq2', 'seq3', 'seq1'}, mode='labels', extra_split_by=':')
++
++        test_stdout('--num-top-labels 1', '0\tquery1\t<seq2>:13', mode='matches')
++        test_stdout('--min-kmers-fraction-label 0.5', {'0', 'query1', '<seq2>:13', '<seq3>:12', '<seq1>:10'}, mode='matches')
++        test_stdout('--min-kmers-fraction-label 1.0', '0\tquery1\t<seq2>:13', mode='matches')
++        test_stdout('', {'0', 'query1', '<seq2>:13', '<seq3>:12', '<seq1>:10'}, mode='matches')
++        test_stdout('--num-top-labels 2', '0\tquery1\t<seq2>:13\t<seq3>:12', mode='matches')
++        test_stdout('--num-top-labels 3', {'0', 'query1', '<seq2>:13', '<seq3>:12', '<seq1>:10'}, mode='matches')
++
++        test_stdout('--num-top-labels 1',
++            '0\tquery1\t<seq2>:0=1:1-12=3', mode='counts')
++        test_stdout('--min-kmers-fraction-label 0.5',
++            {'0', 'query1', '<seq2>:0=1:1-12=3', '<seq3>:1-12=1', '<seq1>:0-3=1:5-7=1:9-11=1'}, mode='counts')
++        test_stdout('--min-kmers-fraction-label 1.0',
++            '0\tquery1\t<seq2>:0=1:1-12=3', mode='counts')
++        test_stdout('',
++            {'0', 'query1', '<seq2>:0=1:1-12=3', '<seq3>:1-12=1', '<seq1>:0-3=1:5-7=1:9-11=1'}, mode='counts')
++        test_stdout('--num-top-labels 2',
++            '0\tquery1\t<seq2>:0=1:1-12=3\t<seq3>:1-12=1', mode='counts')
++        test_stdout('--num-top-labels 3',
++            {'0', 'query1', '<seq2>:0=1:1-12=3', '<seq3>:1-12=1', '<seq1>:0-3=1:5-7=1:9-11=1'}, mode='counts')
++
++        test_stdout('--num-top-labels 1', '0\tquery1\t<seq2>:37', mode='counts-sum')
++        test_stdout('--min-kmers-fraction-label 0.5', {'0', 'query1', '<seq2>:37', '<seq3>:12', '<seq1>:10'}, mode='counts-sum')
++        test_stdout('--min-kmers-fraction-label 1.0', '0\tquery1\t<seq2>:37', mode='counts-sum')
++        test_stdout('', {'0', 'query1', '<seq2>:37', '<seq3>:12', '<seq1>:10'}, mode='counts-sum')
++        test_stdout('--num-top-labels 2', '0\tquery1\t<seq2>:37\t<seq3>:12', mode='counts-sum')
++        test_stdout('--num-top-labels 3', {'0', 'query1', '<seq2>:37', '<seq3>:12', '<seq1>:10'}, mode='counts-sum')
++
++        test_stdout('--num-top-labels 1',
++            '0\tquery1\t<seq2>:13:1111111111111:17', mode='signature')
++        test_stdout('--min-kmers-fraction-label 0.5',
++            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
++        test_stdout('--min-kmers-fraction-label 1.0',
++            '0\tquery1\t<seq2>:13:1111111111111:17', mode='signature')
++        test_stdout('',
++            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
++        test_stdout('--num-top-labels 2',
++            '0\tquery1\t<seq2>:13:1111111111111:17\t<seq3>:12:0111111111111:16', mode='signature')
++        test_stdout('--num-top-labels 3',
++            {'0', 'query1', '<seq2>:13:1111111111111:17', '<seq3>:12:0111111111111:16', '<seq1>:10:1111011101110:15'}, mode='signature')
++
++    @parameterized.expand(['labels', 'matches', 'counts', 'counts-sum', 'coords', 'signature'])
++    def test_five_files_single_sequence_each_unsorted(self, query_mode):
++        anno_type = 'filename'
++        graph = self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++
++        # Create 5 files, each with a single sequence
++        files = []
++        sequences = [
++            ('seq1', 'GTATCGATCGATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGTATCGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCC'),
++            ('seq4', 'TATCGATCGATCGATCG'),
++            ('seq5', 'CGCGCGCGCGCGCGCGCGGTATC'),
++        ]
++
++        for i, (header, seq) in enumerate(sequences, 1):
++            file_path = self.tempdir.name + f'/file_{i}.fa'
++            files.append(file_path)
++            with open(file_path, 'w') as f:
++                f.write(f'>{header}\n')
++                f.write(f'{seq}\n')
++
++        # Create a query file that matches sequences from multiple files
++        query_fa = self.tempdir.name + '/query.fa'
++        with open(query_fa, 'w') as f:
++            f.write('>query\n')
++            f.write('GTATCGATTGATCGATCGGTATCGATTGATCGATCG\n')
++
++        # Build graph and annotate
++        all_files = ' '.join(files)
++        self._build_graph(all_files, graph, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(all_files, graph, anno_base, self.anno_repr, anno_type=anno_type)
++
++        self.index_headers(graph, anno_base)
++
++        for discovery_fraction in [0.0, 0.2, 1.0]:
++            for batch_size in [0, 100000000]:
++                # Query with header mapping
++                query_cmd_with = f'{METAGRAPH} query --batch-size {batch_size} --query-mode {query_mode} \
++                                  -i {graph} -a {anno} --min-kmers-fraction-label {discovery_fraction} \
++                                  {query_fa}' + MMAP_FLAG
++                res_with = subprocess.run([query_cmd_with], shell=True, stdout=PIPE, stderr=PIPE)
++                self.assertEqual(res_with.returncode, 0)
++                output_with = res_with.stdout.decode().strip()
++
++                # Query without header mapping
++                res_without = subprocess.run([query_cmd_with + ' --no-coord-mapping'],
++                                             shell=True, stdout=PIPE, stderr=PIPE)
++                self.assertEqual(res_without.returncode, 0)
++                output_without = res_without.stdout.decode().strip()
++
++                # Replace the file labels with the corresponding headers
++                for i, (header, _) in enumerate(sequences, 1):
++                    output_without = output_without.replace(self.tempdir.name + f'/file_{i}.fa', header)
++
++                if query_mode == 'labels':
++                    output_with = output_with.split('\t')[-1].split(':')
++                    output_without = output_without.split('\t')[-1].split(':')
++                else:
++                    output_with = output_with.split('\t')
++                    output_without = output_without.split('\t')
++
++                self.assertEqual(set(output_with), set(output_without))
++
++    @parameterized.expand(['matches', 'counts', 'counts-sum', 'coords', 'signature'])
++    def test_five_files_single_sequence_each_sorted(self, query_mode):
++        anno_type = 'filename'
++        graph = self.tempdir.name + '/graph' + graph_file_extension[self.graph_repr]
++        anno_base = self.tempdir.name + '/annotation'
++        anno = anno_base + anno_file_extension[self.anno_repr]
++
++        # Create 5 files, each with a single sequence
++        files = []
++        sequences = [
++            ('seq1', 'GTATCGATCGATCGATCG'),
++            ('seq2', 'GCTAGCTAGCTAGTATCGCTAGCTA'),
++            ('seq3', 'ATCGATCGAAAAACCCCC'),
++            ('seq4', 'TATCGATCGATCGATCG'),
++            ('seq5', 'CGCGCGCGCGCGCGCGCGGTATC'),
++        ]
++
++        for i, (header, seq) in enumerate(sequences, 1):
++            file_path = self.tempdir.name + f'/file_{i}.fa'
++            files.append(file_path)
++            with open(file_path, 'w') as f:
++                f.write(f'>{header}\n')
++                f.write(f'{seq}\n')
++
++        # Create a query file that matches sequences from multiple files
++        query_fa = self.tempdir.name + '/query.fa'
++        with open(query_fa, 'w') as f:
++            f.write('>query\n')
++            f.write('GTATCGATTGATCGATCGGTATCGATTGATCGATCG\n')
++
++        # Build graph and annotate
++        all_files = ' '.join(files)
++        self._build_graph(all_files, graph, k=5, repr=self.graph_repr, mode='basic')
++        self._annotate_graph(all_files, graph, anno_base, self.anno_repr, anno_type=anno_type)
++
++        self.index_headers(graph, anno_base)
++
++        # Query with header mapping
++        query_cmd_with = f'{METAGRAPH} query --batch-size 0 --query-mode {query_mode} \
++                          -i {graph} -a {anno} --min-kmers-fraction-label 0.0 --num-top-labels 4 \
++                          {query_fa}' + MMAP_FLAG
++        res_with = subprocess.run([query_cmd_with], shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res_with.returncode, 0)
++        output_with = res_with.stdout.decode().strip()
++
++        # Query without header mapping
++        res_without = subprocess.run([query_cmd_with + ' --no-coord-mapping'],
++                                     shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res_without.returncode, 0)
++        output_without = res_without.stdout.decode().strip()
++
++        # Replace the file labels with the corresponding headers
++        for i, (header, _) in enumerate(sequences, 1):
++            output_without = output_without.replace(self.tempdir.name + f'/file_{i}.fa', header)
++
++        # Should have same results
++        self.assertEqual(output_with, output_without)
++
++
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/metagraph/src/annotation/coord_to_header.cpp b/metagraph/src/annotation/coord_to_header.cpp
+new file mode 100644
+index 0000000000..c20a14a993
+--- /dev/null
++++ b/metagraph/src/annotation/coord_to_header.cpp
+@@ -0,0 +1,94 @@
++#include "annotation/coord_to_header.hpp"
++
++#include "common/serialization.hpp"
++#include "common/utils/file_utils.hpp"
++#include "common/threads/threading.hpp"
++#include "graph/representation/base/sequence_graph.hpp"
++
++namespace mtg {
++namespace annot {
++
++using Tuple = CoordToHeader::Tuple;
++
++CoordToHeader::CoordToHeader(std::vector<std::vector<std::string>> &&headers,
++                             std::vector<std::vector<uint64_t>> &&num_kmers)
++      : headers_(std::move(headers)), coord_offsets_(num_kmers.size()) {
++    assert(headers_.size() == num_kmers.size());
++    #pragma omp parallel for num_threads(get_num_threads()) schedule(dynamic)
++    for (size_t j = 0; j < num_kmers.size(); ++j) {
++        assert(num_kmers[j].size() == num_headers(j));
++        if (num_kmers[j].empty())
++            continue;
++        auto &offsets = num_kmers[j];
++        // Ensure no zero k-mer counts (each sequence must have at least one k-mer)
++        assert(std::find(offsets.begin(), offsets.end(), 0) == offsets.end());
++        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
++        coord_offsets_[j] = bit_vector_sd([&](const auto &callback) {
++            for (uint64_t cur_coord : offsets) {
++                callback(cur_coord - 1);
++            }
++        }, offsets.back(), offsets.size());
++    }
++}
++
++void CoordToHeader::map_to_local_coords(std::vector<RowTuples> *rows) const {
++    assert(rows);
++    for (auto &row : *rows) {
++        for (auto &[col, coords] : row) {
++            const auto &offsets = coord_offsets_.at(col);
++            for (uint64_t &coord : coords) {
++                if (coord >= offsets.size()) {
++                    throw std::runtime_error("Querying coordinate " + std::to_string(coord) + " for"
++                            + " column " + std::to_string(col) + " while CoordToHeader has only "
++                            + std::to_string(offsets.size()) + " coordinates for that column");
++                }
++                size_t header = coord ? offsets.rank1(coord - 1) : 0;
++                // Convert global coordinate to local (sequence-based) coordinate
++                uint64_t local_coord = !header ? coord : coord - offsets.select1(header) - 1;
++                if (local_coord > std::numeric_limits<uint64_t>::max() / num_headers(col)) {
++                    throw std::runtime_error(fmt::format("Local coordinate {} is too large for the "
++                            "given {} headers in column {} to encode both local_coord and header_id"
++                            " in a single 64-bit integer", local_coord, num_headers(col), col));
++                }
++                coord = local_coord * num_headers(col) + header;
++            }
++        }
++    }
++}
++
++bool CoordToHeader::load(const std::string &filename_base) {
++    std::unique_ptr<std::ifstream> in
++        = utils::open_ifstream(utils::make_suffix(filename_base, kExtension));
++    if (!in)
++        return false;
++
++    try {
++        uint64_t num_columns = load_number(*in);
++        headers_.resize(num_columns);
++        coord_offsets_.resize(num_columns);
++
++        for (uint64_t i = 0; i < num_columns; ++i) {
++            load_string_vector(*in, &headers_[i]);
++            coord_offsets_[i].load(*in);
++        }
++        return true;
++
++    } catch (...) {
++        return false;
++    }
++}
++
++void CoordToHeader::serialize(const std::string &filename_base) const {
++    auto fname = utils::make_suffix(filename_base, kExtension);
++    std::ofstream out = utils::open_new_ofstream(fname);
++    if (!out)
++        throw std::ios_base::failure("Couldn't open file " + fname + " for writing");
++    serialize_number(out, headers_.size());
++    for (size_t i = 0; i < headers_.size(); ++i) {
++        serialize_string_vector(out, headers_[i]);
++        coord_offsets_[i].serialize(out);
++    }
++}
++
++} // namespace annot
++} // namespace mtg
+diff --git a/metagraph/src/annotation/coord_to_header.hpp b/metagraph/src/annotation/coord_to_header.hpp
+new file mode 100644
+index 0000000000..efdf31b909
+--- /dev/null
++++ b/metagraph/src/annotation/coord_to_header.hpp
+@@ -0,0 +1,69 @@
++#ifndef __COORD_TO_HEADER_HPP__
++#define __COORD_TO_HEADER_HPP__
++
++#include <string>
++#include <vector>
++
++#include "annotation/int_matrix/base/int_matrix.hpp"
++#include "common/vectors/bit_vector_sd.hpp"
++
++
++namespace mtg {
++namespace annot {
++
++/**
++ * An index mapping k-mer coordinates in annotation columns to sequence headers.
++ * This mapping can be used to transform coordinates and labels in query results to show
++ * sequence-based (e.g., "<seq1>:0-0-3\t<seq3>:0-1-5") instead of file-based coordinates
++ * (e.g., "<file.fa>:0-0-3:0-23-27"). This allows showing results of querying coordinate
++ * annotations as if sequences were annotated by their headers instead of source files.
++ */
++class CoordToHeader {
++  public:
++    using Column = mtg::annot::matrix::BinaryMatrix::Column;
++    using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
++    using RowTuples = mtg::annot::matrix::MultiIntMatrix::RowTuples;
++
++    CoordToHeader() {}
++    // Constructor from sequence names and number of k-mers in them, per annotation column.
++    CoordToHeader(std::vector<std::vector<std::string>> &&headers,
++                  std::vector<std::vector<uint64_t>> &&num_kmers);
++
++    bool load(const std::string &filename_base);
++    void serialize(const std::string &filename_base) const;
++
++    /**
++     * Transforms global coordinates to local (sequence-based) coordinates in-place.
++     *
++     * For each coordinate in `rows_tuples`, this function:
++     *   1. Determines which sequence (header) the coordinate belongs to within its column
++     *   2. Converts the global coordinate to a local coordinate within that sequence
++     *   3. Encodes both the local coordinate and header index into a single value
++     *
++     * Encoding scheme: For a coordinate in column `j`, the transformed value is:
++     *   `encoded_coord = local_coord * num_headers[j] + header_id`
++     *
++     * Decoding: To extract the header index and local coordinate from an encoded value:
++     *   `header_id = encoded_coord % num_headers[j]`
++     *   `local_coord = encoded_coord / num_headers[j]`
++     */
++    void map_to_local_coords(std::vector<RowTuples> *rows_tuples) const;
++
++    uint64_t num_columns() const { return coord_offsets_.size(); }
++    uint64_t num_sequences(Column column) const { return headers_[column].size(); }
++    // Get number of k-mers/coordinates in a specific column
++    uint64_t num_kmers(Column column) const { return coord_offsets_[column].size(); }
++    const std::vector<std::string>& get_headers(Column column) const { return headers_[column]; }
++    size_t num_headers(Column column) const { return headers_[column].size(); }
++
++    static constexpr auto kExtension = ".seqs";
++
++  private:
++    std::vector<std::vector<std::string>> headers_;
++    std::vector<bit_vector_sd> coord_offsets_;
++};
++
++} // namespace annot
++} // namespace mtg
++
++#endif // __COORD_TO_HEADER_HPP__
+diff --git a/metagraph/src/cli/annotate.cpp b/metagraph/src/cli/annotate.cpp
+index d04170020f..f00e0ddc9e 100644
+--- a/metagraph/src/cli/annotate.cpp
++++ b/metagraph/src/cli/annotate.cpp
+@@ -8,6 +8,8 @@
+ #include "common/unix_tools.hpp"
+ #include "common/batch_accumulator.hpp"
+ #include "common/threads/threading.hpp"
++#include "common/utils/string_utils.hpp"
++#include "common/utils/file_utils.hpp"
+ #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
+ #include "seq_io/formats.hpp"
+ #include "seq_io/sequence_io.hpp"
+@@ -16,6 +18,7 @@
+ #include "load/load_graph.hpp"
+ #include "load/load_annotated_graph.hpp"
+ #include "graph/annotated_dbg.hpp"
++#include "annotation/coord_to_header.hpp"
+ 
+ 
+ namespace mtg {
+@@ -237,12 +240,48 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+         forward_and_reverse = false;
+     }
+ 
+-    Timer timer;
+-
+     // not too small, not too large
+     const size_t BATCH_SIZE = 5'000;
+     const size_t BATCH_LENGTH = 100'000;
+ 
++    if (config.index_header_coords) {
++        // Collect sequence headers and compute k-mer counts
++        std::vector<std::vector<std::string>> headers(files.size());
++        std::vector<std::vector<uint64_t>> num_kmers(files.size());
++        #pragma omp parallel for num_threads(get_num_threads()) default(shared) schedule(dynamic)
++        for (size_t i = 0; i < files.size(); ++i) {
++            call_annotations(
++                files[i],
++                config.refpath,
++                anno_graph->get_graph(),
++                forward_and_reverse,
++                config.min_count,
++                config.max_count,
++                false, // config.filename_anno
++                true, // config.annotate_sequence_headers
++                false, // parse_counts_from_headers
++                config.fasta_anno_comment_delim,
++                config.fasta_header_delimiter,
++                {}, // config.anno_labels
++                [&](std::string sequence, auto labels, uint64_t) {
++                    assert(labels.size() == 1 && "each sequence has a single label (header)");
++                    if (sequence.size() >= k) {
++                        if (headers[i].empty() || headers[i].back() != labels[0]) {
++                            headers[i].push_back(labels[0]);
++                            num_kmers[i].push_back(0);
++                        }
++                        num_kmers[i].back() += sequence.size() - k + 1;
++                    }
++                }
++            );
++        }
++        annot::CoordToHeader headers_map(std::move(headers), std::move(num_kmers));
++        auto fname = utils::make_suffix(annotator_filename, annot::CoordToHeader::kExtension);
++        headers_map.serialize(fname);
++        logger->trace("CoordToHeader mapping serialized to {}", fname);
++        return;
++    }
++
+     if (config.coordinates) {
+         #pragma omp parallel num_threads(get_num_threads())
+         #pragma omp single
+@@ -287,7 +326,7 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+                     if (config.num_kmers_in_seq
+                             && config.num_kmers_in_seq + k - 1 != sequence.size()) {
+                         logger->error("All input sequences must have the same"
+-                                      " length when flag --const-length is on");
++                                      " length when flag --num-kmers-in-seq is on");
+                         exit(1);
+                     }
+                     if (sequence.size() >= k) {
+@@ -427,6 +466,18 @@ int annotate_graph(Config *config) {
+ 
+     assert(config->infbase_annotators.size() <= 1);
+ 
++    if (config->index_header_coords) {
++        if (!config->filename_anno || config->annotate_sequence_headers || config->anno_labels.size()) {
++            logger->error("A CoordToHeader mapping (annotation with `--index-header-coords`) can "
++                          "only be constructed for annotated filenames (use flag `--anno-filename`)");
++            exit(1);
++        }
++        logger->trace("Parsing headers and computing coordinate offsets for {} files", files.size());
++        logger->info("Note: It's essential that the files are passed in the order of the columns "
++                     "in the graph annotation (check with `metagraph stats --print-col-names ...`)");
++        config->separately = false;
++    }
++
+     const auto graph = load_critical_dbg(config->infbase);
+ 
+     if (!config->separately) {
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index 80b5008827..ae9a59b693 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -131,6 +131,10 @@ Config::Config(int argc, char *argv[]) {
+             print_counts_hist = true;
+         } else if (!strcmp(argv[i], "--coordinates")) {
+             coordinates = true;
++        } else if (!strcmp(argv[i], "--index-header-coords")) {
++            index_header_coords = true;
++        } else if (!strcmp(argv[i], "--no-coord-mapping")) {
++            no_coord_mapping = true;
+         } else if (!strcmp(argv[i], "--num-kmers-in-seq")) {
+             // FYI: experimental
+             std::cerr << "WARNING: Flag --num-kmers-in-seq is experimental and"
+@@ -1226,6 +1230,7 @@ if (advanced) {
+             fprintf(stderr, "\t   --count-kmers \tadd k-mer counts to the annotation [off]\n");
+             fprintf(stderr, "\t   --count-width \tnumber of bits used to represent k-mer abundance [8]\n");
+             fprintf(stderr, "\t   --coordinates \tannotate coordinates as multi-integer attributes [off]\n");
++            fprintf(stderr, "\t   --index-header-coords \tgenerate a CoordToHeader mapping (.seqs file) from input FASTA files [off]\n");
+             fprintf(stderr, "\n");
+             fprintf(stderr, "\t-p --parallel [INT] \tuse multiple threads for computation [1]\n");
+         } break;
+@@ -1310,7 +1315,9 @@ if (advanced) {
+             fprintf(stderr, "\n");
+             fprintf(stderr, "\t   --query-mode \tquery mode (only labels with enough k-mer matches are reported) [%s]\n", querymode_to_string(LABELS).c_str());
+             fprintf(stderr, "\t       Available modes:\n");
++if (advanced) {
+             fprintf(stderr, "\t                %s \t\tprint labels (with enough k-mer matches)\n", querymode_to_string(LABELS).c_str());
++}
+             fprintf(stderr, "\t                %s \tprint number of k-mer matches (for every label with enough k-mer matches)\n", querymode_to_string(MATCHES).c_str());
+ if (advanced) {
+             fprintf(stderr, "\t                %s \tprint masks indicating present/absent k-mers (...)\n", querymode_to_string(SIGNATURE).c_str());
+@@ -1330,6 +1337,7 @@ if (advanced) {
+             fprintf(stderr, "\t   --num-top-labels [INT] \t\tmaximum number of top labels to output [inf]\n");
+             fprintf(stderr, "\t   --min-kmers-fraction-label [FLOAT] \tmin fraction of k-mers from the query required to be present in a label [0.7]\n");
+             fprintf(stderr, "\t   --min-kmers-fraction-graph [FLOAT] \tmin fraction of k-mers from the query required to be present in the graph [0.0]\n");
++            fprintf(stderr, "\t   --no-coord-mapping \t\t\tquery without mapping coords to sequence headers even if the .seq index exists [off]\n");
+ if (advanced) {
+             fprintf(stderr, "\t   --labels-delimiter [STR]\tdelimiter for annotation labels [\":\"]\n");
+             fprintf(stderr, "\t   --suppress-unlabeled \tdo not show results for sequences missing in graph [off]\n");
+@@ -1391,12 +1399,15 @@ if (advanced) {
+             fprintf(stderr, "Available options for server_query:\n");
+             fprintf(stderr, "\t   --port [INT] \tTCP port for incoming connections [5555]\n");
+             fprintf(stderr, "\t   --address \t\tinterface for incoming connections (default: all)\n");
++if (advanced) {
+             fprintf(stderr, "\t   --sparse \t\tuse the row-major sparse matrix to annotate graph [off]\n");
++}
+             // fprintf(stderr, "\t-o --outfile-base [STR] \tbasename of output file []\n");
+             // fprintf(stderr, "\t-d --distance [INT] \tmax allowed alignment distance [0]\n");
+             fprintf(stderr, "\t-p --parallel [INT] \tmaximum number of parallel connections [1]\n");
+             // fprintf(stderr, "\t   --cache-size [INT] \tnumber of uncompressed rows to store in the cache [0]\n");
+             fprintf(stderr, "\n\t   --num-top-labels [INT] \tmaximum number of top labels per query by default [10'000]\n");
++            fprintf(stderr, "\t   --no-coord-mapping \t\tquery without mapping coords to sequence headers even if the .seq index exists [off]\n");
+         } break;
+     }
+ 
+diff --git a/metagraph/src/cli/config/config.hpp b/metagraph/src/cli/config/config.hpp
+index c7da879597..b6689d8fd4 100644
+--- a/metagraph/src/cli/config/config.hpp
++++ b/metagraph/src/cli/config/config.hpp
+@@ -60,6 +60,8 @@ class Config {
+     bool output_json = false;
+     bool aggregate_columns = false;
+     bool coordinates = false;
++    bool index_header_coords = false;
++    bool no_coord_mapping = false;
+     bool advanced = false;
+ 
+     unsigned int k = 3;
+diff --git a/metagraph/src/cli/load/load_annotated_graph.cpp b/metagraph/src/cli/load/load_annotated_graph.cpp
+index 5a2e227ff5..129484da67 100644
+--- a/metagraph/src/cli/load/load_annotated_graph.cpp
++++ b/metagraph/src/cli/load/load_annotated_graph.cpp
+@@ -5,9 +5,11 @@
+ #include "annotation/binary_matrix/row_diff/row_diff.hpp"
+ #include "annotation/binary_matrix/row_sparse/row_sparse.hpp"
+ #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
++#include "annotation/coord_to_header.hpp"
+ #include "graph/representation/canonical_dbg.hpp"
+ #include "graph/annotated_dbg.hpp"
+ #include "common/logger.hpp"
++#include "common/utils/string_utils.hpp"
+ #include "cli/config/config.hpp"
+ #include "load_graph.hpp"
+ #include "load_annotation.hpp"
+@@ -31,20 +33,22 @@ std::unique_ptr<AnnotatedDBG> initialize_annotated_dbg(std::shared_ptr<DeBruijnG
+         logger->trace("Primary graph wrapped into canonical");
+     }
+ 
+-    auto annotation_temp = config.infbase_annotators.size()
++    auto annotation = config.infbase_annotators.size()
+             ? initialize_annotation(config.infbase_annotators.at(0), config, 0, max_chunks_open)
+             : initialize_annotation(config.anno_type, config, max_index, max_chunks_open);
+ 
++    std::unique_ptr<annot::CoordToHeader> coord_to_header;
++
+     if (config.infbase_annotators.size()) {
+         bool loaded = false;
+-        if (auto *cc = dynamic_cast<annot::ColumnCompressed<>*>(annotation_temp.get())) {
++        if (auto *cc = dynamic_cast<annot::ColumnCompressed<>*>(annotation.get())) {
+             loaded = cc->merge_load(config.infbase_annotators);
+         } else {
+             if (config.infbase_annotators.size() > 1) {
+                 logger->warn("Cannot merge annotations of this type. Only the first"
+                              " file {} will be loaded.", config.infbase_annotators.at(0));
+             }
+-            loaded = annotation_temp->load(config.infbase_annotators.at(0));
++            loaded = annotation->load(config.infbase_annotators.at(0));
+         }
+         if (!loaded) {
+             logger->error("Cannot load annotations for graph {}, file corrupted",
+@@ -54,7 +58,7 @@ std::unique_ptr<AnnotatedDBG> initialize_annotated_dbg(std::shared_ptr<DeBruijnG
+ 
+         // row_diff annotation is special, as it must know the graph structure
+         using namespace annot::matrix;
+-        BinaryMatrix &matrix = const_cast<BinaryMatrix &>(annotation_temp->get_matrix());
++        BinaryMatrix &matrix = const_cast<BinaryMatrix &>(annotation->get_matrix());
+         if (IRowDiff *row_diff = dynamic_cast<IRowDiff*>(&matrix)) {
+             row_diff->set_graph(base_graph.get());
+ 
+@@ -63,11 +67,37 @@ std::unique_ptr<AnnotatedDBG> initialize_annotated_dbg(std::shared_ptr<DeBruijnG
+                 row_diff_column->load_fork_succ(config.infbase + kRowDiffForkSuccExt);
+             }
+         }
++
++        if (dynamic_cast<const MultiIntMatrix *>(&annotation->get_matrix())
++                && !config.no_coord_mapping && config.identity != Config::ANNOTATE) {
++            // Load CoordToHeader mapping if exists
++            auto cth_fname = utils::remove_suffix(config.infbase_annotators.at(0),
++                                                  annotation->file_extension())
++                                            + annot::CoordToHeader::kExtension;
++            if (std::filesystem::exists(cth_fname)) {
++                coord_to_header = std::make_unique<annot::CoordToHeader>();
++                if (!coord_to_header->load(cth_fname)) {
++                    logger->error("Failed loading the CoordToHeader mapping from {}", cth_fname);
++                    exit(1);
++                }
++                logger->trace("CoordToHeader mapping loaded successfully from {}. "
++                              "All queries will be performed against individual sequences.",
++                              cth_fname);
++            } else {
++                logger->warn("CoordToHeader mapping file not found at {}. Querying will be done "
++                             "against original labels indexed in annotation {}. Results will show "
++                             "file-based coordinates (e.g., '<file_37.fa>:0-1086-1090') instead of "
++                             "sequence-based coordinates (e.g., '<seq_9>:0-1-5'). For sequence-"
++                             "based queries, create a mapping with '--index-header-coords' during "
++                             "annotation, or pass '--no-coord-mapping' to suppress this warning.",
++                             cth_fname, config.infbase_annotators.at(0));
++            }
++        }
+     }
+ 
+     // load graph
+-    auto anno_graph
+-            = std::make_unique<AnnotatedDBG>(std::move(graph), std::move(annotation_temp));
++    auto anno_graph = std::make_unique<AnnotatedDBG>(std::move(graph), std::move(annotation),
++                                                     false, std::move(coord_to_header));
+ 
+     if (!anno_graph->check_compatibility()) {
+         logger->error("Graph and annotation are not compatible");
+diff --git a/metagraph/src/cli/query.cpp b/metagraph/src/cli/query.cpp
+index 8549819dab..57ff1d3de8 100644
+--- a/metagraph/src/cli/query.cpp
++++ b/metagraph/src/cli/query.cpp
+@@ -1235,7 +1235,7 @@ size_t QueryExecutor::query_fasta(const string &file,
+     }
+ 
+     if (config_.query_batch_size) {
+-        if (config_.query_mode != COORDS) {
++        if (config_.query_mode != COORDS && !anno_graph_.get_coord_to_header()) {
+             // Construct a query graph and query against it
+             return batched_query_fasta(fasta_parser, callback);
+         } else {
+diff --git a/metagraph/src/cli/server.cpp b/metagraph/src/cli/server.cpp
+index 860d0c0f99..fbbdb165a8 100644
+--- a/metagraph/src/cli/server.cpp
++++ b/metagraph/src/cli/server.cpp
+@@ -463,6 +463,18 @@ int run_server(Config *config) {
+             if (!config->fnames.size() && !check_data_ready(anno_graph, response))
+                 throw CustomResponse();  // the index is not loaded yet, so we can't process the request
+ 
++            auto get_num_labels = [](const AnnotatedDBG &anno_dbg) {
++                uint64_t num_labels = 0;
++                if (const auto *coord_to_header = anno_dbg.get_coord_to_header()) {
++                    for (uint64_t col = 0; col < coord_to_header->num_columns(); ++col) {
++                        num_labels += coord_to_header->num_sequences(col);
++                    }
++                } else {
++                    num_labels = anno_dbg.get_annotator().num_labels();
++                }
++                return num_labels;
++            };
++
+             Json::Value root;
+             if (config->fnames.size()) {
+                 // for scenarios with multiple graphs
+@@ -485,7 +497,7 @@ int run_server(Config *config) {
+                 uint64_t num_labels = 0;
+                 for (const auto &[name, graphs] : indexes) {
+                     for (const auto &[graph_fname, anno_fname] : graphs) {
+-                        num_labels += graphs_cache[{ graph_fname, anno_fname }]->get_annotator().num_labels();
++                        num_labels += get_num_labels(*graphs_cache[{ graph_fname, anno_fname }]);
+                     }
+                 }
+                 root["annotation"]["labels"] = num_labels;
+@@ -497,7 +509,7 @@ int run_server(Config *config) {
+                                                         == graph::DeBruijnGraph::CANONICAL);
+                 const auto &annotation = anno_graph.get()->get_annotator();
+                 root["annotation"]["filename"] = std::filesystem::path(config->infbase_annotators.front()).filename().string();
+-                root["annotation"]["labels"] = static_cast<uint64_t>(annotation.num_labels());
++                root["annotation"]["labels"] = get_num_labels(*anno_graph.get());
+                 root["annotation"]["objects"] = static_cast<uint64_t>(annotation.num_objects());
+             }
+             return root;
+diff --git a/metagraph/src/cli/stats.cpp b/metagraph/src/cli/stats.cpp
+index 7051ca0002..abb9258a3c 100644
+--- a/metagraph/src/cli/stats.cpp
++++ b/metagraph/src/cli/stats.cpp
+@@ -13,6 +13,7 @@
+ #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
+ #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
+ #include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
++#include "annotation/coord_to_header.hpp"
+ #include "config/config.hpp"
+ #include "load/load_graph.hpp"
+ #include "load/load_annotation.hpp"
+@@ -367,6 +368,51 @@ void print_annotation_stats(const std::string &fname, const Config &config) {
+     std::cout << "========================================================" << std::endl;
+ }
+ 
++void print_coord_to_header_stats(const std::string &fname) {
++    logger->info("Statistics for CoordToHeader mapping '{}'", fname);
++
++    annot::CoordToHeader coord_to_header;
++    if (!coord_to_header.load(fname)) {
++        logger->error("Cannot load CoordToHeader mapping from file '{}'", fname);
++        exit(1);
++    }
++
++    size_t total_num_kmers = 0;
++    size_t total_num_sequences = 0;
++    for (uint64_t col = 0; col < coord_to_header.num_columns(); ++col) {
++        total_num_kmers += coord_to_header.num_kmers(col);
++        total_num_sequences += coord_to_header.num_sequences(col);
++    }
++
++    std::cout << "================ COORD-TO-HEADER STATS =================" << '\n';
++    std::cout << "columns: " << coord_to_header.num_columns() << '\n';
++    std::cout << "total sequences: " << total_num_sequences << '\n';
++    std::cout << "total k-mers: " << total_num_kmers << '\n';
++
++    if (get_verbose()) {
++        std::cout << "=================== PER-COLUMN STATS ===================" << '\n';
++        auto first_headers = [&](size_t col, size_t num_first = 3) {
++            const auto &labels = coord_to_header.get_headers(col);
++            auto first_labels = std::vector<std::string>(labels.begin(),
++                                                         std::min(labels.begin() + num_first, labels.end()));
++            if (first_labels.size() < labels.size())
++                first_labels.push_back("...");
++            return fmt::format(" ({})", fmt::join(first_labels, "\t"));
++        };
++        for (uint64_t col = 0; col < coord_to_header.num_columns(); ++col) {
++            std::cout << "column " << col << ":\n";
++            std::cout << "  sequences: " << coord_to_header.num_sequences(col) << first_headers(col) << '\n';
++            std::cout << "  k-mers: " << coord_to_header.num_kmers(col) << '\n';
++            std::cout << "  k-mers per sequence: " << (coord_to_header.num_sequences(col)
++                ? fmt::format("{:.1f}", static_cast<double>(coord_to_header.num_kmers(col))
++                                            / coord_to_header.num_sequences(col))
++                : "NA") << '\n';
++        }
++    }
++
++    std::cout << "========================================================" << std::endl;
++}
++
+ int print_stats(Config *config) {
+     assert(config);
+ 
+@@ -378,6 +424,11 @@ int print_stats(Config *config) {
+             continue;
+         }
+ 
++        if (utils::ends_with(file, annot::CoordToHeader::kExtension)) {
++            print_coord_to_header_stats(file);
++            continue;
++        }
++
+         std::shared_ptr<graph::DeBruijnGraph> graph;
+ 
+         graph = load_critical_dbg(file);
+diff --git a/metagraph/src/common/vector_map.hpp b/metagraph/src/common/vector_map.hpp
+index 85047db6e3..a2b4392940 100644
+--- a/metagraph/src/common/vector_map.hpp
++++ b/metagraph/src/common/vector_map.hpp
+@@ -11,4 +11,11 @@ using VectorMap = tsl::ordered_map<Key, T, Hash, std::equal_to<Key>,
+                                    std::vector<std::pair<Key, T>>,
+                                    IndexType>;
+ 
++template <typename Key, typename T, typename IndexType = uint64_t, class Hash = std::hash<Key>>
++std::vector<std::pair<Key, T>> to_vector(VectorMap<Key, T, IndexType, Hash> &&map) {
++    std::vector<std::pair<Key, T>> vector;
++    vector.swap(const_cast<std::vector<std::pair<Key, T>>&>(map.values_container()));
++    return vector;
++}
++
+ #endif // __VECTOR_MAP_HPP__
+diff --git a/metagraph/src/graph/annotated_dbg.cpp b/metagraph/src/graph/annotated_dbg.cpp
+index 430365365a..e8e38f5367 100644
+--- a/metagraph/src/graph/annotated_dbg.cpp
++++ b/metagraph/src/graph/annotated_dbg.cpp
+@@ -3,9 +3,13 @@
+ #include <array>
+ #include <cstdlib>
+ 
++#include <tsl/hopscotch_set.h>
++#include <tsl/hopscotch_map.h>
++
+ #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
+ #include "annotation/int_matrix/base/int_matrix.hpp"
+ #include "graph/representation/canonical_dbg.hpp"
++#include "annotation/coord_to_header.hpp"
+ #include "common/aligned_vector.hpp"
+ #include "common/vectors/vector_algorithm.hpp"
+ #include "common/vector_map.hpp"
+@@ -19,6 +23,7 @@ using mtg::common::logger;
+ using mtg::annot::matrix::IntMatrix;
+ using mtg::annot::matrix::MultiIntMatrix;
+ using Column = mtg::annot::matrix::BinaryMatrix::Column;
++using Tuple = mtg::annot::matrix::MultiIntMatrix::Tuple;
+ 
+ typedef AnnotatedDBG::Label Label;
+ typedef std::pair<Label, size_t> StringCountPair;
+@@ -36,8 +41,10 @@ ::AnnotatedSequenceGraph(std::shared_ptr<SequenceGraph> graph,
+ 
+ AnnotatedDBG::AnnotatedDBG(std::shared_ptr<DeBruijnGraph> dbg,
+                            std::unique_ptr<Annotator>&& annotation,
+-                           bool force_fast)
+-      : AnnotatedSequenceGraph(dbg, std::move(annotation), force_fast), dbg_(*dbg) {}
++                           bool force_fast,
++                           std::unique_ptr<annot::CoordToHeader> coord_to_header)
++      : AnnotatedSequenceGraph(dbg, std::move(annotation), force_fast), dbg_(*dbg),
++        coord_to_header_(std::move(coord_to_header)) {}
+ 
+ void AnnotatedSequenceGraph
+ ::annotate_sequence(std::string_view sequence,
+@@ -232,6 +239,17 @@ std::vector<Label> AnnotatedDBG::get_labels(std::string_view sequence,
+     if (sequence.size() < dbg_.get_k())
+         return {};
+ 
++    if (coord_to_header_) {
++        auto kmer_coord_res = get_kmer_coordinates(sequence, std::numeric_limits<size_t>::max(),
++                                                   discovery_fraction, presence_fraction);
++        std::vector<Label> result;
++        result.reserve(kmer_coord_res.size());
++        for (auto &[label, count, coords] : kmer_coord_res) {
++            result.emplace_back(std::move(label));
++        }
++        return result;
++    }
++
+     VectorMap<row_index, size_t> index_counts;
+     index_counts.reserve(sequence.size() - dbg_.get_k() + 1);
+ 
+@@ -306,6 +324,23 @@ AnnotatedDBG::get_top_labels(std::string_view sequence,
+     if (sequence.size() < dbg_.get_k())
+         return {};
+ 
++    if (coord_to_header_) {
++        auto kmer_coord_res = get_kmer_coordinates(sequence, num_top_labels,
++                                                   discovery_fraction, presence_fraction);
++        std::vector<StringCountPair> result;
++        result.reserve(kmer_coord_res.size());
++        for (auto &[label, count, coords] : kmer_coord_res) {
++            if (with_kmer_counts) {
++                count = 0;
++                for (const auto &tuple : coords) {
++                    count += tuple.size();
++                }
++            }
++            result.emplace_back(std::move(label), count);
++        }
++        return result;
++    }
++
+     VectorMap<row_index, size_t> index_counts;
+     size_t num_kmers = sequence.size() - dbg_.get_k() + 1;
+     index_counts.reserve(num_kmers);
+@@ -384,6 +419,21 @@ AnnotatedDBG::get_kmer_counts(const std::vector<node_index> &nodes,
+     if (!nodes.size())
+         return {};
+ 
++    if (coord_to_header_) {
++        auto kmer_coord_res = get_kmer_coordinates(nodes, num_top_labels,
++                                                   discovery_fraction, presence_fraction);
++        std::vector<std::tuple<std::string, size_t, std::vector<size_t>>> result;
++        result.reserve(kmer_coord_res.size());
++        for (auto &[label, count, coords] : kmer_coord_res) {
++            result.emplace_back(std::move(label), count, coords.size());
++            auto &counts = std::get<2>(result.back());
++            for (size_t i = 0; i < coords.size(); ++i) {
++                counts[i] = coords[i].size();
++            }
++        }
++        return result;
++    }
++
+     std::vector<row_index> rows;
+     rows.reserve(nodes.size());
+ 
+@@ -501,6 +551,87 @@ AnnotatedDBG::get_kmer_coordinates(const std::vector<node_index> &nodes,
+ 
+     auto rows_tuples = tuple_matrix->get_row_tuples(rows);
+ 
++    if (coord_to_header_) {
++        if (tuple_matrix->get_binary_matrix().num_columns() != coord_to_header_->num_columns()) {
++            logger->error("Incompatible number of columns in CoordToHeader mapping and annotation matrix: {} != {}",
++                          coord_to_header_->num_columns(), tuple_matrix->get_binary_matrix().num_columns());
++            exit(1);
++        }
++
++        coord_to_header_->map_to_local_coords(&rows_tuples);
++        // Now each coord in `rows_tuples` is `coord = local_coord * num_headers[j] + header_id`
++
++        // Before splitting coords across headers, filter them by the number of k-mer matches
++        using Header = std::pair<Column, size_t>; // global header id
++        using Count = size_t;
++        std::vector<std::pair<Header, Count>> counts;
++        {
++            VectorMap<Header, Count> counts_map;
++            tsl::hopscotch_set<Header> matches;
++            for (const auto &row : rows_tuples) {
++                matches.clear();
++                for (auto &[col, coords] : row) {
++                    for (uint64_t coord : coords) {
++                        size_t header = coord % coord_to_header_->num_headers(col);
++                        matches.emplace(col, header);
++                    }
++                }
++                for (const Header &h : matches) {
++                    counts_map[h]++;
++                }
++            }
++            counts = to_vector(std::move(counts_map));
++        }
++
++        // remove headers with insufficient number of k-mer matches
++        counts.erase(std::remove_if(counts.begin(), counts.end(),
++                                    [&](const auto &pair) { return pair.second < min_count; }),
++                     counts.end());
++
++        // keep only top-n headers
++        if (counts.size() > num_top_labels) {
++            auto comp = [](const auto &x, const auto &y) {
++                return std::make_pair(y.second, x.first)
++                      < std::make_pair(x.second, y.first);
++            };
++            std::nth_element(counts.begin(), counts.begin() + num_top_labels, counts.end(), comp);
++            counts.resize(num_top_labels);
++            std::sort(counts.begin(), counts.end(), comp);
++        }
++
++        // split coordinates across headers
++        tsl::hopscotch_map<Header, std::vector<Tuple>> coords_map;
++        coords_map.reserve(counts.size());
++        for (const auto &[h, count] : counts) {
++            coords_map.emplace(h, nodes.size());
++        }
++        for (size_t i = 0; i < rows_tuples.size(); ++i) {
++            for (auto &[col, coords] : rows_tuples[i]) {
++                for (uint64_t coord : coords) {
++                    size_t header = coord % coord_to_header_->num_headers(col);
++                    uint64_t local_coord = coord / coord_to_header_->num_headers(col);
++                    auto it = coords_map.find({col, header});
++                    if (it != coords_map.end())
++                        it.value()[kmer_positions[i]].push_back(local_coord);
++                }
++                coords.clear();
++            }
++            rows_tuples[i].clear();
++        }
++        rows_tuples.clear();
++
++        std::vector<std::tuple<std::string, Count, std::vector<Tuple>>> result;
++        result.reserve(counts.size());
++        for (const auto &[h, count] : counts) {
++            const auto &[col, header] = h;
++            auto &coords = coords_map[h];
++            result.emplace_back(coord_to_header_->get_headers(col)[header],
++                                count, std::move(coords));
++        }
++
++        return result;
++    }
++
+     // FYI: one could use tsl::hopscotch_map for counting but it is slower
+     // than std::vector unless the number of columns is ~1M or higher
+     Vector<size_t> col_counts(annotator_->num_labels(), 0);
+@@ -566,6 +697,23 @@ AnnotatedDBG::get_top_label_signatures(std::string_view sequence,
+         return presence_vectors;
+     }
+ 
++    if (coord_to_header_) {
++        auto kmer_coord_res = get_kmer_coordinates(sequence, num_top_labels,
++                                                   discovery_fraction, presence_fraction);
++        std::vector<std::pair<Label, sdsl::bit_vector>> result;
++        result.reserve(kmer_coord_res.size());
++        for (auto &[label, count, coords] : kmer_coord_res) {
++            assert(coords.size() == sequence.size() - dbg_.get_k() + 1);
++            result.emplace_back(std::move(label), coords.size());
++            auto &mask = result.back().second;
++            for (size_t i = 0; i < coords.size(); ++i) {
++                if (coords[i].size())
++                    mask[i] = true;
++            }
++        }
++        return result;
++    }
++
+     // kmers and their positions in the query sequence
+     std::vector<row_index> row_indices;
+     row_indices.reserve(num_kmers);
+diff --git a/metagraph/src/graph/annotated_dbg.hpp b/metagraph/src/graph/annotated_dbg.hpp
+index 4660a907d1..e5340a80b2 100644
+--- a/metagraph/src/graph/annotated_dbg.hpp
++++ b/metagraph/src/graph/annotated_dbg.hpp
+@@ -10,6 +10,7 @@
+ #include "representation/base/sequence_graph.hpp"
+ #include "annotation/representation/base/annotation.hpp"
+ #include "common/vector.hpp"
++#include "annotation/coord_to_header.hpp"
+ 
+ 
+ namespace mtg {
+@@ -70,12 +71,18 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+   public:
+     AnnotatedDBG(std::shared_ptr<DeBruijnGraph> dbg,
+                  std::unique_ptr<Annotator>&& annotation,
+-                 bool force_fast = false);
++                 bool force_fast = false,
++                 std::unique_ptr<annot::CoordToHeader> coord_to_header = {});
+ 
+     using AnnotatedSequenceGraph::get_labels;
+ 
+     const DeBruijnGraph& get_graph() const { return dbg_; }
+ 
++    // Returns pointer to the coordinate-to-header mapping if available, nullptr otherwise.
++    // This mapping transforms file-based coordinates to sequence-header-based coordinates
++    // for query results. The returned pointer is valid for the lifetime of this object.
++    const annot::CoordToHeader* get_coord_to_header() const { return coord_to_header_.get(); }
++
+     // add k-mer counts to the annotation, thread-safe for concurrent calls
+     void add_kmer_counts(std::string_view sequence,
+                          const std::vector<Label> &labels,
+@@ -163,6 +170,7 @@ class AnnotatedDBG : public AnnotatedSequenceGraph {
+ 
+   private:
+     DeBruijnGraph &dbg_;
++    std::unique_ptr<annot::CoordToHeader> coord_to_header_;
+ };
+ 
+ } // namespace graph

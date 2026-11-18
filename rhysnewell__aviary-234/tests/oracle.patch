@@ -1,0 +1,190 @@
+diff --git a/aviary.yml b/aviary.yml
+index 82f27e1c..131635fc 100644
+--- a/aviary.yml
++++ b/aviary.yml
+@@ -14,3 +14,4 @@ dependencies:
+   - parallel
+   - bbmap
+   - extern # for tests
++  - pyopenssl>22.1.0 # see https://github.com/pyca/cryptography/issues/7959#issuecomment-1368711852
+diff --git a/aviary/aviary.py b/aviary/aviary.py
+index e18f7625..aad581d5 100755
+--- a/aviary/aviary.py
++++ b/aviary/aviary.py
+@@ -583,12 +583,12 @@ def main():
+     binning_group.add_argument(
+         '--extra-binners', '--extra_binners', '--extra-binner', '--extra_binner',
+         help='Optional list of extra binning algorithms to run. Can be any combination of: \n'
+-             'maxbin, maxbin2, concoct \n'
++             'maxbin, maxbin2, concoct, comebin \n'
+              'These binners are skipped by default as they can have long runtimes \n'
+              'N.B. specifying "maxbin" and "maxbin2" are equivalent \n',
+         dest='extra_binners',
+         nargs='*',
+-        choices=["maxbin", "maxbin2", "concoct"]
++        choices=["maxbin", "maxbin2", "concoct", "comebin"]
+     )
+ 
+     binning_group.add_argument(
+diff --git a/aviary/modules/binning/binning.smk b/aviary/modules/binning/binning.smk
+index 182c3a3c..1c2f0e0b 100644
+--- a/aviary/modules/binning/binning.smk
++++ b/aviary/modules/binning/binning.smk
+@@ -393,6 +393,31 @@ rule semibin:
+         "touch {output.done} || SemiBin single_easy_bin -i {input.fasta} -b data/binning_bams/*.bam -o data/semibin_bins -p {threads} --self-supervised > {log} 2>&1 "
+         "&& touch {output.done} || touch {output.done}"
+ 
++
++rule comebin:
++    input:
++        fasta = ancient(config["fasta"]),
++        bams_indexed = ancient("data/binning_bams/done")
++    output:
++        done = "data/comebin_bins/done"
++    threads:
++        config["max_threads"]
++    resources:
++        mem_mb = lambda wildcards, attempt: min(int(config["max_memory"])*1024, 128*1024*attempt),
++        runtime = lambda wildcards, attempt: 24*60*attempt,
++        gpus = 1 if config["request_gpu"] else 0
++    conda:
++        "envs/comebin.yaml"
++    log:
++        "logs/comebin.log"
++    benchmark:
++        "benchmarks/comebin.benchmark.txt"
++    shell:
++        "rm -rf data/comebin_bins/; "
++        "run_comebin.sh -a {input.fasta} -p data/binning_bams -t {threads} -o data/comebin_bins > {log} 2>&1 && "
++        "touch {output.done} || touch {output.done}"
++
++
+ rule checkm_rosella:
+     input:
+         done = ancient("data/rosella_bins/done")
+@@ -622,6 +647,7 @@ rule das_tool:
+         metabat_sense = [] if "metabat_sens" in config["skip_binners"] else "data/metabat_bins_sens/done",
+         rosella_done = [] if "rosella" in config["skip_binners"] else "data/rosella_refined/done",
+         semibin_done = [] if "semibin" in config["skip_binners"] else "data/semibin_refined/done",
++        comebin_done = [] if "comebin" in config["skip_binners"] else "data/comebin_bins/done",
+         vamb_done = [] if "vamb" in config["skip_binners"] else "data/vamb_bins/done",
+     threads:
+         config["max_threads"]
+diff --git a/aviary/modules/binning/envs/comebin.yaml b/aviary/modules/binning/envs/comebin.yaml
+new file mode 100755
+index 00000000..4a091d06
+--- /dev/null
++++ b/aviary/modules/binning/envs/comebin.yaml
+@@ -0,0 +1,9 @@
++channels:
++  - pytorch
++  - nvidia
++  - conda-forge
++  - bioconda
++dependencies:
++  - comebin=1.0.*
++  - pytorch
++  - pytorch-cuda=11.8
+diff --git a/aviary/modules/binning/scripts/das_tool.py b/aviary/modules/binning/scripts/das_tool.py
+index e8fabfe5..d0dab2fe 100644
+--- a/aviary/modules/binning/scripts/das_tool.py
++++ b/aviary/modules/binning/scripts/das_tool.py
+@@ -8,10 +8,13 @@
+     unrefined_binners_to_use = [
+         ('concoct', 'fa'),
+         ('maxbin2', 'fasta'),
+-        ('vamb', 'fna')]
++        ('vamb', 'fna'),
++        ('comebin', 'fa'),
++        ]
+     refined_binners_to_use = [
+         ('rosella', 'fna'),
+-        ('semibin', 'fna')]
++        ('semibin', 'fna'),
++        ]
+ 
+     # N.B. specifying "metabat" will skip both MetaBAT1 and MetaBAT2.
+     metabats = ['metabat_sspec', 'metabat_ssens', 'metabat_sens', 'metabat_spec']
+@@ -19,7 +22,12 @@
+     binners = []
+     for (binner, extension) in unrefined_binners_to_use:
+         if binner not in snakemake.config['skip_binners']:
+-            extra = 'bins/' if binner == 'vamb' else ''
++            extra = ''
++            if binner == 'vamb':
++                extra = 'bins/'
++            elif binner == 'comebin':
++                extra = 'comebin_res/comebin_res_bins/'
++
+             binners.append((f'{binner}_bins/'+extra, extension, f'data/{binner}_bins.tsv'))
+ 
+     for (binner, extension) in refined_binners_to_use:
+diff --git a/aviary/modules/processor.py b/aviary/modules/processor.py
+index 6de61027..2f247bff 100644
+--- a/aviary/modules/processor.py
++++ b/aviary/modules/processor.py
+@@ -124,7 +124,7 @@ def __init__(self,
+                 self.skip_singlem = True
+             self.binning_only = args.binning_only
+ 
+-            self.skip_binners = ["maxbin2", "concoct"]
++            self.skip_binners = ["maxbin2", "concoct", "comebin"]
+             if args.extra_binners:
+                 for binner in args.extra_binners:
+                     binner = binner.lower()   
+@@ -132,6 +132,8 @@ def __init__(self,
+                         self.skip_binners.remove("maxbin2")
+                     elif binner == "concoct":
+                         self.skip_binners.remove("concoct")
++                    elif binner == "comebin":
++                        self.skip_binners.remove("comebin")
+                     else:
+                         logging.warning(f"Unknown extra binner {binner} specified. Skipping...")
+ 
+diff --git a/test/test_integration.py b/test/test_integration.py
+index c3cb232b..dac014ee 100755
+--- a/test/test_integration.py
++++ b/test/test_integration.py
+@@ -191,6 +191,42 @@ def test_short_read_recovery_vamb(self):
+ 
+         self.assertFalse(os.path.isfile(f"{output_dir}/aviary_out/data/final_contigs.fasta"))
+ 
++    def test_short_read_recovery_comebin(self):
++        output_dir = os.path.join("example", "test_short_read_recovery_comebin")
++        self.setup_output_dir(output_dir)
++
++        # Create inflated assembly file
++        cmd = f"cat {data}/assembly.fasta > {output_dir}/assembly.fasta"
++        multiplier = 100
++        for i in range(multiplier):
++            cmd += f" && awk '/^>/ {{print $0 \"{i}\"}} !/^>/ {{print $0}}' {data}/assembly.fasta >> {output_dir}/assembly.fasta"
++
++        subprocess.run(cmd, shell=True, check=True)
++
++        cmd = (
++            f"aviary recover "
++            f"--assembly {output_dir}/assembly.fasta "
++            f"-o {output_dir}/aviary_out "
++            f"-1 {data}/wgsim.1.fq.gz "
++            f"-2 {data}/wgsim.2.fq.gz "
++            f"--binning-only "
++            f"--skip-binners rosella semibin metabat vamb "
++            f"--extra-binners comebin "
++            f"--skip-qc "
++            f"--refinery-max-iterations 0 "
++            f"--conda-prefix {path_to_conda} "
++            f"-n 32 -t 32 "
++        )
++        subprocess.run(cmd, shell=True, check=True)
++
++        bin_info_path = f"{output_dir}/aviary_out/bins/bin_info.tsv"
++        self.assertTrue(os.path.isfile(bin_info_path))
++        with open(bin_info_path) as f:
++            num_lines = sum(1 for _ in f)
++        self.assertTrue(num_lines > 2)
++
++        self.assertFalse(os.path.isfile(f"{output_dir}/aviary_out/data/final_contigs.fasta"))
++
+     @unittest.skip("Skipping test due to queue submission")
+     def test_short_read_recovery_queue_submission(self):
+         output_dir = os.path.join("example", "test_short_read_recovery_queue_submission")

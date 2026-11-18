@@ -1,0 +1,898 @@
+diff --git a/metagraph/docs/source/quick_start.rst b/metagraph/docs/source/quick_start.rst
+index a353ba77e6..daec1719e5 100644
+--- a/metagraph/docs/source/quick_start.rst
++++ b/metagraph/docs/source/quick_start.rst
+@@ -858,6 +858,32 @@ that is, all leaves (original labels) directly connected to the root of the BRWT
+ 
+ For further examples on real data, see `<https://github.com/ratschlab/counting_dbg/blob/master/scripts.md#index-with-k-mer-counts>`_.
+ 
++Move an annotation to another graph with the same k-mers
++""""""""""""""""""""""""""""""""""""""""""""""""""""""""
++A ``brwt`` or ``row_diff_brwt`` annotation can be moved to another graph with the same k-mers, such as an SSHash graph built from the unitigs of a succinct graph.
++This avoids annotating the new graph again from the input sequences.
++Both graphs must be in ``basic`` mode.
++Pass the graph that the annotation was built for with ``--remap-graph`` and the new graph with ``-i``::
++
++    metagraph transform_anno -v -p 36 --remap-graph graph.dbg -i graph.sshashdbg \
++                             -o moved annotation.row_diff_brwt.annodbg
++
++The result keeps the labels and the relations of every k-mer, and without conversion also the BRWT tree.
++Rows without a k-mer, such as the dummy nodes of a succinct graph, are dropped.
++The command stops with an error if the graphs differ in any k-mer.
++For ``row_diff_brwt``, it also stops if a row that is not an anchor would lose its successor.
++
++A ``row_diff_brwt`` annotation can be converted to ``row_diff_flat`` or ``row_diff_disk`` in the same run with ``--anno-type``.
++This skips writing and loading the intermediate ``row_diff_brwt`` file::
++
++    metagraph transform_anno -v -p 36 --remap-graph graph.dbg -i graph.sshashdbg \
++                             --anno-type row_diff_disk -o moved annotation.row_diff_brwt.annodbg
++
++The command saves the matching of rows as ``moved.rowmap``.
++A repeated run with the same output name reuses this file and skips matching the rows again.
++Before reusing it, the command checks a sample of rows against both graphs and stops if they no longer match.
++Delete the file after changing either graph.
++
+ .. _query_index:
+ 
+ Query index
+diff --git a/metagraph/integration_tests/test_remap_anno.py b/metagraph/integration_tests/test_remap_anno.py
+new file mode 100644
+index 0000000000..0942fad380
+--- /dev/null
++++ b/metagraph/integration_tests/test_remap_anno.py
+@@ -0,0 +1,155 @@
++import unittest
++from parameterized import parameterized
++import subprocess
++from subprocess import PIPE
++from tempfile import TemporaryDirectory
++import os
++from base import PROTEIN_MODE, TestingBase, METAGRAPH, MMAP_FLAG
++
++"""Test moving annotation rows from a succinct graph to an SSHash graph"""
++
++TEST_DATA_DIR = os.path.dirname(os.path.realpath(__file__)) + '/../tests/data'
++INPUT = TEST_DATA_DIR + '/transcripts_100.fa'
++NUM_THREADS = 4
++K = 21
++
++anno_file_extension = {'brwt': '.brwt.annodbg',
++                       'row_diff_brwt': '.row_diff_brwt.annodbg',
++                       'row_diff_flat': '.row_diff_flat.annodbg',
++                       'row_diff_disk': '.row_diff_disk.annodbg'}
++
++
++@unittest.skipIf(PROTEIN_MODE, 'SSHash graphs need DNA')
++class TestRemapAnnotation(TestingBase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tempdir = TemporaryDirectory()
++        cls.source = cls.tempdir.name + '/graph.dbg'
++        cls.target = cls.tempdir.name + '/graph.sshashdbg'
++        # Keep dummy nodes unmasked so that the source has rows without k-mers.
++        cls._build_graph(INPUT, cls.source, K, 'succinct', 'basic')
++        cls._build_sshash(INPUT, cls.target)
++
++        cls.partial_input = cls.tempdir.name + '/partial.fa'
++        with open(INPUT) as f:
++            records = f.read().split('>')[1:]
++        with open(cls.partial_input, 'w') as f:
++            f.write(''.join('>' + r for r in records[:50]))
++        cls.partial_target = cls.tempdir.name + '/partial.sshashdbg'
++        cls._build_sshash(cls.partial_input, cls.partial_target)
++
++    @staticmethod
++    def _build_sshash(input, output):
++        # SSHash needs each k-mer once, so build it from the unitigs of a succinct graph.
++        prefix = output.removesuffix('.sshashdbg')
++        TestingBase._build_graph(input, prefix + '_unitigs.dbg', K, 'succinct', 'basic')
++        TestingBase._run_command(
++            f'{METAGRAPH} transform -p {NUM_THREADS} --to-fasta -o {prefix}_unitigs'
++            f' {prefix}_unitigs.dbg', 'Transform command', shell=True)
++        TestingBase._run_command(
++            f'{METAGRAPH} build -p {NUM_THREADS} --mode basic --graph sshash'
++            f' -k {K} -o {output} {prefix}_unitigs.fasta.gz', 'Build command', shell=True)
++
++    def _query(self, graph, anno, mode):
++        res = subprocess.run(
++            f'{METAGRAPH} query --query-mode {mode} -i {graph} -a {anno} {INPUT}' + MMAP_FLAG,
++            shell=True, stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        return sorted(res.stdout.decode().splitlines())
++
++    def _remap(self, anno, out, target, anno_type=None):
++        anno_type_flag = f' --anno-type {anno_type}' if anno_type else ''
++        return subprocess.run(
++            f'{METAGRAPH} transform_anno -p {NUM_THREADS} --remap-graph {self.source}'
++            f' -i {target}{anno_type_flag} -o {out} {anno}',
++            shell=True, stdout=PIPE, stderr=PIPE)
++
++    @parameterized.expand([
++        ('row_diff_brwt', False),
++        ('row_diff_brwt', True),
++        ('brwt', False),
++    ])
++    def test_remap_to_sshash(self, anno_repr, no_fork_opt):
++        prefix = f'{self.tempdir.name}/{anno_repr}_{int(no_fork_opt)}'
++        self._annotate_graph(INPUT, self.source, prefix, anno_repr,
++                             no_fork_opt=no_fork_opt, num_threads=NUM_THREADS)
++        anno = prefix + anno_file_extension[anno_repr]
++        out = prefix + '_remapped'
++        out_anno = out + anno_file_extension[anno_repr]
++
++        res = self._remap(anno, out, self.target)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++
++        stats = self._get_stats(f'-a {out_anno}')
++        self.assertEqual(stats['returncode'], 0)
++        self.assertEqual(stats['labels'], '100')
++        target_stats = self._get_stats(self.target)
++        self.assertEqual(stats['objects'], target_stats['nodes (k)'])
++
++        for mode in ['labels', 'matches', 'signature']:
++            expected = self._query(self.source, anno, mode)
++            self.assertEqual(len(expected), 100)
++            self.assertTrue(all(line.split('\t')[-1] for line in expected))
++            self.assertEqual(expected, self._query(self.target, out_anno, mode))
++
++        # A second run reuses the saved row map and writes the same annotation.
++        with open(out_anno, 'rb') as f:
++            first = f.read()
++        self.assertTrue(os.path.exists(out + '.rowmap'))
++        res = self._remap(anno, out, self.target)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        with open(out_anno, 'rb') as f:
++            self.assertEqual(first, f.read())
++
++        # The saved row map belongs to the first target and is rejected for another one.
++        res = self._remap(anno, out, self.partial_target)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('does not match', res.stderr.decode() + res.stdout.decode())
++
++    @parameterized.expand(['row_diff_flat', 'row_diff_disk'])
++    def test_remap_and_convert(self, anno_type):
++        prefix = f'{self.tempdir.name}/convert_{anno_type}'
++        self._annotate_graph(INPUT, self.source, prefix, 'row_diff_brwt',
++                             num_threads=NUM_THREADS)
++        anno = prefix + anno_file_extension['row_diff_brwt']
++        out = prefix + '_remapped'
++        out_anno = out + anno_file_extension[anno_type]
++
++        res = self._remap(anno, out, self.target, anno_type)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        self.assertFalse(os.path.exists(out + anno_file_extension['row_diff_brwt']))
++
++        stats = self._get_stats(f'-a {out_anno}')
++        self.assertEqual(stats['returncode'], 0)
++        self.assertEqual(stats['objects'], self._get_stats(self.target)['nodes (k)'])
++        for mode in ['labels', 'matches']:
++            self.assertEqual(self._query(self.source, anno, mode),
++                             self._query(self.target, out_anno, mode))
++
++    @parameterized.expand([
++        ('brwt', 'row_diff_flat'),
++        ('row_diff_brwt', 'column'),
++        ('row_diff_brwt', 'brwt'),
++    ])
++    def test_remap_rejects_conversion(self, anno_repr, anno_type):
++        prefix = f'{self.tempdir.name}/reject_{anno_repr}_{anno_type}'
++        self._annotate_graph(INPUT, self.source, prefix, anno_repr,
++                             num_threads=NUM_THREADS)
++        res = self._remap(prefix + anno_file_extension[anno_repr],
++                          prefix + '_remapped', self.target, anno_type)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('--anno-type' if anno_repr == 'row_diff_brwt' else 'can convert only',
++                      res.stderr.decode() + res.stdout.decode())
++
++    def test_remap_rejects_different_kmers(self):
++        prefix = f'{self.tempdir.name}/mismatch'
++        self._annotate_graph(INPUT, self.source, prefix, 'row_diff_brwt',
++                             num_threads=NUM_THREADS)
++        res = self._remap(prefix + anno_file_extension['row_diff_brwt'],
++                          prefix + '_remapped', self.partial_target)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('different k-mers', res.stderr.decode() + res.stdout.decode())
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/metagraph/src/annotation/annotation_remap.cpp b/metagraph/src/annotation/annotation_remap.cpp
+new file mode 100644
+index 0000000000..1453716c75
+--- /dev/null
++++ b/metagraph/src/annotation/annotation_remap.cpp
+@@ -0,0 +1,201 @@
++#include "annotation_remap.hpp"
++
++#include <atomic>
++#include <mutex>
++#include <stdexcept>
++
++#include "annotation/binary_matrix/multi_brwt/brwt.hpp"
++#include "annotation/binary_matrix/row_diff/row_diff.hpp"
++#include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
++#include "common/logger.hpp"
++#include "common/threads/threading.hpp"
++#include "common/vectors/vector_algorithm.hpp"
++#include "graph/representation/succinct/dbg_succinct.hpp"
++
++
++namespace mtg {
++namespace annot {
++
++using graph::DeBruijnGraph;
++using node_index = DeBruijnGraph::node_index;
++using mtg::common::logger;
++
++static uint64_t width_for(uint64_t max_value) {
++    return max_value ? sdsl::bits::hi(max_value) + 1 : 1;
++}
++
++sdsl::int_vector<> map_rows_to_graph(const DeBruijnGraph &source,
++                                     const DeBruijnGraph &target,
++                                     size_t num_threads) {
++    if (source.get_mode() != DeBruijnGraph::BASIC
++            || target.get_mode() != DeBruijnGraph::BASIC)
++        throw std::invalid_argument("Row remapping supports only graphs in basic mode");
++
++    if (source.get_k() != target.get_k())
++        throw std::invalid_argument("Row remapping needs graphs with the same k");
++
++    const uint64_t num_target_rows = target.max_index();
++    sdsl::int_vector<> row_map(source.max_index(), 0, width_for(num_target_rows));
++    sdsl::bit_vector found(num_target_rows, false);
++
++    // Entries of row_map are packed, so concurrent writes are guarded by a lock
++    // per block. A block of 2^12 entries spans a whole number of 64-bit words.
++    constexpr uint64_t kBlockBits = 12;
++    constexpr uint64_t kNumLocks = 1 << 12;
++    std::unique_ptr<std::mutex[]> locks(new std::mutex[kNumLocks]);
++
++    std::atomic<uint64_t> num_mapped(0);
++    std::atomic<uint64_t> num_missing(0);
++    std::atomic<uint64_t> num_repeated(0);
++
++    source.call_sequences([&](const std::string &sequence, const std::vector<node_index> &path) {
++        uint64_t mapped = 0;
++        uint64_t missing = 0;
++        uint64_t repeated = 0;
++        size_t i = 0;
++        target.map_to_nodes_sequentially(sequence, [&](node_index target_node) {
++            node_index source_node = path.at(i++);
++            if (!target_node) {
++                ++missing;
++                return;
++            }
++            if (fetch_and_set_bit(found.data(), target_node - 1, true,
++                                  std::memory_order_relaxed)) {
++                ++repeated;
++                return;
++            }
++            uint64_t row = source_node - 1;
++            std::lock_guard<std::mutex> lock(locks[(row >> kBlockBits) % kNumLocks]);
++            row_map[row] = target_node;
++            ++mapped;
++        });
++        num_mapped += mapped;
++        num_missing += missing;
++        num_repeated += repeated;
++    }, num_threads);
++
++    if (num_missing || num_repeated || num_mapped != target.num_nodes()) {
++        throw std::runtime_error(fmt::format(
++            "The graphs have different k-mers: {} source k-mers are missing from the"
++            " target graph, {} target nodes were matched more than once, and {} of"
++            " {} target nodes were matched",
++            num_missing.load(), num_repeated.load(), num_mapped.load(), target.num_nodes()));
++    }
++
++    logger->trace("Matched {} of {} source rows to target rows",
++                  num_mapped.load(), source.max_index());
++    return row_map;
++}
++
++bool check_row_map(const DeBruijnGraph &source,
++                   const DeBruijnGraph &target,
++                   const sdsl::int_vector<> &row_map,
++                   uint64_t num_samples) {
++    if (row_map.size() != source.max_index())
++        return false;
++
++    uint64_t num_kept = 0;
++    uint64_t max_target_row = 0;
++    #pragma omp parallel for num_threads(get_num_threads()) reduction(+:num_kept) reduction(max:max_target_row)
++    for (uint64_t row = 0; row < row_map.size(); ++row) {
++        num_kept += row_map[row] != 0;
++        max_target_row = std::max<uint64_t>(max_target_row, row_map[row]);
++    }
++    if (num_kept != target.num_nodes() || max_target_row > target.max_index())
++        return false;
++
++    const uint64_t step = std::max<uint64_t>(1, row_map.size() / std::max<uint64_t>(1, num_samples));
++    for (uint64_t row = 0; row < row_map.size(); row += step) {
++        if (row_map[row] && target.kmer_to_node(source.get_node_sequence(row + 1)) != row_map[row])
++            return false;
++    }
++    return true;
++}
++
++std::unique_ptr<MultiLabelAnnotation<std::string>>
++remap_annotation_rows(const MultiLabelAnnotation<std::string> &annotation,
++                      const DeBruijnGraph &source,
++                      const sdsl::int_vector<> &row_map,
++                      uint64_t target_num_rows,
++                      size_t num_threads) {
++    using matrix::BRWT;
++    using matrix::RowDiff;
++
++    if (annotation.get_matrix().num_rows() != row_map.size())
++        throw std::invalid_argument("The row map does not match the annotation's rows");
++
++    uint64_t max_target_row = 0;
++    #pragma omp parallel for num_threads(std::max<size_t>(1, num_threads)) reduction(max:max_target_row)
++    for (uint64_t row = 0; row < row_map.size(); ++row) {
++        max_target_row = std::max<uint64_t>(max_target_row, row_map[row]);
++    }
++    if (max_target_row > target_num_rows)
++        throw std::invalid_argument("The row map points past the end of the target graph");
++
++    const auto &label_encoder = annotation.get_label_encoder();
++
++    if (const auto *brwt = dynamic_cast<const MultiBRWTAnnotator *>(&annotation)) {
++        auto matrix = brwt->get_matrix().remap_rows(row_map, target_num_rows, num_threads);
++        return std::make_unique<MultiBRWTAnnotator>(std::move(matrix), label_encoder);
++    }
++
++    const auto *row_diff = dynamic_cast<const RowDiffBRWTAnnotator *>(&annotation);
++    if (!row_diff)
++        throw std::invalid_argument("Row remapping supports only brwt and row_diff_brwt annotations");
++
++    const RowDiff<BRWT> &matrix = row_diff->get_matrix();
++    const auto &anchor = matrix.anchor();
++    const auto &fork_succ = matrix.fork_succ();
++
++    if (anchor.size() != row_map.size())
++        throw std::invalid_argument("The annotation has no anchors for every row");
++
++    if (!fork_succ.size() && !dynamic_cast<const graph::DBGSuccinct *>(&source))
++        throw std::invalid_argument("The annotation has no successor bitmap, which is"
++                                    " needed for graphs other than succinct");
++
++    // Keep each row's successor from the source graph. Successors are marked by
++    // node index, so the bitmap has one extra entry.
++    sdsl::bit_vector new_anchor(target_num_rows, false);
++    sdsl::bit_vector new_succ(target_num_rows + 1, false);
++    std::atomic<uint64_t> num_lost_successors(0);
++
++    #pragma omp parallel for num_threads(std::max<size_t>(1, num_threads)) schedule(static, 1 << 20)
++    for (uint64_t row = 0; row < row_map.size(); ++row) {
++        uint64_t target_row = row_map[row];
++        if (!target_row)
++            continue;
++
++        if (anchor[row]) {
++            set_bit(new_anchor.data(), target_row - 1, true, std::memory_order_relaxed);
++            continue;
++        }
++
++        node_index succ = row_diff_successor(source, row + 1, fork_succ);
++        uint64_t target_succ = succ && succ <= row_map.size() ? row_map[succ - 1] : 0;
++        if (!target_succ) {
++            ++num_lost_successors;
++            continue;
++        }
++        set_bit(new_succ.data(), target_succ, true, std::memory_order_relaxed);
++    }
++
++    if (num_lost_successors) {
++        throw std::runtime_error(fmt::format(
++            "{} rows that are not anchors have a dropped row-diff successor",
++            num_lost_successors.load()));
++    }
++
++    auto diffs = matrix.diffs().remap_rows(row_map, target_num_rows, num_threads);
++    logger->trace("Remapped row-diff matrix: {} of {} relations kept",
++                  diffs->num_relations(), matrix.diffs().num_relations());
++
++    auto result = std::make_unique<RowDiff<BRWT>>(nullptr, std::move(*diffs));
++    result->set_anchor(matrix::IRowDiff::anchor_bv_type(std::move(new_anchor)));
++    result->set_fork_succ(matrix::IRowDiff::fork_succ_bv_type(std::move(new_succ)));
++
++    return std::make_unique<RowDiffBRWTAnnotator>(std::move(result), label_encoder);
++}
++
++} // namespace annot
++} // namespace mtg
+diff --git a/metagraph/src/annotation/annotation_remap.hpp b/metagraph/src/annotation/annotation_remap.hpp
+new file mode 100644
+index 0000000000..f654790384
+--- /dev/null
++++ b/metagraph/src/annotation/annotation_remap.hpp
+@@ -0,0 +1,60 @@
++#ifndef __ANNOTATION_REMAP_HPP__
++#define __ANNOTATION_REMAP_HPP__
++
++#include <memory>
++#include <string>
++
++#include <sdsl/int_vector.hpp>
++
++
++namespace mtg {
++
++namespace graph {
++class DeBruijnGraph;
++} // namespace graph
++
++namespace annot {
++
++template <typename Label>
++class MultiLabelAnnotation;
++
++/**
++ * Match the annotation rows of `source` to the rows of `target` by k-mer.
++ * Both graphs must be in BASIC mode and contain the same k-mers. Source nodes
++ * that do not represent a k-mer, such as the dummy nodes of a succinct graph,
++ * are dropped.
++ *
++ * Returns a vector with source.max_index() entries. Entry r holds the target row
++ * + 1 for source row r, or 0 if the row is dropped.
++ */
++sdsl::int_vector<> map_rows_to_graph(const graph::DeBruijnGraph &source,
++                                     const graph::DeBruijnGraph &target,
++                                     size_t num_threads = 1);
++
++/**
++ * Check a saved row map against both graphs. Returns false if the row counts
++ * differ, or if a kept row maps to another target row than its k-mer. The
++ * k-mer check covers num_samples evenly spaced rows and skips dropped ones.
++ */
++bool check_row_map(const graph::DeBruijnGraph &source,
++                   const graph::DeBruijnGraph &target,
++                   const sdsl::int_vector<> &row_map,
++                   uint64_t num_samples = 10000);
++
++/**
++ * Move the rows of a BRWT or RowDiff<BRWT> annotation built for `source` to a graph
++ * with target_num_rows rows, using a row map from map_rows_to_graph. The BRWT
++ * topology and column order are kept. For RowDiff, every kept row keeps its
++ * successor in `source`, which is stored as a successor bitmap for the target graph.
++ */
++std::unique_ptr<MultiLabelAnnotation<std::string>>
++remap_annotation_rows(const MultiLabelAnnotation<std::string> &annotation,
++                      const graph::DeBruijnGraph &source,
++                      const sdsl::int_vector<> &row_map,
++                      uint64_t target_num_rows,
++                      size_t num_threads = 1);
++
++} // namespace annot
++} // namespace mtg
++
++#endif // __ANNOTATION_REMAP_HPP__
+diff --git a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
+index 0e061665ea..189281ee8b 100644
+--- a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
++++ b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.cpp
+@@ -2,8 +2,10 @@
+ 
+ #include <queue>
+ #include <numeric>
++#include <mutex>
+ 
+ #include <progress_bar.hpp>
++#include <sdsl/int_vector_buffer.hpp>
+ 
+ #include "common/algorithms.hpp"
+ #include "common/serialization.hpp"
+@@ -595,6 +597,108 @@ void BRWT::BFT(std::function<void(const BRWT &node)> callback) const {
+     }
+ }
+ 
++
++namespace {
++
++// Remap the index of one node. Returns, for every set bit of the old index in
++// order, its new rank + 1 among the set bits of the new index (0 if dropped).
++// This is the row map of the node's children. Returns an empty vector for leaves.
++template <class RowMap>
++sdsl::int_vector<> remap_index(const bit_vector &old_index, RowMap &new_row,
++                               uint64_t num_new_rows, bool leaf,
++                               std::unique_ptr<bit_vector> *new_index) {
++    sdsl::bit_vector buffer(num_new_rows, false);
++    sdsl::int_vector<> child_row;
++    if (!leaf) {
++        child_row = sdsl::int_vector<>(old_index.num_set_bits(), 0,
++                                       num_new_rows ? sdsl::bits::hi(num_new_rows) + 1 : 1);
++    }
++    uint64_t r = 0;
++    old_index.call_ones([&](uint64_t i) {
++        uint64_t v = new_row[i];
++        if (v) {
++            if (v > num_new_rows)
++                throw std::runtime_error("BRWT row remap: target row out of range");
++            if (buffer[v - 1])
++                throw std::runtime_error("BRWT row remap: two rows map to the same row");
++            buffer[v - 1] = true;
++        }
++        if (!leaf)
++            child_row[r] = v;
++        ++r;
++    });
++
++    *new_index = std::make_unique<bit_vector_smallrank>(std::move(buffer));
++
++    for (uint64_t j = 0; j < child_row.size(); ++j) {
++        if (uint64_t v = child_row[j])
++            child_row[j] = (*new_index)->rank1(v - 1);
++    }
++    return child_row;
++}
++
++} // namespace
++
++template <class RowMap>
++std::unique_ptr<BRWT> BRWT::remap_rows(RowMap &new_row, uint64_t num_new_rows,
++                                       size_t num_threads) const {
++    auto result = std::make_unique<BRWT>();
++
++    // The root map can be large and is read sequentially, in a single thread.
++    auto child_row = std::make_shared<const sdsl::int_vector<>>(
++        remap_index(*nonzero_rows_, new_row, num_new_rows, child_nodes_.empty(),
++                    &result->nonzero_rows_));
++
++    std::mutex error_mutex;
++    std::exception_ptr error;
++
++    std::function<void(const BRWT *, BRWT *, std::shared_ptr<const sdsl::int_vector<>>)> remap_children
++        = [&](const BRWT *source, BRWT *target, std::shared_ptr<const sdsl::int_vector<>> rows) {
++        target->assignments_ = source->assignments_;
++        if (source->child_nodes_.empty())
++            return;
++
++        uint64_t num_child_rows = target->nonzero_rows_->num_set_bits();
++        target->child_nodes_.resize(source->child_nodes_.size());
++        for (size_t c = 0; c < source->child_nodes_.size(); ++c) {
++            target->child_nodes_[c] = std::make_unique<BRWT>();
++            const BRWT *child = source->child_nodes_[c].get();
++            BRWT *new_child = target->child_nodes_[c].get();
++            #pragma omp task firstprivate(rows, child, new_child, num_child_rows) \
++                             shared(remap_children, error, error_mutex)
++            {
++                try {
++                    auto grandchild_rows = std::make_shared<const sdsl::int_vector<>>(
++                        remap_index(*child->nonzero_rows_, *rows, num_child_rows,
++                                    child->child_nodes_.empty(), &new_child->nonzero_rows_));
++                    rows.reset();
++                    remap_children(child, new_child, std::move(grandchild_rows));
++                } catch (...) {
++                    std::lock_guard<std::mutex> lock(error_mutex);
++                    if (!error)
++                        error = std::current_exception();
++                }
++            }
++        }
++    };
++
++    #pragma omp parallel num_threads(std::max<size_t>(1, num_threads))
++    #pragma omp single
++    remap_children(this, result.get(), std::move(child_row));
++
++    if (error)
++        std::rethrow_exception(error);
++
++    return result;
++}
++
++template std::unique_ptr<BRWT>
++BRWT::remap_rows(sdsl::int_vector<> &, uint64_t, size_t) const;
++template std::unique_ptr<BRWT>
++BRWT::remap_rows(sdsl::int_vector_buffer<> &, uint64_t, size_t) const;
++template std::unique_ptr<BRWT>
++BRWT::remap_rows(const sdsl::int_vector<> &, uint64_t, size_t) const;
++
+ } // namespace matrix
+ } // namespace annot
+ } // namespace mtg
+diff --git a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
+index 3bc2848e82..6ce1181cb7 100644
+--- a/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
++++ b/metagraph/src/annotation/binary_matrix/multi_brwt/brwt.hpp
+@@ -83,6 +83,21 @@ class BRWT : public BinaryMatrix, public GetEntrySupport {
+                      ThreadPool *thread_pool = nullptr,
+                      bool adaptive_chunk_size = true) const;
+ 
++  public:
++    /**
++     * Return a copy of this matrix with its rows moved to new positions.
++     * Row i moves to row new_row[i] - 1, or is dropped if new_row[i] == 0.
++     * The mapping must be injective on the rows it keeps, and new_row must
++     * have num_rows() entries, accessed in increasing order at the root.
++     * The tree topology and column assignments are preserved.
++     * RowMap is instantiated in brwt.cpp for sdsl::int_vector<> (const or not)
++     * and sdsl::int_vector_buffer<>.
++     */
++    template <class RowMap>
++    std::unique_ptr<BRWT> remap_rows(RowMap &new_row, uint64_t num_new_rows,
++                                     size_t num_threads = 1) const;
++
++  private:
+     // assigns columns to the child nodes
+     RangePartition assignments_;
+     std::unique_ptr<bit_vector> nonzero_rows_;
+diff --git a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+index c559f616a1..8a642e8ed7 100644
+--- a/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
++++ b/metagraph/src/annotation/binary_matrix/row_diff/row_diff.hpp
+@@ -53,6 +53,9 @@ class IRowDiff {
+ 
+     const fork_succ_bv_type& fork_succ() const { return fork_succ_; }
+ 
++    void set_anchor(anchor_bv_type&& anchor) { anchor_ = std::move(anchor); }
++    void set_fork_succ(fork_succ_bv_type&& fork_succ) { fork_succ_ = std::move(fork_succ); }
++
+   protected:
+     template <std::derived_from<BinaryMatrix> Matrix>
+     std::vector<BinaryMatrix::Row>
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index e5eee6f7f7..b702756fdd 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -126,6 +126,7 @@ Config::Config(int argc, char *argv[]) {
+     };
+ 
+     bool print_usage_and_exit = false;
++    bool anno_type_given = false;
+     bool xdrop_override = false;
+ 
+     // parse remaining command line items
+@@ -350,10 +351,13 @@ Config::Config(int argc, char *argv[]) {
+ 
+         } else if (!strcmp(argv[i], "--anno-type")) {
+             anno_type = string_to_annotype(get_value(i++));
++            anno_type_given = true;
+         } else if (!strcmp(argv[i], "--graph")) {
+             graph_type = string_to_graphtype(get_value(i++));
+         } else if (!strcmp(argv[i], "--rename-cols")) {
+             rename_instructions_file = std::string(get_value(i++));
++        } else if (!strcmp(argv[i], "--remap-graph")) {
++            remap_graph = std::string(get_value(i++));
+         } else if (!strcmp(argv[i], "-a") || !strcmp(argv[i], "--annotator")) {
+             infbase_annotators.emplace_back(get_value(i++));
+         } else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--infile-base")) {
+@@ -648,7 +652,19 @@ Config::Config(int argc, char *argv[]) {
+                     && outfbase.empty())
+         print_usage_and_exit = true;
+ 
+-    if (identity == TRANSFORM_ANNOTATION) {
++    if (identity == TRANSFORM_ANNOTATION && remap_graph.size()) {
++        if (infbase.empty() || fnames.size() != 1) {
++            std::cerr << "--remap-graph needs one annotation and the target graph"
++                         " passed with '-i <GRAPH>'" << std::endl;
++            print_usage_and_exit = true;
++        }
++        if (anno_type_given && anno_type != RowDiffRowFlat && anno_type != RowDiffDisk) {
++            std::cerr << "With --remap-graph, --anno-type can only be "
++                      << annotype_to_string(RowDiffRowFlat) << " or "
++                      << annotype_to_string(RowDiffDisk) << std::endl;
++            print_usage_and_exit = true;
++        }
++    } else if (identity == TRANSFORM_ANNOTATION) {
+         const bool to_row_diff = anno_type == RowDiff
+                                     || anno_type == RowDiffBRWT
+                                     || anno_type == RowDiffDisk
+@@ -1330,6 +1346,11 @@ if (advanced) {
+             fprintf(stderr, "\t                       \t          L_2 L_2_renamed\n");
+             fprintf(stderr, "\t                       \t          L_2 L_2_renamed\n");
+             fprintf(stderr, "\t                       \t          ... ...........'\n");
++            fprintf(stderr, "\t   --remap-graph [STR] \tmove the rows of a brwt or row_diff_brwt annotation built for this graph\n");
++            fprintf(stderr, "\t                       \tto the graph given with -i, matching nodes by k-mer. Both graphs must be\n");
++            fprintf(stderr, "\t                       \tin basic mode and have the same k-mers. The row map is saved as\n");
++            fprintf(stderr, "\t                       \t<OUT>.rowmap and reused if present. A row_diff_brwt annotation can be\n");
++            fprintf(stderr, "\t                       \tconverted in the same run with --anno-type row_diff_flat or row_diff_disk []\n");
+             fprintf(stderr, "\t   --anno-type [STR] \ttarget annotation format [column]\n");
+             fprintf(stderr, "%s\n", annotation_list);
+             fprintf(stderr, "\t   --arity \t\tarity in the brwt tree [2]\n");
+diff --git a/metagraph/src/cli/config/config.hpp b/metagraph/src/cli/config/config.hpp
+index 18cff74623..2667dacbda 100644
+--- a/metagraph/src/cli/config/config.hpp
++++ b/metagraph/src/cli/config/config.hpp
+@@ -161,6 +161,7 @@ class Config {
+     std::string outfbase;
+     std::string infbase;
+     std::string rename_instructions_file;
++    std::string remap_graph;
+     std::string refpath;
+     std::string suffix;
+     std::string fasta_header_delimiter;
+diff --git a/metagraph/src/cli/transform_annotation.cpp b/metagraph/src/cli/transform_annotation.cpp
+index ee930b9342..3b3b586975 100644
+--- a/metagraph/src/cli/transform_annotation.cpp
++++ b/metagraph/src/cli/transform_annotation.cpp
+@@ -1,5 +1,7 @@
+ #include "transform_annotation.hpp"
+ 
++#include <filesystem>
++
+ #include <progress_bar.hpp>
+ 
+ #include "common/logger.hpp"
+@@ -11,6 +13,8 @@
+ #include "annotation/representation/annotation_matrix/static_annotators_def.hpp"
+ #include "annotation/binary_matrix/multi_brwt/clustering.hpp"
+ #include "annotation/annotation_converters.hpp"
++#include "annotation/annotation_remap.hpp"
++#include "load/load_graph.hpp"
+ #include "config/config.hpp"
+ #include "load/load_annotation.hpp"
+ 
+@@ -311,6 +315,101 @@ int transform_annotation(Config *config) {
+ 
+     Timer timer;
+ 
++    /********************************************************/
++    /************** move rows to another graph **************/
++    /********************************************************/
++
++    if (config->remap_graph.size()) {
++        if (input_anno_type != Config::BRWT && input_anno_type != Config::RowDiffBRWT) {
++            logger->error("--remap-graph supports only {} and {} annotations",
++                          Config::annotype_to_string(Config::BRWT),
++                          Config::annotype_to_string(Config::RowDiffBRWT));
++            exit(1);
++        }
++
++        // Without --anno-type the input format is kept (checked in Config).
++        const bool convert = config->anno_type == Config::RowDiffRowFlat
++                                || config->anno_type == Config::RowDiffDisk;
++        if (convert && input_anno_type != Config::RowDiffBRWT) {
++            logger->error("--remap-graph can convert only {} annotations to {}",
++                          Config::annotype_to_string(Config::RowDiffBRWT),
++                          Config::annotype_to_string(config->anno_type));
++            exit(1);
++        }
++
++        // The row map is the expensive part, so keep it for a rerun.
++        const std::string row_map_fname = config->outfbase + ".rowmap";
++        sdsl::int_vector<> row_map;
++        uint64_t target_num_rows;
++
++        auto source = load_critical_dbg(config->remap_graph);
++        auto target = load_critical_dbg(config->infbase);
++        target_num_rows = target->max_index();
++
++        if (std::filesystem::exists(row_map_fname)) {
++            logger->trace("Loading row map from {}", row_map_fname);
++            std::ifstream in(row_map_fname, std::ios::binary);
++            row_map.load(in);
++            if (!in.good() || !check_row_map(*source, *target, row_map)) {
++                logger->error("Row map {} does not match graphs {} and {}. Delete it and run again",
++                              row_map_fname, config->remap_graph, config->infbase);
++                exit(1);
++            }
++        } else {
++            logger->trace("Matching rows of {} to {}...", config->remap_graph, config->infbase);
++            try {
++                row_map = map_rows_to_graph(*source, *target, get_num_threads());
++            } catch (const std::exception &e) {
++                logger->error("{}", e.what());
++                exit(1);
++            }
++
++            const std::string tmp_fname = row_map_fname + ".tmp";
++            std::ofstream out(tmp_fname, std::ios::binary);
++            row_map.serialize(out);
++            out.close();
++            if (!out) {
++                logger->error("Cannot write row map to {}", tmp_fname);
++                exit(1);
++            }
++            std::filesystem::rename(tmp_fname, row_map_fname);
++            logger->trace("Row map saved to {} in {} sec", row_map_fname, timer.elapsed());
++        }
++        target.reset();
++
++        auto annotation = initialize_annotation(files.at(0), *config);
++        if (!annotation->load(files.at(0))) {
++            logger->error("Cannot load annotation from {}", files.at(0));
++            exit(1);
++        }
++        logger->trace("Annotation loaded in {} sec", timer.elapsed());
++
++        std::unique_ptr<MultiLabelAnnotation<std::string>> remapped;
++        try {
++            remapped = remap_annotation_rows(*annotation, *source, row_map,
++                                             target_num_rows, get_num_threads());
++        } catch (const std::exception &e) {
++            logger->error("{}", e.what());
++            exit(1);
++        }
++        annotation.reset();
++        row_map = sdsl::int_vector<>();
++        source.reset();
++
++        if (!convert) {
++            remapped->serialize(config->outfbase);
++        } else if (config->anno_type == Config::RowDiffRowFlat) {
++            convert_to_row_diff<RowDiffRowFlatAnnotator>(
++                    dynamic_cast<const RowDiffBRWTAnnotator &>(*remapped), config->outfbase);
++        } else {
++            convert_to_row_diff<RowDiffDiskAnnotator>(
++                    dynamic_cast<const RowDiffBRWTAnnotator &>(*remapped), config->outfbase);
++        }
++        logger->trace("Remapped annotation serialized to {} in {} sec",
++                      config->outfbase, timer.elapsed());
++        return 0;
++    }
++
+     /********************************************************/
+     /***************** dump labels to text ******************/
+     /********************************************************/
+diff --git a/metagraph/tests/annotation/test_matrix_BRWT.cpp b/metagraph/tests/annotation/test_matrix_BRWT.cpp
+index db1f1ad4cf..cac25bd74e 100644
+--- a/metagraph/tests/annotation/test_matrix_BRWT.cpp
++++ b/metagraph/tests/annotation/test_matrix_BRWT.cpp
+@@ -160,4 +160,64 @@ TYPED_TEST(BinaryMatrixBRWTTest, RowViewsAcrossChunkBoundaries) {
+     }
+ }
+ 
++TYPED_TEST(BinaryMatrixBRWTTest, RemapRows) {
++    constexpr size_t num_rows = 131;
++    constexpr size_t num_new_rows = 150;
++    constexpr size_t num_columns = 24;
++    BitVectorPtrArray columns;
++    for (size_t col = 0; col < num_columns; ++col) {
++        sdsl::bit_vector bits(num_rows, false);
++        for (size_t row = 0; row < num_rows; ++row) {
++            bits[row] = row % 13 && (row + col * 7) % 11 < 5;
++        }
++        columns.emplace_back(new bit_vector_stat(std::move(bits)));
++    }
++    auto matrix = build_matrix_from_columns<TypeParam>(std::move(columns));
++
++    // Move row r to row (r * 17) % num_new_rows and drop every tenth row.
++    // Entries hold the new row + 1, and 0 drops the row.
++    sdsl::int_vector<> new_row(num_rows, 0, 64);
++    for (size_t row = 0; row < num_rows; ++row) {
++        if (row % 10)
++            new_row[row] = row * 17 % num_new_rows + 1;
++    }
++
++    for (size_t num_threads : { 1, 4 }) {
++        auto remapped = matrix.remap_rows(new_row, num_new_rows, num_threads);
++        ASSERT_EQ(num_new_rows, remapped->num_rows());
++        ASSERT_EQ(num_columns, remapped->num_columns());
++
++        std::vector<BinaryMatrix::SetBitPositions> expected(num_new_rows);
++        for (size_t row = 0; row < num_rows; ++row) {
++            if (new_row[row])
++                expected[new_row[row] - 1] = matrix.get_rows(std::vector<BinaryMatrix::Row>{ row })[0];
++        }
++        uint64_t num_relations = 0;
++        for (size_t row = 0; row < num_new_rows; ++row) {
++            auto actual = remapped->get_rows(std::vector<BinaryMatrix::Row>{ row })[0];
++            std::sort(actual.begin(), actual.end());
++            std::sort(expected[row].begin(), expected[row].end());
++            EXPECT_EQ(expected[row], actual) << "row " << row << ", threads " << num_threads;
++            num_relations += expected[row].size();
++        }
++        EXPECT_EQ(num_relations, remapped->num_relations());
++    }
++}
++
++TYPED_TEST(BinaryMatrixBRWTTest, RemapRowsRejectsInvalidMap) {
++    BitVectorPtrArray columns;
++    columns.emplace_back(new bit_vector_stat({ 1, 0, 1, 1 }));
++    columns.emplace_back(new bit_vector_stat({ 0, 1, 1, 0 }));
++    auto matrix = build_matrix_from_columns<TypeParam>(std::move(columns));
++
++    sdsl::int_vector<> repeated(4, 0, 8);
++    repeated[0] = 1;
++    repeated[1] = 1;
++    EXPECT_THROW(matrix.remap_rows(repeated, 4), std::runtime_error);
++
++    sdsl::int_vector<> out_of_range(4, 0, 8);
++    out_of_range[2] = 5;
++    EXPECT_THROW(matrix.remap_rows(out_of_range, 4), std::runtime_error);
++}
++
+ } // namespace

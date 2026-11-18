@@ -1,0 +1,299 @@
+diff --git a/environment.yml b/environment.yml
+index 8f94ca27..ebe0b823 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -8,4 +8,4 @@ dependencies:
+   - biopython # Needed for building test data
+   - kraken2 # Needed for building test data
+   - semantic_version
+-  - python=3.10
++  - python>=3.10
+diff --git a/setup.py b/setup.py
+index 851d9614..b19e5b66 100644
+--- a/setup.py
++++ b/setup.py
+@@ -3,7 +3,7 @@
+ setup(
+     name="sunbeam",
+     setup_requires=['setuptools'],
+-    install_requires=['pysam', 'semantic_version', 'pytest'],
++    install_requires=['more-itertools', 'semantic_version', 'pytest'],
+     packages=find_packages(),
+     include_package_data=True,
+     package_data={"sunbeamlib": ["sunbeamlib/data/*.yml", "sunbeamlib/data/*.yaml"]},
+diff --git a/sunbeamlib/__init__.py b/sunbeamlib/__init__.py
+index 6c79aba7..f29fe462 100755
+--- a/sunbeamlib/__init__.py
++++ b/sunbeamlib/__init__.py
+@@ -7,12 +7,9 @@
+ import csv
+ 
+ from pathlib import Path
+-from pkg_resources import get_distribution
+ 
+ from semantic_version import Version
+-from snakemake.utils import listfiles
+-from snakemake.workflow import expand
+-from Bio import SeqIO
++from sunbeamlib.parse import parse_fasta
+ 
+ __version__ = str(Version.coerce(os.environ.get("SUNBEAM_VER", "0.0.0")))
+ 
+@@ -165,4 +162,5 @@ def read_seq_ids(fasta_fp):
+     """
+     Return the sequence identifiers for a given fasta filename.
+     """
+-    return [record.id for record in SeqIO.parse(str(fasta_fp), "fasta")]
++    with open(str(fasta_fp)) as f:
++        return list(parse_fasta(f))
+diff --git a/sunbeamlib/decontam.py b/sunbeamlib/decontam.py
+deleted file mode 100644
+index 7113e912..00000000
+--- a/sunbeamlib/decontam.py
++++ /dev/null
+@@ -1,42 +0,0 @@
+-import pysam
+-import sys
+-
+-
+-def get_mapped_reads(fp, min_pct_id, min_len_frac, log):
+-    log.write(
+-        f"Running get_mapped_reads on {fp} with min_pct_id = {min_pct_id} and min_len_frac = {min_len_frac}\n"
+-    )
+-    sam = pysam.AlignmentFile(fp)
+-    count = 0
+-    count_ret = 0
+-    for read in sam:
+-        count += 1
+-        if (
+-            (not read.is_unmapped)
+-            and (_get_frac(read) > min_len_frac)
+-            and (_get_pct_identity(read) > min_pct_id)
+-        ):
+-            count_ret += 1
+-            yield read.query_name
+-
+-    log.write(f"Total reads processed: {count}\n")
+-    log.write(f"Total reads used: {count_ret}\n")
+-
+-
+-def _get_pct_identity(read):
+-    if read.has_tag("NM"):
+-        edit_dist = read.get_tag("NM")
+-    else:
+-        edit_dist = 0
+-    pct_mm = float(edit_dist) / read.alen
+-    return 1 - pct_mm
+-
+-
+-def _get_frac(read):
+-    cigar = read.cigartuples
+-    clip = 0
+-    for pair in cigar:
+-        if pair[0] == 4 or pair[0] == 5:
+-            clip = clip + pair[1]
+-    frac = float(read.query_alignment_length) / (read.query_alignment_length + clip)
+-    return frac
+diff --git a/sunbeamlib/parse.py b/sunbeamlib/parse.py
+new file mode 100755
+index 00000000..0aca8cf6
+--- /dev/null
++++ b/sunbeamlib/parse.py
+@@ -0,0 +1,33 @@
++from itertools import groupby
++from more_itertools import grouper
++
++# Source: https://www.biostars.org/p/710/
++def parse_fasta(f):
++    faiter = (x[1] for x in groupby(f, lambda line: line[0] == ">"))
++
++    for header in faiter:
++        # drop the ">"
++        header_str = header.__next__()[1:].strip()
++
++        # join all sequence lines to one.
++        seq_str = "".join(s.strip() for s in faiter.__next__())
++
++        yield (header_str, seq_str)
++
++
++def parse_fastq(f):
++    for g in grouper(f.readlines(), 4):
++        header_str = g[0][1:].strip()
++        seq_str = g[1].strip()
++        plus_str = g[2].strip()
++        quality_str = g[3].strip()
++
++        yield (header_str, seq_str, plus_str, quality_str)
++
++
++def write_fastq(record, f):
++    for i, l in enumerate(record):
++        if i == 0:
++            f.write(f"@{l}\n")
++        else:
++            f.write(f"{l}\n")
+diff --git a/sunbeamlib/qc.py b/sunbeamlib/qc.py
+index cc385030..6b36b567 100644
+--- a/sunbeamlib/qc.py
++++ b/sunbeamlib/qc.py
+@@ -4,7 +4,7 @@
+ 
+ import gzip
+ import re
+-from Bio import SeqIO
++from sunbeamlib.parse import parse_fastq, write_fastq
+ 
+ 
+ def strip_seq_id_suffix(fp_in, fp_out, suffix_pattern):
+@@ -24,9 +24,22 @@ def strip_seq_id_suffix(fp_in, fp_out, suffix_pattern):
+             f_out = gzip.open(fp_out, "wt")
+         else:
+             f_out = open(fp_out, "w")
+-        for record in SeqIO.parse(f_in, "fastq"):
+-            record.id = re.sub(suffix_pattern + "$", "", record.id)
+-            SeqIO.write(record, f_out, "fastq")
++        for record in parse_fastq(f_in):
++            trimmed_id = re.sub(suffix_pattern + "$", "", record[0])
++            write_fastq((trimmed_id, record[1], record[2], record[3]), f_out)
+     finally:
+         f_in.close()
+         f_out.close()
++
++
++def filter_ids(fp_in, fp_out, ids):
++    """Remove ids from FASTQ file.
++
++    fp_in: path to input FASTQ
++    fp_out: path to output FASTQ
++    ids: list of ids to be removed
++    """
++    with gzip.open(fp_in, "rt") as f_in, gzip.open(fp_out, "wt") as f_out:
++        for record in parse_fastq(f_in):
++            if record[0] not in ids:
++                write_fastq(record, f_out)
+diff --git a/sunbeamlib/reports.py b/sunbeamlib/reports.py
+index dada49a3..bc3a0db0 100644
+--- a/sunbeamlib/reports.py
++++ b/sunbeamlib/reports.py
+@@ -1,42 +1,10 @@
+-import warnings
+-
+-warnings.filterwarnings("ignore", ".*experimental.*")
+-from pathlib import Path
+-from collections import Counter, OrderedDict
++from collections import OrderedDict
+ import re
+ import os
+ import sys
+ 
+ import pandas
+ from io import StringIO
+-from Bio import SearchIO
+-
+-from xml.etree.ElementTree import ParseError
+-
+-
+-def blast_summary(blast_files, blast_format="blast-xml"):
+-    """Summarize BLAST results from an set of BLAST output files."""
+-    for infile in blast_files:
+-        sample = Path(infile).stem
+-        try:
+-            for result in SearchIO.parse(infile, blast_format):
+-                if len(result.hits) > 0:
+-                    yield {
+-                        "sample": sample,
+-                        "query": result.id,
+-                        "hit": result.hits[0].id,
+-                    }
+-        except ParseError:
+-            print("Skipping empty/malformed %s" % infile)
+-            continue
+-
+-
+-def blast_contig_summary(xml_files):
+-    return {r["query"]: r["hit"] for r in blast_summary(xml_files)}
+-
+-
+-def blast_hits(blast_xml_files):
+-    return Counter(c["query"] for c in blast_summary(blast_xml_files))
+ 
+ 
+ def parse_trim_summary_paired(f):
+diff --git a/workflow/envs/rbt.yml b/workflow/envs/rbt.yml
+deleted file mode 100755
+index 40017d46..00000000
+--- a/workflow/envs/rbt.yml
++++ /dev/null
+@@ -1,6 +0,0 @@
+-name: rust-bio-tools
+-channels:
+-  - bioconda
+-  - conda-forge
+-dependencies:
+-  - rust-bio-tools
+\ No newline at end of file
+diff --git a/workflow/envs/reports.yml b/workflow/envs/reports.yml
+index 1618e2b0..b4f2a732 100755
+--- a/workflow/envs/reports.yml
++++ b/workflow/envs/reports.yml
+@@ -1,10 +1,6 @@
+ name: reports
+ channels:
+   - conda-forge
+-  - bioconda
+ dependencies:
+-  - conda-forge::biopython
+   - numpy
+-  - pandas
+-  - bioconda::pysam
+-  - python=3.10
+\ No newline at end of file
++  - pandas
+\ No newline at end of file
+diff --git a/workflow/rules/qc.smk b/workflow/rules/qc.smk
+index 038b28b7..d7f89a22 100755
+--- a/workflow/rules/qc.smk
++++ b/workflow/rules/qc.smk
+@@ -207,12 +207,9 @@ rule remove_low_complexity:
+     benchmark:
+         BENCHMARK_FP / "remove_low_complexity_{sample}_{rp}.tsv"
+     conda:
+-        "../envs/rbt.yml"
+-    shell:
+-        """
+-        gzip -dc {input.reads} | rbt fastq-filter {input.ids} 2>&1 | tee {log} |\
+-        gzip > {output}
+-        """
++        "../envs/reports.yml"
++    script:
++        "../scripts/remove_low_complexity.py"
+ 
+ 
+ rule qc_final:
+diff --git a/workflow/scripts/filter_unmapped_reads.py b/workflow/scripts/filter_unmapped_reads.py
+index 58d6d54a..3f8e858a 100755
+--- a/workflow/scripts/filter_unmapped_reads.py
++++ b/workflow/scripts/filter_unmapped_reads.py
+@@ -30,8 +30,6 @@
+     l.write(f"Total unmapped count: {total_unmapped_count}\n")
+     l.write(f"Collisions count: {collisions}\n")
+ 
+-    # Sanity check
+-
+     host = total_count - total_unmapped_count
+     nonhost = total_unmapped_count
+ 
+diff --git a/workflow/scripts/remove_low_complexity.py b/workflow/scripts/remove_low_complexity.py
+new file mode 100755
+index 00000000..eedc37fa
+--- /dev/null
++++ b/workflow/scripts/remove_low_complexity.py
+@@ -0,0 +1,7 @@
++from sunbeamlib.qc import filter_ids
++
++ids = []
++with open(snakemake.input.ids) as f:
++    ids = [id.strip() for id in f.readlines()]
++
++filter_ids(snakemake.input.reads, snakemake.output[0], ids)

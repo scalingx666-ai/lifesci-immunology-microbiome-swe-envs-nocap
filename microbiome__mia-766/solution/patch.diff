@@ -1,0 +1,257 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 0f1f84387..7d525bd80 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -1,6 +1,6 @@
+ Package: mia
+ Type: Package
+-Version: 1.17.8
++Version: 1.17.9
+ Authors@R:
+     c(person(given = "Tuomas", family = "Borman", role = c("aut", "cre"),
+              email = "tuomas.v.borman@utu.fi",
+diff --git a/NEWS b/NEWS
+index e17638fd1..f9ae6d3e5 100644
+--- a/NEWS
++++ b/NEWS
+@@ -179,3 +179,4 @@ Changes in version 1.17.x
+ + Added transformation method that replaces values <= threshold with NA (2025-05-09)
+ + importMetaPhlAn: Preserve features without taxonomy
+ + Added agglomerateByModule()
+++ Added inverse rank normalization (2025-09-10)
+diff --git a/R/transformCounts.R b/R/transformCounts.R
+index ddb93c57a..40bdbbef3 100644
+--- a/R/transformCounts.R
++++ b/R/transformCounts.R
+@@ -75,7 +75,7 @@
+ #' \itemize{
+ #'
+ #' \item 'alr', 'chi.square', 'clr', 'frequency', 'hellinger', 'log',
+-#' 'normalize', 'pa', 'rank', 'rclr' relabundance', 'rrank', 'standardize',
++#' 'normalize', 'pa', 'rank', 'rclr', 'relabundance', 'rrank', 'standardize',
+ #' 'total': please refer to
+ #' \code{\link[vegan:decostand]{decostand}} for details.
+ #'
+@@ -109,6 +109,17 @@
+ #' Calculates \eqn{x / y} for all unique feature pairs across samples,
+ #' where \eqn{x} and \eqn{y} are entries of the specified assay.type.
+ #'
++#' \item 'invnorm': Inverse rank normalisation. Ranks values per
++#' sample/feature and maps them to standard normal quantiles.
++#' \deqn{
++#' z = \Phi^{-1}\!\left(
++#'   \frac{r - \mathrm{offset}}{\,n + 1 - 2\,\mathrm{offset}\,}
++#' \right)
++#' }
++#' Controlled by \code{offset} (default \code{0.5}; also
++#' \code{0.375}=Blom, \code{0}=van der Waerden) and \code{ties.method}
++#' (passed to \code{base::rank}, default \code{"average"}).
++#'
+ #' \item 'pseudocount': Adds only pseudocount.
+ #'
+ #' \item 'cutoff': In some ecological studies, only strictly positive values
+@@ -259,9 +270,10 @@ setMethod("transformAssay", signature = c(x = "SingleCellExperiment"),
+         x, assay.type = "counts", assay_name = NULL,
+         method = c(
+             "alr", "chi.square", "clr", "css", "cutoff", "difference", "-",
+-            "division", "/", "frequency", "hellinger", "log", "log10", "log2",
+-            "max", "normalize", "pa", "philr", "pseudocount", "range", "rank",
+-            "rclr", "relabundance", "rrank", "standardize", "total", "z"),
++            "division", "/", "frequency", "hellinger", "invnorm", "log",
++            "log10", "log2", "max", "normalize", "pa", "philr", "pseudocount",
++            "range", "rank", "rclr", "relabundance", "rrank", "standardize",
++            "total", "z"),
+         MARGIN = "samples",
+         name = method,
+         pseudocount = FALSE,
+@@ -313,7 +325,8 @@ setMethod("transformAssay", signature = c(x = "SingleCellExperiment"),
+     attr(assay, "pseudocount") <- NULL
+     # Calls help function that does the transformation
+     # Help function is different for mia and vegan transformations
+-    if( method %in% c("log10", "log2", "css", "difference", "division") ){
++    if( method %in% c(
++            "log10", "log2", "css", "difference", "division", "invnorm") ){
+         transformed_table <- .apply_transformation(
+             assay, method, MARGIN, ...)
+     } else if( method %in% c("philr") ){
+@@ -351,7 +364,8 @@ setMethod("transformAssay", signature = c(x = "SingleCellExperiment"),
+         log2 = .calc_log,
+         css = .calc_css,
+         difference = .apply_transformation_difference_or_division,
+-        division = .apply_transformation_difference_or_division
++        division = .apply_transformation_difference_or_division,
++        invnorm = .apply_transformation_invnorm
+     )
+     # Get transformed table
+     assay <- do.call(
+@@ -826,6 +840,73 @@ NULL
+     return(mat)
+ }
+ 
++############################## .apply_transformation_invnorm ##################
++# Inverse rank normalisation
++# For each column (or row if MARGIN=1L), values are ranked and then
++# transformed to the standard normal distribution quantiles.
++# v : numeric vector to be normalized
++# ties.method : method to handle ties in ranking ("average" is default)
++# offset : adjustment for ranks when computing probabilities
++.invnorm_one <- function(x, ties.method = "average", offset = 0.5, ...){
++    # Identify non-missing values
++    non_missing <- !is.na(x)
++    n_non_missing  <- non_missing |> sum()
++    # Initialize result vector with NAs
++    res <- rep(NA_real_, length(x))
++    # If there are values that are not missing
++    if( n_non_missing > 0L ){
++        # Rank the non-missing value
++        ranking <- rank(x[non_missing], ties.method = ties.method)
++        # Convert ranks to probabilities/percentiles in (0,1) interval
++        # The denominator adjusts for offset to avoid p=0 or p=1
++        prob <- (ranking - offset) / (n_non_missing + 1 - 2 * offset)
++        # Ensure probabilities are strictly between (0,1) to avoid Inf/-Inf in
++        # qnorm
++        prob[prob <= 0] <- .Machine$double.eps
++        prob[prob >= 1] <- 1 - .Machine$double.eps
++        # Map probabilities to standard normal quantiles
++        res[non_missing] <- qnorm(prob)
++    }
++    return(res)
++}
++
++#' @importFrom BiocParallel bplapply bpparam
++.apply_transformation_invnorm <- function(
++        mat, ties.method = "average", offset = 0.5,
++        BPPARAM = SerialParam(), ...) {
++    # Check offset
++    if( !(.is_a_numeric(offset) && offset >= 0 && offset <= 0.5) ){
++        stop("'offset' must be a single numeric in [0, 0.5].", call. = FALSE)
++    }
++    # Check ties.method
++    valid_ties <- c("average", "first", "last", "random", "max", "min")
++    if( !(.is_a_string(ties.method) && ties.method %in% valid_ties) ){
++        stop("'ties.method' must be one of the following options: ",
++            paste(valid_ties, collapse = ", "), call. = FALSE)
++    }
++    #
++    # Apply inverse rank normalisation for each column
++    res <- BiocParallel::bplapply(
++        X = asplit(mat, 2L),
++        FUN = .invnorm_one,
++        ties.method = ties.method,
++        offset = offset,
++        BPPARAM = BPPARAM,
++        ...
++    )
++    res <- do.call(cbind, res)
++    dimnames(res) <- dimnames(mat)
++
++    # Add attributes
++    attr(res, "mia") <- "invnorm"
++    attr(res, "parameters") <- c(
++        attr(res, "parameters"),
++        list(ties.method = ties.method, offset = offset)
++    )
++
++    return(res)
++}
++
+ # This function is used to add transformed table back to TreeSE. With most of
+ # the methods it is simple: it is added to assay. However, with transformations
+ # that change the dimensionality (e.g. philr, difference, division), the
+diff --git a/man/transformAssay.Rd b/man/transformAssay.Rd
+index 1e4cd7753..15d5bc773 100644
+--- a/man/transformAssay.Rd
++++ b/man/transformAssay.Rd
+@@ -141,6 +141,17 @@ where \eqn{x} and \eqn{y} are entries of the specified assay.type.
+ Calculates \eqn{x / y} for all unique feature pairs across samples,
+ where \eqn{x} and \eqn{y} are entries of the specified assay.type.
+ 
++\item 'invnorm': Inverse rank normalisation. Ranks values per
++sample/feature and maps them to standard normal quantiles.
++\deqn{
++z = \Phi^{-1}\!\left(
++  \frac{r - \mathrm{offset}}{\,n + 1 - 2\,\mathrm{offset}\,}
++\right)
++}
++Controlled by \code{offset} (default \code{0.5}; also
++\code{0.375}=Blom, \code{0}=van der Waerden) and \code{ties.method}
++(passed to \code{base::rank}, default \code{"average"}).
++
+ \item 'pseudocount': Adds only pseudocount.
+ 
+ \item 'cutoff': In some ecological studies, only strictly positive values
+diff --git a/tests/testthat/test-5transformCounts.R b/tests/testthat/test-5transformCounts.R
+index dd659274b..bb9587179 100644
+--- a/tests/testthat/test-5transformCounts.R
++++ b/tests/testthat/test-5transformCounts.R
+@@ -512,6 +512,70 @@ test_that("transformAssay", {
+             all(div[pair, ] == ref)
+         })
+         all_correct |> all() |> expect_true()
++
++
++		############################## INVNORM ################################
++        tse <- GlobalPatterns
++
++        # Run inverse-rank normalisation column-wise (samples)
++        res <- transformAssay(
++            tse,
++            method = "invnorm",
++            MARGIN = "samples",
++            ties.method = "average",
++            offset = 0.5,
++            BPPARAM = BiocParallel::SerialParam()
++        )
++        inv <- assay(res, "invnorm")
++        cnt <- assay(tse, "counts")
++
++        # Shape and names match counts
++        expect_identical(dim(inv), dim(cnt))
++        expect_identical(dimnames(inv), dimnames(cnt))
++
++        # Attributes: method tag + parameters
++        expect_identical(attr(inv, "mia"), "invnorm")
++        pars <- attr(inv, "parameters")
++        expect_true(is.list(pars))
++        expect_identical(pars$`ties.method`, "average")
++        expect_identical(pars$offset, 0.5)
++
++        # NAs preserved in the same positions
++        expect_identical(is.na(inv), is.na(cnt))
++
++        # Compare columns against the formula
++        sel <- seq_len(ncol(cnt))
++        manual <- cnt[, sel, drop = FALSE]
++        for( j in seq_along(sel) ){
++            v  <- manual[, j]
++            ok <- !is.na(v)
++            n  <- sum(ok)
++            if (n == 0L) next
++            r <- rank(v[ok], ties.method = "average")
++            p <- (r - 0.5) / (n + 1 - 2 * 0.5)  # offset = 0.5
++            p[p <= 0] <- .Machine$double.eps
++            p[p >= 1] <- 1 - .Machine$double.eps
++            manual[ok, j]  <- qnorm(p)
++            manual[!ok, j] <- NA_real_
++        }
++        expect_equal(inv[, sel, drop = FALSE], manual, tolerance = 1e-12,
++                     check.attributes = FALSE)
++
++        # Counts assay unchanged
++        expect_equal(assay(res, "counts"), cnt, check.attributes = FALSE)
++
++        # Changing ties.method should change results
++        res_max <- transformAssay(
++            tse, method = "invnorm", MARGIN = "samples",
++            ties.method = "max", BPPARAM = BiocParallel::SerialParam()
++        )
++        expect_false(identical(assay(res_max, "invnorm"), inv))
++
++        # Invalid parameter values should error
++        expect_error(transformAssay(tse, method = "invnorm", offset = 0.75))
++        expect_error(transformAssay(tse, method = "invnorm", offset = -0.01))
++        expect_error(transformAssay(tse, method = "invnorm",
++                                    ties.method = "nope"))
+     }
+ 
+     # TSE object

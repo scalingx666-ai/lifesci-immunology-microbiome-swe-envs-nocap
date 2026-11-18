@@ -1,0 +1,332 @@
+diff --git a/qiita_db/artifact.py b/qiita_db/artifact.py
+index 8547301ba..0c0b57f04 100644
+--- a/qiita_db/artifact.py
++++ b/qiita_db/artifact.py
+@@ -655,6 +655,73 @@ def delete(cls, artifact_id):
+             sql = "DELETE FROM qiita.artifact WHERE artifact_id IN %s"
+             qdb.sql_connection.TRN.add(sql, [all_ids])
+ 
++    @classmethod
++    def archive(cls, artifact_id):
++        """Archive artifact with artifact_id
++
++        Parameters
++        ----------
++        artifact_id : int
++            The artifact to be archived
++
++        Raises
++        ------
++        QiitaDBOperationNotPermittedError
++            If the artifact is not public
++            If the artifact_type is not BIOM
++            If the artifact belongs to an analysis
++            If the artifact has no parents (raw file)
++        """
++        artifact = cls(artifact_id)
++
++        if artifact.visibility != 'public':
++            raise qdb.exceptions.QiitaDBOperationNotPermittedError(
++                'Only public artifacts can be archived')
++        if artifact.artifact_type != 'BIOM':
++            raise qdb.exceptions.QiitaDBOperationNotPermittedError(
++                'Only BIOM artifacts can be archived')
++        if artifact.analysis is not None:
++            raise qdb.exceptions.QiitaDBOperationNotPermittedError(
++                'Only non analysis artifacts can be archived')
++        if not artifact.parents:
++            raise qdb.exceptions.QiitaDBOperationNotPermittedError(
++                'Only non raw artifacts can be archived')
++
++        # let's find all ancestors that can be deleted (it has parents and no
++        # ancestors (that have no descendants), and delete them
++        to_delete = [x for x in artifact.ancestors.nodes()
++                     if x.id != artifact_id and x.parents and
++                     not [y for y in x.descendants.nodes()
++                     if y.id not in (artifact_id, x.id)]]
++        # ignore artifacts that can and has been submitted to EBI
++        to_delete = [x for x in to_delete if not x.can_be_submitted_to_ebi or
++                     x.is_submitted_to_vamps]
++
++        # get the log file so we can delete
++        fids = [x['fp_id'] for x in artifact.filepaths
++                if x['fp_type'] == 'log']
++
++        with qdb.sql_connection.TRN:
++            artifact._set_visibility('archived', propagate=False)
++            sql = 'DELETE FROM qiita.parent_artifact WHERE artifact_id = %s'
++            qdb.sql_connection.TRN.add(sql, [artifact_id])
++
++            sql = '''DELETE FROM qiita.artifact_output_processing_job
++                     WHERE artifact_id = %s'''
++            qdb.sql_connection.TRN.add(sql, [artifact_id])
++
++            if fids:
++                sql = '''DELETE FROM qiita.artifact_filepath
++                         WHERE filepath_id IN %s'''
++                qdb.sql_connection.TRN.add(sql, [tuple(fids)])
++
++            qdb.sql_connection.TRN.execute()
++
++        # cleaning the extra artifacts
++        for x in to_delete:
++            x._set_visibility('sandbox', propagate=False)
++            cls.delete(x.id)
++
+     @property
+     def name(self):
+         """The name of the artifact
+@@ -745,18 +812,21 @@ def visibility(self):
+             qdb.sql_connection.TRN.add(sql, [self.id])
+             return qdb.sql_connection.TRN.execute_fetchlast()
+ 
+-    def _set_visibility(self, value):
++    def _set_visibility(self, value, propagate=True):
+         "helper method to split validation and actual set of the visibility"
+         # In order to correctly propagate the visibility we need to find
+         # the root of this artifact and then propagate to all the artifacts
+         vis_id = qdb.util.convert_to_id(value, "visibility")
+ 
+-        sql = "SELECT * FROM qiita.find_artifact_roots(%s)"
+-        qdb.sql_connection.TRN.add(sql, [self.id])
+-        root_id = qdb.sql_connection.TRN.execute_fetchlast()
+-        root = qdb.artifact.Artifact(root_id)
+-        # these are the ids of all the children from the root
+-        ids = [a.id for a in root.descendants.nodes()]
++        if propagate:
++            sql = "SELECT * FROM qiita.find_artifact_roots(%s)"
++            qdb.sql_connection.TRN.add(sql, [self.id])
++            root_id = qdb.sql_connection.TRN.execute_fetchlast()
++            root = qdb.artifact.Artifact(root_id)
++            # these are the ids of all the children from the root
++            ids = [a.id for a in root.descendants.nodes()]
++        else:
++            ids = [self.id]
+ 
+         sql = """UPDATE qiita.artifact
+                  SET visibility_id = %s
+@@ -1317,9 +1387,11 @@ def youngest_artifact(self):
+             sql = """SELECT artifact_id
+                      FROM qiita.artifact_descendants(%s)
+                         JOIN qiita.artifact USING (artifact_id)
++                     WHERE visibility_id NOT IN %s
+                      ORDER BY generated_timestamp DESC
+                      LIMIT 1"""
+-            qdb.sql_connection.TRN.add(sql, [self.id])
++            qdb.sql_connection.TRN.add(
++                sql, [self.id, qdb.util.artifact_visibilities_to_skip()])
+             a_id = qdb.sql_connection.TRN.execute_fetchindex()
+             # If the current artifact has no children, the previous call will
+             # return an empty list, so the youngest artifact in the lineage is
+diff --git a/qiita_db/metadata_template/prep_template.py b/qiita_db/metadata_template/prep_template.py
+index e97984252..e969c14bd 100644
+--- a/qiita_db/metadata_template/prep_template.py
++++ b/qiita_db/metadata_template/prep_template.py
+@@ -548,8 +548,9 @@ def status(self):
+                      FROM qiita.prep_template
+                         JOIN qiita.artifact USING (artifact_id)
+                         JOIN qiita.visibility USING (visibility_id)
+-                     WHERE prep_template_id = %s"""
+-            qdb.sql_connection.TRN.add(sql, [self._id])
++                     WHERE prep_template_id = %s and visibility_id NOT IN %s"""
++            qdb.sql_connection.TRN.add(
++                sql, [self._id, qdb.util.artifact_visibilities_to_skip()])
+ 
+             return qdb.util.infer_status(
+                 qdb.sql_connection.TRN.execute_fetchindex())
+diff --git a/qiita_db/study.py b/qiita_db/study.py
+index 30394853f..367b846a1 100644
+--- a/qiita_db/study.py
++++ b/qiita_db/study.py
+@@ -148,8 +148,9 @@ def status(self):
+                      FROM qiita.visibility
+                         JOIN qiita.artifact USING (visibility_id)
+                         JOIN qiita.study_artifact USING (artifact_id)
+-                     WHERE study_id = %s"""
+-            qdb.sql_connection.TRN.add(sql, [self._id])
++                     WHERE study_id = %s and visibility_id NOT IN %s"""
++            qdb.sql_connection.TRN.add(
++                sql, [self._id, qdb.util.artifact_visibilities_to_skip()])
+             return qdb.util.infer_status(
+                 qdb.sql_connection.TRN.execute_fetchindex())
+ 
+@@ -1098,8 +1099,9 @@ def artifacts(self, dtype=None, artifact_type=None):
+                         JOIN qiita.data_type USING (data_type_id)
+                         JOIN qiita.study_artifact USING (artifact_id)
+                         JOIN qiita.artifact_type USING (artifact_type_id)
+-                     WHERE study_id = %s{0}
++                     WHERE study_id = %s{0} AND visibility_id NOT IN %s
+                      ORDER BY artifact_id""".format(sql_where)
++            sql_args.append(qdb.util.artifact_visibilities_to_skip())
+ 
+             qdb.sql_connection.TRN.add(sql, sql_args)
+             return [qdb.artifact.Artifact(aid)
+diff --git a/qiita_db/support_files/patches/86.sql b/qiita_db/support_files/patches/86.sql
+new file mode 100644
+index 000000000..eeca1ae66
+--- /dev/null
++++ b/qiita_db/support_files/patches/86.sql
+@@ -0,0 +1,25 @@
++-- Jun 8, 2022
++-- adding the new visibility level: archived
++
++INSERT INTO qiita.visibility (visibility, visibility_description) VALUES ('archived', 'Archived artifact');
++
++-- update function to ignore archived artifacts
++CREATE OR REPLACE FUNCTION qiita.bioms_from_preparation_artifacts(prep_id bigint) RETURNS TEXT AS $$
++DECLARE
++  artifacts TEXT := NULL;
++BEGIN
++  SELECT array_to_string(array_agg(artifact_id), ',') INTO artifacts
++  FROM qiita.preparation_artifact
++  LEFT JOIN qiita.artifact USING (artifact_id)
++  LEFT JOIN qiita.artifact_type USING (artifact_type_id)
++  LEFT JOIN qiita.software_command USING (command_id)
++  LEFT JOIN qiita.software USING (software_id)
++  LEFT JOIN qiita.visibility USING (visibility_id)
++  WHERE
++    prep_template_id = prep_id AND
++    artifact_type = 'BIOM' AND
++    NOT deprecated AND
++    visibility != 'archived';
++  RETURN artifacts;
++END
++$$ LANGUAGE plpgsql;
+diff --git a/qiita_db/test/test_artifact.py b/qiita_db/test/test_artifact.py
+index 121de08fa..5f0ee0e09 100644
+--- a/qiita_db/test/test_artifact.py
++++ b/qiita_db/test/test_artifact.py
+@@ -1361,5 +1361,40 @@ def test_descendants_with_jobs_one_element(self):
+         self.assertCountEqual(obs, exp)
+ 
+ 
++@qiita_test_checker()
++class ArtifactArchiveTests(TestCase):
++    def test_archive(self):
++        A = qdb.artifact.Artifact
++        QE = qdb.exceptions.QiitaDBOperationNotPermittedError
++
++        # check nodes, without any change
++        exp_nodes = [A(1), A(2), A(3), A(4), A(5), A(6)]
++        self.assertCountEqual(A(1).descendants.nodes(), exp_nodes)
++        obs_artifacts = len(qdb.util.get_artifacts_information([4, 5, 6, 8]))
++        self.assertEqual(4, obs_artifacts)
++
++        # check errors
++        with self.assertRaisesRegex(QE, 'Only public artifacts can be '
++                                    'archived'):
++            A.archive(1)
++        A(1).visibility = 'public'
++
++        with self.assertRaisesRegex(QE, 'Only BIOM artifacts can be archived'):
++            A.archive(1)
++
++        A(8).visibility = 'public'
++        with self.assertRaisesRegex(QE, 'Only non analysis artifacts can '
++                                    'be archived'):
++            A.archive(8)
++
++        for aid in range(4, 7):
++            A.archive(aid)
++            exp_nodes.remove(A(aid))
++            self.assertCountEqual(A(1).descendants.nodes(), exp_nodes)
++
++        obs_artifacts = len(qdb.util.get_artifacts_information([4, 5, 6, 8]))
++        self.assertEqual(1, obs_artifacts)
++
++
+ if __name__ == '__main__':
+     main()
+diff --git a/qiita_db/test/test_util.py b/qiita_db/test/test_util.py
+index 8d88db246..a5382072c 100644
+--- a/qiita_db/test/test_util.py
++++ b/qiita_db/test/test_util.py
+@@ -808,7 +808,7 @@ def test_scrub_data_single_quote(self):
+ 
+     def test_get_visibilities(self):
+         obs = qdb.util.get_visibilities()
+-        exp = ['awaiting_approval', 'sandbox', 'private', 'public']
++        exp = ['awaiting_approval', 'sandbox', 'private', 'public', 'archived']
+         self.assertEqual(obs, exp)
+ 
+     def test_infer_status(self):
+diff --git a/qiita_db/util.py b/qiita_db/util.py
+index c322d5d38..db4c8107f 100644
+--- a/qiita_db/util.py
++++ b/qiita_db/util.py
+@@ -1726,6 +1726,7 @@ def get_artifacts_information(artifact_ids, only_biom=True):
+                 JOIN qiita.filepath USING (filepath_id)
+                 WHERE af.artifact_id = a.artifact_id) filepaths ON true
+             WHERE a.artifact_id IN %s
++                AND a.visibility_id NOT IN %s
+             GROUP BY a.artifact_id, a.name, a.command_id, sc.name,
+                      a.generated_timestamp, dt.data_type, parent_id,
+                      parent_info.command_id, parent_info.name
+@@ -1774,7 +1775,8 @@ def get_artifacts_information(artifact_ids, only_biom=True):
+         ps = {}
+         algorithm_az = {'': ''}
+         PT = qdb.metadata_template.prep_template.PrepTemplate
+-        qdb.sql_connection.TRN.add(sql, [tuple(artifact_ids)])
++        qdb.sql_connection.TRN.add(sql, [
++            tuple(artifact_ids), qdb.util.artifact_visibilities_to_skip()])
+         for row in qdb.sql_connection.TRN.execute_fetchindex():
+             aid, name, cid, cname, gt, aparams, dt, pid, pcid, pname, \
+                 pparams, filepaths, _, prep_template_id = row
+@@ -1950,6 +1952,10 @@ def open_file(filepath_or, *args, **kwargs):
+             fh.close()
+ 
+ 
++def artifact_visibilities_to_skip():
++    return tuple([qdb.util.convert_to_id('archived', "visibility")])
++
++
+ def generate_analysis_list(analysis_ids, public_only=False):
+     """Get general analysis information
+ 
+diff --git a/qiita_pet/support_files/doc/source/qiita-philosophy/index.rst b/qiita_pet/support_files/doc/source/qiita-philosophy/index.rst
+index 8c16a807b..cf8dab9a9 100755
+--- a/qiita_pet/support_files/doc/source/qiita-philosophy/index.rst
++++ b/qiita_pet/support_files/doc/source/qiita-philosophy/index.rst
+@@ -20,22 +20,27 @@ A Study
+ 
+ Qiita’s main entity is the idea of a study. A study can have many samples, with
+ many preparations, that have been sequenced several times, Figure 1.
+-Additionally, study artifacts have 3 different states: sandboxed, private and
+-public. A sandboxed artifact has all operational capabilities in the system
+-but is not publicly available, allowing for quick integration with other
+-studies but at the same time keeping it private so the user can improve the
+-analysis. Once a user decides that is time to make their artifact public they
+-can request an administrator to validate their study information and make it
+-private and possibly submit to a permanent repository, where it can also be
+-kept private until the user wants to make it public. At this stage in Qiita
+-the whole study (including all processed data) is private. This process is
+-completely automatic via the Graphical User Interface (GUI). Currently sequence
+-data is being deposited for permanent storage to the European Nucleotide
+-Archive (ENA), part of the European Bioinformatics Institute (EBI). Finally,
+-when the user is ready, usually when the main manuscript of the study is ready
+-for publication, the user can request for the artifact to be made public
+-public, both in Qiita and the permanent repository, Figure 2.
+ 
++Additionally, study artifacts have 5 different states: sandboxed, awaiting_approval,
++private, public and archived. A sandboxed artifact has all operational capabilities in
++the system but is not publicly available, allowing for quick integration with other
++studies but at the same time keeping it hidden.
++
++Once a user is satisfied with their study and analysis, they can request to upgrade
++their preparation and all their artifacts status to 'private'; this confers additional
++benefits to the project, including permanent space in the repository. During this time,
++an administrator will validate their study and its status will change to
++'awaiting_approval'; note that users need to request this transition from, please
++review :ref:`checklist-for-ebi-ena-submission`.
++
++At this stage in Qiita the whole preparation in the study (including raw and all
++processed data) is private. If the user also requests it, the raw data can be deposited
++for permanent storage to the European Nucleotide Archive (ENA), part of the European Bioinformatics
++Institute (EBI). Then, when the user is ready, usually when the main manuscript of
++the study is ready for publication, the user can make for the preparation and all its artifacts
++to be 'public', both in Qiita and the permanent repository, Figure 2. Finally,
++when new processing algorithms are available, the older BIOM artifacts are
++'archived', for long term storage.
+ 
+ .. figure::  images/figure1.png
+    :align:   center

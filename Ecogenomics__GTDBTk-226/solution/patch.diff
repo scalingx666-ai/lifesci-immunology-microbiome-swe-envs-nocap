@@ -1,0 +1,264 @@
+diff --git a/README.md b/README.md
+index baf3f0ec..8f61848c 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,8 @@ Please post questions and issues related to GTDB-Tk on the Issues section of the
+     * Updated the `gtdb_to_ncbi_majority_vote.py` script for translating taxonomy.
+     * Added the `--pplacer_cpus` argument to specify the number of pplacer threads when running `classify` and `classify_wf` (#195).
+     * The `--debug` flag in `align` outputs aligned markers to disk before trimming.
++    * An optional third column in the `--batchfile` will specify an override to which translation
++    table should be used. Leave blank to automatically determine the translation table (default).
+ 
+ **Note (Dec 12, 2019)**:
+ * GTDB-Tk v1.0.2 has been released
+diff --git a/bin/gtdbtk b/bin/gtdbtk
+index bf56715b..55138783 100755
+--- a/bin/gtdbtk
++++ b/bin/gtdbtk
+@@ -160,7 +160,7 @@ if __name__ == '__main__':
+     mutex_group.add_argument('--genome_dir',
+                              help="directory containing genome files in FASTA format")
+     mutex_group.add_argument('--batchfile',
+-                             help="file describing genomes - tab separated in 2 columns (FASTA file, genome ID)")
++                             help="file describing genomes - tab separated in 3 columns (FASTA file, genome ID, translation table [optional])")
+ 
+     required_classify_wf = classify_wf_parser.add_argument_group('required named arguments')
+     required_classify_wf.add_argument('--out_dir', required=True,
+@@ -197,7 +197,7 @@ if __name__ == '__main__':
+     mutex_group.add_argument('--genome_dir',
+                              help="directory containing genome files in FASTA format")
+     mutex_group.add_argument('--batchfile',
+-                             help="file describing genomes - tab separated in 2 columns (FASTA file, genome ID)")
++                             help="file describing genomes - tab separated in 3 columns (FASTA file, genome ID, translation table [optional])")
+ 
+     required_identify = identify_parser.add_argument_group('required named arguments')
+     required_identify.add_argument('--out_dir', required=True,
+diff --git a/gtdbtk/external/prodigal.py b/gtdbtk/external/prodigal.py
+index 0da5eeac..1fe74c08 100644
+--- a/gtdbtk/external/prodigal.py
++++ b/gtdbtk/external/prodigal.py
+@@ -67,13 +67,15 @@ def _get_version(self):
+         except:
+             return "(version unavailable)"
+ 
+-    def _run_prodigal(self, genome_id, fasta_path):
++    def _run_prodigal(self, genome_id, fasta_path, usr_tln_table):
+         """Run Prodigal.
+ 
+         Parameters
+         ----------
+         fasta_path : str
+             Path to FASTA file to process.
++        usr_tln_table : int
++            User-specified translation table, None if automatic.
+         :return
+             False if an error occurred.
+         """
+@@ -82,7 +84,8 @@ def _run_prodigal(self, genome_id, fasta_path):
+ 
+         prodigal = BioLibProdigal(1, False)
+         summary_stats = prodigal.run(
+-            [fasta_path], output_dir, called_genes=self.proteins)
++            [fasta_path], output_dir, called_genes=self.proteins,
++            translation_table=usr_tln_table)
+ 
+         # An error occurred in BioLib Prodigal.
+         if not summary_stats:
+@@ -139,9 +142,9 @@ def _worker(self, out_dict, worker_queue, writer_queue):
+             if data is None:
+                 break
+ 
+-            genome_id, file_path = data
++            genome_id, file_path, usr_tln_table = data
+ 
+-            rtn_files = self._run_prodigal(genome_id, file_path)
++            rtn_files = self._run_prodigal(genome_id, file_path, usr_tln_table)
+ 
+             # Only proceed if an error didn't occur in BioLib Prodigal
+             if rtn_files:
+@@ -172,13 +175,15 @@ def _writer(self, num_items, writer_queue):
+ 
+         sys.stdout.write('\n')
+ 
+-    def run(self, genomic_files):
++    def run(self, genomic_files, tln_tables):
+         """Run Prodigal across a set of genomes.
+ 
+         Parameters
+         ----------
+         genomic_files : dict
+             Dictionary indicating the genomic and gene file for each genome.
++        tln_tables : Dict[str, int]
++            Mapping of genome id to user-specified translation table.
+         """
+ 
+         # populate worker queue with data to process
+@@ -186,7 +191,7 @@ def run(self, genomic_files):
+         writer_queue = mp.Queue()
+ 
+         for genome_id, file_path in genomic_files.items():
+-            worker_queue.put([genome_id, file_path])
++            worker_queue.put((genome_id, file_path, tln_tables.get(genome_id)))
+ 
+         for _ in range(self.threads):
+             worker_queue.put(None)
+diff --git a/gtdbtk/main.py b/gtdbtk/main.py
+index c68b296e..4e7d64a3 100644
+--- a/gtdbtk/main.py
++++ b/gtdbtk/main.py
+@@ -112,7 +112,7 @@ def _genomes_to_process(self, genome_dir, batchfile, extension):
+             Map of genomes to their genomic FASTA files.
+         """
+ 
+-        genomic_files = {}
++        genomic_files, tln_tables = dict(), dict()
+         if genome_dir:
+             for f in os.listdir(genome_dir):
+                 if f.endswith(extension):
+@@ -126,12 +126,20 @@ def _genomes_to_process(self, genome_dir, batchfile, extension):
+                     if line_split[0] == '':
+                         continue  # blank line
+ 
+-                    if len(line_split) != 2:
+-                        self.logger.error(
+-                            'Batch file must contain exactly 2 columns.')
+-                        raise GenomeBatchfileMalformed
++                    if len(line_split) not in {2, 3}:
++                        raise GTDBTkExit('Batch file must contain either 2 '
++                                         'columns (detect translation table), '
++                                         'or 3 (specify translation table).')
++
++                    if len(line_split) == 2:
++                        genome_file, genome_id = line_split
++                    elif len(line_split) == 3:
++                        genome_file, genome_id, tln_table = line_split
++                        if tln_table not in {'4', '11'}:
++                            raise GTDBTkExit('Specified translation table must '
++                                             'be either 4, or 11.')
++                        tln_tables[genome_id] = int(tln_table)
+ 
+-                    genome_file, genome_id = line_split
+                     self._verify_genome_id(genome_id)
+ 
+                     if genome_file is None or genome_file == '':
+@@ -183,7 +191,7 @@ def _genomes_to_process(self, genome_dir, batchfile, extension):
+                                   'check the format of this file.' % batchfile)
+             raise GTDBTkExit
+ 
+-        return genomic_files
++        return genomic_files, tln_tables
+ 
+     def _marker_set_id(self, bac120_ms, ar122_ms, rps23_ms):
+         """Get unique identifier for marker set.
+@@ -233,11 +241,12 @@ def identify(self, options):
+ 
+         make_sure_path_exists(options.out_dir)
+ 
+-        genomes = self._genomes_to_process(
++        genomes, tln_tables = self._genomes_to_process(
+             options.genome_dir, options.batchfile, options.extension)
+ 
+         markers = Markers(options.cpus)
+         markers.identify(genomes,
++                         tln_tables,
+                          options.out_dir,
+                          options.prefix,
+                          options.force)
+@@ -402,7 +411,7 @@ def classify(self, options):
+         if options.scratch_dir:
+             make_sure_path_exists(options.scratch_dir)
+ 
+-        genomes = self._genomes_to_process(
++        genomes, _ = self._genomes_to_process(
+             options.genome_dir, options.batchfile, options.extension)
+ 
+         classify = Classify(options.cpus, options.pplacer_cpus)
+diff --git a/gtdbtk/markers.py b/gtdbtk/markers.py
+index 8406005b..0c085946 100644
+--- a/gtdbtk/markers.py
++++ b/gtdbtk/markers.py
+@@ -210,13 +210,15 @@ def _report_identified_marker_genes(self, gene_dict, outdir, prefix):
+         symlink_f(PATH_TLN_TABLE_SUMMARY.format(prefix=prefix),
+                   os.path.join(outdir, os.path.basename(PATH_TLN_TABLE_SUMMARY.format(prefix=prefix))))
+ 
+-    def identify(self, genomes, out_dir, prefix, force):
++    def identify(self, genomes, tln_tables, out_dir, prefix, force):
+         """Identify marker genes in genomes.
+ 
+         Parameters
+         ----------
+         genomes : dict
+             Genome IDs as the key, path to genome file as value.
++        tln_tables: Dict[str, int]
++            Genome ID -> translation table mapping for those user-specified.
+         out_dir : str
+             Path to the output directory.
+         prefix : str
+@@ -245,7 +247,7 @@ def identify(self, genomes, out_dir, prefix, force):
+                             force)
+         self.logger.info(
+             "Running Prodigal {} to identify genes.".format(prodigal.version))
+-        genome_dictionary = prodigal.run(genomes)
++        genome_dictionary = prodigal.run(genomes, tln_tables)
+ 
+         # annotated genes against TIGRFAM and Pfam databases
+         self.logger.info("Identifying TIGRFAM protein families.")
+diff --git a/tests/test_gtdbtk/test_main.py b/tests/test_gtdbtk/test_main.py
+index 2ebad52c..8c62ff9c 100644
+--- a/tests/test_gtdbtk/test_main.py
++++ b/tests/test_gtdbtk/test_main.py
+@@ -51,7 +51,7 @@ def test__genomes_to_process__genome_dir__valid(self):
+         open(os.path.join(self.dir_tmp, 'genome_1.fna'), 'a').close()
+         open(os.path.join(self.dir_tmp, 'genome_2.fna'), 'a').close()
+         open(os.path.join(self.dir_tmp, 'other_file.txt'), 'a').close()
+-        results = self.options_parser._genomes_to_process(self.dir_tmp, '', 'fna')
++        results, tln_table = self.options_parser._genomes_to_process(self.dir_tmp, '', 'fna')
+         expected = {'genome_1': os.path.join(self.dir_tmp, 'genome_1.fna'),
+                     'genome_2': os.path.join(self.dir_tmp, 'genome_2.fna')}
+         self.assertDictEqual(results, expected)
+@@ -65,13 +65,15 @@ def test__genomes_to_process__batchfile__valid(self):
+         open(path_genome_2, 'a').close()
+ 
+         with open(path_batchfile, 'a') as f:
+-            f.write('%s\tgenome_1\n' % path_genome_1)
++            f.write(f'{path_genome_1}\tgenome_1\n')
+             f.write('\n')
+-            f.write('%s\tgenome_2\n' % path_genome_2)
++            f.write(f'{path_genome_2}\tgenome_2\t4\n')
+ 
+-        results = self.options_parser._genomes_to_process('', path_batchfile, 'fna')
++        results, tln_table = self.options_parser._genomes_to_process('', path_batchfile, 'fna')
+         expected = {'genome_1': path_genome_1, 'genome_2': path_genome_2}
++        expected_tln = {'genome_2': 4}
+         self.assertDictEqual(results, expected)
++        self.assertDictEqual(tln_table, expected_tln)
+ 
+     def test__genomes_to_process__batchfile__invalid_columns(self):
+         """ Test that a batchfile containing columns not equal to 2 throws an exception. """
+@@ -86,7 +88,7 @@ def test__genomes_to_process__batchfile__invalid_columns(self):
+             f.write('\n')
+             f.write('%s\tgenome_2\tfoo\n' % path_genome_2)
+ 
+-        self.assertRaises(GenomeBatchfileMalformed, self.options_parser._genomes_to_process, '', path_batchfile,
++        self.assertRaises(GTDBTkExit, self.options_parser._genomes_to_process, '', path_batchfile,
+                           'fna')
+ 
+     def test__genomes_to_process__batchfile__blank_genome_path(self):
+@@ -102,7 +104,7 @@ def test__genomes_to_process__batchfile__blank_genome_path(self):
+             f.write('\n')
+             f.write('%s\tgenome_2\n' % '')
+ 
+-        self.assertRaises(GenomeBatchfileMalformed, self.options_parser._genomes_to_process, '', path_batchfile,
++        self.assertRaises(GTDBTkExit, self.options_parser._genomes_to_process, '', path_batchfile,
+                           'fna')
+ 
+     def test__genomes_to_process__batchfile__blank_genome_id(self):
+@@ -118,7 +120,7 @@ def test__genomes_to_process__batchfile__blank_genome_id(self):
+             f.write('\n')
+             f.write('%s\t\n' % path_genome_2)
+ 
+-        self.assertRaises(GenomeBatchfileMalformed, self.options_parser._genomes_to_process, '', path_batchfile,
++        self.assertRaises(GTDBTkExit, self.options_parser._genomes_to_process, '', path_batchfile,
+                           'fna')
+ 
+     def test__genomes_to_process__batchfile__duplicate_genome_id(self):

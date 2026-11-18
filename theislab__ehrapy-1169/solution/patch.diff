@@ -1,0 +1,201 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index e6d9dcda..55dc0541 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -94,6 +94,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🐛 Bug Fixes
+ 
++* {func}`ep.ml.calibrate <ehrapy.ml.calibrate>` defaults to `method="platt"` instead of `"isotonic"`, because isotonic regression overfits tuning sets of typical size, such as on PhysioNet 2012 with a calibration slope of 0.54 against 0.95 with Platt scaling ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
++* {func}`ep.ml.evaluate <ehrapy.ml.evaluate>` and {func}`ep.pl.subgroup_performance <ehrapy.plot.subgroup_performance>` keep the subgroups of `groupby` in the order of its categories, or of their appearance, instead of sorting them ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
++* {func}`ep.pp.summarize_measurements <ehrapy.preprocessing.summarize_measurements>` returns NaN without RuntimeWarnings for variables without values in a window of longitudinal data ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+ * Matplotlib figures in notebooks display inline after a holoviews-based ehrapy plot that runs before the first matplotlib figure, without `%matplotlib inline` ([#1168](https://github.com/theislab/ehrapy/pull/1168)) @Zethson
+ * {func}`ep.tl.ols <ehrapy.tools.ols>` and {func}`ep.tl.glm <ehrapy.tools.glm>` find the `obs` columns and variables quoted as `Q('...')` in a formula, so that names with spaces work again, by requiring formulaic 1.2.2 ([#1165](https://github.com/theislab/ehrapy/pull/1165)) @Zethson
+ * {func}`ep.pp.pca <ehrapy.preprocessing.pca>` uses scanpy's dask-native `covariance_eigh` solver for dask arrays by default instead of requiring dask-ml ([#1163](https://github.com/theislab/ehrapy/pull/1163)) @Zethson
+diff --git a/docs/references.bib b/docs/references.bib
+index eb232b96..b95aed48 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -950,6 +950,17 @@ @inproceedings{silva2012predicting
+   organization = {IEEE}
+ }
+ 
++@article{reyna2020early,
++  title     = {Early prediction of sepsis from clinical data: the PhysioNet/Computing in Cardiology Challenge 2019},
++  author    = {Reyna, Matthew A and Josef, Christopher S and Jeter, Russell and Shashikumar, Supreeth P and Westover, M Brandon and Nemati, Shamim and Clifford, Gari D and Sharma, Ashish},
++  journal   = {Critical Care Medicine},
++  volume    = {48},
++  number    = {2},
++  pages     = {210--217},
++  year      = {2020},
++  doi       = {10.1097/CCM.0000000000004145}
++}
++
+ @article{goldberger2000physiobank,
+   title     = {PhysioBank, PhysioToolkit, and PhysioNet: components of a new research resource for complex physiologic signals},
+   author    = {Goldberger, Ary L and Amaral, Luis AN and Glass, Leon and Hausdorff, Jeffrey M and Ivanov, Plamen Ch and Mark, Roger G and Mietus, Joseph E and Moody, George B and Peng, Chung-Kang and Stanley, H Eugene},
+diff --git a/ehrapy/ml/_evaluate.py b/ehrapy/ml/_evaluate.py
+index e99499d4..ddd05e62 100644
+--- a/ehrapy/ml/_evaluate.py
++++ b/ehrapy/ml/_evaluate.py
+@@ -89,7 +89,7 @@ def evaluate(
+     """
+     y, prediction, obs = _evaluation_data(edata, task, key=key, split_key=split_key, split=split)
+     metrics = _metrics(task.kind, threshold)
+-    groups = None if groupby is None else obs[groupby].to_numpy()
++    groups = None if groupby is None else pd.Categorical(obs[groupby], categories=_subgroups(obs[groupby]))
+     patients = pd.factorize(obs.index if patient_key is None else obs[patient_key])[0]
+ 
+     def table(rows: np.ndarray) -> pd.Series:
+@@ -130,8 +130,15 @@ def _evaluation_data(
+     return (y if task.kind in {"regression", "survival"} else y.astype(np.int64)), prediction, obs
+ 
+ 
++def _subgroups(column: pd.Series) -> pd.Index:
++    """The subgroups in `column`, in the order of its categories or else of their appearance."""
++    if isinstance(column.dtype, pd.CategoricalDtype):
++        return column.cat.remove_unused_categories().cat.categories
++    return pd.Index(column.dropna().unique())
++
++
+ def _table(
+-    y: np.ndarray, prediction: np.ndarray, groups: np.ndarray | None, metrics: Mapping[str, Metric], kind: Kind
++    y: np.ndarray, prediction: np.ndarray, groups: pd.Categorical | None, metrics: Mapping[str, Metric], kind: Kind
+ ) -> pd.Series:
+     """The metrics, per subgroup with their largest differences if `groups` is given."""
+     if groups is None:
+@@ -139,7 +146,8 @@ def _table(
+     per_group = pd.DataFrame(
+         {
+             group: _values(y[groups == group], prediction[groups == group], metrics, kind)
+-            for group in np.unique(groups[pd.notna(groups)])
++            for group in groups.categories
++            if (groups == group).any()
+         },
+         index=pd.Index(list(metrics), name="metric"),
+     )
+diff --git a/ehrapy/ml/_uncertainty.py b/ehrapy/ml/_uncertainty.py
+index 9aace815..034b9b03 100644
+--- a/ehrapy/ml/_uncertainty.py
++++ b/ehrapy/ml/_uncertainty.py
+@@ -25,13 +25,14 @@ def calibrate(
+     edata: EHRData,
+     predictor: Predictor,
+     *,
+-    method: Literal["platt", "isotonic", "temperature"] = "isotonic",
++    method: Literal["platt", "isotonic", "temperature"] = "platt",
+     split_key: str = "split",
+     split: str = "tuning",
+ ) -> Predictor:
+     """Calibrate the predicted probabilities of a fitted model on held-out observations.
+ 
+     Platt scaling fits a logistic regression to the log-odds of binary predictions, isotonic regression fits a monotonic function to them, and temperature scaling divides the log-odds or log-probabilities by a single temperature, which keeps the order of predictions and also applies to multiclass tasks.
++    Platt scaling is the default because isotonic regression overfits all but large held-out sets.
+ 
+     Args:
+         edata: Central data object.
+diff --git a/ehrapy/preprocessing/_summarize_measurements.py b/ehrapy/preprocessing/_summarize_measurements.py
+index f55759c9..13a1b941 100644
+--- a/ehrapy/preprocessing/_summarize_measurements.py
++++ b/ehrapy/preprocessing/_summarize_measurements.py
+@@ -204,14 +204,15 @@ def _aggregate_time(X: Array, statistic: str) -> Array:
+     if not xp.isdtype(X.dtype, "real floating"):
+         X = xp.astype(X, xp.float64)
+     match statistic:
+-        case "min":
+-            return xpx.nanmin(X, axis=2)
+-        case "max":
+-            return xpx.nanmax(X, axis=2)
+-        case "mean":
+-            return xpx.nanmean(X, axis=2)
+-        case "median":
+-            return nanquantile(X, 0.5, axis=2)
++        case "min" | "max" | "mean" | "median":
++            measured = xp.any(~xp.isnan(X), axis=2)
++            filled = xp.where(measured[..., None], X, 0)
++            summary = (
++                nanquantile(filled, 0.5, axis=2)
++                if statistic == "median"
++                else getattr(xpx, f"nan{statistic}")(filled, axis=2)
++            )
++            return xp.where(measured, summary, xp.nan)
+         case "count":
+             return xp.sum(xp.astype(~xp.isnan(X), X.dtype), axis=2)
+         case "std" | "slope":
+diff --git a/tests/ml/test_evaluate.py b/tests/ml/test_evaluate.py
+index 900cc24e..8c6bdbc6 100644
+--- a/tests/ml/test_evaluate.py
++++ b/tests/ml/test_evaluate.py
+@@ -70,6 +70,19 @@ def test_evaluate_subgroups():
+     assert difference["equalized_odds"] == max(difference["sensitivity"], difference["specificity"])
+ 
+ 
++@pytest.mark.parametrize("categorical", [True, False])
++def test_evaluate_keeps_subgroup_order(categorical):
++    edata = _calibrated()
++    edata.obs["group"] = edata.obs["group"].map({"a": "young", "b": "old"})
++    edata.obs.iloc[0, edata.obs.columns.get_loc("group")] = "young"
++    if categorical:
++        edata.obs["group"] = pd.Categorical(edata.obs["group"], categories=["young", "middle", "old"])
++
++    result = ep.ml.evaluate(edata, ep.ml.Task("y"), split=None, groupby="group", n_bootstrap=5)
++
++    assert result.index.get_level_values("group").unique().tolist() == ["young", "old", "difference"]
++
++
+ def test_evaluate_resamples_patients():
+     patients = np.repeat(np.arange(5), [1, 2, 3, 4, 5])
+     rows = _resample(patients, np.random.default_rng(0))
+diff --git a/tests/ml/test_uncertainty.py b/tests/ml/test_uncertainty.py
+index d2e3dfcd..f7a9be6b 100644
+--- a/tests/ml/test_uncertainty.py
++++ b/tests/ml/test_uncertainty.py
+@@ -30,6 +30,17 @@ def test_calibrate_improves_calibration(edata, method):
+         assert auroc[1] == pytest.approx(auroc[0])
+ 
+ 
++def test_calibrate_defaults_to_platt_scaling(edata):
++    predictor = ep.ml.fit(edata, ep.ml.Task("label", prediction_time=6, observation_window=4))
++    predictions = [
++        ep.ml.predict(edata, ep.ml.calibrate(edata, predictor, **kwargs), copy=True).obs["prediction"]
++        for kwargs in ({}, {"method": "platt"}, {"method": "isotonic"})
++    ]
++
++    np.testing.assert_array_equal(predictions[0], predictions[1])
++    assert not np.array_equal(predictions[0], predictions[2])
++
++
+ def test_temperature_scaling_of_multiclass_predictions(edata):
+     predictor = ep.ml.fit(edata, TASKS["multiclass"], model="random_forest")
+     calibrated = ep.ml.calibrate(edata, predictor, method="temperature")
+diff --git a/tests/plot/test_prediction.py b/tests/plot/test_prediction.py
+index 428c23e3..cb949f36 100644
+--- a/tests/plot/test_prediction.py
++++ b/tests/plot/test_prediction.py
+@@ -49,3 +49,13 @@ def test_subgroup_performance(edata):
+ 
+     assert len(plot) == 2
+     assert all(isinstance(panel, hv.Overlay) for panel in plot)
++
++
++def test_subgroup_performance_keeps_subgroup_order(edata):
++    edata.obs["group"] = pd.Categorical(edata.obs["group"], categories=["b", "a"])
++    performance = ep.ml.evaluate(edata, ep.ml.Task("y"), split=None, groupby="group", n_bootstrap=0)
++
++    (panel,) = ep.pl.subgroup_performance(performance, metrics=["auroc"])
++
++    rendered = hv.render(panel, backend="bokeh")
++    assert list(rendered.x_range.factors) == ["b", "a"]
+diff --git a/tests/preprocessing/test_summarize_measurements.py b/tests/preprocessing/test_summarize_measurements.py
+index ac5a3078..ead12f90 100644
+--- a/tests/preprocessing/test_summarize_measurements.py
++++ b/tests/preprocessing/test_summarize_measurements.py
+@@ -101,7 +101,7 @@ def test_summarize_measurements_unknown_var(edata_blob_small):
+         summarize_measurements(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME, var_names=["unknown"])
+ 
+ 
+-@pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
++@pytest.mark.filterwarnings("error::RuntimeWarning")
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu)
+ @pytest.mark.parametrize(("ndim", "tem_names"), [(2, None), (3, None), (3, {"early": slice(0, 2), "late": ["2", "3"]})])
+ def test_summarize_measurements_array_types(array_type, ndim, tem_names, rng):

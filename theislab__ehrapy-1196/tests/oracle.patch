@@ -1,0 +1,166 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 6936cc23..b019bb9c 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -95,6 +95,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🐛 Bug Fixes
+ 
++* {func}`ep.pp.detect_bias <ehrapy.preprocessing.detect_bias>` and {func}`ep.tl.rank_features_supervised <ehrapy.tools.rank_features_supervised>` no longer fail for variables whose name is also a column of `obs` or that have missing values, and leave out the observations without a value of the predicted variable or the sensitive feature ([#1196](https://github.com/theislab/ehrapy/pull/1196)) @Zethson
+ * {func}`ep.tl.cox_ph_adjusted_curves <ehrapy.tools.cox_ph_adjusted_curves>` raises an error when `strata` is neither a covariate nor one of the `strata` of `cph`, which gave every group the same curve, and its documentation no longer asks to leave `strata` out of the model ([#1192](https://github.com/theislab/ehrapy/pull/1192)) @Zethson
+ * {func}`ep.pl.cox_ph_forestplot <ehrapy.plot.cox_ph_forestplot>` draws the confidence intervals as horizontal error bars, puts the reference line at a coefficient of 0, which is a hazard ratio of 1, instead of 1, and gives the header its own row instead of overlapping the top coefficient ([#1191](https://github.com/theislab/ehrapy/pull/1191)) @Zethson
+ * The survival models that derive durations from a longitudinal `event_col` measure them in the unit of `edata.tem["time_value"]`, such as hours on PhysioNet 2012 and 2019, instead of in seconds of `edata.tem["interval_start_offset"]`, which they keep using when `tem` has no `time_value` ([#1190](https://github.com/theislab/ehrapy/pull/1190)) @Zethson
+diff --git a/ehrapy/preprocessing/_bias.py b/ehrapy/preprocessing/_bias.py
+index c2f2b393..aa86be70 100644
+--- a/ehrapy/preprocessing/_bias.py
++++ b/ehrapy/preprocessing/_bias.py
+@@ -218,7 +218,8 @@ def _get_group_name(encoded_feature: str, group_val: int) -> str | int:
+     continuous = X[:, edata.var_names.get_indexer(continuous_var_names)]
+     for sens_feature in cat_sens_features:
+         sens_values = _column(sens_feature)
+-        sens_feature_groups = sorted(pd.unique(sens_values))
++        observed = ~pd.isna(sens_values)
++        sens_feature_groups = sorted(pd.unique(sens_values[observed]))
+         if len(sens_feature_groups) == 1:
+             continue
+         smd_df = pd.DataFrame(index=continuous_var_names, columns=sens_feature_groups)
+@@ -226,7 +227,7 @@ def _get_group_name(encoded_feature: str, group_val: int) -> str | int:
+         for _group_nr, group in enumerate(sens_feature_groups):
+             # Compute SMD for all continuous features between the sensitive group and all other observations
+             group_mean, group_std = _nan_mean_std(continuous[sens_values == group])
+-            comparison_mean, comparison_std = _nan_mean_std(continuous[sens_values != group])
++            comparison_mean, comparison_std = _nan_mean_std(continuous[observed & (sens_values != group)])
+ 
+             smd = pd.Series(
+                 (group_mean - comparison_mean) / np.sqrt((group_std**2 + comparison_std**2) / 2),
+@@ -317,23 +318,15 @@ def _get_group_name(encoded_feature: str, group_val: int) -> str | int:
+             "Prediction Score": [],
+         }
+         for prediction_feature in edata.var_names:
+-            try:
+-                rank_features_supervised(
+-                    edata,
+-                    predicted_feature=prediction_feature,
+-                    var_names="all",
+-                    model="rf",
+-                    key_added=f"{prediction_feature}_feature_importances",
+-                    percent_output=True,
+-                    verbose=False,
+-                )
+-            except ValueError as e:
+-                if "Input y contains NaN" in str(e):
+-                    raise ValueError(
+-                        f"During feature importance computation, input feature y ({prediction_feature}) was found to contain NaNs."
+-                    ) from e
+-                else:
+-                    raise e
++            rank_features_supervised(
++                edata,
++                predicted_feature=prediction_feature,
++                var_names="all",
++                model="rf",
++                key_added=f"{prediction_feature}_feature_importances",
++                percent_output=True,
++                verbose=False,
++            )
+ 
+             prediction_score = edata.uns[f"{prediction_feature}_feature_importances"]["score"]
+             for sens_feature in sens_features_list:
+diff --git a/ehrapy/tools/feature_ranking/_feature_importances.py b/ehrapy/tools/feature_ranking/_feature_importances.py
+index 90897dc4..c113ecb4 100644
+--- a/ehrapy/tools/feature_ranking/_feature_importances.py
++++ b/ehrapy/tools/feature_ranking/_feature_importances.py
+@@ -7,14 +7,14 @@
+ from ehrdata._feature_types import _check_feature_types
+ from ehrdata._logger import logger
+ from ehrdata.core.constants import CATEGORICAL_TAG, DATE_TAG, FEATURE_TYPE_KEY, NUMERIC_TAG
++from fast_array_utils.conv import to_dense
+ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+ from sklearn.linear_model import LinearRegression, LogisticRegression
+ from sklearn.model_selection import train_test_split
+ from sklearn.preprocessing import MinMaxScaler, StandardScaler
+ from sklearn.svm import SVC, SVR
+ 
+-from ehrapy._compat import function_2D_only
+-from ehrapy.get import obs_df
++from ehrapy._compat import _var_indices, function_2D_only
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+@@ -44,6 +44,7 @@ def rank_features_supervised(
+     Args:
+         edata: Central data object.
+         predicted_feature: The feature to predict by the model. Must be present in edata.var_names.
++            Observations without a value of this feature are left out.
+         model: The model to use for prediction.
+             Choose between 'regression', 'svm', or 'rf'.
+             Multi-class classification is only possible with 'rf'.
+@@ -96,7 +97,10 @@ def rank_features_supervised(
+     if var_names == "all":
+         var_names = [var_name for var_name in edata.var_names if var_name != predicted_feature]
+     columns = list(dict.fromkeys([*var_names, predicted_feature]))
+-    data = obs_df(edata, keys=columns, layer=layer)
++    X = edata.X if layer is None else edata.layers[layer]
++    values = to_dense(X[:, _var_indices(edata, columns)], to_cpu_memory=True)
++    data = pd.DataFrame(values, index=edata.obs_names, columns=columns)
++    data = data[data[predicted_feature].notna()]
+ 
+     prediction_type = edata.var[FEATURE_TYPE_KEY].loc[predicted_feature]
+ 
+diff --git a/tests/preprocessing/test_bias.py b/tests/preprocessing/test_bias.py
+index d5ecb625..cfdb534a 100644
+--- a/tests/preprocessing/test_bias.py
++++ b/tests/preprocessing/test_bias.py
+@@ -96,6 +96,27 @@ def test_detect_bias_specified_sensitive_features(edata_small_bias):
+     assert len(df) == 2  # contin1 predicts cat1 and cat1 predicts contin1
+ 
+ 
++def test_detect_bias_obs_column_and_missing_values(edata_small_bias):
++    X = edata_small_bias.X.astype(np.float64)
++    X[::7, 3] = np.nan
++    X[::11, 4] = np.nan
++    edata_small_bias.X = X
++    edata_small_bias.obs["contin1"] = X[:, 3]
++
++    ep.pp.detect_bias(
++        edata_small_bias,
++        sensitive_features=["cat1"],
++        run_feature_importances=True,
++        feature_importance_threshold=0.5,
++        prediction_confidence_threshold=0.4,
++    )
++
++    results = edata_small_bias.uns["bias"]
++    assert list(edata_small_bias.uns["smd"]["cat1"].columns) == [0, 1]
++    assert set(results["standardized_mean_differences"]["Sensitive Group"]) == {0, 1}
++    assert results["feature_importances"]["Predicted Feature"].tolist() == ["contin1"]
++
++
+ def test_unencoded_data():
+     edata = ed.io.from_pandas(
+         pd.DataFrame({"Unencoded": ["A", "B", "C", "D", "E", "F"], "Encoded": [1, 2, 3, 4, 5, 6]})
+diff --git a/tests/tools/feature_ranking/test_feature_importances.py b/tests/tools/feature_ranking/test_feature_importances.py
+index 7c4e538d..ddc23d2d 100644
+--- a/tests/tools/feature_ranking/test_feature_importances.py
++++ b/tests/tools/feature_ranking/test_feature_importances.py
+@@ -80,6 +80,20 @@ def test_var_names_subset():
+     assert pd.isna(edata.var["feature_importances"]["feature2"])
+ 
+ 
++def test_obs_column_and_missing_target():
++    rng = np.random.default_rng(0)
++    target = rng.random(200)
++    target[::5] = np.nan
++    edata = ed.EHRData(np.stack((target, target * 2, rng.random(200))).T, obs=pd.DataFrame({"feature1": target}))
++    edata.var_names = ["target", "feature1", "feature2"]
++    edata.var[FEATURE_TYPE_KEY] = [NUMERIC_TAG] * 3
++
++    rank_features_supervised(edata, predicted_feature="target", model="rf", var_names="all")
++
++    assert edata.var["feature_importances"]["feature1"] > edata.var["feature_importances"]["feature2"]
++    assert edata.uns["feature_importances"]["score"] > 0.9
++
++
+ def test_copy():
+     target = np.random.default_rng(0).random(100)
+     edata = ed.EHRData(np.stack((target, target * 2)).T)

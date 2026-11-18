@@ -1,0 +1,360 @@
+diff --git a/metagraph/docs/source/faq.rst b/metagraph/docs/source/faq.rst
+index bd642c0b74..e4edfe27b2 100644
+--- a/metagraph/docs/source/faq.rst
++++ b/metagraph/docs/source/faq.rst
+@@ -52,7 +52,10 @@ Which alphabet?
+ 
+ - **DNA** (default): DNA/RNA sequences (A,C,G,T)
+ - **DNA5**: With ambiguous bases (A,C,G,T,N)
+-- **DNA_CASE_SENSITIVE**: When case matters (A,C,G,T,N,a,c,g,t)
++- **DNA_CASE_SENSITIVE**: Preserves uppercase and lowercase bases as distinct
++  symbols (A,C,G,T,N,a,c,g,t), including lowercase bases used for soft masking.
++  Reverse complements preserve case: ``ACG`` becomes ``CGT``, and ``acg`` becomes
++  ``cgt``. Lowercase bases are still indexed and matched; they are not skipped.
+ - **Protein**: Amino acid sequences (A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,Y,Z,X)
+ 
+ 
+diff --git a/metagraph/docs/source/release_notes.rst b/metagraph/docs/source/release_notes.rst
+index e359138385..6e6641cdad 100644
+--- a/metagraph/docs/source/release_notes.rst
++++ b/metagraph/docs/source/release_notes.rst
+@@ -4,6 +4,18 @@ Release notes
+ Unreleased
+ ----------
+ 
++Case-sensitive DNA packed reverse complements now preserve case, matching
++string reverse complements: ``ACG`` becomes ``CGT``, and ``acg`` becomes ``cgt``.
++Case can retain soft-masking information; uppercase and lowercase bases remain
++distinct symbols during indexing and matching.
++Rebuild existing case-sensitive canonical and primary graphs and their dependent
++annotations. Basic graphs retain their previous behavior.
++
++SSHash protein graphs with ``k=12`` now use 64-bit k-mer keys instead of 128-bit
++keys. Rebuild existing SSHash protein graphs with ``k=12`` and their dependent
++annotations before using this version. Other k-mer lengths retain their existing
++storage width.
++
+ ``metagraph build`` now chooses its default k-mer length at compile time from
+ the alphabet's packed 64-bit encoding, rounding down to an odd length for
+ nucleotide alphabets:
+diff --git a/metagraph/integration_tests/test_case_sensitive.py b/metagraph/integration_tests/test_case_sensitive.py
+new file mode 100644
+index 0000000000..76b322f801
+--- /dev/null
++++ b/metagraph/integration_tests/test_case_sensitive.py
+@@ -0,0 +1,111 @@
++"""Case is preserved throughout graph construction, lookup and extraction."""
++import gzip
++import itertools
++import json
++import os
++from pathlib import Path
++import subprocess
++from tempfile import TemporaryDirectory
++import unittest
++
++from base import METAGRAPH
++
++
++COMPLEMENT = str.maketrans("ACGTNacgt", "TGCANtgca")
++
++
++def reverse(sequence):
++    return sequence.translate(COMPLEMENT)[::-1]
++
++
++def kmers(sequences):
++    return {s[i:i + 3] for s in sequences for i in range(len(s) - 2)}
++
++
++@unittest.skipUnless('DNA_CASE_SENSITIVE' in os.path.realpath(METAGRAPH),
++                     'requires the case-sensitive executable')
++class TestCaseSensitive(unittest.TestCase):
++    def run_cli(self, *args):
++        result = subprocess.run([METAGRAPH, *map(str, args)], capture_output=True,
++                                text=True, timeout=120)
++        self.assertEqual(result.returncode, 0, result.stderr)
++        return result.stdout
++
++    def check_queries(self, graph, root, fasta, query, sequences, both):
++        annotation = root / 'annotation'
++        self.run_cli('annotate', '-i', graph, '--anno-header', '-o', annotation,
++                     *(['--fwd-and-reverse'] if both == 'input' else []), fasta)
++        output = self.run_cli('query', '-i', graph, '-a', str(annotation) + '.column.annodbg',
++                              '--query-mode', 'labels', '--min-kmers-fraction-label', '1',
++                              '--json', query)
++        results = {}
++        decoder = json.JSONDecoder()
++        while output.strip():
++            item, end = decoder.raw_decode(output.lstrip())
++            output = output.lstrip()[end:]
++            results[item['seq_description']] = {r['sample'] for r in item['results']}
++        self.assertEqual(len(results), 9 ** 3)
++        for q, labels in results.items():
++            expected = {s for s in sequences
++                        if q in s or (both and reverse(q) in s)}
++            self.assertEqual(labels, expected, q)
++
++    def test_case_preserving_complements_and_extraction(self):
++        sequences = ['ACG', 'acg', 'AcG', 'ANT', 'aNt', 'NNN',
++                     'ACGTAC', 'acgtac', 'AcGNta']
++        queries = [''.join(s) for s in itertools.product('ACGTNacgt', repeat=3)]
++        for backend, extension in [('hashfast', '.hashfastdbg'), ('succinct', '.dbg')]:
++            for mode in ['basic', 'canonical', 'primary']:
++                with self.subTest(backend=backend, mode=mode), TemporaryDirectory() as tmp:
++                    root = Path(tmp)
++                    fasta, query = root / 'input.fa', root / 'query.fa'
++                    fasta.write_text(''.join(f'>{s}\n{s}\n' for s in sequences))
++                    query.write_text(''.join(f'>{s}\n{s}\n' for s in queries))
++                    if mode == 'primary':
++                        # Primary mode expects one representative per strand pair.
++                        self.run_cli('build', '--graph', backend, '--mode', 'canonical',
++                                     '-k', '3', '-p', '1', '-o', root / 'canonical', fasta)
++                        self.run_cli('transform', '--to-fasta', '--primary-kmers',
++                                     '-o', root / 'primary', str(root / 'canonical') + extension)
++                        build_input = root / 'primary.fasta.gz'
++                    else:
++                        build_input = fasta
++                    self.run_cli('build', '--graph', backend, '--mode', mode, '-k', '3',
++                                 '-p', '1', '-o', root / 'graph', build_input)
++                    graph = str(root / 'graph') + extension
++                    self.check_queries(graph, root, fasta, query, sequences, mode != 'basic')
++                    normalize = (lambda s: min(s, reverse(s))) if mode != 'basic' else (lambda s: s)
++                    expected = {normalize(s) for s in kmers(sequences)}
++                    # Check both contig and unitig extraction, including strand deduplication.
++                    for unitigs in [False, True]:
++                        prefix = root / ('unitigs' if unitigs else 'contigs')
++                        self.run_cli('transform', '--to-fasta',
++                                     *(['--unitigs'] if unitigs else []),
++                                     *(['--primary-kmers'] if mode != 'basic' else []),
++                                     '-o', prefix, graph)
++                        exported = Path(str(prefix) + '.fasta.gz')
++                        with gzip.open(exported, 'rt') as stream:
++                            records = stream.read().split('>')[1:]
++                        extracted = [''.join(record.splitlines()[1:]) for record in records]
++                        self.assertEqual({normalize(s) for s in kmers(extracted)}, expected)
++                        # Rebuild exported sequences and annotate using the original input.
++                        rebuilt = str(prefix) + '-rebuilt'
++                        self.run_cli('build', '--graph', backend, '--mode', mode, '-k', '3',
++                                     '-p', '1', '-o', rebuilt, exported)
++                        self.check_queries(rebuilt + extension, root, fasta, query,
++                                           sequences, mode != 'basic')
++
++    def test_reverse_input_in_basic_graph(self):
++        sequences = ['ACG', 'AcGNta']
++        for backend, extension in [('hashfast', '.hashfastdbg'), ('succinct', '.dbg')]:
++            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
++                root = Path(tmp)
++                fasta, query = root / 'input.fa', root / 'query.fa'
++                fasta.write_text(''.join(f'>{s}\n{s}\n' for s in sequences))
++                query.write_text(''.join(f'>{s}\n{s}\n' for s in
++                                        map(''.join, itertools.product('ACGTNacgt', repeat=3))))
++                self.run_cli('build', '--graph', backend, '--mode', 'basic',
++                             '--fwd-and-reverse', '-k', '3', '-p', '1',
++                             '-o', root / 'graph', fasta)
++                self.check_queries(str(root / 'graph') + extension, root, fasta, query,
++                                   sequences, 'input')
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index 0d24f8ea65..c3847d5010 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -30,13 +30,6 @@
+ namespace mtg {
+ namespace graph {
+ 
+-#if _PROTEIN_GRAPH
+-static constexpr uint16_t bits_per_char = sshash::aa_uint_kmer_t<uint64_t>::bits_per_char;
+-#else
+-static constexpr uint16_t bits_per_char = sshash::dna_uint_kmer_t<uint64_t>::bits_per_char;
+-#endif
+-
+-
+ const std::string DBGSSHash::alphabet_ = kmer::KmerExtractor2Bit().alphabet;
+ 
+ constexpr DeBruijnGraph::node_index sshash_to_graph_index(uint64_t idx) {
+@@ -54,16 +47,14 @@ DBGSSHash::DBGSSHash(size_t k, Mode mode) : k_(k), num_nodes_(0), mode_(mode) {
+     if (mode == PRIMARY)
+         mode_ = CANONICAL;
+ 
+-    size_t odd_k = (k_ | 1);
+-
+-    if (odd_k * bits_per_char <= 64) {
++    if (k_ <= kmer_t<KmerInt64>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt64>, sshash::decoded_offsets>>();
+-    } else if (odd_k * bits_per_char <= 128) {
++    } else if (k_ <= kmer_t<KmerInt128>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt128>, sshash::decoded_offsets>>();
+-    } else if (odd_k * bits_per_char <= 256) {
++    } else if (k_ <= kmer_t<KmerInt256>::max_k) {
+         dict_.emplace<sshash::dictionary<kmer_t<KmerInt256>, sshash::decoded_offsets>>();
+     } else {
+-        common::logger->error("k too big: {} > {}", odd_k, 256 / bits_per_char);
++        common::logger->error("k too big: {} > {}", k_, kmer_t<KmerInt256>::max_k);
+         throw std::length_error("k fail");
+     }
+ }
+diff --git a/metagraph/src/kmer/alphabets.hpp b/metagraph/src/kmer/alphabets.hpp
+index 9d8d873b00..b7964132ad 100644
+--- a/metagraph/src/kmer/alphabets.hpp
++++ b/metagraph/src/kmer/alphabets.hpp
+@@ -41,7 +41,7 @@ constexpr uint8_t kBOSSCharToDNACaseSent[128] = {
+     5, 6, 5, 7,  5, 5, 5, 8,  5, 5, 5, 5,  5, 5, 5, 5,
+     5, 5, 5, 5,  9, 9, 5, 5,  5, 5, 5, 5,  5, 5, 5, 5
+ };
+-const std::vector<uint8_t> kBOSSComplementMapDNACaseSent = { 0, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
++const std::vector<uint8_t> kBOSSComplementMapDNACaseSent = { 0, 4, 3, 2, 1, 5, 9, 8, 7, 6 };
+ static_assert(kBOSSSigmaDNACaseSent <= 1llu << kBOSSBitsPerCharDNACaseSent);
+ static_assert(kBOSSSigmaDNACaseSent > 1llu << (kBOSSBitsPerCharDNACaseSent - 1));
+ 
+@@ -104,7 +104,7 @@ constexpr uint8_t kCharToDNACaseSent[128] = {
+     4, 5, 4, 6,  4, 4, 4, 7,  4, 4, 4, 4,  4, 4, 4, 4,
+     4, 4, 4, 4,  8, 8, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4
+ };
+-const std::vector<uint8_t> kComplementMapDNACaseSent = { 8, 7, 6, 5, 4, 3, 2, 1, 0 };
++const std::vector<uint8_t> kComplementMapDNACaseSent = { 3, 2, 1, 0, 4, 8, 7, 6, 5 };
+ static_assert(kSigmaDNACaseSent <= 1llu << kBitsPerCharDNACaseSent);
+ static_assert(kSigmaDNACaseSent > 1llu << (kBitsPerCharDNACaseSent - 1));
+ 
+diff --git a/metagraph/tests/graph/test_dbg_sshash.cpp b/metagraph/tests/graph/test_dbg_sshash.cpp
+index e33a543f6e..e042655ac3 100644
+--- a/metagraph/tests/graph/test_dbg_sshash.cpp
++++ b/metagraph/tests/graph/test_dbg_sshash.cpp
+@@ -1,5 +1,6 @@
+ #include <fstream>
+ #include <random>
++#include <sstream>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -63,6 +64,84 @@ void expect_rejected(const std::string &contents,
+ 
+ const std::string seq_30 = "ACGTTGCAAGGCTTACCATGGTACCAGTTA";
+ 
++TEST_F(DBGSSHashInput, ChoosesSmallestPackedWord) {
++    constexpr auto k64 = DBGSSHash::kmer_t<uint64_t>::max_k;
++    constexpr auto k128 = DBGSSHash::kmer_t<__uint128_t>::max_k;
++    constexpr auto k256 = DBGSSHash::kmer_t<sdsl::uint256_t>::max_k;
++    EXPECT_EQ(0u, DBGSSHash(k64).data().index());
++    EXPECT_EQ(1u, DBGSSHash(k64 + 1).data().index());
++    EXPECT_EQ(1u, DBGSSHash(k128).data().index());
++    EXPECT_EQ(2u, DBGSSHash(k128 + 1).data().index());
++    EXPECT_EQ(2u, DBGSSHash(k256).data().index());
++    EXPECT_THROW(DBGSSHash(k256 + 1), std::length_error);
++}
++
++#if _PROTEIN_GRAPH
++const std::string protein_sequence = "MKWVTFISRLDPQEAHNYCG";
++
++void check_protein_nodes(const DBGSSHash &graph, const std::string &sequence,
++                         const std::vector<uint64_t> &expected_nodes) {
++    const size_t k = graph.get_k();
++    EXPECT_EQ(sequence.size() - k + 1, graph.num_nodes());
++    std::vector<uint64_t> nodes;
++    graph.map_to_nodes_sequentially(sequence, [&](auto node) { nodes.push_back(node); });
++    ASSERT_EQ(expected_nodes, nodes);
++    for (size_t i = 0; i < nodes.size(); ++i) {
++        ASSERT_NE(0u, nodes[i]);
++        EXPECT_EQ(sequence.substr(i, k), graph.get_node_sequence(nodes[i]));
++        EXPECT_EQ(nodes[i], graph.kmer_to_node(sequence.substr(i, k)));
++        if (i + 1 < nodes.size()) {
++            EXPECT_EQ(nodes[i + 1], graph.traverse(nodes[i], sequence[i + k]));
++            EXPECT_EQ(nodes[i], graph.traverse_back(nodes[i + 1], sequence[i]));
++        }
++    }
++    EXPECT_EQ(0u, graph.kmer_to_node(std::string(k, 'A')));
++}
++
++TEST_F(DBGSSHashInput, ProteinPackedWordConstructionAndRoundTrip) {
++    const std::string sequence = protein_sequence + "STVQKMDF";
++    for (size_t k : {11, 12, 13, 25, 26}) {
++        SCOPED_TRACE(k);
++        write_input(">a\n" + sequence + "\n");
++        DBGSSHash graph(test_input, k);
++        const size_t expected_width = k <= 12 ? 0 : k <= 25 ? 1 : 2;
++        EXPECT_EQ(expected_width, graph.data().index());
++        std::vector<uint64_t> nodes;
++        graph.map_to_nodes_sequentially(sequence, [&](auto node) { nodes.push_back(node); });
++        check_protein_nodes(graph, sequence, nodes);
++
++        std::stringstream bytes;
++        graph.serialize(bytes);
++        DBGSSHash restored(3);
++        ASSERT_TRUE(restored.load(bytes));
++        EXPECT_EQ(k, restored.get_k());
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++
++        graph.serialize(test_input + ".graph");
++        ASSERT_TRUE(restored.load(test_input + ".graph"));
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++
++        auto mapped = utils::open_ifstream(test_input + ".graph.sshashdbg", true);
++        ASSERT_TRUE(restored.load(*mapped));
++        EXPECT_EQ(expected_width, restored.data().index());
++        check_protein_nodes(restored, sequence, nodes);
++    }
++}
++
++TEST_F(DBGSSHashInput, Protein12EmptyGraphRoundTrip) {
++    DBGSSHash graph(12);
++    std::stringstream bytes;
++    graph.serialize(bytes);
++    DBGSSHash restored(3);
++    ASSERT_TRUE(restored.load(bytes));
++    EXPECT_EQ(12u, restored.get_k());
++    EXPECT_EQ(0u, restored.num_nodes());
++    EXPECT_EQ(0u, restored.data().index());
++}
++#endif
++
+ TEST_F(DBGSSHashInput, RejectsSequenceShorterThanK) {
+     expect_rejected(">a\n" + seq_30 + "\n>b\nACGTA\n",
+                     "sequence 2 has length 5, shorter than k = 21");
+diff --git a/metagraph/tests/test_kmer_extractor.cpp b/metagraph/tests/test_kmer_extractor.cpp
+index 71a48703c1..ec0aa8bf32 100644
+--- a/metagraph/tests/test_kmer_extractor.cpp
++++ b/metagraph/tests/test_kmer_extractor.cpp
+@@ -15,6 +15,42 @@ using namespace mtg;
+ 
+ using mtg::kmer::KmerExtractor2Bit;
+ 
++TEST(StringReverseComplement, CompiledAlphabet) {
++    std::string sequence = "ACG";
++    reverse_complement(sequence);
++    EXPECT_EQ("CGT", sequence);
++    sequence = "AcGNnUu";
++    reverse_complement(sequence);
++    EXPECT_EQ("aAnNCgT", sequence);
++    sequence.clear();
++    reverse_complement(sequence);
++    EXPECT_TRUE(sequence.empty());
++}
++
++#if _DNA_CASE_SENSITIVE_GRAPH
++TEST(StringReverseComplement, AgreesWithPackedCaseSensitiveAlphabet) {
++    KmerExtractor2Bit encoder;
++    const std::string alphabet = "ACGTNacgt";
++    for (char a : alphabet) {
++        EXPECT_EQ(encoder.decode(encoder.complement_code()[encoder.encode(a)]),
++                  complement(a));
++        for (char b : alphabet) {
++            for (char c : alphabet) {
++                const std::string original = { a, b, c };
++                std::string sequence = original;
++                reverse_complement(sequence);
++                std::string expected;
++                for (auto it = original.rbegin(); it != original.rend(); ++it)
++                    expected += encoder.decode(encoder.complement_code()[encoder.encode(*it)]);
++                EXPECT_EQ(expected, sequence);
++                reverse_complement(sequence);
++                EXPECT_EQ(original, sequence);
++            }
++        }
++    }
++}
++#endif
++
+ template <typename Kmer>
+ class ExtractKmers2Bit : public ::testing::Test { };
+ 

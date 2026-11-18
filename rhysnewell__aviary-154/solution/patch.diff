@@ -1,0 +1,785 @@
+diff --git a/aviary/aviary.py b/aviary/aviary.py
+index 1d2ab663..fa24f087 100644
+--- a/aviary/aviary.py
++++ b/aviary/aviary.py
+@@ -328,7 +328,7 @@ def main():
+ 
+     qc_group.add_argument(
+         '--min-mean-q', '--min_mean_q',
+-        help='Minimum mean quality threshold',
++        help='Minimum long read mean quality threshold',
+         dest="min_mean_q",
+         default=10
+     )
+@@ -340,6 +340,51 @@ def main():
+         default=100
+     )
+ 
++    qc_group.add_argument(
++        '--min-short-read-length', '--min_short_read_length',
++        help='Minimum length of short reads to be kept',
++        dest="min_short_read_length",
++        default=15
++    )
++
++    qc_group.add_argument(
++        '--max-short-read-length', '--max_short_read_length',
++        help='Maximum length of short reads to be kept, 0 = no maximum',
++        dest="max_short_read_length",
++        default=0
++    )
++
++    qc_group.add_argument(
++        '--disable-adpater-trimming', '--disable_adpater_trimming',
++        help='Disable adapter trimming of short reads',
++        type=str2bool,
++        nargs='?',
++        const=True,
++        dest="disable_adapter_trimming",
++        default=False
++    )
++
++    qc_group.add_argument(
++        '--unqualified-percent-limit', '--unqualified_percent_limit',
++        help='how many percents of bases are allowed to be unqualified. Default 40 means 40 percent',
++        dest="unqualified_percent_limit",
++        default=40
++    )
++
++    qc_group.add_argument(
++        '--quality-cutoff', '--quality_cutoff',
++        help='The short read quality value that a base is qualified. Default 15 means phred quality >=Q15 is qualified.',
++        dest="quality_cutoff",
++        default=15
++    )
++
++    qc_group.add_argument(
++        '--extra-fastp-params', '--extra_fastp_params',
++        help='Extra parameters to pass to fastp, supply as a single string e.g. --extra-fastp-params "-V -e 10"',
++        dest="extra_fastp_params",
++        default=''
++    )
++
+     qc_group.add_argument(
+         '--skip-qc', '--skip_qc',
+         help='Skip quality control steps',
+diff --git a/aviary/envs/minimap2.yaml b/aviary/envs/minimap2.yaml
+index 4af82df1..523d055c 100644
+--- a/aviary/envs/minimap2.yaml
++++ b/aviary/envs/minimap2.yaml
+@@ -5,4 +5,5 @@ channels:
+ dependencies:
+   - samtools = 1.9
+   - minimap2 = 2.18
++  - fastp
+   - pigz
+\ No newline at end of file
+diff --git a/aviary/modules/processor.py b/aviary/modules/processor.py
+index 17bf4fa5..940b42f2 100644
+--- a/aviary/modules/processor.py
++++ b/aviary/modules/processor.py
+@@ -148,6 +148,12 @@ def __init__(self,
+             self.min_mean_q = args.min_mean_q
+             self.keep_percent = args.keep_percent
+             self.skip_qc = args.skip_qc
++            self.min_short_read_size = args.min_short_read_length
++            self.max_short_read_size = args.max_short_read_length
++            self.disable_adapter_trimming = args.disable_adapter_trimming
++            self.unqualified_percent_limit = args.unqualified_percent_limit
++            self.quality_cutoff = args.quality_cutoff
++            self.extra_fastp_params = args.extra_fastp_params
+         except AttributeError:
+             self.reference_filter = 'none'
+             self.gold_standard = 'none'
+@@ -155,6 +161,13 @@ def __init__(self,
+             self.min_mean_q = 0
+             self.keep_percent = 100
+             self.skip_qc = False
++            self.min_short_read_size = 0
++            self.max_short_read_size = 0
++            self.disable_adapter_trimming = False
++            self.unqualified_percent_limit = 0
++            self.quality_cutoff = 0
++            self.extra_fastp_params = 'none'
++
+ 
+         try:
+             self.gsa_mappings = args.gsa_mappings
+@@ -321,6 +334,12 @@ def make_config(self):
+         conf["min_read_size"] = self.min_read_size
+         conf["min_mean_q"] = self.min_mean_q
+         conf["keep_percent"] = self.keep_percent
++        conf["min_short_read_size"] = self.min_short_read_size
++        conf["max_short_read_size"] = self.max_short_read_size
++        conf["disable_adapter_trimming"] = self.disable_adapter_trimming
++        conf["unqualified_percent_limit"] = self.unqualified_percent_limit
++        conf["quality_cutoff"] = self.quality_cutoff
++        conf["extra_fastp_params"] = self.extra_fastp_params
+         conf["skip_qc"] = self.skip_qc
+         conf["gsa"] = self.gold_standard
+         conf["gsa_mappings"] = self.gsa_mappings
+diff --git a/aviary/modules/quality_control/qc.smk b/aviary/modules/quality_control/qc.smk
+index 0a0ab9c0..d7c6de69 100755
+--- a/aviary/modules/quality_control/qc.smk
++++ b/aviary/modules/quality_control/qc.smk
+@@ -16,6 +16,12 @@ rule qc_short_reads:
+         fastq = "data/short_reads.fastq.gz",
+         filtered = "data/short_filter.done"
+     params:
++        disable_adapter_trimming = config["disable_adapter_trimming"],
++        min_length = config['min_short_read_size'],
++        max_length = config['max_short_read_size'],
++        quality_cutoff = config['quality_cutoff'],
++        unqualified_percent_limit = config['unqualified_percent_limit'],
++        extra_fastp_params = config['extra_fastp_params'],
+         coassemble = config["coassemble"],
+         reference_filter = [] if "none" in config["reference_filter"] else config["reference_filter"],
+         skip_qc = config["skip_qc"]
+diff --git a/aviary/modules/quality_control/scripts/qc_short_reads.py b/aviary/modules/quality_control/scripts/qc_short_reads.py
+index 42f8a0b8..bcbb0dfa 100755
+--- a/aviary/modules/quality_control/scripts/qc_short_reads.py
++++ b/aviary/modules/quality_control/scripts/qc_short_reads.py
+@@ -27,7 +27,7 @@ def cat_reads(read_path: str, output_path: str, threads: int, log: str):
+             logf.write(f"cat return: {cat_p1.returncode}\n")
+             logf.write(f"pigz return: {pigz_p2.returncode}\n")
+ 
+-def run_skip_qc(
++def combine_reads(
+     short_reads_1,
+     short_reads_2,
+     output_fastq: str,
+@@ -35,14 +35,14 @@ def run_skip_qc(
+     log_file: str
+ ):
+     """
+-    Skip quality control
++    Combine reads before QC
+     :param long_reads: list of long reads
+     :param output_long_reads: output long reads
+     :param coassemble: coassemble or not, if true we will filter all reads into the same file
+     :return:
+     """
+     with open(log_file, 'a') as logf:
+-        logf.write(f"Skipping quality control\n")
++        logf.write(f"Combining reads before quality control\n")
+         logf.write(f"Coassemble: {coassemble}\n")
+ 
+         if "none" in short_reads_1 and "none" in short_reads_2:
+@@ -77,7 +77,7 @@ def run_skip_qc(
+         
+         else:
+             # if we have paired reads, we need to concatenate them together
+-            if "none" not in short_reads_2:
++            if "none" not in short_reads_2 and "none" not in short_reads_1:
+                 for reads1, reads2 in zip(short_reads_1, short_reads_2):
+                     if not os.path.exists(reads1):
+                         logf.write(f"Short read file {reads1} does not exist\n")
+@@ -90,7 +90,7 @@ def run_skip_qc(
+                     cat_reads(reads1, output_fastq, threads, log)
+                     cat_reads(reads2, output_fastq, threads, log)
+                     break
+-            else:
++            elif "none" not in short_reads_1:
+                 # otherwise we just need to symlink the first file
+                 logf.write(f"Symlinking {short_reads_1[0]} to {output_fastq}\n")
+                 if not os.path.exists(short_reads_1[0]):
+@@ -98,6 +98,17 @@ def run_skip_qc(
+                     exit(1)
+ 
+                 os.symlink(short_reads_1[0], output_fastq)
++            elif "none" not in short_reads_2:
++                # otherwise we just need to symlink the first file
++                logf.write(f"Symlinking {short_reads_2[0]} to {output_fastq}\n")
++                if not os.path.exists(short_reads_2[0]):
++                    logf.write(f"Short read file {short_reads_2[0]} does not exist\n")
++                    exit(1)
++
++                os.symlink(short_reads_2[0], output_fastq)
++            else:
++                logf.write(f"Both reads_1 and reads_2 are None, Error has occured in read concatenation.\n")
++                exit(1)
+ 
+ 
+ 
+@@ -122,11 +133,10 @@ def run_mapping_process(
+         samtools_view_cmd = f"samtools view -b -f 12 -@ {threads} -o {output_bam}".split()
+         logf.write(f"Shell style : {' '.join(minimap_cmd)} | {' '.join(samtools_view_cmd)}\n")
+ 
+-        minimap_p1 = Popen(minimap_cmd, stdout=PIPE, stderr=logf) # stderr=PIPE optional, dd is chatty
++        minimap_p1 = Popen(minimap_cmd, stdout=PIPE, stderr=logf)
+         samtools_view_p2 = Popen(samtools_view_cmd, stdin=minimap_p1.stdout, stderr=logf)
+         samtools_view_p2.wait()
+ 
+-        # thoretically p1 and p2 may still be running, this ensures we are collecting their return codes
+         minimap_p1.wait()
+         logf.write(f"minimap return: {minimap_p1.returncode}\n")
+         logf.write(f"samtools view return: {samtools_view_p2.returncode}\n")
+@@ -144,15 +154,76 @@ def run_mapping_process(
+             samtools_bam2fq_p1 = Popen(samtools_bam2fq_cmd, stdout=PIPE, stderr=logf)
+             pigz_p2 = Popen(pigz_cmd, stdin=samtools_bam2fq_p1.stdout, stdout=output_fq, stderr=logf)
+ 
+-            # thoretically p1 and p2 may still be running, this ensures we are collecting their return codes
+             samtools_bam2fq_p1.wait()
+             pigz_p2.wait()
+             logf.write(f"samtools bam2fq return: {samtools_bam2fq_p1.returncode}\n")
+             logf.write(f"pigz return: {pigz_p2.returncode}\n")
+ 
++def run_fastp(
++    reads_1,
++    reads_2,
++    output_fastq: str,
++    threads: int,
++    disable_adapter_trimming: bool,
++    quality_cutoff: int,
++    unqualified_percent_limit: int,
++    min_length: int,
++    max_length: int,
++    extra_fastp_params: str,
++    log: str,
++) -> str:
++    """
++    :param input_fastq: input fastq file
++    :param output_fastq: output fastq file
++    :param threads: number of threads
++    :param disable_adapter_trimming: disable adapter trimming
++    :param quality_cutoff: quality cutoff
++    :param unqualified_percent_limit: unqualified percent limit
++    :param min_length: minimum length
++    :param max_length: maximum length
++    :return:
++    """
++    with open(log, "a") as logf:
++        if reads_1 is None and reads_2 is None:
++            logf.write(f"Both reads_1 and reads_2 are None, Error has occured in read concatenation.\n")
++            exit(1)
++
++        fastp_cmd_list = ["fastp", "--stdout", "-w", str(threads), "-q", str(quality_cutoff), "-u", str(unqualified_percent_limit), "-l", str(min_length), "--length_limit", str(max_length)]
++        if disable_adapter_trimming:
++            fastp_cmd_list.append("--disable_adapter_trimming")
++
++        if reads_2 is not None:
++            fastp_cmd_list.extend(["-i", reads_1, "-I", reads_2])
++        
++        if reads_1 is not None and reads_2 is None:
++            fastp_cmd_list.extend(["-i", reads_1])
++        
++        fastp_cmd_list.extend(extra_fastp_params.split())
++
++        pigz_cmd = f"pigz -p {threads}".split()
++
++        logf.write(f"Shell style : {' '.join(fastp_cmd_list)} | {' '.join(pigz_cmd)} > {output_fastq}\n")
++        
++        with open(output_fastq, 'w') as output_fq:
++            fastp_p1 = Popen(fastp_cmd_list, stdout=PIPE, stderr=logf)
++            pigz_p2 = Popen(pigz_cmd, stdin=fastp_p1.stdout, stdout=output_fq, stderr=logf)
++
++            pigz_p2.wait()
++            fastp_p1.wait()
++            logf.write(f"fastp return: {fastp_p1.returncode}\n")
++            logf.write(f"pigz return: {pigz_p2.returncode}\n")
++
++    return output_fastq
++
+ def filter_illumina_reference(
+     short_reads_1,
+     short_reads_2,
++    disable_adapter_trimming: bool,
++    quality_cutoff: int,
++    unqualified_percent_limit: int,
++    min_length: int,
++    max_length: int,
++    extra_fastp_params: str,
+     reference_filter: List[str],
+     output_bam: str,
+     output_fastq: str,
+@@ -163,14 +234,63 @@ def filter_illumina_reference(
+     skip_qc: bool,
+ ):
+     
+-    if skip_qc or len(reference_filter) == 0 or ("none" in short_reads_1 and "none" in short_reads_2):
+-        run_skip_qc(short_reads_1, short_reads_2, output_fastq, coassemble, log)
++    if skip_qc or ("none" in short_reads_1 and "none" in short_reads_2):
++        combine_reads(short_reads_1, short_reads_2, output_fastq, coassemble, log)
++        with open(log, 'a') as logf:
++            logf.write(f"Skipping quality control\n")
+         Path(filtered).touch()
+         Path(output_bam).touch()
+         return
+ 
++    # run fastp for quality control of reads
++    se1_string = None
++    if "none" not in short_reads_1:
++        combine_reads(short_reads_1, ["none"], "data/short_reads.pre_qc.1.fastq.gz", coassemble, log)
++        se1_string = "data/short_reads.pre_qc.1.fastq.gz"
++    
++    se2_string = None
++    if "none" not in short_reads_2:
++        combine_reads(["none"], short_reads_2, "data/short_reads.pre_qc.2.fastq.gz", coassemble, log)
++        se2_string = "data/short_reads.pre_qc.2.fastq.gz"
++    
++    run_fastp(
++        reads_1=se1_string,
++        reads_2=se2_string,
++        output_fastq="data/short_reads.fastq.gz",
++        threads=threads,
++        disable_adapter_trimming=disable_adapter_trimming,
++        quality_cutoff=quality_cutoff,
++        unqualified_percent_limit=unqualified_percent_limit,
++        min_length=min_length,
++        max_length=max_length,
++        extra_fastp_params=extra_fastp_params,
++        log=log,
++    )
++
++    # Move fastp.json and fastp.html to www/
++    if os.path.exists("fastp.json") and os.path.exists("fastp.html"):
++        # make sure www/ exists
++        if not os.path.exists("www/"):
++            os.mkdir("www/")
++        os.rename("fastp.html", "www/fastp.html")
++        os.rename("fastp.json", "www/fastp.json")
++
++    # remove the pre qc files
++    if os.path.exists("data/short_reads.pre_qc.1.fastq.gz"):
++        os.remove("data/short_reads.pre_qc.1.fastq.gz")
++    if os.path.exists("data/short_reads.pre_qc.2.fastq.gz"):
++        os.remove("data/short_reads.pre_qc.2.fastq.gz")
++
++    
++
+     reference_filter_file_string = ''
+     with open(log, "a") as logf:
++        if len(reference_filter) == 0:
++            logf.write(f"Not performing reference filtering: {reference_filter}\n")
++            Path(filtered).touch()
++            Path(output_bam).touch()
++            return
++        
+         if len(reference_filter) > 1:
+             with open(f'data/reference_filter.fasta', 'w') as out:
+                 for reference in reference_filter:
+@@ -206,67 +326,15 @@ def filter_illumina_reference(
+ 
+             reference_filter_file_string = f'{reference_filter[0]}'
+ 
+-    if os.path.exists('data/short_reads.fastq.gz'):
+-        run_mapping_process(
+-            reads_string='data/short_reads.fastq.gz',
+-            input_fasta=reference_filter_file_string,
+-            output_bam=output_bam,
+-            output_fastq=output_fastq,
+-            threads=threads,
+-            log=log,
+-        )
+-
+-    elif "none" not in short_reads_2:
+-        if len(short_reads_2) == 1 or not coassemble:
+-            pe1 = short_reads_1[0]
+-            pe2 = short_reads_2[0]
+-        else:
+-            if not os.path.exists("data/short_reads.1.fastq.gz"):
+-                for reads1, reads2 in zip(short_reads_1, short_reads_2):
+-                    with open(log, "a") as logf:
+-                        with open("data/short_reads.1.fastq.gz", "a") as f:
+-                            run(f"cat {reads1}", stdout=f, stderr=logf)
+-
+-                        with open("data/short_reads.2.fastq.gz", "a") as f:
+-                            run(f"cat {reads2}", stdout=f, stderr=logf)
+-            pe1 = "data/short_reads.1.fastq.gz"
+-            pe2 = "data/short_reads.2.fastq.gz"
+-
+-        reads_string = f"{pe1} {pe2}"
+-        run_mapping_process(
+-            reads_string=reads_string,
+-            input_fasta=reference_filter_file_string,
+-            output_bam=output_bam,
+-            output_fastq=output_fastq,
+-            threads=threads,
+-            log=log,
+-        )
+-        if os.path.exists("data/short_reads.1.fastq.gz"):
+-            os.remove("data/short_reads.1.fastq.gz")
+-            os.remove("data/short_reads.2.fastq.gz")
+-
+-    elif "none" not in short_reads_1:
+-        if len(short_reads_1) == 1 or not coassemble:
+-            pe1 = short_reads_1[0]
+-        else:
+-            if not os.path.exists("data/short_reads.1.fastq.gz") or not coassemble:
+-                for reads1 in short_reads_1:
+-                    with open(log, "a") as logf:
+-                        with open("data/short_reads.1.fastq.gz", "a") as f:
+-                            run(f"cat {reads1}", stdout=f, stderr=logf)
+-            pe1 = "data/short_reads.1.fastq.gz"
+-
+-
+-        run_mapping_process(
+-            reads_string=pe1,
+-            input_fasta=reference_filter_file_string,
+-            output_bam=output_bam,
+-            output_fastq=output_fastq,
+-            threads=threads,
+-            log=log,
+-        )
+-        if os.path.exists("data/short_reads.1.fastq.gz"):
+-            os.remove("data/short_reads.1.fastq.gz")
++
++    run_mapping_process(
++        reads_string='data/short_reads.fastq.gz',
++        input_fasta=reference_filter_file_string,
++        output_bam=output_bam,
++        output_fastq=output_fastq,
++        threads=threads,
++        log=log,
++    )
+ 
+     # remove the reference filter file
+     if os.path.exists("data/reference_filter.fasta.gz"):
+@@ -280,6 +348,15 @@ def filter_illumina_reference(
+     output_bam = snakemake.output.bam
+     output_fastq = snakemake.output.fastq
+     output_filtered = snakemake.output.filtered
++
++    # fastp parameters
++    disable_adapter_trimming = snakemake.params.disable_adapter_trimming
++    quality_cutoff = snakemake.params.quality_cutoff
++    unqualified_percent_limit = snakemake.params.unqualified_percent_limit
++    min_length = snakemake.params.min_length
++    max_length = snakemake.params.max_length
++    extra_fastp_params = snakemake.params.extra_fastp_params
++
+     coassemble = snakemake.params.coassemble
+     reference_filter = snakemake.params.reference_filter
+     skip_qc = snakemake.params.skip_qc
+@@ -292,6 +369,12 @@ def filter_illumina_reference(
+     filter_illumina_reference(
+         short_reads_1=short_reads_1,
+         short_reads_2=short_reads_2,
++        disable_adapter_trimming=disable_adapter_trimming,
++        quality_cutoff=quality_cutoff,
++        unqualified_percent_limit=unqualified_percent_limit,
++        min_length=min_length,
++        max_length=max_length,
++        extra_fastp_params=extra_fastp_params,
+         reference_filter=reference_filter,
+         output_bam=output_bam,
+         output_fastq=output_fastq,
+diff --git a/aviary/modules/strain_analysis/scripts/run_lorikeet.py b/aviary/modules/strain_analysis/scripts/run_lorikeet.py
+index 62a6e9eb..d9aeb612 100755
+--- a/aviary/modules/strain_analysis/scripts/run_lorikeet.py
++++ b/aviary/modules/strain_analysis/scripts/run_lorikeet.py
+@@ -30,7 +30,7 @@ def run_lorikeet(
+     else:
+         short_reads = ""
+ 
+-    lorikeet_cmd = f"lorikeet call -t {threads} -d {mag_directory} -x {mag_extension} -p {parallel_genomes} {short_reads} {long_reads} -o {output_directory} --calculate-dnds --calculate-fst".split()
++    lorikeet_cmd = f"lorikeet call -t {threads} -d {mag_directory} -x {mag_extension} -p {parallel_genomes} {short_reads} {long_reads} -o {output_directory} --do-not-call-svs --calculate-dnds --calculate-fst".split()
+ 
+     run(lorikeet_cmd)
+ 
+diff --git a/docs/citations.md b/docs/citations.md
+index 09d917c3..cdd147c9 100755
+--- a/docs/citations.md
++++ b/docs/citations.md
+@@ -12,10 +12,12 @@ modules are added to aviary.
+ 
+ ## QC
+ - **NanoPack**: De Coster, W., D’Hert, S., Schultz, D. T., Cruts, M. & Van Broeckhoven, C. NanoPack: visualizing and processing long-read sequencing data. Bioinformatics 34, 2666–2669 (2018). https://doi.org/10.1093/bioinformatics/bty149
++- **NanoPack2**: De Coster, W. & Rademakers, R. NanoPack2: population-scale evaluation of long-read sequencing data. Bioinformatics 39, (2023). https://doi.org/10.1093/bioinformatics/btad311
++- **fastp**: Chen, S., Zhou, Y., Chen, Y. & Gu, J. fastp: an ultra-fast all-in-one FASTQ preprocessor. Bioinformatics 34, i884–i890 (2018). https://doi.org/10.1093/bioinformatics/bty560
+ 
+ ## Assembly
+ - **Flye**: Kolmogorov, M., Yuan, J., Lin, Y. & Pevzner, P. A. Assembly of long, error-prone reads using repeat graphs. Nature Biotechnology 37, 540–546 (2019). https://doi.org/10.1038/s41587-019-0072-8
+-- **Circlator**: Hunt, M. et al. Circlator: automated circularization of genome assemblies using long sequencing reads. Genome Biology 16, 294 (2015). https://doi.org/10.1186/s13059-015-0849-0
++- **Medaka**: https://github.com/nanoporetech/medaka
+ - **Racon**: Vaser, R., Sović, I., Nagarajan, N. & Šikić, M. Fast and accurate de novo genome assembly from long uncorrected reads. Genome Res 27, 737–746 (2017). https://doi.org/10.1101/gr.214270.116 
+ - **Pilon**: Walker, B. J. et al. Pilon: An Integrated Tool for Comprehensive Microbial Variant Detection and Genome Assembly Improvement. PLOS ONE 9, e112963 (2014). https://doi.org/10.1371/journal.pone.0112963
+ - **metaSPAdes**: Nurk, S., Meleshko, D., Korobeynikov, A., & Pevzner, P. A. (2017). metaSPAdes: a new versatile metagenomic assembler. Genome research, 27(5), 824-834. https://doi.org/10.1101/gr.213959.116
+@@ -35,6 +37,7 @@ modules are added to aviary.
+ https://doi.org/10.1038/s41564-018-0171-1
+ - **SemiBin2**: Pan, S., Zhao, X. M., & Coelho, L. P. (2023). SemiBin2: self-supervised contrastive learning leads to better MAGs for short-and long-read sequencing, Bioinformatics, Volume 39, Issue Supplement_1, June 2023, Pages i21–i29. https://doi.org/10.1093/bioinformatics/btad209
+ - **MaxBin 2.0**: Wu, Y.-W., Simmons, B. A. & Singer, S. W. MaxBin 2.0: an automated binning algorithm to recover genomes from multiple metagenomic datasets. Bioinformatics 32, 605–607 (2016). https://doi.org/10.1093/bioinformatics/btv638
++- **Rosella**: https://github.com/rhysnewell/rosella
+ 
+ ## Annotation
+ - **CheckM2**: Chklovski, A., Parks, D. H., Woodcroft, B. J., & Tyson, G. W. (2023). CheckM2: a rapid, scalable and accurate tool for assessing microbial genome quality using machine learning. Nature Methods, 1-10. https://doi.org/10.1038/s41592-023-01940-w
+@@ -42,3 +45,6 @@ https://doi.org/10.1038/s41564-018-0171-1
+ - **eggNOG mapper 2**: Cantalapiedra, C. P., Hernández-Plaza, A., Letunic, I., Bork, P., & Huerta-Cepas, J. (2021). eggNOG-mapper v2: functional annotation, orthology assignments, and domain prediction at the metagenomic scale. Molecular biology and evolution, 38(12), 5825-5829. https://doi.org/10.1093/molbev/msab293
+ - **GTDB-Tk 2**: Chaumeil, P. A., Mussig, A. J., Hugenholtz, P., & Parks, D. H. (2022). GTDB-Tk v2: memory friendly classification with the genome taxonomy database. Bioinformatics, 38(23), 5315-5316. https://doi.org/10.1093/bioinformatics/btac672
+ - **GraftM**: Boyd, J. A., Woodcroft, B. J. & Tyson, G. W. GraftM: a tool for scalable, phylogenetically informed classification of genes within metagenomes. Nucleic Acids Research 46, e59 (2018). https://doi.org/10.1093/nar/gky174
++
++## Variant calling
++- **Lorikeet**: https://github.com/rhysnewell/Lorikeet
+\ No newline at end of file
+diff --git a/docs/examples.md b/docs/examples.md
+index 384aee93..033eea8a 100755
+--- a/docs/examples.md
++++ b/docs/examples.md
+@@ -32,6 +32,22 @@ input reads.
+ If at any point the Aviary workflow is interrupted, the pipeline can be restarted and pick up from the last completed
+ step.
+ 
++## Batch Processing
++
++Aviary allows users to supply a batch file to the `aviary batch` command. This will cause aviary to run on every line within
++the input batch file individually. Example batch files can be found at [here](/examples/example_batch.tsv) and [here](/examples/example_batch.csv).
++
++## Advanced Usage
++
++Often users are required to send long running jobs off on to high performance clusters. Aviary and snakemake are
++perfectly compatible with clusters and can be sent off as either a single pipeline via PBS script or equivalent.
++Alternatively, snakemake can send individual jobs in a pipeline off into a cluster to share the load across nodes. 
++You can make use of this feature in Aviary via the `--snakemake-cmds` parameter, E.g.
++```
++aviary assemble -1 *.1.fq.gz -2 *.2.fq.gz --longreads *.nanopore.fastq.gz --long_read_type ont -t 24 -p 24 -n 24 --snakemake-cmds '--cluster qsub '
++```
++NOTE: The space after `--cluster qsub ` is required due to a strange quirk in how python's `argparse` module works.
++
+ ## HPC cluster submission
+ 
+ Often users are required to send long running jobs off on to high performance clusters. Aviary and snakemake are
+@@ -49,8 +65,50 @@ jobs: 10000
+ cluster-cancel: qdel
+ ```
+ 
++## Expected output
++
++Aviary will produce a variety of different outputs depending on the parameters provided. The following is a list of the expected outputs from the different subcommands.
++
++In general, you will find rule benchmarks in the `benchmarks/` folder. Logs and error messages will be found in the `logs/` folder.
++
++The `data/` folder contains various output from the different programs that have run. Aviary attempts to keep this folder clean, but there can be a lot of superfluous content in here. The `data/` folder is also where the final outputs from the pipeline will be found, they will be symlinked out of this folder into their respective output folders.
++
++#### 1. Assemble
++
++- `assembly/final_contigs.fasta` - The assembled genome in FASTA format
++- `www/assembly_stats.txt` - A summary of the assembly statistics
++- `www/fastqc` - A folder containing the output from fastqc
++- `www/nanoplot` - A folder containing the output from NanoPlot
++
++#### 2. Recover
++
++If assembly is performed during the recover process, then the outputs from the assembly step will also be present.
++- `bins/bin_info.tsv` - A file containing all of the information about the recovered MAGs. Taxonomy, QC, size, N50, etc.
++- `bins/checkm_minimal.tsv` - A minimal version of the `bin_info.tsv` file.
++- `bins/coverm_abundances.tsv` - The abundance of each MAG in each sample.
++- `bins/final_bins` - A folder containing the final MAGs in FASTA format.
++- `diversity/singlem_out` - A folder containing the output from singlem.
++- `taxonomy/` - A folder containing the output from GTDB-tk
++
++#### 3. Annotate
++
++- `annotation/` - A folder containing the output from EggNOG-mapper.
++
++
++
+ ## Helpful parameters and commands
+ 
++### Environment variables
++Upon first running Aviary, you will be prompted to input the location for several database folders if
++they haven't already been provided. If at any point the location of these folders change you can
++use the the `aviary configure` module to update the environment variables used by aviary.
++
++These environment variables can also be configured manually, just set the following variables in your `.bashrc` file:
++```
++GTDBTK_DATA_PATH
++CONDA_ENV_PATH
++```
++
+ ### Thread control
+ Aviary has three thread contol options:
+ 
+@@ -74,3 +132,20 @@ can also be kind of memory intensive when given extra threads.
+ 
+ When performing assembly, users are required to estimate how much RAM they will need to use via `-m, --max-memory, --max_memory`.
+ With HPC cluster submission (see above), requested job memory is increased with each rerun and capped at `max_memory`.
++
++### Temporary directory
++
++By default, Aviary will use `/tmp` to store temporary files during many processes throughtout assembly and MAG recovery.
++If you would like to use a different directory, you can specify this by using the flexible `--tmp` parameter.
++If you would permanently like to change the temporary directory, you can use `aviary configure --tmp /new/tmp` to 
++change the `TMPDIR` environment variable within your current conda environment. 
++
++### Workflow control
++
++Often users may not want to run a complete aviary module, as such specific rules can be targeted via the `-w, --workflow`
++parameter. For example, if a user wanted to only run a specific binning algorithm then that rule can be specified directly:
++```
++aviary recover -w rosella --assembly scaffolds.fasta -1 sr1.1.fq sr2.1.fq.gz -2 sr1.2.fq sr2.2.fq.gz --longreads nanopore.fastq.gz --output output_dir/ --max_threads 12
++```
++NOTE: Every step up to the targeted rule still has to be run if it hasn't been run before. The specific rules that can be 
++used can be found within each modules specific snakemake file.
+diff --git a/docs/faqs.md b/docs/faqs.md
+index a43968fa..a3451be1 100755
+--- a/docs/faqs.md
++++ b/docs/faqs.md
+@@ -8,6 +8,40 @@ FAQs & Troubleshooting
+ This page is just meant for general questions that I notice are asked with some frequency. If you feel like something
+ is missing from here and you'd like to see it included, feel free to ask it by raising an issue on GitHub.
+ 
++
++### I want to perform both MAG recovery and assembly, how do I do that?
++
++If you supply all reads to the `recover` command then Aviary will perform assembly first and then perform MAG recovery. You can perform assembly first by using the `assemble` command and then using the output assembly file as the input to the `recover` command. However, it is much simpler to let aviary handle this process for you.
++
++### An error occurred but I don't know where to look for the error message
++
++All of the error messages are stored in the `logs/` folder. The error messages are stored in the `logs/` folder with the name of the file corresponding the name of the rule that they originate from. If you had an error occur in the `qc_short_reads` rule then consult the `logs/qc_short_reads.log` file for the error message.
++
++### Is Aviary cluster compatible?
++
++Yes! Consult the examples page for more information.
++
++### I have access to a GPU, can I use it?
++
++Yes! Aviary supports the use of GPUs for the assembly process. If the GPU is on a local machine, you must first install the `cuda` package into your conda environment. Then, programs that use GPUs should automatically detect its presence.
++
++If you are using a cluster, you can supply the `--request-gpu` flag and Aviary will attempt to place rules that use GPUs on to a machine that has GPUs available.
++
++### Error in prepare_binning_files
++
++This error is almost always caused by the user running out of storage in their `/tmp` folder when `coverm` performs the mapping process. To fix this, you can either increase the amount of storage available to the `/tmp` folder or you can change the location of the temporary folder by setting the `TMPDIR` environment variable to a folder with more storage. Aviary also allows the user to specify the location of the temporary folder by using the `--tmpdir` parameter.
++
++### I wish to remove host contamination from my reads
++
++Aviary supports the removal of host contamination during the assembly process via the `-r`, `--reference-filter` parameter. This flag can take one or more compressed or non-compressed fasta files. Aviary will then compare the reads to these references and remove any reads that map to them.
++
++### SPAdes error: "Error code: -9" or other errors
++
++The most likely solution to this is that you are running out of memory. SPAdes is a memory intensive program and will exit unexpectedly if it reaches the maximum memory limit of your machine or supplied by aviary.
++To increase the amount of memory available to SPAdes, you can either increase the amount of memory available to the entire pipeline by using the `-m` parameter.
++
++
++
+ ### qsub and pysam - ModuleNotFoundError
+ 
+ A known issue with using snakemake + pysam + qsub results in the a break in the pipeline. The issue arises because pysam 
+diff --git a/docs/usage/README.md b/docs/usage/README.md
+deleted file mode 100755
+index 58278c53..00000000
+--- a/docs/usage/README.md
++++ /dev/null
+@@ -1,105 +0,0 @@
+----
+-title: Usage
+----
+-
+-Usage
+-========
+-
+-## Basic Usage
+-
+-To perform hybrid assembly:
+-```
+-aviary assemble -1 *.1.fq.gz -2 *.2.fq.gz --longreads *.nanopore.fastq.gz --long_read_type ont -t 24 -n 48
+-```
+-Aviary is compatible with both Nanopore and PacBio long read technologies. 
+-Note: Aviary can also perform assembly using just short or long reads as well.
+-```
+-aviary assemble -1 *.1.fq.gz -2 *.2.fq.gz -t 24 -n 48
+-
+-OR
+-
+-aviary assemble --longreads *.nanopore.fastq.gz --long_read_type ont -t 24 -n 48
+-```
+-
+-
+-To perform mag recovery:
+-```
+-aviary recover --assembly scaffolds.fasta -1 sr1.1.fq sr2.1.fq.gz -2 sr1.2.fq sr2.2.fq.gz --longreads nanopore.fastq.gz -z ont --output output_dir/ --max_threads 12 --n_cores 24 --gtdb_path /path/to/gtdb/release/
+-```
+-If no assembly file is provided, then aviary will first perform the assembly pipeline to produce an assembly using the 
+-input reads.
+-
+-If at any point the Aviary workflow is interrupted, the pipeline can be restarted and pick up from the last completed
+-step.
+-
+-## Batch Processing
+-
+-Aviary allows users to supply a batch file to the `aviary batch` command. This will cause aviary to run on every line within
+-the input batch file individually. Example batch files can be found at [here](/examples/example_batch.tsv) and [here](/examples/example_batch.csv).
+-
+-## Advanced Usage
+-
+-Often users are required to send long running jobs off on to high performance clusters. Aviary and snakemake are
+-perfectly compatible with clusters and can be sent off as either a single pipeline via PBS script or equivalent.
+-Alternatively, snakemake can send individual jobs in a pipeline off into a cluster to share the load across nodes. 
+-You can make use of this feature in Aviary via the `--snakemake-cmds` parameter, E.g.
+-```
+-aviary assemble -1 *.1.fq.gz -2 *.2.fq.gz --longreads *.nanopore.fastq.gz --long_read_type ont -t 24 -p 24 -n 24 --snakemake-cmds '--cluster qsub '
+-```
+-NOTE: The space after `--cluster qsub ` is required due to a strange quirk in how python's `argparse` module works.
+-
+-## Helpful parameters and commands
+-
+-### Environment variables
+-Upon first running Aviary, you will be prompted to input the location for several database folders if
+-they haven't already been provided. If at any point the location of these folders change you can
+-use the the `aviary configure` module to update the environment variables used by aviary.
+-
+-These environment variables can also be configured manually, just set the following variables in your `.bashrc` file:
+-```
+-GTDBTK_DATA_PATH
+-BUSCO_DB
+-CONDA_ENV_PATH
+-```
+-
+-Make sure to reactivate your conda environment or re-source your `.bashrc` for aviary to be able to access these variables.
+-
+-### Thread control
+-Aviary has three thread contol options:
+-
+-#### `-t, --threads`
+-
+-- Controls how many threads any individual program can use. If set to 24, then each program that has threading options 
+-will use 24 threads when they run.
+-
+-#### `-n, --n-cores, --n_cores`
+-
+-- Controls how many cores (CPUs) snakemake will be given. If this value is set higher than `--threads`, then potentially
+-multiple programs will run concurrently providing a great boost in performance. If this value is not set then it defaults 
+-to being the same value as `--threads`
+-
+-#### `-p, --pplacer-threads, --pplacer_threads`
+-
+-- Pplacer is special and gets its own thread parameter. Why? Because it randomly deadlocks when given too many threads and 
+-can also be kind of memory intensive when given extra threads.
+-
+-### RAM control
+-
+-When performing assembly, users are required to estimate how much RAM they will need to use via `-m, --max-memory, --max_memory`
+-
+-### Temporary directory
+-
+-By default, Aviary will use `/tmp` to store temporary files during many processes throughtout assembly and MAG recovery.
+-If you would like to use a different directory, you can specify this by using the flexible `--tmp` parameter.
+-If you would permanently like to change the temporary directory, you can use `aviary configure --tmp /new/tmp` to 
+-change the `TMPDIR` environment variable within your current conda environment. 
+-
+-### Workflow control
+-
+-Often users may not want to run a complete aviary module, as such specific rules can be targeted via the `-w, --workflow`
+-parameter. For example, if a user wanted to only run a specific binning algorithm then that rule can be specified directly:
+-```
+-aviary recover -w rosella --assembly scaffolds.fasta -1 sr1.1.fq sr2.1.fq.gz -2 sr1.2.fq sr2.2.fq.gz --longreads nanopore.fastq.gz --output output_dir/ --max_threads 12
+-```
+-NOTE: Every step up to the targeted rule still has to be run if it hasn't been run before. The specific rules that can be 
+-used can be found within each modules specific snakemake file.
+\ No newline at end of file
+diff --git a/doctave.yaml b/doctave.yaml
+index 33ba81be..1c63fbcd 100755
+--- a/doctave.yaml
++++ b/doctave.yaml
+@@ -6,9 +6,7 @@ colors:
+   main: "#8CD58C"
+ navigation:
+   - path: docs/installation.md
+-  - path: docs/usage
+-    children: "*"
+-  - path: docs/concepts.md
+-  - path: docs/citations.md
+   - path: docs/examples.md
+   - path: docs/faqs.md
++  - path: docs/concepts.md
++  - path: docs/citations.md

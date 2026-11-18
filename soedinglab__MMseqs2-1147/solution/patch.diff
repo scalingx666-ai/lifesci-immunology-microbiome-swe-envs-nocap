@@ -1,0 +1,292 @@
+diff --git a/src/MMseqsBase.cpp b/src/MMseqsBase.cpp
+index e92db319f..c4e580c65 100644
+--- a/src/MMseqsBase.cpp
++++ b/src/MMseqsBase.cpp
+@@ -789,7 +789,7 @@ std::vector<Command> baseCommands = {
+                 "<i:sequenceDB> <o:clusterDB>",
+                 CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                    {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb }}},
+-        {"mergeclusters",        mergeclusters,        &par.threadsandcompression,COMMAND_CLUSTER,
++        {"mergeclusters",        mergeclusters,        &par.mergeclusters,        COMMAND_CLUSTER,
+                 "Merge multiple cascaded clustering steps",
+                 NULL,
+                 "Maria Hauser & Martin Steinegger <martin.steinegger@snu.ac.kr>",
+diff --git a/src/commons/DBReader.cpp b/src/commons/DBReader.cpp
+index f78a67c05..383d05051 100644
+--- a/src/commons/DBReader.cpp
++++ b/src/commons/DBReader.cpp
+@@ -208,12 +208,18 @@ template <typename T> bool DBReader<T>::open(int accessType){
+     if (externalData == false && clusterIndex) {
+         // one range of all entries; only the entry count and the data size are read here
+         FILE *indexFile = FileUtil::openFileOrDie(indexFileName, "r", true);
+-        uint64_t lastOffset = 0;
+-        if (fseek(indexFile, -static_cast<long>(sizeof(uint64_t)), SEEK_END) != 0 || fread(&lastOffset, sizeof(uint64_t), 1, indexFile) != 1) {
++        uint64_t lastCell[2] = { 0, 0 };
++        if (fseek(indexFile, -static_cast<long>(sizeof(lastCell)), SEEK_END) != 0 || fread(lastCell, sizeof(uint64_t), 2, indexFile) != 2) {
+             Debug(Debug::ERROR) << "Cannot read index file " << indexFileName << "\n";
+             EXIT(EXIT_FAILURE);
+         }
++        const uint64_t lastOffset = lastCell[1];
+         const size_t indexBytes = ftell(indexFile);
++        // the index ends with (DB_KEY_INVALID, data size), unless its writer stopped early
++        if (indexBytes % sizeof(lastCell) != 0 || lastCell[0] != static_cast<uint64_t>(DB_KEY_INVALID)) {
++            Debug(Debug::ERROR) << "Index file " << indexFileName << " is incomplete\n";
++            EXIT(EXIT_FAILURE);
++        }
+         if (fclose(indexFile) != 0) {
+             Debug(Debug::ERROR) << "Cannot close index file " << indexFileName << "\n";
+             EXIT(EXIT_FAILURE);
+@@ -275,6 +281,10 @@ template <typename T> bool DBReader<T>::open(int accessType){
+                 index[i].offset = isHeader ? 0 : Util::fast_atoi<size_t>(cols[1]);
+                 index[i].length = isHeader ? 0 : Util::fast_atoi<size_t>(cols[2]);
+                 const size_t count = Util::fast_atoi<size_t>(cols[isHeader ? 1 : 3]);
++                if (size + count > DB_KEY_INVALID) {
++                    Debug(Debug::ERROR) << "Database " << dataFileName << " has more sequences than keys of this build; compile MMseqs2 with -DMMSEQS_INT64_IDS=1\n";
++                    EXIT(EXIT_FAILURE);
++                }
+                 index2dbfile[i] = isHeader ? static_cast<unsigned int>(i) : Util::fast_atoi<unsigned int>(cols[4]);
+                 if (isHeader) {
+                     headerOffsetsFileNames.push_back(std::string(dataFileName) + ".index." + SSTR(i));
+@@ -1596,6 +1606,12 @@ void DBReader<T>::copyDb(const std::string &databaseName, const std::string &out
+ 
+ template<typename T>
+ std::vector<size_t> DBReader<T>::getFileKeyOffsets(size_t fileCount) {
++    // the files hold ascending keys, so the last row is in the last file
++    const size_t databaseFiles = (indexSize == 0) ? 0 : index2dbfile[indexSize - 1] + 1;
++    if (databaseFiles != fileCount) {
++        Debug(Debug::ERROR) << "Database " << dataFileName << " has " << databaseFiles << " data files, but runs on " << fileCount << " nodes\n";
++        EXIT(EXIT_FAILURE);
++    }
+     std::vector<size_t> offsets(fileCount + 1, 0);
+     for (size_t row = 0; row < indexSize; row++) {
+         offsets[index2dbfile[row] + 1] = (row + 1 < indexSize) ? indexIdToNum(&index[row + 1].id) : size;
+diff --git a/src/commons/MMseqsNode.cpp b/src/commons/MMseqsNode.cpp
+index 9913a5a3e..b51f5f829 100644
+--- a/src/commons/MMseqsNode.cpp
++++ b/src/commons/MMseqsNode.cpp
+@@ -19,6 +19,8 @@
+ 
+ unsigned int MMseqsNode::rank = 0;
+ unsigned int MMseqsNode::count = 1;
++// the first line of every barrier file, so a file that a killed run left is told apart from one of this run
++static std::string runId;
+ 
+ void MMseqsNode::init() {
+     const char *procId = getenv("SLURM_PROCID");
+@@ -27,6 +29,13 @@ void MMseqsNode::init() {
+         rank = strtoul(procId, NULL, 10);
+         count = strtoul(taskCount, NULL, 10);
+     }
++    const char *runVariables[] = { "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_RESTART_COUNT" };
++    runId.clear();
++    for (size_t i = 0; i < sizeof(runVariables) / sizeof(runVariables[0]); i++) {
++        const char *value = getenv(runVariables[i]);
++        runId += std::string(value != NULL ? value : "") + "\t";
++    }
++    runId += "\n";
+     if (count == 0 || rank >= count) {
+         Debug(Debug::ERROR) << "Invalid SLURM_PROCID " << rank << " for " << count << " tasks\n";
+         EXIT(EXIT_FAILURE);
+@@ -91,12 +100,32 @@ std::string MMseqsNode::gatherFiles(const std::string &prefix) {
+     return content;
+ }
+ 
++// a file of another run is read again until this run replaces it
++static std::string waitForRunFile(const std::string &file) {
++    std::string content = MMseqsNode::waitForFile(file);
++    while (content.compare(0, runId.size(), runId) != 0) {
++        sleep(1);
++        content = MMseqsNode::waitForFile(file);
++    }
++    return content.substr(runId.size());
++}
++
++static std::string gatherRunFiles(const std::string &prefix) {
++    std::string content;
++    for (unsigned int node = 0; node < MMseqsNode::count; node++) {
++        const std::string file = prefix + SSTR(node);
++        content += waitForRunFile(file);
++        FileUtil::remove(file.c_str());
++    }
++    return content;
++}
++
+ std::string MMseqsNode::barrier(const std::string &file, const std::string &content) {
+-    publishFile(file + "." + SSTR(rank), content);
++    publishFile(file + "." + SSTR(rank), runId + content);
+     if (isMaster()) {
+-        publishFile(file, gatherFiles(file + "."));
++        publishFile(file, runId + gatherRunFiles(file + "."));
+     }
+-    return waitForFile(file);
++    return waitForRunFile(file);
+ }
+ 
+ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets) {
+@@ -218,7 +247,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
+     FILE *handle = FileUtil::openAndDelete(exchangeFile.c_str(), "w");
+     std::string indexData;
+     size_t writtenBytes = 0;
+-    const size_t memoryLimit = Util::computeMemory(0);
++    const size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
+     const size_t pairCapacity = memoryLimit / 2 / sizeof(ClusterPair);
+     ClusterPair *pairs = new(std::nothrow) ClusterPair[pairCapacity];
+     Util::checkAllocation(pairs, "Can not allocate pairs memory in sendClusterPairs");
+@@ -239,12 +268,18 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
+         repKeys.resize(loadEnd - loadBegin);
+         for (size_t i = loadBegin; i < loadEnd; i++) {
+             const DBKeyType key = cluDb.getDbKey(i);
+-            while (receivedQueue.empty() == false && receivedQueue.top().pair.memberKey < key) {
++            repKeys[i - loadBegin] = key;
++            if (receivedQueue.empty() == false && receivedQueue.top().pair.memberKey == key) {
++                repKeys[i - loadBegin] = receivedQueue.top().pair.repKey;
+                 const size_t block = receivedQueue.top().block;
+                 receivedQueue.pop();
+                 queueNextPair(receivedQueue, receivedBlocks, block, receivedPrefix);
+             }
+-            repKeys[i - loadBegin] = (receivedQueue.empty() == false && receivedQueue.top().pair.memberKey == key) ? receivedQueue.top().pair.repKey : key;
++            // a received member that was passed is no entry of this node, or the entries are not in key order
++            if (receivedQueue.empty() == false && receivedQueue.top().pair.memberKey <= key) {
++                Debug(Debug::ERROR) << "Key " << receivedQueue.top().pair.memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << " in key order\n";
++                EXIT(EXIT_FAILURE);
++            }
+         }
+         for (size_t firstEntry = loadBegin; firstEntry < loadEnd;) {
+             // a line has at least a digit and a newline
+@@ -304,6 +339,10 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
+             firstEntry = endEntry;
+         }
+     }
++    if (receivedQueue.empty() == false) {
++        Debug(Debug::ERROR) << "Key " << receivedQueue.top().pair.memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << "\n";
++        EXIT(EXIT_FAILURE);
++    }
+     writePairs(pairs, pairCount, compare, nodeKeyOffsets, handle, exchangeFile, indexData, writtenBytes);
+     cluDb.close();
+     delete[] pairs;
+@@ -322,9 +361,9 @@ void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName,
+ void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges) {
+     barrier(prefix + ".merged");
+     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
+-    publishFile(prefix + ".done." + SSTR(rank), "");
++    publishFile(prefix + ".done." + SSTR(rank), runId);
+     if (isMaster()) {
+-        gatherFiles(prefix + ".done.");
++        gatherRunFiles(prefix + ".done.");
+         for (size_t i = 0; i < exchanges.size(); i++) {
+             FileUtil::remove((exchanges[i] + ".index").c_str());
+         }
+diff --git a/src/commons/Parameters.cpp b/src/commons/Parameters.cpp
+index 1c931b52c..0278a3121 100644
+--- a/src/commons/Parameters.cpp
++++ b/src/commons/Parameters.cpp
+@@ -378,6 +378,12 @@ Parameters::Parameters():
+     threadsandcompression.push_back(&PARAM_COMPRESSED);
+     threadsandcompression.push_back(&PARAM_V);
+ 
++    // mergeclusters
++    mergeclusters.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
++    mergeclusters.push_back(&PARAM_THREADS);
++    mergeclusters.push_back(&PARAM_COMPRESSED);
++    mergeclusters.push_back(&PARAM_V);
++
+     // createclusearchdb
+     createclusearchdb.push_back(&PARAM_THREADS);
+     createclusearchdb.push_back(&PARAM_COMPRESSED);
+@@ -654,6 +660,7 @@ Parameters::Parameters():
+     createtsv.push_back(&PARAM_THREADS);
+     createtsv.push_back(&PARAM_COMPRESSED);
+     createtsv.push_back(&PARAM_V);
++    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+ 
+     //result2stats
+     result2stats.push_back(&PARAM_STAT);
+diff --git a/src/util/createtsv.cpp b/src/util/createtsv.cpp
+index c63632f54..c095916ff 100644
+--- a/src/util/createtsv.cpp
++++ b/src/util/createtsv.cpp
+@@ -114,6 +114,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex,
+     size_t writtenBytes = 0;
+     std::vector<MemberAccession> memberAccessions;
+     std::string accessions;
++    DBKeyType previousMemberKey = DB_KEY_INVALID;
+     for (size_t keyBegin = localFirstKey; keyBegin < localEndKey; keyBegin += keysPerLoad) {
+         const size_t keyEnd = std::min(localEndKey, keyBegin + keysPerLoad);
+         headers.loadData(keyBegin, keyEnd);
+@@ -124,6 +125,11 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex,
+             const QueuedPair queuedPair = memberQueue.top();
+             memberQueue.pop();
+             MMseqsNode::queueNextPair(memberQueue, memberBlocks, queuedPair.block, sortedByMember);
++            if (queuedPair.pair.memberKey == previousMemberKey) {
++                Debug(Debug::ERROR) << "Key " << queuedPair.pair.memberKey << " is in two clusters\n";
++                EXIT(EXIT_FAILURE);
++            }
++            previousMemberKey = queuedPair.pair.memberKey;
+             const std::string accession = Util::parseFastaHeader(headers.getData(queuedPair.pair.memberKey, 0));
+             const MemberAccession memberAccession = { queuedPair.pair.repKey, queuedPair.pair.memberKey, accessions.size(), static_cast<unsigned int>(accession.size()) };
+             accessions.append(accession);
+@@ -136,6 +142,10 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex,
+             }
+         }
+     }
++    if (memberQueue.empty() == false) {
++        Debug(Debug::ERROR) << "Key " << memberQueue.top().pair.memberKey << " of the clustering is not in the sequence database\n";
++        EXIT(EXIT_FAILURE);
++    }
+     writeMemberAccessions(memberAccessions, accessions, nodeKeyOffsets, sortedByRepHandle, sortedByRepFile, sortedByRepIndexData, writtenBytes);
+     MMseqsNode::closeExchangeFiles(memberFiles, sortedByMember);
+     return MMseqsNode::closeExchange(sortedByRepHandle, sortedByRepFile, sortedByRep + ".index", sortedByRepIndexData);
+@@ -165,6 +175,10 @@ static void writeRepresentativeEntries(const std::string &sortedByRepIndex, cons
+                 writer.writeEnd(currentRepKey, 0, par.dbOut);
+             }
+             // the representative itself comes first
++            if (queuedMemberAccession.memberKey != queuedMemberAccession.repKey) {
++                Debug(Debug::ERROR) << "The cluster of key " << queuedMemberAccession.repKey << " has no line for its representative\n";
++                EXIT(EXIT_FAILURE);
++            }
+             currentRepKey = queuedMemberAccession.repKey;
+             repAccession.assign(queuedMemberAccession.accession, queuedMemberAccession.accessionLength);
+             writer.writeStart(0);
+@@ -195,13 +209,23 @@ int createtsv(int argc, const char **argv, const Command &command) {
+             Debug(Debug::ERROR) << "createtsv needs the --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " database as both query and target database: createtsv DB DB clu tsv\n";
+             EXIT(EXIT_FAILURE);
+         }
++        if (par.fullHeader || par.targetTsvColumn != 1 || par.idxSeqSrc != 0 || par.dbOut) {
++            Debug(Debug::ERROR) << "--full-header, --target-column, --idx-seq-src and --db-output are not supported for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
++            EXIT(EXIT_FAILURE);
++        }
++        const int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
++        if (Parameters::isEqualDbtype(clusterDbtype, Parameters::DBTYPE_CLUSTER_RES) == false
++            || (DBReader<DBKeyType>::getExtendedDbtype(clusterDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
++            Debug(Debug::ERROR) << par.db3 << " is not a --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " clustering\n";
++            EXIT(EXIT_FAILURE);
++        }
+         DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
+         headers.open(DBReader<DBKeyType>::NOSORT);
+         const std::vector<size_t> nodeKeyOffsets = headers.getFileKeyOffsets(MMseqsNode::count);
+         const std::string sortedByMember = par.db4 + "_sortedbymem";
+         const std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
+         const std::string sortedByRep = par.db4 + "_sortedbyrep";
+-        const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, par.hdr1 + ".index." + SSTR(MMseqsNode::rank), Util::computeMemory(0), sortedByRep);
++        const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, par.hdr1 + ".index." + SSTR(MMseqsNode::rank), Util::computeMemory(par.splitMemoryLimit), sortedByRep);
+         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
+         writeRepresentativeEntries(sortedByRepIndex, sortedByRep, par.db4, par);
+         std::vector<std::string> exchanges;
+diff --git a/src/util/mergeclusters.cpp b/src/util/mergeclusters.cpp
+index 28549f4a9..1c6ca0d74 100644
+--- a/src/util/mergeclusters.cpp
++++ b/src/util/mergeclusters.cpp
+@@ -60,7 +60,12 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
+     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
+     if (isLinfinity) {
+         MMseqsNode::init();
+-        DBReader<DBKeyType> dbr(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
++        if (par.filenames.size() > 4) {
++            Debug(Debug::ERROR) << "mergeclusters merges at most two --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " clusterings\n";
++            EXIT(EXIT_FAILURE);
++        }
++        // the header index has a line for every data file, also for one without sequences
++        DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
+         dbr.open(DBReader<DBKeyType>::NOSORT);
+         const std::vector<size_t> nodeKeyOffsets = dbr.getFileKeyOffsets(MMseqsNode::count);
+         dbr.close();

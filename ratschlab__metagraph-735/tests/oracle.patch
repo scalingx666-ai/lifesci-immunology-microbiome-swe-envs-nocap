@@ -1,0 +1,1014 @@
+diff --git a/metagraph/src/graph/annotation_key_mapper.cpp b/metagraph/src/graph/annotation_key_mapper.cpp
+index 6693fbd1ee..1ed200d1ca 100644
+--- a/metagraph/src/graph/annotation_key_mapper.cpp
++++ b/metagraph/src/graph/annotation_key_mapper.cpp
+@@ -32,16 +32,13 @@ auto AnnotationKeyMapper::keys(std::span<const node_index> nodes,
+                                 std::string_view sequence) const -> std::vector<node_index> {
+     if (nodes.empty())
+         return {};
+-    std::vector<node_index> result(nodes.size());
+     if (needs_sequence()) {
+         assert(sequence.size() == nodes.size() + graph_.get_k() - 1);
+-        size_t i = 0;
+-        graph_.map_to_nodes(sequence, [&](node_index key) { result[i++] = key; });
+-        assert(i == nodes.size());
+-    } else {
+-        std::transform(nodes.begin(), nodes.end(), result.begin(),
+-                       [&](node_index node) { return key(node); });
++        return map_to_nodes(graph_, sequence);
+     }
++    std::vector<node_index> result(nodes.size());
++    std::transform(nodes.begin(), nodes.end(), result.begin(),
++                   [&](node_index node) { return key(node); });
+     return result;
+ }
+ 
+diff --git a/metagraph/src/graph/representation/base/node_stream.hpp b/metagraph/src/graph/representation/base/node_stream.hpp
+new file mode 100644
+index 0000000000..fc4fe3c4f0
+--- /dev/null
++++ b/metagraph/src/graph/representation/base/node_stream.hpp
+@@ -0,0 +1,109 @@
++#ifndef __NODE_STREAM_HPP__
++#define __NODE_STREAM_HPP__
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <memory>
++#include <span>
++#include <vector>
++
++
++namespace mtg {
++namespace graph {
++
++// Pull-based mapping of the k-mers of a sequence to graph nodes: one node per
++// k-mer position, in input order, npos (0) for k-mers missing from the graph.
++// The stream keeps a reference to the sequence; it must outlive the stream.
++class NodeStream {
++  public:
++    typedef uint64_t node_index;
++
++    virtual ~NodeStream() {}
++
++    // Write the nodes of the next k-mers to |out| and return their number.
++    // Returns less than out.size() only when the sequence is exhausted.
++    virtual size_t next(std::span<node_index> out) = 0;
++};
++
++// A stream over nodes that were already computed.
++class BufferedNodeStream final : public NodeStream {
++  public:
++    explicit BufferedNodeStream(std::vector<node_index>&& nodes) : nodes_(std::move(nodes)) {}
++
++    size_t next(std::span<node_index> out) override {
++        size_t n = std::min(out.size(), nodes_.size() - pos_);
++        std::copy(nodes_.begin() + pos_, nodes_.begin() + pos_ + n, out.begin());
++        pos_ += n;
++        return n;
++    }
++
++  private:
++    std::vector<node_index> nodes_;
++    size_t pos_ = 0;
++};
++
++// Single-pass input range over a NodeStream. Reads the stream in small chunks
++// to amortize the virtual call. Example:
++//     for (node_index node : graph.node_range(sequence)) { ... }
++class NodeRange {
++  public:
++    typedef NodeStream::node_index node_index;
++    static constexpr size_t kChunkSize = 64;
++
++    explicit NodeRange(std::unique_ptr<NodeStream> stream) : stream_(std::move(stream)) {}
++
++    class iterator {
++      public:
++        using iterator_concept = std::input_iterator_tag;
++        using value_type = node_index;
++        using difference_type = std::ptrdiff_t;
++
++        iterator() = default;
++        explicit iterator(NodeRange *range) : range_(range) {}
++
++        node_index operator*() const { return range_->buffer_[range_->pos_]; }
++        iterator& operator++() { ++range_->pos_; return *this; }
++        void operator++(int) { ++*this; }
++
++        friend bool operator==(const iterator &it, std::default_sentinel_t) {
++            return it.at_end();
++        }
++
++      private:
++        NodeRange *range_ = nullptr;
++
++        bool at_end() const { return range_->pos_ == range_->size_ && !range_->refill(); }
++    };
++
++    iterator begin() {
++        if (pos_ == size_)
++            refill();
++        return iterator(this);
++    }
++    std::default_sentinel_t end() const { return {}; }
++
++  private:
++    std::unique_ptr<NodeStream> stream_;
++    std::array<node_index, kChunkSize> buffer_;
++    size_t pos_ = 0;
++    size_t size_ = 0;
++
++    bool refill() {
++        pos_ = 0;
++        size_ = stream_ ? stream_->next(buffer_) : 0;
++        if (size_ < kChunkSize)
++            stream_.reset();
++        return size_;
++    }
++};
++
++static_assert(std::input_iterator<NodeRange::iterator>);
++static_assert(std::sentinel_for<std::default_sentinel_t, NodeRange::iterator>);
++
++} // namespace graph
++} // namespace mtg
++
++#endif // __NODE_STREAM_HPP__
+diff --git a/metagraph/src/graph/representation/base/sequence_graph.cpp b/metagraph/src/graph/representation/base/sequence_graph.cpp
+index 3ff04fc7a3..ab4a4322d2 100644
+--- a/metagraph/src/graph/representation/base/sequence_graph.cpp
++++ b/metagraph/src/graph/representation/base/sequence_graph.cpp
+@@ -1,5 +1,7 @@
+ #include "sequence_graph.hpp"
+ 
++#include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <progress_bar.hpp>
+ #include <sdsl/int_vector.hpp>
+@@ -538,6 +540,39 @@ size_t incoming_edge_rank(const SequenceGraph &graph,
+     return edge_rank;
+ }
+ 
++std::unique_ptr<NodeStream>
++SequenceGraph::node_stream(std::string_view sequence, bool sequential) const {
++    return std::make_unique<BufferedNodeStream>(
++        sequential ? graph::map_to_nodes_sequentially(*this, sequence)
++                   : graph::map_to_nodes(*this, sequence)
++    );
++}
++
++void DeBruijnGraph::call_streamed_nodes(std::string_view sequence, bool sequential,
++                                        const std::function<void(node_index)> &callback,
++                                        const std::function<bool()> &terminate,
++                                        size_t max_chunk_size) const {
++    assert(max_chunk_size && max_chunk_size <= NodeRange::kChunkSize);
++    if (terminate())
++        return;
++
++    // Pull chunks of doubling size: a virtual call per node is slow for fast
++    // graphs, while terminate() may stop early, and then at most as many nodes
++    // are mapped in vain as were already passed to the callback
++    auto stream = node_stream(sequence, sequential);
++    std::array<node_index, NodeRange::kChunkSize> buffer;
++    for (size_t size = 1; ; size = std::min(2 * size, max_chunk_size)) {
++        size_t n = stream->next({ buffer.data(), size });
++        for (size_t i = 0; i < n; ++i) {
++            callback(buffer[i]);
++            if (terminate())
++                return;
++        }
++        if (n < size)
++            return;
++    }
++}
++
+ std::vector<SequenceGraph::node_index>
+ map_to_nodes_sequentially(const SequenceGraph &graph, std::string_view sequence) {
+     std::vector<SequenceGraph::node_index> nodes;
+diff --git a/metagraph/src/graph/representation/base/sequence_graph.hpp b/metagraph/src/graph/representation/base/sequence_graph.hpp
+index c0bf4bfb57..e1c2dcf60c 100644
+--- a/metagraph/src/graph/representation/base/sequence_graph.hpp
++++ b/metagraph/src/graph/representation/base/sequence_graph.hpp
+@@ -2,6 +2,7 @@
+ #define __SEQUENCE_GRAPH_HPP__
+ 
+ #include "common/vectors/bit_vector.hpp"
++#include "graph/representation/base/node_stream.hpp"
+ 
+ #include <vector>
+ #include <string>
+@@ -54,6 +55,18 @@ class SequenceGraph {
+                                            const std::function<void(node_index)> &callback,
+                                            const std::function<bool()> &terminate = [](){ return false; }) const = 0;
+ 
++    // Map the k-mers of |sequence| to nodes lazily, one node per k-mer position.
++    // With |sequential|, nodes are those of map_to_nodes_sequentially, otherwise
++    // those of map_to_nodes. |sequence| must outlive the returned range.
++    NodeRange node_range(std::string_view sequence, bool sequential = false) const {
++        return NodeRange(node_stream(sequence, sequential));
++    }
++
++    // Backend of node_range. The default runs the callback interface and
++    // buffers all nodes; graphs with a streaming mapping override it.
++    virtual std::unique_ptr<NodeStream> node_stream(std::string_view sequence,
++                                                    bool sequential) const;
++
+     // Given a node index, call the target nodes of all edges outgoing from it.
+     virtual void adjacent_outgoing_nodes(node_index node,
+                                          const std::function<void(node_index)> &callback) const = 0;
+@@ -250,6 +263,14 @@ class DeBruijnGraph : public SequenceGraph {
+ 
+     // Call all nodes that have no incoming edges
+     virtual void call_source_nodes(const std::function<void(node_index)> &callback) const;
++
++  protected:
++    // Callback interface on top of node_stream, for graphs that override it.
++    // Maps at most |max_chunk_size| - 1 nodes past the one terminate() stops at.
++    void call_streamed_nodes(std::string_view sequence, bool sequential,
++                             const std::function<void(node_index)> &callback,
++                             const std::function<bool()> &terminate,
++                             size_t max_chunk_size = NodeRange::kChunkSize) const;
+ };
+ 
+ 
+diff --git a/metagraph/src/graph/representation/canonical_dbg.cpp b/metagraph/src/graph/representation/canonical_dbg.cpp
+index de4c02b840..05eb5b37be 100644
+--- a/metagraph/src/graph/representation/canonical_dbg.cpp
++++ b/metagraph/src/graph/representation/canonical_dbg.cpp
+@@ -111,15 +111,7 @@ ::map_to_nodes_sequentially(std::string_view sequence,
+                 ++it;
+             },
+             []() { return false; },
+-            [&]() {
+-                if (is_missing() || *it) {
+-                    path.push_back(npos);
+-                    ++it;
+-                    return true;
+-                } else {
+-                    return false;
+-                }
+-            }
++            [&]() { return is_missing() || *it; }
+         );
+ 
+         assert(it == rev_path.rend());
+diff --git a/metagraph/src/graph/representation/hash/dbg_hash_fast.cpp b/metagraph/src/graph/representation/hash/dbg_hash_fast.cpp
+index 15b2517f5f..0ad929cb7e 100644
+--- a/metagraph/src/graph/representation/hash/dbg_hash_fast.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_hash_fast.cpp
+@@ -73,6 +73,13 @@ class DBGHashFastImpl : public DBGHashFast::DBGHashFastInterface {
+                                    const std::function<void(node_index)> &callback,
+                                    const std::function<bool()> &terminate) const override final;
+ 
++    std::unique_ptr<NodeStream> node_stream(std::string_view sequence,
++                                            bool sequential) const override final {
++        return std::make_unique<HashNodeStream>(
++            *this, sequence_to_kmers(sequence, !sequential && mode_ == CANONICAL)
++        );
++    }
++
+     void call_outgoing_kmers(node_index node,
+                              const OutgoingEdgeCallback &callback) const override final;
+ 
+@@ -182,6 +189,27 @@ class DBGHashFastImpl : public DBGHashFast::DBGHashFastInterface {
+ 
+     node_index get_node_index(const Kmer &kmer) const;
+ 
++    class HashNodeStream final : public NodeStream {
++      public:
++        HashNodeStream(const DBGHashFastImpl &graph, Vector<std::pair<Kmer, bool>>&& kmers)
++              : graph_(graph), kmers_(std::move(kmers)) {}
++
++        size_t next(std::span<node_index> out) override {
++            size_t n = std::min(out.size(), kmers_.size() - i_);
++            for (size_t j = 0; j < n; ++j, ++i_) {
++                const auto &[kmer, valid] = kmers_[i_];
++                out[j] = valid ? graph_.get_node_index(kmer) : npos;
++                assert(!out[j] || kmer == graph_.get_kmer(out[j]));
++            }
++            return n;
++        }
++
++      private:
++        const DBGHashFastImpl &graph_;
++        Vector<std::pair<Kmer, bool>> kmers_;
++        size_t i_ = 0;
++    };
++
+     const Kmer get_kmer(node_index node) const {
+         assert(in_graph(node));
+ 
+@@ -286,43 +314,19 @@ void DBGHashFastImpl<KMER>::add_sequence(std::string_view sequence,
+     }
+ }
+ 
+-// Traverse graph mapping sequence to the graph nodes
+-// and run callback for each node until the termination condition is satisfied.
+-// Guarantees that nodes are called in the same order as the input sequence.
+-// In canonical mode, non-canonical k-mers are NOT mapped to canonical ones
+ template <typename KMER>
+ void DBGHashFastImpl<KMER>::map_to_nodes_sequentially(
+                                 std::string_view sequence,
+                                 const std::function<void(node_index)> &callback,
+                                 const std::function<bool()> &terminate) const {
+-    for (const auto &[kmer, valid] : sequence_to_kmers(sequence)) {
+-        if (terminate())
+-            return;
+-
+-        assert((kmers_.find(kmer.data() & kIgnoreLastCharMask) == kmers_.end())
+-               || get_node_index(kmer) == npos
+-               || kmer == get_kmer(get_node_index(kmer)));
+-
+-        callback(valid ? get_node_index(kmer) : npos);
+-        // TODO: `next_kmer()` could speed this up
+-    }
++    this->call_streamed_nodes(sequence, true, callback, terminate);
+ }
+ 
+-// Traverse graph mapping sequence to the graph nodes
+-// and run callback for each node until the termination condition is satisfied
+ template <typename KMER>
+ void DBGHashFastImpl<KMER>::map_to_nodes(std::string_view sequence,
+                                          const std::function<void(node_index)> &callback,
+                                          const std::function<bool()> &terminate) const {
+-    for (const auto &[kmer, valid] : sequence_to_kmers(sequence, mode_ == CANONICAL)) {
+-        if (terminate())
+-            return;
+-
+-        assert(!get_node_index(kmer) || kmer == get_kmer(get_node_index(kmer)));
+-
+-        callback(valid ? get_node_index(kmer) : npos);
+-        // TODO: `next_kmer()` could speed this up
+-    }
++    this->call_streamed_nodes(sequence, false, callback, terminate);
+ }
+ 
+ 
+diff --git a/metagraph/src/graph/representation/hash/dbg_hash_fast.hpp b/metagraph/src/graph/representation/hash/dbg_hash_fast.hpp
+index a9b849301b..9c66dca8f5 100644
+--- a/metagraph/src/graph/representation/hash/dbg_hash_fast.hpp
++++ b/metagraph/src/graph/representation/hash/dbg_hash_fast.hpp
+@@ -45,6 +45,11 @@ class DBGHashFast : public DeBruijnGraph {
+         hash_dbg_->map_to_nodes_sequentially(sequence, callback, terminate);
+     }
+ 
++    std::unique_ptr<NodeStream> node_stream(std::string_view sequence,
++                                            bool sequential) const override final {
++        return hash_dbg_->node_stream(sequence, sequential);
++    }
++
+     void call_nodes(const std::function<void(node_index)> &callback,
+                     const std::function<bool()> &stop_early = [](){ return false; },
+                     size_t num_threads = 1,
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index 7b082ad540..b8b83ea332 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -1,6 +1,7 @@
+ #include "dbg_sshash.hpp"
+ 
+ #include <memory>
++#include <optional>
+ #include <type_traits>
+ 
+ #include <sdsl/memory_management.hpp>
+@@ -280,107 +281,107 @@ void DBGSSHash::add_sequence(std::string_view sequence,
+     throw std::logic_error("adding sequences not supported");
+ }
+ 
++namespace {
++
++// Maps k-mers with sshash::streaming_query (with_rc) or a rolling k-mer (basic).
++// With |oriented|, k-mers matched in reverse-complement orientation map to
++// their reverse-complement nodes.
+ template <bool with_rc, class Dict>
+-void map_to_nodes_with_rc_impl(const DBGSSHash& graph,
+-                               const Dict& dict,
+-                               std::string_view sequence,
+-                               const std::function<void(sshash::lookup_result)>& callback,
+-                               const std::function<bool()>& terminate) {
+-    size_t k = graph.get_k();
+-    size_t n = sequence.size();
+-    if (terminate() || n < k)
+-        return;
++class SSHashNodeStream final : public NodeStream {
++    using kmer_t = typename Dict::kmer_type;
+ 
+-    if (!dict.num_kmers()) {
+-        for (size_t i = 0; i + k <= sequence.size() && !terminate(); ++i) {
+-            callback(sshash::lookup_result());
++  public:
++    SSHashNodeStream(const DBGSSHash &graph, const Dict &dict,
++                     std::string_view sequence, bool oriented)
++          : graph_(graph), dict_(dict), seq_(sequence), k_(graph.get_k()),
++            end_(sequence.size() >= k_ ? sequence.size() - k_ + 1 : 0),
++            oriented_(oriented) {
++        if constexpr (with_rc) {
++            // an empty dictionary has no valid parameters for a query
++            if (dict.num_kmers())
++                parser_.emplace(&dict);
++        } else {
++            std::vector<bool> invalid_char(seq_.size());
++            for (size_t i = 0; i < seq_.size(); ++i) {
++                invalid_char[i] = !kmer_t::is_valid(seq_[i]);
++            }
++            invalid_kmer_ = utils::drag_and_mark_segments(invalid_char, true, k_);
+         }
+-        return;
+     }
+ 
+-    using kmer_t = typename Dict::kmer_type;
++    size_t next(std::span<node_index> out) override {
++        size_t n = std::min(out.size(), end_ - i_);
++        if (!dict_.num_kmers()) {
++            std::fill(out.begin(), out.begin() + n, DeBruijnGraph::npos);
++        } else {
++            for (size_t j = 0; j < n; ++j) {
++                out[j] = lookup(i_ + j);
++            }
++        }
++        i_ += n;
++        return n;
++    }
+ 
+-    if (with_rc) {
+-        auto parser = sshash::streaming_query<Dict>(&dict);
+-        for (size_t i = 0; i + k <= sequence.size() && !terminate(); ++i) {
+-            auto ret_val = parser.lookup(sequence.data() + i);
++  private:
++    const DBGSSHash &graph_;
++    const Dict &dict_;
++    std::string_view seq_;
++    size_t k_;
++    size_t end_;
++    bool oriented_;
++    size_t i_ = 0;
++    std::optional<sshash::streaming_query<Dict>> parser_;
++    std::vector<bool> invalid_kmer_;
++    kmer_t uint_kmer_;
++    bool begin_ = true;
++
++    node_index lookup(size_t i) {
++        sshash::lookup_result res;
++        if constexpr (with_rc) {
++            res = parser_->lookup(seq_.data() + i);
+             // Direct dictionary lookup assumes a valid alphabet. Streaming
+             // lookup also accepts ambiguous bases and returns no match.
+-            assert(!sshash::util::is_valid<kmer_t>(sequence.data() + i, k)
+-                   || sshash::equal_lookup_result(ret_val,
+-                                               dict.lookup(sequence.data() + i, with_rc)));
+-            callback(ret_val);
+-        }
+-    } else {
+-        std::vector<bool> invalid_char(n);
+-        for (size_t i = 0; i < n; ++i) {
+-            invalid_char[i] = !kmer_t::is_valid(sequence[i]);
+-        }
+-
+-        auto invalid_kmer = utils::drag_and_mark_segments(invalid_char, true, k);
+-
+-        bool begin = true;
+-        kmer_t uint_kmer;
+-        for (size_t i = 0; i + k <= n && !terminate(); ++i) {
+-            sshash::lookup_result ret_val;
+-            if (invalid_kmer[i + k - 1]) {
+-                begin = true;
+-                callback(ret_val);
+-                continue;
++            assert(!sshash::util::is_valid<kmer_t>(seq_.data() + i, k_)
++                   || sshash::equal_lookup_result(res, dict_.lookup(seq_.data() + i, true)));
++        } else {
++            if (invalid_kmer_[i + k_ - 1]) {
++                begin_ = true;
++                return DeBruijnGraph::npos;
+             }
+-
+-            if (begin) {
+-                begin = false;
+-                uint_kmer = sshash::util::string_to_uint_kmer<kmer_t>(sequence.data() + i, k);
++            if (begin_) {
++                begin_ = false;
++                uint_kmer_ = sshash::util::string_to_uint_kmer<kmer_t>(seq_.data() + i, k_);
+             } else {
+-                uint_kmer.drop_char();
+-                uint_kmer.set(k - 1, kmer_t::char_to_uint(sequence[i + k - 1]));
++                uint_kmer_.drop_char();
++                uint_kmer_.set(k_ - 1, kmer_t::char_to_uint(seq_[i + k_ - 1]));
+             }
+-            ret_val = dict.lookup(uint_kmer, with_rc);
+-
+-            assert(sshash::equal_lookup_result(ret_val,
+-                                               dict.lookup(sequence.data() + i, with_rc)));
+-            callback(ret_val);
++            res = dict_.lookup(uint_kmer_, false);
++            assert(sshash::equal_lookup_result(res, dict_.lookup(seq_.data() + i, false)));
+         }
++        node_index node = sshash_to_graph_index(res.kmer_id);
++        assert(!node || graph_.in_graph(node));
++        return oriented_ && node && res.kmer_orientation < 0
++                ? graph_.reverse_complement(node)
++                : node;
+     }
+-}
++};
+ 
+-template <bool with_rc>
+-void DBGSSHash::map_to_nodes_with_rc(std::string_view sequence,
+-                                     const std::function<void(node_index, bool)>& callback,
+-                                     const std::function<bool()>& terminate) const {
+-    std::visit(
+-            [&](const auto& dict) {
+-                map_to_nodes_with_rc_impl<with_rc>(
+-                        *this, dict, sequence,
+-                        [&](sshash::lookup_result res) {
+-                            auto node = sshash_to_graph_index(res.kmer_id);
+-                            assert(!node || in_graph(node));
+-                            callback(node, res.kmer_orientation < 0);
+-                        },
+-                        terminate);
+-            },
+-            dict_);
+-}
++} // namespace
+ 
+-template void
+-DBGSSHash::map_to_nodes_with_rc<true>(std::string_view,
+-                                      const std::function<void(node_index, bool)>&,
+-                                      const std::function<bool()>&) const;
+-template void
+-DBGSSHash::map_to_nodes_with_rc<false>(std::string_view,
+-                                       const std::function<void(node_index, bool)>&,
+-                                       const std::function<bool()>&) const;
++std::unique_ptr<NodeStream>
++DBGSSHash::node_stream(std::string_view sequence, bool sequential) const {
++    return std::visit([&](const auto &dict) -> std::unique_ptr<NodeStream> {
++        using Dict = std::decay_t<decltype(dict)>;
++        if (mode_ == BASIC)
++            return std::make_unique<SSHashNodeStream<false, Dict>>(*this, dict, sequence, false);
++        return std::make_unique<SSHashNodeStream<true, Dict>>(*this, dict, sequence, sequential);
++    }, dict_);
++}
+ 
+ void DBGSSHash::map_to_nodes(std::string_view sequence,
+                              const std::function<void(node_index)>& callback,
+                              const std::function<bool()>& terminate) const {
+-    if (mode_ == BASIC) {
+-        map_to_nodes_sequentially(sequence, callback, terminate);
+-    } else {
+-        map_to_nodes_with_rc<true>(
+-                sequence, [&](node_index node, bool) { callback(node); }, terminate);
+-    }
++    call_streamed_nodes(sequence, false, callback, terminate);
+ }
+ 
+ DBGSSHash::node_index DBGSSHash::reverse_complement(node_index node) const {
+@@ -417,17 +418,7 @@ uint64_t DBGSSHash::num_nodes() const {
+ void DBGSSHash::map_to_nodes_sequentially(std::string_view sequence,
+                                           const std::function<void(node_index)>& callback,
+                                           const std::function<bool()>& terminate) const {
+-    if (mode_ != BASIC) {
+-        map_to_nodes_with_rc<true>(
+-                sequence,
+-                [&](node_index n, bool revcompl) {
+-                    callback(n && revcompl ? reverse_complement(n) : n);
+-                },
+-                terminate);
+-    } else {
+-        map_to_nodes_with_rc<false>(
+-                sequence, [&](node_index node, bool) { callback(node); }, terminate);
+-    }
++    call_streamed_nodes(sequence, true, callback, terminate);
+ }
+ 
+ DBGSSHash::node_index DBGSSHash::traverse(node_index node, char next_char) const {
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.hpp b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+index 0f380e67df..ee9fc7f00c 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.hpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+@@ -57,11 +57,8 @@ class DBGSSHash : public DeBruijnGraph {
+             const std::function<void(node_index)>& callback,
+             const std::function<bool()>& terminate = []() { return false; }) const override;
+ 
+-    template <bool with_rc = true>
+-    void map_to_nodes_with_rc(
+-            std::string_view sequence,
+-            const std::function<void(node_index, bool)>& callback,
+-            const std::function<bool()>& terminate = []() { return false; }) const;
++    std::unique_ptr<NodeStream> node_stream(std::string_view sequence,
++                                            bool sequential) const override;
+ 
+     uint64_t num_nodes() const override;
+ 
+diff --git a/metagraph/src/graph/representation/succinct/boss.cpp b/metagraph/src/graph/representation/succinct/boss.cpp
+index 980f286d38..6ca71df940 100644
+--- a/metagraph/src/graph/representation/succinct/boss.cpp
++++ b/metagraph/src/graph/representation/succinct/boss.cpp
+@@ -987,7 +987,10 @@ void BOSS::map_to_edges(std::string_view sequence,
+                         const std::function<void(edge_index)> &callback,
+                         const std::function<bool()> &terminate,
+                         const std::function<bool()> &skip) const {
+-    map_to_edges(encode(sequence), callback, terminate, skip);
++    EdgeStream edges(*this, sequence, skip);
++    while (!edges.done() && !terminate()) {
++        callback(edges.next());
++    }
+ }
+ 
+ std::vector<edge_index> BOSS::map_to_edges(std::string_view sequence) const {
+@@ -998,51 +1001,46 @@ void BOSS::map_to_edges(const std::vector<TAlphabet> &seq_encoded,
+                         const std::function<void(edge_index)> &callback,
+                         const std::function<bool()> &terminate,
+                         const std::function<bool()> &skip) const {
+-    assert(std::all_of(seq_encoded.begin(), seq_encoded.end(),
+-                       [this](TAlphabet c) { return c <= alph_size; }));
+-
+-    if (seq_encoded.size() <= k_)
+-        return;
+-
+-    // Mark where (k+1)-mers with invalid characters end
+-    // Example for (k+1)=3: [X]***[X]****[X]***
+-    //              ---->   [111]0[111]00[111]0
+-    auto invalid = utils::drag_and_mark_segments(seq_encoded, alph_size, k_ + 1);
+-
+-    // slide through all (k+1)-mers
+-    for (size_t i = 0; i + k_ + 1 <= seq_encoded.size() && !terminate(); ++i) {
+-        if (skip())
+-            continue;
+-
+-        if (invalid[i + k_]) {
+-            // this (k+1)-mer contains at least one invalid character
+-            callback(npos);
+-            continue;
+-        }
++    EdgeStream edges(*this, std::span<const TAlphabet>(seq_encoded), skip);
++    while (!edges.done() && !terminate()) {
++        callback(edges.next());
++    }
++}
+ 
+-        auto edge = map_to_edge(seq_encoded.data() + i,
+-                                seq_encoded.data() + i + k_ + 1);
+-        callback(edge);
++BOSS::EdgeStream::EdgeStream(const BOSS &boss, std::string_view sequence,
++                             std::function<bool()> skip)
++      : EdgeStream(boss, boss.encode(sequence), std::move(skip)) {}
+ 
+-        while (edge && ++i + k_ < seq_encoded.size()) {
+-            if (terminate())
+-                return;
++BOSS::EdgeStream::EdgeStream(const BOSS &boss, std::vector<TAlphabet>&& seq_encoded,
++                             std::function<bool()> skip)
++      : EdgeStream(boss, std::span<const TAlphabet>(seq_encoded), std::move(skip)) {
++    // moving a vector keeps its buffer, so |seq_| stays valid
++    owned_seq_ = std::move(seq_encoded);
++}
+ 
+-            if (skip())
+-                break;
++BOSS::EdgeStream::EdgeStream(const BOSS &boss, std::span<const TAlphabet> seq_encoded,
++                             std::function<bool()> skip)
++      : boss_(&boss), seq_(seq_encoded), skip_(std::move(skip)) {
++    assert(std::all_of(seq_.begin(), seq_.end(),
++                       [&](TAlphabet c) { return c <= boss.alph_size; }));
++    if (seq_.size() > boss.k_)
++        invalid_ = utils::drag_and_mark_segments(seq_, boss.alph_size, boss.k_ + 1);
++}
+ 
+-            if (invalid[i + k_]) {
+-                // this (k+1)-mer contains at least one invalid character
+-                callback(npos);
+-                break;
+-            }
++edge_index BOSS::EdgeStream::next() {
++    assert(!done());
++    const size_t i = i_++;
++    const size_t k = boss_->k_;
+ 
+-            edge = fwd(edge, seq_encoded[i + k_ - 1]);
+-            edge = pick_edge(edge, seq_encoded[i + k_]);
++    if ((skip_ && skip_()) || invalid_[i + k])
++        return edge_ = npos;
+ 
+-            callback(edge);
+-        }
++    if (edge_) {
++        edge_ = boss_->fwd(edge_, seq_[i + k - 1]);
++        return edge_ = boss_->pick_edge(edge_, seq_[i + k]);
+     }
++
++    return edge_ = boss_->map_to_edge(seq_.data() + i, seq_.data() + i + k + 1);
+ }
+ 
+ std::vector<edge_index>
+diff --git a/metagraph/src/graph/representation/succinct/boss.hpp b/metagraph/src/graph/representation/succinct/boss.hpp
+index 1244f16f25..1715b37f86 100644
+--- a/metagraph/src/graph/representation/succinct/boss.hpp
++++ b/metagraph/src/graph/representation/succinct/boss.hpp
+@@ -2,6 +2,7 @@
+ #define __BOSS_HPP__
+ 
+ #include <memory>
++#include <span>
+ #include <type_traits>
+ 
+ #include "common/vectors/bit_vector.hpp"
+@@ -82,6 +83,7 @@ class BOSS {
+     // Traverse graph mapping k-mers from sequence to the graph edges
+     // and run callback for each edge until the termination condition is satisfied
+     // Invokes #callback with npos if a k-mer can't be mapped to the graph edges
++    // or if #skip returns true for it (#skip is called once per k-mer)
+     void map_to_edges(std::string_view sequence,
+                       const std::function<void(edge_index)> &callback,
+                       const std::function<bool()> &terminate = ALWAYS_FALSE,
+@@ -99,6 +101,35 @@ class BOSS {
+     std::vector<edge_index>
+     map_to_edges(const std::vector<TAlphabet> &seq_encoded) const;
+ 
++    // Pull-based form of map_to_edges: each next() returns the edge of the next
++    // (k+1)-mer of |sequence|, or npos if it is missing, invalid, or skipped.
++    class EdgeStream {
++      public:
++        EdgeStream(const BOSS &boss, std::string_view sequence,
++                   std::function<bool()> skip = {});
++        // |seq_encoded| must have no sentinels (zeros) and outlive the stream
++        EdgeStream(const BOSS &boss, std::span<const TAlphabet> seq_encoded,
++                   std::function<bool()> skip = {});
++
++        EdgeStream(const EdgeStream&) = delete;
++        EdgeStream& operator=(const EdgeStream&) = delete;
++
++        bool done() const { return i_ + boss_->k_ + 1 > seq_.size(); }
++        edge_index next();
++
++      private:
++        EdgeStream(const BOSS &boss, std::vector<TAlphabet>&& seq_encoded,
++                   std::function<bool()> skip);
++
++        const BOSS *boss_;
++        std::vector<TAlphabet> owned_seq_;
++        std::span<const TAlphabet> seq_;
++        std::vector<bool> invalid_;
++        std::function<bool()> skip_;
++        size_t i_ = 0;
++        edge_index edge_ = 0;
++    };
++
+     template <class... T>
+     using Call = typename std::function<void(T...)>;
+ 
+diff --git a/metagraph/src/graph/representation/succinct/dbg_succinct.cpp b/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
+index d3ddf10ea9..ec14311ac4 100644
+--- a/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
++++ b/metagraph/src/graph/representation/succinct/dbg_succinct.cpp
+@@ -68,13 +68,7 @@ bool DBGSuccinct::find(std::string_view sequence,
+         },
+         [&]() { return num_kmers_missing > max_kmers_missing
+                         || num_kmers_discovered >= min_kmers_discovered; },
+-        [&]() {
+-            if (!is_invalid())
+-                return false;
+-
+-            num_kmers_missing++;
+-            return true;
+-        }
++        is_invalid
+     );
+ 
+     return num_kmers_missing <= max_kmers_missing;
+@@ -285,23 +279,43 @@ std::string DBGSuccinct::get_node_sequence(node_index node) const {
+ void DBGSuccinct::map_to_nodes_sequentially(std::string_view sequence,
+                                             const std::function<void(node_index)> &callback,
+                                             const std::function<bool()> &terminate) const {
+-    if (sequence.size() < get_k())
+-        return;
++    // a BOSS lookup dwarfs the virtual call: map nothing past terminate()
++    call_streamed_nodes(sequence, true, callback, terminate, 1);
++}
+ 
+-    auto is_missing = get_missing_kmer_skipper(bloom_filter_.get(), sequence);
++namespace {
+ 
+-    boss_graph_->map_to_edges(
+-        sequence,
+-        [&](BOSS::edge_index i) { callback(validate_edge(i)); },
+-        terminate,
+-        [&]() {
+-            if (!is_missing())
+-                return false;
++class DBGSuccinctNodeStream final : public NodeStream {
++  public:
++    DBGSuccinctNodeStream(const DBGSuccinct &graph, std::string_view sequence,
++                          std::function<bool()> skip)
++          : graph_(graph), edges_(graph.get_boss(), sequence, std::move(skip)) {}
+ 
+-            callback(npos);
+-            return true;
++    size_t next(std::span<node_index> out) override {
++        size_t n = 0;
++        for (; n < out.size() && !edges_.done(); ++n) {
++            out[n] = graph_.validate_edge(edges_.next());
+         }
+-    );
++        return n;
++    }
++
++  private:
++    const DBGSuccinct &graph_;
++    BOSS::EdgeStream edges_;
++};
++
++} // namespace
++
++std::unique_ptr<NodeStream>
++DBGSuccinct::node_stream(std::string_view sequence, bool sequential) const {
++    if (mode_ == CANONICAL && !sequential)
++        return DeBruijnGraph::node_stream(sequence, sequential);
++
++    std::function<bool()> skip;
++    if (bloom_filter_ && sequence.size() >= get_k())
++        skip = get_missing_kmer_skipper(bloom_filter_.get(), sequence);
++
++    return std::make_unique<DBGSuccinctNodeStream>(*this, sequence, std::move(skip));
+ }
+ 
+ void DBGSuccinct
+@@ -428,72 +442,50 @@ void DBGSuccinct::traverse(node_index start,
+ void DBGSuccinct::map_to_nodes(std::string_view sequence,
+                                const std::function<void(node_index)> &callback,
+                                const std::function<bool()> &terminate) const {
++    if (mode_ != CANONICAL) {
++        call_streamed_nodes(sequence, false, callback, terminate, 1);
++        return;
++    }
++
+     if (sequence.size() < get_k())
+         return;
+ 
+     auto is_missing = get_missing_kmer_skipper(bloom_filter_.get(), sequence);
+ 
+-    if (mode_ == CANONICAL) {
+-        std::string sequence_rev_compl(sequence.begin(), sequence.end());
+-        reverse_complement(sequence_rev_compl.begin(), sequence_rev_compl.end());
+-
+-        std::vector<BOSS::edge_index> boss_edges;
+-        boss_edges.resize(sequence.size() - get_k() + 1);
+-
+-        auto jt = boss_edges.begin();
+-        boss_graph_->map_to_edges(sequence,
+-            [&](auto index) { *jt = index; ++jt; },
+-            []() { return false; },
+-            [&]() {
+-                if (!is_missing())
+-                    return false;
+-
+-                ++jt;
+-                return true;
+-            }
+-        );
++    std::string sequence_rev_compl(sequence.begin(), sequence.end());
++    reverse_complement(sequence_rev_compl.begin(), sequence_rev_compl.end());
+ 
+-        assert(jt == boss_edges.end());
++    std::vector<BOSS::edge_index> boss_edges;
++    boss_edges.resize(sequence.size() - get_k() + 1);
+ 
+-        auto it = boss_edges.rbegin();
+-        boss_graph_->map_to_edges(sequence_rev_compl,
+-            [&](auto rc_index) {
+-                assert(it < boss_edges.rend());
+-                *it = std::min(*it, rc_index);
+-                ++it;
+-            },
+-            []() { return false; },
+-            [&]() {
+-                assert(it < boss_edges.rend());
+-                // if a k-mer is missing, skip its reverse compliment, as it's missing too.
+-                if (!*it) {
+-                    ++it;
+-                    return true;
+-                } else {
+-                    return false;
+-                }
+-            }
+-        );
++    auto jt = boss_edges.begin();
++    boss_graph_->map_to_edges(sequence,
++        [&](auto index) { *jt = index; ++jt; },
++        []() { return false; },
++        is_missing
++    );
++
++    assert(jt == boss_edges.end());
+ 
+-        for (size_t i = 0; i < boss_edges.size() && !terminate(); ++i) {
+-            // the definition of a canonical k-mer is redefined:
+-            //      use k-mer with smaller index in the BOSS table.
+-            callback(validate_edge(boss_edges[i]));
++    auto it = boss_edges.rbegin();
++    boss_graph_->map_to_edges(sequence_rev_compl,
++        [&](auto rc_index) {
++            assert(it < boss_edges.rend());
++            *it = std::min(*it, rc_index);
++            ++it;
++        },
++        []() { return false; },
++        [&]() {
++            assert(it < boss_edges.rend());
++            // if a k-mer is missing, skip its reverse compliment, as it's missing too.
++            return !*it;
+         }
++    );
+ 
+-    } else {
+-        boss_graph_->map_to_edges(
+-            sequence,
+-            [&](BOSS::edge_index i) { callback(validate_edge(i)); },
+-            terminate,
+-            [&]() {
+-                if (!is_missing())
+-                    return false;
+-
+-                callback(npos);
+-                return true;
+-            }
+-        );
++    for (size_t i = 0; i < boss_edges.size() && !terminate(); ++i) {
++        // the definition of a canonical k-mer is redefined:
++        //      use k-mer with smaller index in the BOSS table.
++        callback(validate_edge(boss_edges[i]));
+     }
+ }
+ 
+diff --git a/metagraph/src/graph/representation/succinct/dbg_succinct.hpp b/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
+index 2f243189f4..4c641cfe24 100644
+--- a/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
++++ b/metagraph/src/graph/representation/succinct/dbg_succinct.hpp
+@@ -66,6 +66,11 @@ class DBGSuccinct : public DeBruijnGraph {
+                                            const std::function<void(node_index)> &callback,
+                                            const std::function<bool()> &terminate = [](){ return false; }) const override final;
+ 
++    // Streams the BOSS edges, except for map_to_nodes in canonical mode,
++    // which is buffered
++    virtual std::unique_ptr<NodeStream> node_stream(std::string_view sequence,
++                                                    bool sequential) const override;
++
+     virtual void call_sequences(const CallPath &callback,
+                                 size_t num_threads = 1,
+                                 bool kmers_in_single_form = false,
+diff --git a/metagraph/tests/graph/all/test_dbg_basic.cpp b/metagraph/tests/graph/all/test_dbg_basic.cpp
+index 9f4aea340c..ba5b77c7d6 100644
+--- a/metagraph/tests/graph/all/test_dbg_basic.cpp
++++ b/metagraph/tests/graph/all/test_dbg_basic.cpp
+@@ -437,6 +437,47 @@ TYPED_TEST(DeBruijnGraphTest, get_node_sequence) {
+     EXPECT_EQ(query, mapped_query);
+ }
+ 
++TYPED_TEST(DeBruijnGraphTest, NodeRange) {
++    size_t k = 5;
++    // longer than NodeRange::kChunkSize, with missing k-mers and an invalid character
++    std::string reference = "AGCTTCGAGGCCAATTGCATGCATCGATCGATCGGGATCCTAGCTAGCTTTAGGACCATGACGTACG"
++                            "TTGACCAGTCAGGTCAAGCTAGGCTA";
++    std::string query = reference.substr(0, 40) + "TTTTTNTTTTT" + reference.substr(20)
++                            + "ACGTACGTTTTTTTT";
++
++#if _PROTEIN_GRAPH
++    std::vector<DeBruijnGraph::Mode> modes { DeBruijnGraph::BASIC };
++#else
++    std::vector<DeBruijnGraph::Mode> modes { DeBruijnGraph::BASIC, DeBruijnGraph::CANONICAL,
++                                             DeBruijnGraph::PRIMARY };
++#endif
++    for (auto mode : modes) {
++        auto graph = build_graph<TypeParam>(k, { reference }, mode);
++        for (std::string_view seq : { std::string_view(query), std::string_view(query).substr(0, k - 1) }) {
++            for (bool sequential : { false, true }) {
++                std::vector<DeBruijnGraph::node_index> nodes;
++                for (auto node : graph->node_range(seq, sequential)) {
++                    nodes.push_back(node);
++                }
++                EXPECT_EQ(sequential ? map_to_nodes_sequentially(*graph, seq)
++                                     : map_to_nodes(*graph, seq), nodes)
++                    << "mode " << mode << ", sequential " << sequential;
++                if (!sequential)
++                    continue;
++                ASSERT_EQ(seq.size() >= k ? seq.size() - k + 1 : 0, nodes.size());
++                for (size_t i = 0; i < nodes.size(); ++i) {
++                    // some graphs require valid characters in kmer_to_node
++                    if (seq.substr(i, k).find('N') != std::string_view::npos)
++                        continue;
++
++                    EXPECT_EQ(graph->kmer_to_node(seq.substr(i, k)), nodes[i])
++                        << "mode " << mode << ", position " << i;
++                }
++            }
++        }
++    }
++}
++
+ TYPED_TEST(DeBruijnGraphTest, CallStartNodes) {
+     {
+         std::vector<std::string> sequences = { "AAACACTAG",

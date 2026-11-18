@@ -1,0 +1,303 @@
+diff --git a/README.md b/README.md
+index 328ba5f1..cdf11ba2 100644
+--- a/README.md
++++ b/README.md
+@@ -216,6 +216,7 @@ You may need super-user privileges.
+ SingleM also has the following non-Python dependencies:
+ * [smafa](https://github.com/wwood/smafa) >= 0.5.0
+ * [VSEARCH](https://github.com/torognes/vsearch)
++* [sed](https://www.gnu.org/software/sed/) - is standard on most linux systems
+ 
+ Some dependencies of [GraftM](https://github.com/geronimp/graftM):
+ * [OrfM](https://github.com/wwood/OrfM) >= 0.2.0 
+@@ -223,7 +224,7 @@ Some dependencies of [GraftM](https://github.com/geronimp/graftM):
+ * [mfqe](https://github.com/wwood/mfqe) >= 0.5.0
+ * [pplacer](http://matsen.fhcrc.org/pplacer/) >= 1.1.alpha17
+ * [KronaTools](http://sourceforge.net/p/krona/home/krona/) >= 2.4
+-* [diamond](https://github.com/bbuchfink/diamond) >= 0.9
++* [diamond](https://github.com/bbuchfink/diamond) >= 2.0.0
+ 
+ ## Help
+ If you have any questions or comments, send a message to the [SupportM mailing list](https://groups.google.com/forum/?utm_medium=email&utm_source=footer#!forum/supportm) or raise a [GitHib issue](https://github.com/wwood/singlem/issues).
+diff --git a/bin/singlem b/bin/singlem
+index ef2a3b34..bee43e66 100755
+--- a/bin/singlem
++++ b/bin/singlem
+@@ -313,6 +313,9 @@ if __name__ == '__main__':
+                                     default=False)
+         argument_group.add_argument('--known_sequence_taxonomy', metavar='FILE',
+                                     help='A 2-column "sequence<tab>taxonomy" file specifying some sequences that have known taxonomy [default: unused]')
++        argument_group.add_argument('--diamond_prefilter', action='store_true',
++                                    help='Parse sequence data through DIAMOND blastx using a database constructed from the set of singlem packages, prior to running GraftM graft. Runs faster than default settings with slightly reduced sensitivity. NOTE: not compatible with nucleotide packages [default: not set]',
++                                    default=False)
+     less_common_pipe_arguments = pipe_parser.add_argument_group('Less common options')
+     add_less_common_pipe_arguments(less_common_pipe_arguments)
+ 
+@@ -510,7 +513,8 @@ if __name__ == '__main__':
+             force = args.force,
+             singlem_packages = args.singlem_packages,
+             assign_taxonomy = not args.no_assign_taxonomy,
+-            known_sequence_taxonomy = args.known_sequence_taxonomy)
++            known_sequence_taxonomy = args.known_sequence_taxonomy,
++            diamond_prefilter = args.diamond_prefilter)
+ 
+     elif args.subparser_name=='renew':
+         validate_pipe_args(args)
+@@ -541,7 +545,8 @@ if __name__ == '__main__':
+             force = args.force,
+             singlem_packages = args.singlem_packages,
+             assign_taxonomy = not args.no_assign_taxonomy,
+-            known_sequence_taxonomy = args.known_sequence_taxonomy)
++            known_sequence_taxonomy = args.known_sequence_taxonomy,
++            diamond_prefilter = False)
+ 
+     elif args.subparser_name=='makedb':
+         if not args.otu_tables and not args.archive_otu_tables:
+diff --git a/singlem/pipe.py b/singlem/pipe.py
+index 268b8898..5483e8ba 100644
+--- a/singlem/pipe.py
++++ b/singlem/pipe.py
+@@ -88,6 +88,7 @@ def run_to_otu_table(self, **kwargs):
+         singlem_packages = kwargs.pop('singlem_packages')
+         assign_taxonomy = kwargs.pop('assign_taxonomy')
+         known_sequence_taxonomy = kwargs.pop('known_sequence_taxonomy')
++        diamond_prefilter = kwargs.pop('diamond_prefilter')
+ 
+         working_directory = kwargs.pop('working_directory')
+         working_directory_tmpdir = kwargs.pop('working_directory_tmpdir')
+@@ -173,6 +174,21 @@ def return_cleanly():
+ 
+         #### Search
+         self._singlem_package_database = hmms
++        logging.info("Using as input %i different sequence files e.g. %s" % (
++            len(forward_read_files), forward_read_files[0]))
++        
++        if diamond_prefilter:
++            logging.info("Filtering sequence files through DIAMOND blastx")
++            for pkg in hmms:
++                if not pkg.is_protein_package():
++                    raise Exception(
++                        "DIAMOND prefilter cannot be used with nucleotide SingleM packages")
++                    
++            forward_read_files = self._prefilter(hmms, forward_read_files)
++            if reverse_read_files != None:
++                reverse_read_files = self._prefilter(hmms, reverse_read_files)
++            logging.info("Finished DIAMOND prefilter phase")
++                
+         search_result = self._search(hmms, forward_read_files, reverse_read_files)
+         sample_names = search_result.samples_with_hits()
+         if len(sample_names) == 0:
+@@ -801,11 +817,58 @@ def _graftm_command_prefix(self, is_protein):
+             cmd += "  --filter_minimum %i" % self._filter_minimum_nucleotide
+ 
+         return cmd+' '
++    
++    def _prefilter(self, singlem_package_database, read_files):
++        '''Find all reads that match the DIAMOND database in the 
++        singlem_package database.
++        Parameters
++        ----------
++        singlem_package_database: HmmDatabase 
++            packages to search the reads for
++        read_files: list of str 
++            paths to the sequences to be searched
++        Returns
++        -------
++        path to fasta file of filtered reads
++        '''
++        dmnd = singlem_package_database.get_dmnd()
++
++        filtered_reads = []
++        prefilter_dir = os.path.join(self._working_directory, 'prefilter')
++        os.mkdir(prefilter_dir)
++        
++        for file in read_files:
++            fasta_path = os.path.join(prefilter_dir,
++                                      os.path.basename(file))
++            if fasta_path[-3:] == '.gz':
++                fasta_path = fasta_path[:-3] # remove .gz for destination files
++            fasta_path = os.path.splitext(fasta_path)[0]+'.fna'
++            
++            f = open(fasta_path, 'w+') # create tempfile in working directory
++            f.close()
++            
++            cmd = "zcat -f %s | " \
++                  "diamond blastx " \
++                  "--outfmt 6 qseqid full_qseq " \
++                  "--max-target-seqs 1 " \
++                  "--evalue 0.01 " \
++                  "--index-chunks 1 " \
++                  "--threads %i " \
++                  "--query - " \
++                  "--db %s " \
++                  "| sed -e 's/^/>/' -e 's/\\t/\\n/' > %s" % (
++                      file,
++                      self._num_threads,
++                      dmnd,
++                      fasta_path)
++            extern.run(cmd)
++            filtered_reads.append(fasta_path)
++            
++        return filtered_reads
+ 
+     def _search(self, singlem_package_database, forward_read_files, reverse_read_files):
+         '''Find all reads that match one or more of the search HMMs in the
+         singlem_package_database.
+-
+         Parameters
+         ----------
+         singlem_package_database: HmmDatabase
+@@ -816,14 +879,10 @@ def _search(self, singlem_package_database, forward_read_files, reverse_read_fil
+             paths to the reverse sequences to be searched, or None to run in
+             unpaired mode. Must be the same length as forward_read_files unless
+             None.
+-
+         Returns
+         -------
+         SingleMPipeSearchResult
+-
+         '''
+-        logging.info("Using as input %i different sequence files e.g. %s" % (
+-            len(forward_read_files), forward_read_files[0]))
+         graftm_protein_search_directory = os.path.join(
+             self._working_directory, 'graftm_protein_search')
+         graftm_nucleotide_search_directory = os.path.join(
+@@ -850,7 +909,7 @@ def run(hmm_paths, output_directory, is_protein):
+         num_singlem_packages = len(singlem_package_database.protein_packages())+\
+                                len(singlem_package_database.nucleotide_packages())
+         logging.info("Searching with %i SingleM package(s)" % num_singlem_packages)
+-
++        
+         # Run searches for proteins
+         hmms = singlem_package_database.protein_search_hmm_paths()
+         doing_proteins = False
+diff --git a/singlem/singlem.py b/singlem/singlem.py
+index 9fa636f4..bbd7f7e3 100644
+--- a/singlem/singlem.py
++++ b/singlem/singlem.py
+@@ -4,6 +4,8 @@
+ import logging
+ import itertools
+ import pkg_resources
++import extern
++import tempfile
+ 
+ from .singlem_package import SingleMPackage
+ 
+@@ -58,6 +60,18 @@ def __init__(self, package_paths=None):
+         for pkg in self.singlem_packages:
+             self._hmms_and_positions[pkg.base_directory()] = pkg
+ 
++    def get_dmnd(self):
++        ''' Create temporary DIAMOND file for search method '''
++        fasta_paths = [pkg.graftm_package().unaligned_sequence_database_path() for pkg in self.singlem_packages]
++        temp_dmnd = tempfile.NamedTemporaryFile(mode="w", prefix='singlem-diamond-prefilter', 
++                                                suffix='.dmnd', delete=False).name
++        cmd = 'cat %s | '\
++            'diamond makedb --in - --db %s' % (' '.join(fasta_paths), temp_dmnd)
++        
++        extern.run(cmd)
++        
++        return temp_dmnd
++    
+     def protein_packages(self):
+         return [pkg for pkg in self._hmms_and_positions.values() if pkg.is_protein_package()]
+ 
+@@ -77,4 +91,3 @@ def nucleotide_search_hmm_paths(self):
+     def __iter__(self):
+         for hp in self._hmms_and_positions.values():
+             yield hp
+-
+diff --git a/test/test_pipe.py b/test/test_pipe.py
+index f43e09c0..835d5329 100644
+--- a/test/test_pipe.py
++++ b/test/test_pipe.py
+@@ -56,7 +56,7 @@ def assertEqualOtuTable(self, expected_array, observed_string):
+ 
+         # sort the rest of the table and compare that
+         self.assertEqual(sorted(expected_array[1:]), sorted(observed_array[1:]))
+-
++    
+     def test_fast_protein_package(self):
+         expected = [
+             "\t".join(self.headers),
+@@ -75,6 +75,24 @@ def test_fast_protein_package(self):
+                 list([line.split("\t") for line in expected]),
+                 extern.run(cmd).replace(os.path.basename(n.name).replace('.fa',''),''))
+ 
++    def test_fast_protein_package_prefilter(self):
++        expected = [
++            "\t".join(self.headers),
++            '4.11.22seqs		TTACGTTCACAATTACGTGAAGCTGGTGTTGAGTATAAAGTATACAAAAACACTATGGTA	1	2.44	Root; d__Bacteria; p__Firmicutes',
++            '']
++        inseqs = '''>HWI-ST1243:156:D1K83ACXX:7:1106:18671:79482 1:N:0:TAAGGCGACTAAGCCT
++ATTAACAGTAGCTGAAGTTACTGACTTACGTTCACAATTACGTGAAGCTGGTGTTGAGTATAAAGTATACAAAAACACTATGGTACGTCGTGCAGCTGAA
++'''
++        with tempfile.NamedTemporaryFile(mode='w',suffix='.fa') as n:
++            n.write(inseqs)
++            n.flush()
++
++            cmd = "%s pipe --sequences %s --diamond_prefilter --otu_table /dev/stdout --singlem_packages %s" % (
++                path_to_script, n.name, os.path.join(path_to_data,'4.11.22seqs.gpkg.spkg'))
++            self.assertEqualOtuTable(
++                list([line.split("\t") for line in expected]),
++                extern.run(cmd).replace(os.path.basename(n.name).replace('.fa',''),''))
++    
+     def test_minimal(self):
+         expected = [
+             self.headers,
+@@ -84,6 +102,16 @@ def test_minimal(self):
+         cmd = "%s --debug pipe --sequences %s/1_pipe/minimal.fa --otu_table /dev/stdout --threads 4" % (path_to_script,
+                                                                                                     path_to_data)
+         self.assertEqual(exp, sorted(extern.run(cmd).split("\n")))
++        
++    def test_minimal_prefilter(self):
++        expected = [
++            self.headers,
++            ['S1.5.ribosomal_protein_L11_rplK','minimal','CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG','4','9.76','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales']]
++        exp = sorted(["\t".join(x) for x in expected]+[''])
++
++        cmd = "%s --debug pipe --sequences %s/1_pipe/minimal.fa --diamond_prefilter --otu_table /dev/stdout --threads 4" % (path_to_script,
++                                                                                                    path_to_data)
++        self.assertEqual(exp, sorted(extern.run(cmd).split("\n")))
+ 
+     def test_insert(self):
+         expected = [self.headers,['S1.5.ribosomal_protein_L11_rplK','insert','CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG','2','4.95','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales']]
+@@ -92,6 +120,14 @@ def test_insert(self):
+         cmd = "%s --quiet pipe --sequences %s/1_pipe/insert.fna --otu_table /dev/stdout --threads 4" % (path_to_script,
+                                                                                                     path_to_data)
+         self.assertEqual(exp, sorted(extern.run(cmd).split("\n")))
++    
++    def test_insert_prefilter(self):
++        expected = [self.headers,['S1.5.ribosomal_protein_L11_rplK','insert','CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG','2','4.95','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales']]
++        exp = sorted(["\t".join(x) for x in expected]+[''])
++
++        cmd = "%s --quiet pipe --sequences %s/1_pipe/insert.fna --diamond_prefilter --otu_table /dev/stdout --threads 4" % (path_to_script,
++                                                                                                    path_to_data)
++        self.assertEqual(exp, sorted(extern.run(cmd).split("\n")))
+ 
+     def test_print_insert(self):
+         expected = [self.headers,['S1.5.ribosomal_protein_L11_rplK','insert','CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG','1','2.44','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales'],
+@@ -264,6 +300,22 @@ def test_nucleotide_package(self):
+                              extern.run(cmd).replace(
+                                  os.path.basename(n.name).replace('.fa',''),
+                                  '').split("\n"))
++            
++    def test_nucleotide_package_prefilter(self):
++        """ correct behaviour is to fail, as DIAMOND does not have a blastn capability """
++        inseqs = '''>HWI-ST1243:156:D1K83ACXX:7:1105:6981:63483 1:N:0:AAGAGGCAAAGGAGTA
++GATATGGAGGAACACCAGTGGCGAAGGCGACTTTCTGGTCTGTAACTGACGCTGATGTGCGAAAGCGTGGGGATCAAACAGGATTAGATACCCTGGTAGT
++'''
++        with tempfile.NamedTemporaryFile(mode='w',suffix='.fa') as n:
++            n.write(inseqs)
++            n.flush()
++            try:
++                cmd = "%s pipe --sequences %s --diamond_prefilter --otu_table /dev/stdout --singlem_packages %s" % (
++                    path_to_script, n.name, os.path.join(path_to_data,'61_otus.v3.gpkg.spkg'))
++                self.fail() # this is meant to fail
++            except:
++                pass
++                
+ 
+     def test_revcom_nucleotide_package(self):
+         expected = [

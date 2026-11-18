@@ -1,0 +1,1009 @@
+diff --git a/charcoal/Snakefile b/charcoal/Snakefile
+index b79475f..443f834 100644
+--- a/charcoal/Snakefile
++++ b/charcoal/Snakefile
+@@ -3,7 +3,7 @@
+ #
+ # --configfile must be specified on command line.
+ #
+-import csv, sys, os
++import csv, sys, os, json
+ from snakemake.workflow import srcdir
+ from charcoal.utils import CSV_DictHelper
+ 
+@@ -106,11 +106,27 @@ if provided_lineages_file:
+ 
+     print(f'** read {len(provided_lineages)} provided lineages')
+ 
++def check_is_fraction(f):
++    if f >= 0 and f <= 1:
++        return True
++    return False
++
+ min_f_ident = config['min_f_ident']
+ min_f_ident = float(min_f_ident)
++assert check_is_fraction(min_f_ident), 'min_f_ident should be between 0 and 1'
+ 
+ min_f_major = config['min_f_major']
+ min_f_major = float(min_f_major)
++assert check_is_fraction(min_f_major), 'min_f_major should be between 0 and 1'
++
++min_align_pident = config['min_align_pident']
++min_align_pident = int(min_align_pident)
++assert min_align_pident > 1.0, 'min_align_pident should be between 1 and 100'
++assert min_align_pident <= 100, 'min_align_pident should be between 1 and 100'
++
++min_query_coverage = config['min_query_coverage']
++min_query_coverage = float(min_query_coverage)
++assert check_is_fraction(min_query_coverage), 'min_query_coverage should be between 0 and 1'
+ 
+ default_match_rank = config['match_rank']
+ 
+@@ -145,10 +161,8 @@ def get_hitlist_genomes():
+ 
+ 
+ def get_hitlist_match_accs(g):
+-    import yaml
+-
+-    with open(f'{stage2_dir}/{g}.hitlist.matches.yaml') as fp:
+-        matches_info = yaml.safe_load(fp)
++    with open(f'{stage2_dir}/{g}.matches.json') as fp:
++        matches_info = json.load(fp)
+ 
+     if matches_info["matches"]:
+         match_accs = list(matches_info["matches"])
+@@ -329,14 +343,13 @@ rule compare_taxonomy_single:
+         contam_json = stage1_dir + '/{g}.contam_summary.json',
+     conda: 'conf/env-sourmash.yml'
+     params:
+-        output_dir = stage1_dir,
++        input_dir = stage1_dir,
+         min_f_major = min_f_major,
+         min_f_ident = min_f_ident,
+         match_rank = default_match_rank,
+     shell: """
+         python -m charcoal.compare_taxonomy \
+-            --input-directory {params.output_dir} \
+-            --genome-list-file {input.genome_list} \
++            --input-directory {params.input_dir} \
+             --lineages-csv {input.lineages} \
+             --provided-lineages {input.provided_lineages} \
+             --hit-list {output.hit_list_csv} \
+@@ -378,8 +391,7 @@ rule combine_genome_summary:
+ # stage 2: produce matches detail & genome alignments
+ rule stage2:
+     input:
+-        Checkpoint_HitListGenomes(stage2_dir + '/{g}.hitlist.matches.yaml'),
+-        Checkpoint_HitListPairs(stage2_dir + '/{g}.x.{acc}.mashmap.align'),
++        output_dir + '/stage2_summary.csv',
+ 
+ # download genbank genome details; make an info.csv file for entry.
+ rule make_genbank_info_csv:
+@@ -435,7 +447,7 @@ checkpoint hitlist_make_contigs_matches:
+         lineages = config['lineages_csv'],
+         hitlist = output_dir + '/stage1_hitlist.csv'
+     output:
+-        matches_yaml = stage2_dir + '/{g}.hitlist.matches.yaml',
++        matches_json = stage2_dir + '/{g}.matches.json',
+     conda: 'conf/env-sourmash.yml'
+     params:
+         match_rank = default_match_rank,
+@@ -445,7 +457,7 @@ checkpoint hitlist_make_contigs_matches:
+             --genome-sig {input.genome_sig} \
+             --matches-sig {input.matches} \
+             --hitlist {input.hitlist} \
+-            --yaml-out {output.matches_yaml} \
++            --json-out {output.matches_json} \
+             --match-rank {params.match_rank}
+     """
+ 
+@@ -463,6 +475,46 @@ rule mashmap_compare:
+             --pi 95 > {output.outfile}
+     """
+ 
++# postprocess alignments w/taxonomy and summarize.
++rule postprocess_alignments:
++    input:
++        Checkpoint_HitListPairs(stage2_dir + '/{g}.x.{acc}.mashmap.align'),
++        genome = genome_dir + '/{g}',
++        hit_list_csv = stage1_dir + '/{g}.hitlist_for_filtering.csv',
++        matches = f'{stage2_dir}/{{g}}.matches.json',
++        hitlist_acc_csv = stage2_dir + '/hitlist-accessions.info.csv', # @CTB?
++    output:
++        json_out = stage2_dir + '/{g}.stage2.json',
++        summary_csv = stage2_dir + '/{g}.stage2.csv',
++        report = stage2_dir + '/{g}.postprocess.txt',
++    conda: 'conf/env-sourmash.yml'
++    params:
++        input_dir = stage2_dir,
++        min_query_coverage = min_query_coverage,
++        min_align_pident = min_align_pident,
++    shell: """
++        python -m charcoal.postprocess_alignments \
++            --input-directory {params.input_dir} \
++            --hit-list {input.hit_list_csv} \
++            --matches-json {input.matches} \
++            --json-out {output.json_out} \
++            --summary-csv {output.summary_csv} \
++            --min-query-coverage={params.min_query_coverage} \
++            --min-align-pident={params.min_align_pident} \
++            {input.genome} | tee {output.report}
++    """
++
++# combine postprocessing summary details for the matches from stage 2.
++rule combine_postprocessing_csv:
++    input:
++        Checkpoint_HitListGenomes(f'{stage2_dir}/{{g}}.stage2.csv'),
++    output:
++        output_dir + '/stage2_summary.csv',
++    shell: """
++        python -m charcoal.combine_csvs --sort-by remove_kb --reverse \
++            {input} > {output}
++    """
++
+ ###
+ ### stage 3 rules -- do actual genome cleaning.
+ ###
+@@ -494,7 +546,8 @@ rule report:
+     input:
+         expand("{dir}/{g}.fig.html", dir=report_dir, g=genome_list),
+         Checkpoint_HitListGenomes(f'{report_dir}/{{g}}.align.html'),
+-        f'{report_dir}/index.html'
++        f'{report_dir}/index.html',
++        f'{report_dir}/stage2.html'
+ 
+ # configure notebook kernel; all notebook rules depend on this setup.
+ rule set_kernel:
+@@ -543,7 +596,7 @@ rule make_notebook_alignment:
+     input:
+         Checkpoint_HitListPairs(stage2_dir + '/{g}.x.{acc}.mashmap.align'),
+         nb = 'charcoal/notebooks/report-alignment.ipynb',
+-        summary = f'{stage2_dir}/{{g}}.hitlist.matches.yaml',
++        summary = f'{stage2_dir}/{{g}}.matches.json',
+         hitlist_acc_csv = stage2_dir + '/hitlist-accessions.info.csv',
+         kernel_set = rules.set_kernel.output
+     output:
+@@ -562,7 +615,7 @@ rule make_notebook_alignment:
+ rule make_html_alignment:
+     input:
+         notebook=report_dir + '/{g}.align.ipynb',
+-        summary=f'{stage2_dir}/{{g}}.hitlist.matches.yaml',
++        summary=f'{stage2_dir}/{{g}}.matches.json',
+     output:
+         report_dir + '/{g}.align.html',
+     conda: 'conf/env-reporting.yml'
+@@ -575,6 +628,24 @@ rule all_alignment_reports:
+     input:
+         Checkpoint_HitListGenomes(f'{report_dir}/{{g}}.align.html'),
+ 
++# make the stage 2 index
++rule make_stage2_index:
++    input:
++        Checkpoint_HitListGenomes(f'{report_dir}/{{g}}.align.html'),
++        notebook='charcoal/notebooks/report-stage2.ipynb',
++        summary=f'{output_dir}/stage2_summary.csv',
++        kernel_set = rules.set_kernel.output
++    output:
++        nb=f'{report_dir}/stage2.ipynb',
++        html=f'{report_dir}/stage2.html',
++    conda: 'conf/env-reporting.yml'
++    shell: """
++        papermill {input.notebook} - -p name {output_dir:q} -p render '' \
++            -p directory .. -k charcoal --cwd {report_dir} > {output.nb}
++        python -m nbconvert {output.nb} --to html --stdout --no-input > {output.html}
++    """
++
++
+ # make the index.
+ rule make_index:
+     input:
+diff --git a/charcoal/alignplot.py b/charcoal/alignplot.py
+index f929a29..c536106 100755
+--- a/charcoal/alignplot.py
++++ b/charcoal/alignplot.py
+@@ -11,7 +11,7 @@
+ import os
+ from collections import defaultdict, namedtuple
+ import numpy
+-from itertools import cycle
++from itertools import cycle, chain
+ 
+ import matplotlib
+ import matplotlib.pyplot as plt
+@@ -148,6 +148,14 @@ def __init__(
+                 if row["acc"] in self.target_names:
+                     self.target_names[row["acc"]] = row["ncbi_tax_name"]
+ 
++    def __len__(self):
++        "Return total number of aligned regions"
++        return sum([ len(v) for v in self.results.values() ])
++
++    def __iter__(self):
++        "Iterate over all aligned regions"
++        return iter(chain(*self.results.values()))
++
+     def get_targetfile(self, t_acc):
+         "Return the target file, given target accession."
+         targetfile = None
+@@ -361,9 +369,7 @@ def calc_shared(self, t_acc=None):
+         if t_acc:
+             regions = self.results[t_acc]
+         else:
+-            regions = []
+-            for t_acc in self.results:
+-                regions.extend(self.results[t_acc])
++            regions = list(self)
+ 
+         regions_by_query = group_regions_by(regions, 'query')
+         sum_kb = calc_regions_aligned_bp(regions_by_query, 'query')
+@@ -491,9 +497,7 @@ def query_response_curve(self):
+         alignment = self.alignment
+ 
+         # aggregate regions over _all_ results
+-        regions = []
+-        for k, v in alignment.results.items():
+-            regions.extend(v)
++        regions = iter(self)
+ 
+         queryfile = alignment.queryfile
+ 
+@@ -546,10 +550,7 @@ def __init__(self, alignment):
+         
+     def calculate(self, select_n=None, plot_all_contigs=False):
+         alignment = self.alignment
+-
+-        regions = []
+-        for k, v in alignment.results.items():
+-            regions.extend(v)
++        regions = iter(alignment)
+ 
+         # calculate and sort region summed kb in alignments over 95%
+         regions_by_query = group_regions_by(regions, "query")
+diff --git a/charcoal/compare_taxonomy.py b/charcoal/compare_taxonomy.py
+index f41084e..8f4af72 100644
+--- a/charcoal/compare_taxonomy.py
++++ b/charcoal/compare_taxonomy.py
+@@ -407,10 +407,9 @@ def cmdline(sys_args):
+     "Command line entry point w/argparse action."
+     p = argparse.ArgumentParser(sys_args)
+     p.add_argument('--input-directory', required=True)
+-    p.add_argument('--genome-list-file', required=True)
+     p.add_argument('--hit-list', required=True)
+     p.add_argument('--genome-summary', required=True)
+-    p.add_argument('--contam-summary-json', required=True)
++    p.add_argument('--contam-summary-json', required=True)   # @CTB remove?
+     p.add_argument('--lineages-csv', help='lineage spreadsheet', required=True)
+     p.add_argument('--provided-lineages', help='provided lineages')
+     p.add_argument('--min_f_ident', type=float, default=F_IDENT_THRESHOLD)
+diff --git a/charcoal/conf/env-sourmash.yml b/charcoal/conf/env-sourmash.yml
+index d899ced..7e68973 100644
+--- a/charcoal/conf/env-sourmash.yml
++++ b/charcoal/conf/env-sourmash.yml
+@@ -9,3 +9,6 @@ dependencies:
+     - pytest>6,<7
+     - pytest-dependency>=0.5.1
+     - pyyaml>5.3,<6
++    - pip
++    - pip:
++      - pyinterval
+diff --git a/charcoal/conf/system.conf b/charcoal/conf/system.conf
+index abfa3a2..ee1a1fb 100644
+--- a/charcoal/conf/system.conf
++++ b/charcoal/conf/system.conf
+@@ -24,3 +24,10 @@ min_f_ident: 0.1
+ 
+ # minimum fraction of hashes that must be classified as lineage to -> genome
+ min_f_major: 0.2
++
++# percent identity (0-100) required for alignments to be considered valid
++min_align_pident: 95
++
++# what fraction of the query contig must be covered by dirty alignments to be
++# considered _completely_ dirty and => removed.
++min_query_coverage: 0.5
+diff --git a/charcoal/contigs_list_contaminants.py b/charcoal/contigs_list_contaminants.py
+index a1d90e6..4466f6b 100644
+--- a/charcoal/contigs_list_contaminants.py
++++ b/charcoal/contigs_list_contaminants.py
+@@ -5,7 +5,7 @@
+ import sys
+ import argparse
+ import os.path
+-import yaml
++import json
+ from collections import defaultdict
+ 
+ import screed
+@@ -100,7 +100,7 @@ def main(args):
+     # complain.)
+     if not siglist:
+         print('no non-identical matches for this genome, exiting.')
+-        with open(args.yaml_out, 'wt') as fp:
++        with open(args.json_out, 'wt') as fp:
+             pass
+         return 0
+ 
+@@ -160,7 +160,7 @@ def main(args):
+     print(f"Processed {n + 1} contigs.")
+ 
+     # save!
+-    with open(args.yaml_out, 'wt') as fp:
++    with open(args.json_out, 'wt') as fp:
+         out_dict = {}
+         info_dict = {}
+         info_dict['genome'] = genomebase
+@@ -178,7 +178,7 @@ def main(args):
+             matches_info_out[acc] = acc_info
+         out_dict['matches'] = matches_info_out
+ 
+-        yaml.dump(out_dict, fp)
++        json.dump(out_dict, fp)
+ 
+     return 0
+ 
+@@ -194,8 +194,8 @@ def cmdline(sys_args):
+     p.add_argument('--force', help='continue past survivable errors',
+                    action='store_true')
+ 
+-    p.add_argument('--yaml-out',
+-                   help='YAML-format output file of all matches',
++    p.add_argument('--json-out',
++                   help='JSON output file of all matches',
+                    required=True)
+     p.add_argument('--match-rank', required=True)
+     args = p.parse_args()
+diff --git a/charcoal/notebooks/report-alignment.ipynb b/charcoal/notebooks/report-alignment.ipynb
+index 4599555..7ef2b9b 100644
+--- a/charcoal/notebooks/report-alignment.ipynb
++++ b/charcoal/notebooks/report-alignment.ipynb
+@@ -15,7 +15,7 @@
+     "genome_dir = '../../gtdb-contam-dna'\n",
+     "output_dir = '../../output.gtdb-contam-dna'\n",
+     "genbank_genomes = '../../genbank_genomes'\n",
+-    "name = 'GCF_002154655.1_genomic.fna.gz'"
++    "name = 'GCF_001683825.1_genomic.fna.gz'"
+    ]
+   },
+   {
+@@ -36,8 +36,9 @@
+     "import matplotlib.pyplot as plt\n",
+     "import importlib\n",
+     "import pprint\n",
+-    "import yaml\n",
++    "import json\n",
+     "import glob\n",
++    "import itertools\n",
+     "\n",
+     "import charcoal.alignplot\n",
+     "importlib.reload(charcoal.alignplot)\n",
+@@ -56,7 +57,7 @@
+     "# configure paths to files based on parameters\n",
+     "genomebase = name\n",
+     "queryfile = f'{genome_dir}/{genomebase}'\n",
+-    "matches_info_file = f'{output_dir}/stage2/{genomebase}.hitlist.matches.yaml'"
++    "matches_info_file = f'{output_dir}/stage2/{genomebase}.matches.json'"
+    ]
+   },
+   {
+@@ -77,15 +78,17 @@
+    "outputs": [],
+    "source": [
+     "with open(matches_info_file, 'rt') as fp:\n",
+-    "    matches_info = yaml.safe_load(fp)\n",
++    "    matches_info = json.load(fp)\n",
+     "matches_info\n",
+     "\n",
+-    "genome_lin = matches_info['query_info']['genome_lineage']\n",
++    "genome_lin = utils.make_lineage(matches_info['query_info']['genome_lineage'])\n",
+     "match_rank = matches_info['query_info']['match_rank']\n",
+     "scaled = matches_info['query_info']['scaled']\n",
+     "\n",
+     "clean_accs = []\n",
++    "clean_accs_d = {}\n",
+     "dirty_accs = []\n",
++    "dirty_accs_d = {}\n",
+     "for match_acc, acc_info in matches_info['matches'].items():\n",
+     "    match_counts = acc_info['counts']\n",
+     "    match_type = acc_info['match_type']\n",
+@@ -93,28 +96,13 @@
+     "\n",
+     "    if match_type == 'clean':\n",
+     "        clean_accs.append((match_acc, match_lineage, match_counts))\n",
++    "        clean_accs_d[match_acc] = (match_lineage, match_counts)\n",
+     "    elif match_type == 'dirty':\n",
+     "        dirty_accs.append((match_acc, match_lineage, match_counts))\n",
++    "        dirty_accs_d[match_acc] = (match_lineage, match_counts)\n",
+     "        \n",
+     "clean_accs.sort(key=lambda x: -x[2])\n",
+-    "dirty_accs.sort(key=lambda x: -x[2])\n",
+-    "\n",
+-    "output = []\n",
+-    "\n",
+-    "output.append(f'loaded {len(clean_accs)} clean accs and {len(dirty_accs)} dirty accs')\n",
+-    "output.append('')\n",
+-    "output.append(f'query genome lineage: `{genome_lin}`\\n')\n",
+-    "\n",
+-    "output.append(f'genomes that match the lineage at {match_rank}:')\n",
+-    "for (match_acc, match_lineage, match_counts) in clean_accs:\n",
+-    "    output.append(f'* `{match_acc}` with est {match_counts*scaled} kb;\\n`{match_lineage}`')\n",
+-    "\n",
+-    "output.append('')\n",
+-    "output.append('genomes that do NOT match the lineage:')\n",
+-    "for (match_acc, match_lineage, match_counts) in dirty_accs:\n",
+-    "    output.append(f'* `{match_acc}` with est {match_counts*scaled} kb;\\n`{match_lineage}`')\n",
+-    "\n",
+-    "display(md(\"\\n\".join(output)))"
++    "dirty_accs.sort(key=lambda x: -x[2])"
+    ]
+   },
+   {
+@@ -179,27 +167,6 @@
+     "display(md(f'**clean bases: {sum_clean_kb:.1f}kb of alignments to query genome, across all targets.**'))"
+    ]
+   },
+-  {
+-   "cell_type": "code",
+-   "execution_count": null,
+-   "metadata": {},
+-   "outputs": [],
+-   "source": [
+-    "x = []\n",
+-    "y = []\n",
+-    "for i in range (1, 21):\n",
+-    "    f = i / 20\n",
+-    "    a = dirty_alignment.filter_by_query_coverage(f)\n",
+-    "\n",
+-    "    sum_dirty_kb = sum(a.calc_shared().values())\n",
+-    "    x.append(f)\n",
+-    "    y.append(sum_dirty_kb)\n",
+-    "    \n",
+-    "plt.plot(x, y, '.-')\n",
+-    "plt.xlabel('fraction of contig that must be covered')\n",
+-    "_ = plt.ylabel('kb covered in dirty contigs')\n"
+-   ]
+-  },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+@@ -210,72 +177,76 @@
+     "clean_alignment = clean_alignment.filter_by_query_coverage(0.5)"
+    ]
+   },
+-  {
+-   "cell_type": "markdown",
+-   "metadata": {},
+-   "source": [
+-    "## Stacked DotPlot view\n",
+-    "\n",
+-    "(this is an n-ary dotplot)"
+-   ]
+-  },
+   {
+    "cell_type": "code",
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "clean_dotplot = StackedDotPlot(clean_alignment)\n",
+-    "_ = clean_dotplot.plot()\n",
+-    "_ = plt.title('Alignments to clean genomes')"
+-   ]
+-  },
+-  {
+-   "cell_type": "code",
+-   "execution_count": null,
+-   "metadata": {},
+-   "outputs": [],
+-   "source": [
+-    "dirty_dotplot = StackedDotPlot(dirty_alignment)\n",
+-    "_ = dirty_dotplot.plot()\n",
+-    "_ = plt.title('Alignments to dirty genomes')"
+-   ]
+-  },
+-  {
+-   "cell_type": "code",
+-   "execution_count": null,
+-   "metadata": {},
+-   "outputs": [],
+-   "source": [
+-    "clean_slope = AlignmentSlopeDiagram(clean_alignment)\n",
+-    "_ = clean_slope.plot()\n",
++    "contigs_by_acc = {}\n",
++    "contigs_to_acc = {}\n",
++    "all_sizes = {}\n",
++    "all_sizes.update(alignplot.load_contig_sizes(queryfile))\n",
++    "for acc, _, _ in itertools.chain(clean_accs, dirty_accs):\n",
++    "    filename = glob.glob(f'{genbank_genomes}/{acc}*.fna.gz')\n",
++    "    filename = filename[0]\n",
++    "    sizes = alignplot.load_contig_sizes(filename)\n",
++    "    all_sizes.update(sizes)\n",
++    "    contigs_by_acc[acc] = sizes\n",
++    "    for contig_name in sizes:\n",
++    "        assert contig_name not in contigs_to_acc\n",
++    "        contigs_to_acc[contig_name] = acc\n",
+     "\n",
+-    "_ = plt.title('Alignments to clean genomes')"
+-   ]
+-  },
+-  {
+-   "cell_type": "code",
+-   "execution_count": null,
+-   "metadata": {},
+-   "outputs": [],
+-   "source": [
+-    "dirty_slope = AlignmentSlopeDiagram(dirty_alignment)\n",
+-    "_ = dirty_slope.plot()\n",
++    "dirty_alignment = AlignmentContainer(genomebase, queryfile, contaminant_pairs, f'{output_dir}/stage2/hitlist-accessions.info.csv')\n",
+     "\n",
+-    "_ = plt.title('Alignments to dirty genomes')"
++    "results = {}\n",
++    "for t_acc, _ in contaminant_pairs:\n",
++    "    mashmap_file = f'{output_dir}/stage2/{genomebase}.x.{t_acc}.mashmap.align'\n",
++    "    results[t_acc] = dirty_alignment._read_mashmap(mashmap_file)\n",
++    "dirty_alignment.results = results\n",
++    "\n",
++    "output = []\n",
++    "\n",
++    "output.append(f'filtering dirty alignments to query size >= 500 and identity >= 95%')\n",
++    "dirty_alignment.filter(query_size=0.5, pident=95)\n",
++    "output.append(f'filtering dirty alignments to min query coverage 50%')\n",
++    "dirty_alignment = dirty_alignment.filter_by_query_coverage(0.5)\n",
++    "\n",
++    "sum_dirty_kb = sum(dirty_alignment.calc_shared().values())\n",
++    "#output.append(f'query genome lineage: {utils.display_lineage(genome_lin)}')\n",
++    "output.append(f'**dirty bases: {sum_dirty_kb:.1f}kb of alignments to query genome, across all targets.**')\n",
++    "\n",
++    "all_regions = []\n",
++    "for t_acc, vv in dirty_alignment.results.items():\n",
++    "    all_regions.extend(vv)\n",
++    "regions_by_query = alignplot.group_regions_by(all_regions, 'query')\n",
++    "query_shared = dirty_alignment.calc_shared()\n",
++    "\n",
++    "sum_to_remove = 0\n",
++    "for k, covered_bases in query_shared.items():\n",
++    "    sum_to_remove += all_sizes[k]\n",
++    "    #output.append(f'removing {all_sizes[k]:.0f}kb with {covered_bases:.0f}kb dirty, contig name {k}.')\n",
++    "    for region in regions_by_query[k]:\n",
++    "        source_acc = contigs_to_acc[region.target]\n",
++    "        source_lin = utils.make_lineage(dirty_accs_d[source_acc][0])\n",
++    "        query_aligned = alignplot.region_size(region, 'query')\n",
++    "        #print(f'   {query_aligned:.0f}kb aligns to {source_acc}:{region.target} at {region.pident:.1f}%')\n",
++    "        #print(f'   ({utils.display_lineage(source_lin)})')\n",
++    "        disagree_rank = utils.find_disagree_rank(genome_lin, source_lin)\n",
++    "        query_at_rank = utils.pop_to_rank(genome_lin, disagree_rank)[-1].name\n",
++    "        source_at_rank = utils.pop_to_rank(source_lin, disagree_rank)[-1].name\n",
++    "        #print(f\"   ** disagreement at rank '{disagree_rank}'; query lineage {query_at_rank}, database lineage {source_at_rank}\")\n",
++    "\n",
++    "output.append(f'**removing {sum_to_remove:.0f}kb total in contigs >= 50% dirty, based on alignments at 95% identity over 0.5kb or more**')\n",
++    "\n",
++    "display(md(\"\\n\\n\".join(output)))\n"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "## region response curve\n",
+-    "\n",
+-    "underlying logic:\n",
+-    "\n",
+-    "* for our primary use case here (contamination/legitimate \"shared\" nucleotides), we can consider nt alignments of >= 95% to be contamination to be removed\n",
+-    "* we want to remove as many bp of contamination as possible with as little \"legit\" non-shared nt as possible.\n",
+-    "* what's the response curve for that, and can we use it to figure out which genome(s) have the likely contaminants?"
++    "## Alignment views"
+    ]
+   },
+   {
+@@ -284,17 +255,19 @@
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "for t_acc, _ in contaminant_pairs:\n",
+-    "    x, y, sat1 = dirty_dotplot.target_response_curve(t_acc)\n",
+-    "    if max(y):\n",
+-    "        plt.plot(x, y / max(y)) #, label=f'target loss ({t_acc})')\n",
++    "if clean_alignment:\n",
++    "    display(md(f\"showing {len(clean_alignment)} clean alignments total.\"))\n",
+     "\n",
+-    "x3, y3, sat3 = dirty_dotplot.query_response_curve()\n",
+-    "plt.plot(x3, y3 / max(y3), label='query loss (non-contaminated genome)')\n",
++    "    clean_dotplot = StackedDotPlot(clean_alignment)\n",
++    "    _ = clean_dotplot.plot()\n",
++    "    _ = plt.title('Alignments to clean genomes')\n",
++    "    \n",
++    "    clean_slope = AlignmentSlopeDiagram(clean_alignment)\n",
++    "    _ = clean_slope.plot()\n",
+     "\n",
+-    "plt.xlabel('kb in genome contigs removed')\n",
+-    "plt.ylabel('fraction of alignments removed')\n",
+-    "plt.legend(loc='lower right')"
++    "    _ = plt.title('Alignments to clean genomes')\n",
++    "else:\n",
++    "    display(md(\"**no alignments to clean genomes to show!**\"))"
+    ]
+   },
+   {
+@@ -303,25 +276,25 @@
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "for t_acc, _ in clean_pairs:\n",
+-    "    x, y, sat1 = clean_dotplot.target_response_curve(t_acc)\n",
+-    "    if max(y):\n",
+-    "        plt.plot(x, y / max(y)) #, label=f'target loss ({t_acc})')\n",
++    "if dirty_alignment:\n",
++    "    display(md(f\"showing {len(dirty_alignment)} dirty alignments total.\"))\n",
++    "    dirty_dotplot = StackedDotPlot(dirty_alignment)\n",
++    "    _ = dirty_dotplot.plot()\n",
++    "    _ = plt.title('Alignments to dirty genomes')\n",
+     "\n",
+-    "x3, y3, sat3 = clean_dotplot.query_response_curve()\n",
+-    "plt.plot(x3, y3 / max(y3), label='query loss (non-contaminated genome)')\n",
++    "    dirty_slope = AlignmentSlopeDiagram(dirty_alignment)\n",
++    "    _ = dirty_slope.plot()\n",
+     "\n",
+-    "plt.xlabel('kb in genome contigs removed')\n",
+-    "plt.ylabel('fraction of alignments removed')\n",
+-    "plt.legend(loc='lower right')\n",
+-    "print(f'{sat1:.1f}kb, {sat3:.1f}kb')"
++    "    _ = plt.title('Alignments to dirty genomes')    \n",
++    "else:\n",
++    "    display(md(\"**no alignments to clean genomes to show!**\"))"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "## Reporting alignments"
++    "## Contig alignment report"
+    ]
+   },
+   {
+@@ -330,19 +303,35 @@
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "regions = []\n",
+-    "for k, v in dirty_alignment.results.items():\n",
+-    "    regions.extend(v)\n",
++    "output = []\n",
+     "\n",
+-    "queryfile = dirty_alignment.queryfile\n",
++    "sum_dirty_kb = sum(dirty_alignment.calc_shared().values())\n",
++    "#output.append(f'query genome lineage: {utils.display_lineage(genome_lin)}')\n",
++    "output.append(f'**dirty bases: {sum_dirty_kb:.1f}kb of alignments to query genome, across all targets.**')\n",
+     "\n",
+-    "# calculate and sort region summed kb in alignments over 95%            \n",
+-    "regions_by_query = alignplot.group_regions_by(regions, \"query\")\n",
+-    "regions_aligned_kb = alignplot.calc_regions_aligned_bp(\n",
+-    "    regions_by_query, \"query\", filter_by=lambda r: r.pident >= 95\n",
+-    ")\n",
+-    "region_items = list(regions_aligned_kb.items())\n",
+-    "region_items.sort(key=lambda x: -x[1])"
++    "all_regions = []\n",
++    "for t_acc, vv in dirty_alignment.results.items():\n",
++    "    all_regions.extend(vv)\n",
++    "regions_by_query = alignplot.group_regions_by(all_regions, 'query')\n",
++    "query_shared = dirty_alignment.calc_shared()\n",
++    "\n",
++    "sum_to_remove = 0\n",
++    "for k, covered_bases in query_shared.items():\n",
++    "    sum_to_remove += all_sizes[k]\n",
++    "    output.append(f'\\ncontig name {k}, total size {all_sizes[k]:.0f}kb, of which {covered_bases:.0f}kb ({covered_bases / all_sizes[k]*100:.0f}%) aligns to other genomes with a taxonomic mismatch.')\n",
++    "    for region in regions_by_query[k]:\n",
++    "        source_acc = contigs_to_acc[region.target]\n",
++    "        source_lin = utils.make_lineage(dirty_accs_d[source_acc][0])\n",
++    "        query_aligned = alignplot.region_size(region, 'query')\n",
++    "        output.append(f'\\n * {query_aligned:.0f}kb aligns to genome `{source_acc}`, contig `{region.target}` at {region.pident:.1f}% identity')\n",
++    "        #output.append(f'   ({utils.display_lineage(source_lin)})')\n",
++    "        output.append(f'\\n   * alignment from query `{region.query}[{int(region.qstart*1000)}:{int(region.qend*1000)}]` to database `{region.target}[{int(region.tstart*1000)}:{int(region.tend*1000)}]`')\n",
++    "        disagree_rank = utils.find_disagree_rank(genome_lin, source_lin)\n",
++    "        query_at_rank = utils.pop_to_rank(genome_lin, disagree_rank)[-1].name\n",
++    "        source_at_rank = utils.pop_to_rank(source_lin, disagree_rank)[-1].name\n",
++    "        output.append(f\"   * disagreement at rank '{disagree_rank}'; query lineage `{query_at_rank}`, database lineage `{source_at_rank}`\")\n",
++    "\n",
++    "display(md(\"\\n\".join(output)))\n"
+    ]
+   },
+   {
+@@ -350,14 +339,7 @@
+    "execution_count": null,
+    "metadata": {},
+    "outputs": [],
+-   "source": [
+-    "print('Top 5 dirty contigs w/all alignments b/t query and matches --')\n",
+-    "for n, (name, aligned_kb) in enumerate(region_items[:5]):\n",
+-    "    print(f'contig #{n+1} in query - contig name {name}')\n",
+-    "    for i, a in enumerate(regions_by_query[name]):\n",
+-    "        print(f\"* alignment {i}: {a.pident:.1f}% identity across {abs(a.qend - a.qstart):.0f} kb\\n  {a.query}[{int(a.qstart*1000)}:{int(a.qend*1000)}] aligns to {a.target}[{int(a.tstart*1000)}:{int(a.tend*1000)}]\")\n",
+-    "    print('')"
+-   ]
++   "source": []
+   }
+  ],
+  "metadata": {
+diff --git a/charcoal/notebooks/report-stage2.ipynb b/charcoal/notebooks/report-stage2.ipynb
+new file mode 100644
+index 0000000..e6fdb48
+--- /dev/null
++++ b/charcoal/notebooks/report-stage2.ipynb
+@@ -0,0 +1,75 @@
++{
++ "cells": [
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "tags": [
++     "parameters"
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "import os\n",
++    "directory = '../../output.gtdb-contam-dna'\n",
++    "render='svg'\n",
++    "name=os.path.basename(directory)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "from charcoal.utils import CSV_DictHelper\n",
++    "from IPython.display import display, Markdown\n",
++    "\n",
++    "summary = CSV_DictHelper(f'{directory}/stage2_summary.csv', 'genome')\n",
++    "display(Markdown(f\"# charcoal stage 2 summary report for `{name}`\"))\n"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "lines = []\n",
++    "for g in summary:\n",
++    "    row = summary[g]\n",
++    "    lines.append(f\"* `{row.genome}` - {row.dirty_kb}kb dirty, {row.remove_kb}kb removed - [alignment report]({row.genome}.align.html)\")\n",
++    "\n",
++    "display(Markdown(\"\\n\".join(lines)))"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": []
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python (myenv)",
++   "language": "python",
++   "name": "myenv"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.7.6"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 4
++}
+diff --git a/charcoal/postprocess_alignments.py b/charcoal/postprocess_alignments.py
+new file mode 100644
+index 0000000..a0b07e9
+--- /dev/null
++++ b/charcoal/postprocess_alignments.py
+@@ -0,0 +1,178 @@
++#! /usr/bin/env python
++"""
++Create a "hit list" of how much will be removed at what ranks.
++"""
++import sys
++import argparse
++import csv
++import os.path
++import json
++import glob
++import itertools
++
++from . import alignplot
++from .alignplot import AlignmentContainer
++
++import sourmash
++from . import utils
++
++# minimum alignment size, in kb
++# in practice, this is also bounded by the aligner used - mashmap generally
++# won't go below 5kb, for example.
++MIN_ALIGN_SIZE=0.5
++
++
++def main(args):
++    "Main entry point for scripting. Use cmdline for command line entry."
++
++    inp_dir = args.input_directory
++    hitlist = utils.CSV_DictHelper(args.hit_list, 'genome')
++
++    genomebase = os.path.basename(args.genome)
++
++    with open(args.matches_json, 'rt') as fp:
++        matches_info = json.load(fp)
++
++    ##
++    genome_lin = utils.make_lineage(matches_info['query_info']['genome_lineage'])
++    match_rank = matches_info['query_info']['match_rank']
++    scaled = matches_info['query_info']['scaled']
++
++    clean_accs = []
++    clean_accs_d = {}
++    dirty_accs = []
++    dirty_accs_d = {}
++    for match_acc, acc_info in matches_info['matches'].items():
++        match_counts = acc_info['counts']
++        match_type = acc_info['match_type']
++        match_lineage = acc_info['lineage']
++
++        assert match_acc not in clean_accs_d
++        assert match_acc not in dirty_accs_d
++
++        if match_type == 'clean':
++            clean_accs.append((match_acc, match_lineage, match_counts))
++            clean_accs_d[match_acc] = (match_lineage, match_counts)
++        elif match_type == 'dirty':
++            dirty_accs.append((match_acc, match_lineage, match_counts))
++            dirty_accs_d[match_acc] = (match_lineage, match_counts)
++
++    clean_accs.sort(key=lambda x: -x[2])
++    dirty_accs.sort(key=lambda x: -x[2])
++
++    output = []
++
++    output.append(f'loaded {len(clean_accs)} clean accs and {len(dirty_accs)} dirty accs')
++    output.append('')
++    output.append(f'query genome lineage: `{utils.display_lineage(genome_lin)}`\n')
++
++    output.append(f'genomes that match the lineage at {match_rank}:')
++    for (match_acc, match_lineage, match_counts) in clean_accs:
++        output.append(f'* `{match_acc}` with est {match_counts*scaled} kb;\n`{match_lineage}`')
++
++    output.append('')
++    output.append('genomes that do NOT match the lineage:')
++    for (match_acc, match_lineage, match_counts) in dirty_accs:
++        output.append(f'* `{match_acc}` with est {match_counts*scaled} kb;\n`{match_lineage}`')
++
++    print("\n".join(output))
++
++    def load_target_pairs(match_list):
++        pairs = []
++        for acc, _, _ in match_list:
++            filename = glob.glob(f'genbank_genomes/{acc}*.fna.gz')
++            #assert len(filename) == 1, filename # @CTB
++            filename = filename[0]
++            pairs.append((acc, filename))
++
++        return pairs
++
++    contaminant_pairs = load_target_pairs(dirty_accs)
++    clean_pairs = load_target_pairs(clean_accs)
++
++    contigs_by_acc = {}
++    contigs_to_acc = {}
++    all_sizes = {}
++    all_sizes.update(alignplot.load_contig_sizes(args.genome))
++    for acc, _, _ in itertools.chain(clean_accs, dirty_accs):
++        filename = glob.glob(f'genbank_genomes/{acc}*.fna.gz')
++        filename = filename[0]
++        sizes = alignplot.load_contig_sizes(filename)
++        all_sizes.update(sizes)
++        contigs_by_acc[acc] = sizes
++        for contig_name in sizes:
++            assert contig_name not in contigs_to_acc
++            contigs_to_acc[contig_name] = acc
++
++    dirty_alignment = AlignmentContainer(genomebase, args.genome, contaminant_pairs, f'{inp_dir}/hitlist-accessions.info.csv')
++
++    results = {}
++    for t_acc, _ in contaminant_pairs:
++        mashmap_file = f'{inp_dir}/{genomebase}.x.{t_acc}.mashmap.align'
++        results[t_acc] = dirty_alignment._read_mashmap(mashmap_file)
++    dirty_alignment.results = results
++
++    print(f'filtering dirty alignments to query size >= 500 and identity >= {args.min_align_pident}%')
++    dirty_alignment.filter(query_size=MIN_ALIGN_SIZE, pident=args.min_align_pident)
++    print(f'filtering dirty alignments to min query coverage {args.min_query_coverage}')
++    dirty_alignment = dirty_alignment.filter_by_query_coverage(args.min_query_coverage)
++
++    sum_dirty_kb = sum(dirty_alignment.calc_shared().values())
++    print(f'query genome lineage: {utils.display_lineage(genome_lin)}')
++    print(f'**dirty bases: {sum_dirty_kb:.1f}kb of alignments to query genome, across all targets.**')
++
++    all_regions = []
++    for t_acc, vv in dirty_alignment.results.items():
++        all_regions.extend(vv)
++    regions_by_query = alignplot.group_regions_by(all_regions, 'query')
++    query_shared = dirty_alignment.calc_shared()
++
++    sum_to_remove = 0
++    for k, covered_bases in query_shared.items():
++        sum_to_remove += all_sizes[k]
++        print(f'\nremoving {all_sizes[k]:.0f}kb with {covered_bases:.0f}kb dirty, contig name {k}.')
++        for region in regions_by_query[k]:
++            source_acc = contigs_to_acc[region.target]
++            source_lin = utils.make_lineage(dirty_accs_d[source_acc][0])
++            query_aligned = alignplot.region_size(region, 'query')
++            print(f'   {query_aligned:.0f}kb aligns to {source_acc}:{region.target} at {region.pident:.1f}%')
++            print(f'   ({utils.display_lineage(source_lin)})')
++            disagree_rank = utils.find_disagree_rank(genome_lin, source_lin)
++            query_at_rank = utils.pop_to_rank(genome_lin, disagree_rank)[-1].name
++            source_at_rank = utils.pop_to_rank(source_lin, disagree_rank)[-1].name
++            print(f"   ** disagreement at rank '{disagree_rank}'; genome {query_at_rank}, source {source_at_rank}")
++
++    print(f'\nremoving {sum_to_remove:.0f}kb total in contigs >= {args.min_query_coverage*100:.0f}% dirty, based on alignments at {args.min_align_pident:.0f}% identity over {MIN_ALIGN_SIZE:.2f}kb or more')
++
++    ###
++
++    with open(args.json_out, 'wt') as fp:
++        pass
++    with open(args.summary_csv, 'wt') as fp:
++        w = csv.writer(fp)
++        w.writerow(["genome", "dirty_kb", "remove_kb"])
++        w.writerow([genomebase, round(sum_dirty_kb, 1), round(sum_to_remove, 1)])
++
++    return 0
++
++
++def cmdline(sys_args):
++    "Command line entry point w/argparse action."
++    p = argparse.ArgumentParser(sys_args)
++    p.add_argument('--input-directory', required=True)
++    p.add_argument('--hit-list', required=True)
++    p.add_argument('--matches-json', required=True)
++    p.add_argument('--json-out', required=True)
++    p.add_argument('--summary-csv', required=True)
++    p.add_argument('--min-query-coverage', type=float, required=True)
++    p.add_argument('--min-align-pident', type=float, required=True)
++    p.add_argument('genome')
++    args = p.parse_args()
++
++    return main(args)
++
++
++# execute this, when run with `python -m`.
++if __name__ == '__main__':
++    returncode = cmdline(sys.argv[1:])
++    sys.exit(returncode)
+diff --git a/charcoal/utils.py b/charcoal/utils.py
+index b0626f2..320dd6d 100644
+--- a/charcoal/utils.py
++++ b/charcoal/utils.py
+@@ -49,6 +49,14 @@ def pop_to_rank(lin, rank):
+     return tuple(lin)
+ 
+ 
++def find_disagree_rank(lin_a, lin_b):
++    for a, b in zip(lin_a, lin_b):
++        assert a.rank == b.rank
++        if a.name != b.name:
++            return a.rank
++    return None
++
++
+ def get_idents_for_hashval(lca_db, hashval):
+     "Get the identifiers associated with this hashval."
+     idx_list = lca_db.hashval_to_idx.get(hashval, [])

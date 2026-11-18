@@ -1,0 +1,2047 @@
+diff --git a/metagraph/integration_tests/test_api.py b/metagraph/integration_tests/test_api.py
+index fa0be6cdb5..7efa8b3dd3 100644
+--- a/metagraph/integration_tests/test_api.py
++++ b/metagraph/integration_tests/test_api.py
+@@ -75,6 +75,20 @@ def setUp(self) -> None:
+                                     url=f'http://{self.host}:{self.port}/{cmd}',
+                                     data=payload)
+ 
++    def test_api_cache_does_not_bypass_missing_fasta(self):
++        warm = self.raw_post_request('search', json.dumps({'FASTA': ''}))
++        self.assertEqual(warm.status_code, 200)
++        response = self.raw_post_request('search', '{}')
++        self.assertEqual(response.status_code, 400)
++        self.assertIn('No input sequences', response.json()['error'])
++
++    def test_api_cache_does_not_bypass_graph_filter_validation(self):
++        warm = self.raw_post_request('search', json.dumps({'FASTA': ''}))
++        self.assertEqual(warm.status_code, 200)
++        response = self.raw_post_request('search', json.dumps({'FASTA': '', 'graphs': []}))
++        self.assertEqual(response.status_code, 400)
++        self.assertIn('no support for filtering graphs', response.json()['error'])
++
+     def test_api_raw_incomplete_json(self):
+         ret = self.raw_post_request('search',
+             '{"FASTA": ">query\\nAATAAAGGTGTGAGATAACCCCAGCGGTGCCAGGATCCGTGCA", "discovery_fraction": 0.1,')
+@@ -449,6 +463,13 @@ def setUpClass(
+     def tearDownClass(cls):
+         cls.server_process.kill()
+ 
++    def test_api_cache_does_not_bypass_in_ram_validation(self):
++        url = f'http://{self.host}:{self.port}/search'
++        payload = {'FASTA': '', 'graphs': ['G1']}
++        self.assertEqual(requests.post(url, json=payload, timeout=30).status_code, 200)
++        payload['in_ram'] = []
++        self.assertEqual(requests.post(url, json=payload, timeout=30).status_code, 400)
++
+     def test_api_query_df_multiple_1(self):
+         ret = self.graph_client.search(self.sample_query, parallel=False,
+                                        discovery_threshold=0.01, graphs=['G1'])
+diff --git a/metagraph/integration_tests/test_server_cache.py b/metagraph/integration_tests/test_server_cache.py
+new file mode 100644
+index 0000000000..649182ab47
+--- /dev/null
++++ b/metagraph/integration_tests/test_server_cache.py
+@@ -0,0 +1,177 @@
++from contextlib import contextmanager
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++import threading
++import re
++import subprocess
++import tempfile
++import time
++
++import requests
++
++from base import METAGRAPH, TEST_DATA_DIR, TestingBase
++
++
++class TestServerCache(TestingBase):
++    @contextmanager
++    def running_server(self, *args):
++        with tempfile.NamedTemporaryFile(mode='w+') as log, requests.Session() as client:
++            client.trust_env = False
++            process = subprocess.Popen([METAGRAPH, 'server_query', *map(str, args),
++                                        '--address', '127.0.0.1', '--port', '0', '-p', '4', '-v'],
++                                       stdout=log, stderr=log)
++            try:
++                deadline = time.monotonic() + 30
++                while time.monotonic() < deadline:
++                    self.assertIsNone(process.poll(), 'Server exited during startup')
++                    match = re.search(r'\[Server\] Listening on port (\d+)', Path(log.name).read_text())
++                    if match:
++                        url = f'http://127.0.0.1:{match.group(1)}'
++                        if client.get(url + '/stats', timeout=5).status_code == 200:
++                            break
++                    time.sleep(0.05)
++                else:
++                    self.fail('Server did not become ready')
++                yield client, url + '/search', Path(log.name)
++            finally:
++                if process.poll() is None:
++                    process.terminate()
++                try:
++                    process.wait(timeout=30)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++                    process.wait(timeout=10)
++                    raise
++
++    def tiny_index(self):
++        root = Path(self.tempdir.name) / self._testMethodName
++        root.mkdir()
++        fasta = root / 'input.fa'
++        fasta.write_text('>sample\nACGTACGTACGT\n')
++        graph = root / 'graph.dbg'
++        self._build_graph(str(fasta), str(graph), 6, 'succinct')
++        self._annotate_graph(str(fasta), str(graph), str(root / 'annotation'), 'column',
++                             extra_params='--anno-label sample')
++        return graph, root / 'annotation.column.annodbg'
++
++    def test_hit_compression_oversized_response_and_disabled_cache(self):
++        graph, annotation = self.tiny_index()
++        payload = {'FASTA': '>q\nACGTACGTACGT\n', 'top_labels': 1}
++        with self.running_server('-i', graph, '-a', annotation, '--cache-size', '0.000004096') as (client, url, log):
++            first = client.post(url, json=payload, headers={'Accept-Encoding': 'identity'}, timeout=30)
++            self.assertEqual(first.status_code, 200, first.text)
++            hit = client.post(url, json=payload, headers={'Accept-Encoding': 'deflate'}, timeout=30)
++            self.assertEqual(hit.status_code, 200, hit.text)
++            self.assertEqual(hit.headers.get('Content-Encoding'), 'deflate')
++            self.assertEqual(first.json(), hit.json())
++            oversized = dict(payload, FASTA='>' + 'x' * 6000 + '\nACGTACGTACGT\n')
++            large = client.post(url, json=oversized, timeout=30)
++            self.assertEqual(large.status_code, 200, large.text)
++            again = client.post(url, json=payload, timeout=30)
++            self.assertEqual(again.json(), first.json())
++            text = log.read_text()
++            self.assertEqual(text.count('cache STORE'), 1, text[-3000:])
++            self.assertEqual(text.count('cache HIT'), 2, text[-3000:])
++            self.assertEqual(text.count('cache BYPASS'), 1, text[-3000:])
++        with self.running_server('-i', graph, '-a', annotation, '--cache-size', '0') as (client, url, log):
++            for _ in range(2):
++                response = client.post(url, json=payload, timeout=30)
++                self.assertEqual(response.status_code, 200)
++                self.assertEqual(response.json(), first.json())
++            self.assertNotRegex(log.read_text(), r'cache (HIT|STORE|BYPASS)')
++
++    def test_identical_concurrent_requests_share_one_result(self):
++        graph, annotation = self.tiny_index()
++        payload = {'FASTA': ''.join(f'>q{i}\nACGTACGTACGT\n' for i in range(200)), 'top_labels': 1}
++        with self.running_server('-i', graph, '-a', annotation) as (_, url, log):
++            barrier = threading.Barrier(4)
++            def post():
++                with requests.Session() as client:
++                    client.trust_env = False
++                    barrier.wait(timeout=10)
++                    response = client.post(url, json=payload, timeout=30)
++                    self.assertEqual(response.status_code, 200)
++                    return response.json()
++            with ThreadPoolExecutor(max_workers=4) as pool:
++                results = list(pool.map(lambda _: post(), range(4)))
++            self.assertTrue(all(result == results[0] for result in results))
++            self.assertEqual(log.read_text().count('cache STORE'), 1)
++            self.assertEqual(log.read_text().count('cache HIT'), 3)
++
++    def test_graph_error_waits_for_other_queries(self):
++        graph, annotation = self.tiny_index()
++        bad = graph.with_name('bad.dbg')
++        bad.symlink_to(graph)
++        indexes = graph.with_name('indexes.csv')
++        indexes.write_text(f'bad,{bad},{annotation}\n' + f'slow,{graph},{annotation}\n' * 20)
++        with self.running_server(indexes, '--mmap', '--mem-cap-gb', '1') as (client, url, log):
++            bad.unlink()  # Already mmap-loaded; only this request's in_ram reload fails.
++            response = client.post(url, json={
++                'FASTA': ''.join(f'>q{i}\nACGTACGTACGT\n' for i in range(100)),
++                'graphs': ['bad', 'slow'], 'in_ram': True}, timeout=30)
++            self.assertEqual(response.status_code, 400)
++            text = log.read_text()
++            completed = re.findall(r'Loaded and searched graph .* in [0-9.e+-]+ sec', text)
++            self.assertEqual(len(completed), 20, text[-3000:])
++            self.assertLess(text.rfind('Loaded and searched graph'), text.rfind('Error on request'))
++
++    def test_graph_paths_with_delimiters_have_distinct_cache_entries(self):
++        root = Path(self.tempdir.name)
++        fasta = TEST_DATA_DIR + '/transcripts_100.fa'
++        graph = root / 'graph.dbg'
++        self._build_graph(fasta, str(graph), 6, 'succinct')
++        for label in ['left', 'right']:
++            self._annotate_graph(fasta, str(graph), str(root / label), 'column',
++                                 extra_params=f'--anno-label {label}')
++
++        left_graph = root / 'left.dbg'
++        right_annotation = root / 'right-alias.column.annodbg'
++        middle = root / 'middle.dbg'
++        right_graph = Path(str(left_graph) + '|' + str(middle))
++        left_annotation = Path(str(middle) + '|' + str(right_annotation))
++        # Both pairs have the same old encoding: graph + '|' + annotation.
++        self.assertEqual(f'{left_graph}|{left_annotation}',
++                         f'{right_graph}|{right_annotation}')
++        for target, source in [(left_graph, graph), (right_graph, graph),
++                               (left_annotation, root / 'left.column.annodbg'),
++                               (right_annotation, root / 'right.column.annodbg')]:
++            target.parent.mkdir(parents=True, exist_ok=True)
++            target.symlink_to(source)
++        index_list = root / 'indexes.csv'
++        index_list.write_text(f'left,{left_graph},{left_annotation}\n'
++                              f'right,{right_graph},{right_annotation}\n')
++
++        with tempfile.NamedTemporaryFile(mode='w+') as log:
++            process = subprocess.Popen([METAGRAPH, 'server_query', str(index_list),
++                                        '--address', '127.0.0.1', '--port', '0', '-p', '2'],
++                                       stdout=log, stderr=log)
++            try:
++                with requests.Session() as client:
++                    client.trust_env = False
++                    deadline = time.monotonic() + 30
++                    while time.monotonic() < deadline:
++                        self.assertIsNone(process.poll(), 'Server exited during startup')
++                        match = re.search(r'\[Server\] Listening on port (\d+)',
++                                          Path(log.name).read_text())
++                        if match:
++                            break
++                        time.sleep(0.05)
++                    else:
++                        self.fail('Server did not become ready')
++                    url = f'http://127.0.0.1:{match.group(1)}/search'
++                    for label in ['left', 'right']:
++                        response = client.post(url, json={
++                            'FASTA': '>query\nCCTCTGTGGAATCCAATCTGTCTTCCATCCTGCGTGGCCGAGGG\n',
++                            'discovery_fraction': 0.01, 'graphs': [label]}, timeout=30)
++                        self.assertEqual(response.status_code, 200, response.text)
++                        samples = {hit['sample'] for hit in response.json()[0]['results']}
++                        self.assertEqual(samples & {'left', 'right'}, {label})
++            finally:
++                if process.poll() is None:
++                    process.terminate()
++                try:
++                    process.wait(timeout=30)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++                    process.wait(timeout=10)
++                    raise
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index c3252c1841..d460fde0ce 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -1,6 +1,8 @@
+ #include "config.hpp"
+ 
++#include <cmath>
+ #include <cstring>
++#include <limits>
+ #include <iostream>
+ #include <unordered_set>
+ #include <filesystem>
+@@ -409,8 +411,20 @@ Config::Config(int argc, char *argv[]) {
+             relax_arity_brwt = atoi(get_value(i++));
+         } else if (!strcmp(argv[i], "--RA-ivbuff-size")) {
+             RA_ivbuffer_size = atoll(get_value(i++));
+-        // } else if (!strcmp(argv[i], "--cache-size")) {
+-        //     row_cache_size = atoi(get_value(i++));
++        } else if (!strcmp(argv[i], "--cache-size")) {
++            std::string value = get_value(i++);
++            size_t end = 0;
++            try {
++                server_cache_size = std::stod(value, &end);
++            } catch (const std::exception &) {
++                server_cache_size = -1;
++            }
++            double bytes = server_cache_size * 1e9;
++            if (end != value.size() || !std::isfinite(bytes) || bytes < 0
++                    || bytes >= static_cast<double>(std::numeric_limits<size_t>::max())) {
++                fprintf(stderr, "ERROR: --cache-size must be a finite, non-negative size representable in bytes\n");
++                exit(1);
++            }
+         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+             print_welcome_message();
+             print_usage(argv[0], identity);
+@@ -1438,7 +1452,7 @@ if (advanced) {
+             fprintf(stderr, "\t-p --parallel [INT] \tmaximum number of parallel connections [1]\n");
+             fprintf(stderr, "\t   --threads-each [INT] \tnumber of threads per graph [1]\n");
+             fprintf(stderr, "\t   --one-pass-brwt \tuse one-pass parallel BRWT traversal for queries [off]\n");
+-            // fprintf(stderr, "\t   --cache-size [INT] \tnumber of uncompressed rows to store in the cache [0]\n");
++            fprintf(stderr, "\t   --cache-size [GB] \tmax size of the /search result cache, in GB (0 disables) [1]\n");
+             fprintf(stderr, "\n\t   --num-top-labels [INT] \tmaximum number of top labels per query by default [10'000]\n");
+             fprintf(stderr, "\t   --no-coord-mapping \t\tquery without mapping coords to sequence headers even if the .seqs index exists [off]\n");
+             fprintf(stderr, "\t   --mem-cap-gb [FLOAT] \tmemory in GB available for the server to load graphs for queries into RAM [0]\n");
+diff --git a/metagraph/src/cli/config/config.hpp b/metagraph/src/cli/config/config.hpp
+index 2c2b749011..1b6e0fa909 100644
+--- a/metagraph/src/cli/config/config.hpp
++++ b/metagraph/src/cli/config/config.hpp
+@@ -94,6 +94,7 @@ class Config {
+     unsigned int arity_brwt = 2;
+     unsigned int relax_arity_brwt = 10;
+     unsigned long long RA_ivbuffer_size = 16'384; // in B
++    double server_cache_size = 1.0; // server query cache, in GB (default 1 GB; 0 disables)
+     unsigned int min_tip_size = 1;
+     unsigned int min_unitig_median_kmer_abundance = 1;
+     int fallback_abundance_cutoff = 1;
+diff --git a/metagraph/src/cli/server.cpp b/metagraph/src/cli/server.cpp
+index 02ec6268e5..30abbad182 100644
+--- a/metagraph/src/cli/server.cpp
++++ b/metagraph/src/cli/server.cpp
+@@ -18,6 +18,8 @@
+ #include "query.hpp"
+ #include "align.hpp"
+ #include "server_utils.hpp"
++#include "server_cache.hpp"
++#include "server_request.hpp"
+ #include "cli/load/load_annotation.hpp"
+ 
+ 
+@@ -30,52 +32,9 @@ using namespace mtg::graph;
+ using HttpServer = SimpleWeb::Server<SimpleWeb::HTTP>;
+ 
+ 
+-Json::Value process_search_request(const Json::Value &json,
+-                                   const graph::AnnotatedDBG &anno_graph,
+-                                   const Config &config_orig) {
+-    const auto &fasta = json["FASTA"];
+-    if (fasta.isNull())
+-        throw std::invalid_argument("No input sequences received from client");
+-
+-    Config config(config_orig);
+-    // discovery_fraction a proxy of 1 - %similarity
+-    config.discovery_fraction
+-            = json.get("discovery_fraction", config.discovery_fraction).asDouble();
+-
+-    config.alignment_min_exact_match
+-            = json.get("min_exact_match",
+-                       config.alignment_min_exact_match).asDouble();
+-
+-    config.alignment_max_nodes_per_seq_char = json.get(
+-        "max_num_nodes_per_seq_char",
+-        config.alignment_max_nodes_per_seq_char).asDouble();
+-
+-    if (config.discovery_fraction < 0.0 || config.discovery_fraction > 1.0) {
+-        throw std::invalid_argument(
+-                "Discovery fraction should be within [0, 1.0]. Instead got "
+-                + std::to_string(config.discovery_fraction));
+-    }
+-
+-    if (config.alignment_min_exact_match < 0.0
+-            || config.alignment_min_exact_match > 1.0) {
+-        throw std::invalid_argument(
+-                "Minimum exact match should be within [0, 1.0]. Instead got "
+-                + std::to_string(config.alignment_min_exact_match));
+-    }
+-
+-    config.num_top_labels = json.get("top_labels", config.num_top_labels).asInt();
+-
+-    if (json.get("query_coords", false).asBool()) {
+-        config.query_mode = COORDS;
+-    } else if (json.get("query_counts", false).asBool()) {
+-        config.query_mode = COUNTS;
+-    } else if (json.get("with_signature", false).asBool()) {
+-        config.query_mode = SIGNATURE;
+-    } else if (json.get("abundance_sum", false).asBool()) {
+-        config.query_mode = COUNTS_SUM;
+-    } else {
+-        config.query_mode = MATCHES;
+-    }
++Json::Value process_search_request(const SearchRequest &request,
++                                   const graph::AnnotatedDBG &anno_graph) {
++    const auto &config = request.config;
+ 
+     // Throw client an error if they try to query coordinates/kmer-counts on unsupported indexes
+     if ((config.query_mode == COUNTS || config.query_mode == COUNTS_SUM)
+@@ -91,7 +50,7 @@ Json::Value process_search_request(const Json::Value &json,
+     }
+ 
+     std::unique_ptr<align::DBGAlignerConfig> aligner_config;
+-    if (json.get("align", false).asBool()) {
++    if (request.align) {
+         aligner_config.reset(new align::DBGAlignerConfig(
+             initialize_aligner_config(config, anno_graph.get_graph())
+         ));
+@@ -106,7 +65,7 @@ Json::Value process_search_request(const Json::Value &json,
+     // work on strings seems non-trivial. An alternative would be to use
+     // read_fasta_from_string.
+     utils::TempFile tf(config.tmp_dir);
+-    tf.ofstream() << fasta.asString();
++    tf.ofstream() << request.fasta;
+     tf.ofstream().close();
+ 
+     // Query sequences and callback by appending result to vector with mutex for thread safety
+@@ -380,130 +339,218 @@ int run_server(Config *config) {
+     std::condition_variable space_cv;
+     std::mutex space_mutex;
+ 
+-    // the actual server
++    size_t cache_size_bytes = static_cast<size_t>(config->server_cache_size * 1e9);
++    ServerQueryCache search_cache(cache_size_bytes);
++    if (cache_size_bytes) {
++        logger->info("[Server] /search result cache enabled, max size: {} GB",
++                     config->server_cache_size);
++    } else {
++        logger->info("[Server] /search result cache disabled (--cache-size 0)");
++    }
++
+     HttpServer server;
++
++    // Keep the cache handle alive until the asynchronous response write completes.
+     server.resource["^/search"]["POST"] = [&](shared_ptr<HttpServer::Response> response,
+                                               shared_ptr<HttpServer::Request> request) {
+         size_t request_id = num_requests++;
+-        process_request(response, request, request_id, [&](const std::string& content) {
+-            if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
+-                throw CurrentlyInitializingError();  // the index is not loaded yet, so we can't process the request
++        auto handle_holder = cache_size_bytes
++                ? std::make_shared<ServerQueryCache::Handle>() : nullptr;
++        process_request(response, request, request_id,
++            [&, handle_holder](const std::string &content) -> std::string {
++                if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
++                    throw CurrentlyInitializingError();  // graph still loading
++
++                Json::Value content_json = parse_json_string(content);
++                logger->info("[Server] Request {}: {}", request_id, content_json.toStyledString());
++
++                const auto search_request = parse_search_request(content_json, *config);
++                // Validate fields omitted from the key before returning a cached result.
++                std::vector<std::string> graphs_to_query;
++                bool load_in_ram = false;
++                if (config->fnames.empty()) {
++                    if (content_json.isMember("graphs"))
++                        throw std::invalid_argument("Bad request: no support for filtering graphs on this server");
++                } else {
++                    graphs_to_query = filter_graphs_from_list(indexes, content_json, request_id);
++                    load_in_ram = content_json.get("in_ram", false).asBool() && loaded_with_mmap;
++                }
+ 
+-            Json::Value content_json = parse_json_string(content);
+-            logger->info("[Server] Request {}: {}", request_id, content_json.toStyledString());
+-            Json::Value result;
++                if (handle_holder) {
++                    std::string graph_identity = config->infbase;
++                    if (!config->fnames.empty()) {
++                        std::ostringstream oss;
++                        for (const auto &name : graphs_to_query) {
++                            for (const auto &[g, a] : indexes[name]) {
++                                oss << g.size() << ':' << g << a.size() << ':' << a;
++                            }
++                        }
++                        graph_identity = oss.str();
++                    }
++                    *handle_holder = search_cache.acquire(
++                        make_search_cache_key(search_request, graph_identity));
++                    if (!handle_holder->is_miss()) {
++                        auto cached = handle_holder->get();
++                        logger->info("[Server] Request {}: cache HIT  {:.1f} KB  "
++                                     "(occupancy {:.1f}/{:.0f} MB, {} entries)",
++                                     request_id, cached->size() / 1e3,
++                                     search_cache.size_bytes() / 1e6,
++                                     cache_size_bytes / 1e6,
++                                     search_cache.entry_count());
++                        return *cached;
++                    }
++                }
+ 
+-            // simple case with a single graph pair
+-            if (!config->fnames.size()) {
+-                if (content_json.isMember("graphs"))
+-                    throw std::invalid_argument("Bad request: no support for filtering graphs on this server");
+-                logger->trace("Request {}: Started querying graph {}, in total graphs being queried at the moment: {}",
+-                              request_id, config->infbase, graphs_being_queried.fetch_add(1) + 1);
++                // Cache miss: run the search, publish the result. If the
++                // compute throws, propagate the exception to any duplicate
++                // waiters via set_exception() before re-throwing.
++                Json::Value result;
+                 try {
+-                    result = process_search_request(content_json, *anno_graph.get(), *config);
+-                } catch (...) {
+-                    graphs_being_queried--;
+-                    throw;
+-                }
+-                graphs_being_queried--;
+-            } else {
+-                std::vector<std::string> graphs_to_query
+-                        = filter_graphs_from_list(indexes, content_json, request_id);
+-                std::mutex mu;
+-                std::vector<std::shared_future<std::exception_ptr>> futures;
+-                for (const auto &name : graphs_to_query) {
+-                    for (const auto &[graph_fname, anno_fname] : indexes[name]) {
+-                        futures.push_back(graphs_pool.enqueue([&,config,graph_fname=graph_fname,anno_fname=anno_fname]() {
+-                            logger->trace("Request {}: Started querying graph {}. In total graphs being queried at the moment: {}",
+-                                          request_id, graph_fname, graphs_being_queried.fetch_add(1) + 1);
+-                            size_t index_size_reserved = 0;
+-                            auto release_memory = [&]() {
+-                                if (!index_size_reserved)
+-                                    return;
+-                                {
+-                                    std::unique_lock<std::mutex> lock(space_mutex);
+-                                    memory_left += index_size_reserved;
+-                                }
+-                                index_size_reserved = 0;
+-                                space_cv.notify_all();
+-                            };
+-                            try {
+-                                std::unique_ptr<AnnotatedDBG> index_loaded;
+-                                const AnnotatedDBG *index;
+-                                bool in_ram = content_json.isMember("in_ram") && content_json["in_ram"].asBool();
+-                                if (in_ram && !loaded_with_mmap)
+-                                    in_ram = false;  // already in RAM, no need to re-load
+-                                size_t index_size = in_ram ? std::filesystem::file_size(graph_fname)
+-                                                                + std::filesystem::file_size(anno_fname)
+-                                                           : -1;
+-                                if (in_ram && index_size > memory_all) {
+-                                    logger->warn("Request {}: Graph of size {} GB is too large to fit into "
+-                                                 "RAM (reserved memory: {} GB). It will be queried with mmap",
+-                                                 request_id, index_size / 1e9, memory_all / 1e9);
+-                                    in_ram = false;
+-                                }
+-                                Timer timer;
+-                                if (in_ram) {
+-                                    {
+-                                        std::unique_lock<std::mutex> lock(space_mutex);
+-                                        space_cv.wait(lock, [&]() {
+-                                            return memory_left >= index_size;
+-                                        });
+-                                        memory_left -= index_size;
+-                                    }
+-                                    index_size_reserved = index_size;
+-                                    logger->trace("Request {}: Loading graph {} of size {} GB to RAM...",
+-                                                  request_id, graph_fname, index_size / 1e9);
+-                                    timer.reset();
+-                                    Config config_copy = *config;
+-                                    config_copy.infbase = graph_fname;
+-                                    config_copy.infbase_annotators = { anno_fname };
+-                                    index_loaded = initialize_annotated_dbg(config_copy);
+-                                    index = index_loaded.get();
+-                                } else {
+-                                    index = graphs_cache.at({ graph_fname, anno_fname }).get();
+-                                }
+-
+-                                auto json = process_search_request(content_json, *index, *config);
+-                                logger->trace("Request {}: {} graph {} {} in {} sec",
+-                                              request_id, in_ram ? "Loaded and searched" : "Searched",
+-                                              graph_fname, anno_fname, timer.elapsed());
+-
+-                                index_loaded.reset();
+-                                release_memory();
+-
+-                                std::lock_guard<std::mutex> lock(mu);
+-                                if (result.empty()) {
+-                                    result = std::move(json);
+-                                } else {
+-                                    assert(json.size() == result.size());
+-                                    for (Json::ArrayIndex i = 0; i < result.size(); ++i) {
+-                                        if (result[i][SeqSearchResult::SEQ_DESCRIPTION_JSON_FIELD]
+-                                                != json[i][SeqSearchResult::SEQ_DESCRIPTION_JSON_FIELD]) {
+-                                            throw std::logic_error("ERROR: Results for different sequences can't be merged");
++                    if (!config->fnames.size()) {
++                        logger->trace("Request {}: Started querying graph {}, in total graphs being queried at the moment: {}",
++                                      request_id, config->infbase, graphs_being_queried.fetch_add(1) + 1);
++                        try {
++                            result = process_search_request(search_request, *anno_graph.get());
++                        } catch (...) {
++                            graphs_being_queried--;
++                            throw;
++                        }
++                        graphs_being_queried--;
++                    } else {
++                        std::mutex mu;
++                        struct PendingQueries {
++                            std::vector<std::shared_future<std::exception_ptr>> futures;
++                            ~PendingQueries() {
++                                // Tasks capture request-local state, including mu and result.
++                                for (auto &future : futures)
++                                    future.wait();
++                            }
++                        } pending;
++                        auto &futures = pending.futures;
++                        size_t num_queries = 0;
++                        for (const auto &name : graphs_to_query)
++                            num_queries += indexes.at(name).size();
++                        // Once a task is launched, recording its future must not allocate.
++                        futures.reserve(num_queries);
++                        for (const auto &name : graphs_to_query) {
++                            for (const auto &[graph_fname, anno_fname] : indexes[name]) {
++                                futures.push_back(graphs_pool.enqueue([&,config,graph_fname=graph_fname,anno_fname=anno_fname]() {
++                                    logger->trace("Request {}: Started querying graph {}. In total graphs being queried at the moment: {}",
++                                                  request_id, graph_fname, graphs_being_queried.fetch_add(1) + 1);
++                                    size_t index_size_reserved = 0;
++                                    auto release_memory = [&]() {
++                                        if (!index_size_reserved)
++                                            return;
++                                        {
++                                            std::unique_lock<std::mutex> lock(space_mutex);
++                                            memory_left += index_size_reserved;
++                                        }
++                                        index_size_reserved = 0;
++                                        space_cv.notify_all();
++                                    };
++                                    try {
++                                        std::unique_ptr<AnnotatedDBG> index_loaded;
++                                        const AnnotatedDBG *index;
++                                        bool in_ram = load_in_ram;
++                                        size_t index_size = in_ram ? std::filesystem::file_size(graph_fname)
++                                                                        + std::filesystem::file_size(anno_fname)
++                                                                   : -1;
++                                        if (in_ram && index_size > memory_all) {
++                                            logger->warn("Request {}: Graph of size {} GB is too large to fit into "
++                                                         "RAM (reserved memory: {} GB). It will be queried with mmap",
++                                                         request_id, index_size / 1e9, memory_all / 1e9);
++                                            in_ram = false;
+                                         }
+-                                        for (auto&& value : json[i]["results"]) {
+-                                            result[i]["results"].append(std::move(value));
++                                        Timer timer;
++                                        if (in_ram) {
++                                            {
++                                                std::unique_lock<std::mutex> lock(space_mutex);
++                                                space_cv.wait(lock, [&]() {
++                                                    return memory_left >= index_size;
++                                                });
++                                                memory_left -= index_size;
++                                            }
++                                            index_size_reserved = index_size;
++                                            logger->trace("Request {}: Loading graph {} of size {} GB to RAM...",
++                                                          request_id, graph_fname, index_size / 1e9);
++                                            timer.reset();
++                                            Config config_copy = *config;
++                                            config_copy.infbase = graph_fname;
++                                            config_copy.infbase_annotators = { anno_fname };
++                                            index_loaded = initialize_annotated_dbg(config_copy);
++                                            index = index_loaded.get();
++                                        } else {
++                                            index = graphs_cache.at({ graph_fname, anno_fname }).get();
+                                         }
++
++                                        auto json = process_search_request(search_request, *index);
++                                        logger->trace("Request {}: {} graph {} {} in {} sec",
++                                                      request_id, in_ram ? "Loaded and searched" : "Searched",
++                                                      graph_fname, anno_fname, timer.elapsed());
++
++                                        index_loaded.reset();
++                                        release_memory();
++
++                                        std::lock_guard<std::mutex> lock(mu);
++                                        if (result.empty()) {
++                                            result = std::move(json);
++                                        } else {
++                                            assert(json.size() == result.size());
++                                            for (Json::ArrayIndex i = 0; i < result.size(); ++i) {
++                                                if (result[i][SeqSearchResult::SEQ_DESCRIPTION_JSON_FIELD]
++                                                        != json[i][SeqSearchResult::SEQ_DESCRIPTION_JSON_FIELD]) {
++                                                    throw std::logic_error("ERROR: Results for different sequences can't be merged");
++                                                }
++                                                for (auto&& value : json[i]["results"]) {
++                                                    result[i]["results"].append(std::move(value));
++                                                }
++                                            }
++                                        }
++                                    } catch (...) {
++                                        release_memory();
++                                        graphs_being_queried--;
++                                        return std::current_exception();
+                                     }
+-                                }
+-                            } catch (...) {
+-                                release_memory();
+-                                graphs_being_queried--;
+-                                return std::current_exception();
++                                    graphs_being_queried--;
++                                    return std::exception_ptr();
++                                }));
+                             }
+-                            graphs_being_queried--;
+-                            return std::exception_ptr();
+-                        }));
++                        }
++                        for (auto &future : futures) {
++                            if (auto ex = future.get())
++                                std::rethrow_exception(ex);
++                        }
+                     }
++                } catch (...) {
++                    if (handle_holder)
++                        handle_holder->set_exception(std::current_exception());
++                    throw;
+                 }
+-                for (auto &future : futures) {
+-                    if (auto ex = future.get())
+-                        std::rethrow_exception(ex);
++
++                // Serialize once: the cached form *is* the response
++                // body. Cache hits then skip serialization entirely.
++                std::string serialized = Json::writeString(Json::StreamWriterBuilder(), result);
++                if (handle_holder) {
++                    bool retained = handle_holder->set_result(serialized);
++                    logger->info("[Server] Request {}: cache {} {:.1f} KB  "
++                                 "(occupancy {:.1f}/{:.0f} MB, {} entries)",
++                                 request_id, retained ? "STORE" : "BYPASS", serialized.size() / 1e3,
++                                 search_cache.size_bytes() / 1e6,
++                                 cache_size_bytes / 1e6,
++                                 search_cache.entry_count());
+                 }
+-            }
+-            return result;
+-        });
++                return serialized;
++            },
++            [handle_holder, request_id](const SimpleWeb::error_code &ec) {
++                if (!handle_holder || !*handle_holder)
++                    return;  // never acquired (e.g. early throw before acquire)
++                if (ec) {
++                    logger->info("[Server] Request {}: delivery FAILED ({})", request_id, ec.message());
++                    handle_holder->mark_protected();
++                } else {
++                    handle_holder->mark_delivered();
++                }
++            });
+     };
+ 
+     server.resource["^/align"]["POST"] = [&](shared_ptr<HttpServer::Response> response,
+@@ -512,11 +559,12 @@ int run_server(Config *config) {
+             if (!config->fnames.size() && anno_graph.wait_for(0s) != std::future_status::ready)
+                 throw CurrentlyInitializingError(); // the index is not loaded yet, so we can't process the request
+ 
+-            if (!config->fnames.size())
+-                return process_align_request(content, anno_graph.get()->get_graph(), *config);
+-
+-            throw std::invalid_argument("Bad request: alignment requests are not yet supported for "
+-                                        "servers with multiple graphs");
++            if (config->fnames.size()) {
++                throw std::invalid_argument("Bad request: alignment requests are not yet supported for "
++                                            "servers with multiple graphs");
++            }
++            return Json::writeString(Json::StreamWriterBuilder(),
++                process_align_request(content, anno_graph.get()->get_graph(), *config));
+         });
+     };
+ 
+@@ -542,7 +590,7 @@ int run_server(Config *config) {
+                     }
+                 }
+             }
+-            return root;
++            return Json::writeString(Json::StreamWriterBuilder(), root);
+         });
+     };
+ 
+@@ -601,7 +649,7 @@ int run_server(Config *config) {
+                 root["annotation"]["labels"] = get_num_labels(*anno_graph.get());
+                 root["annotation"]["objects"] = static_cast<uint64_t>(annotation.num_objects());
+             }
+-            return root;
++            return Json::writeString(Json::StreamWriterBuilder(), root);
+         });
+     };
+ 
+diff --git a/metagraph/src/cli/server_cache.cpp b/metagraph/src/cli/server_cache.cpp
+new file mode 100644
+index 0000000000..cbf4ec227a
+--- /dev/null
++++ b/metagraph/src/cli/server_cache.cpp
+@@ -0,0 +1,292 @@
++#include "server_cache.hpp"
++
++#include <exception>
++#include <iomanip>
++#include <limits>
++#include <locale>
++#include <sstream>
++#include <stdexcept>
++
++#include "server_request.hpp"
++
++
++namespace mtg {
++namespace cli {
++
++
++// --- Handle -----------------------------------------------------------------
++
++ServerQueryCache::Handle::Handle(ServerQueryCache *cache,
++                                 std::shared_ptr<Entry> entry,
++                                 std::shared_ptr<std::promise<ResultPtr>> producer)
++      : cache_(cache),
++        entry_(std::move(entry)),
++        producer_(std::move(producer)) {}
++
++ServerQueryCache::Handle::Handle(Handle &&other) noexcept
++      : cache_(other.cache_),
++        entry_(std::move(other.entry_)),
++        producer_(std::move(other.producer_)) {
++    other.cache_ = nullptr;
++}
++
++ServerQueryCache::Handle &
++ServerQueryCache::Handle::operator=(Handle &&other) noexcept {
++    if (this != &other) {
++        release();
++        cache_ = other.cache_;
++        entry_ = std::move(other.entry_);
++        producer_ = std::move(other.producer_);
++        other.cache_ = nullptr;
++    }
++    return *this;
++}
++
++ServerQueryCache::Handle::~Handle() {
++    release();
++}
++
++void ServerQueryCache::Handle::release() {
++    if (!entry_)
++        return;
++    // Producer abandoned without publishing (e.g. throw-before-set_result
++    // along an unexpected path): satisfy the promise with an exception so
++    // duplicate waiters don't block forever on the shared_future.
++    if (producer_) {
++        try {
++            set_exception(std::make_exception_ptr(
++                std::runtime_error("Cache producer abandoned the request")));
++        } catch (const std::future_error &) {
++            // Already satisfied — fine.
++        }
++    }
++    cache_->release_waiter(entry_);
++}
++
++ServerQueryCache::ResultPtr ServerQueryCache::Handle::get() const {
++    return entry_->future.get();
++}
++
++bool ServerQueryCache::Handle::set_result(std::string response) {
++    auto ptr = std::make_shared<const std::string>(std::move(response));
++    size_t bytes = ptr->capacity() + 1;
++    producer_->set_value(ptr);
++    producer_.reset();
++    return cache_->on_result_ready(entry_, bytes);
++}
++
++void ServerQueryCache::Handle::set_exception(std::exception_ptr eptr) {
++    // Existing waiters own this entry. Remove it from lookup before waking
++    // them so retries can start a new computation, even while they unwind.
++    cache_->discard(entry_);
++    producer_->set_exception(eptr);
++    producer_.reset();
++}
++
++void ServerQueryCache::Handle::mark_delivered() {
++    cache_->on_delivery(entry_, DeliveryState::DELIVERED);
++}
++
++void ServerQueryCache::Handle::mark_protected() {
++    cache_->on_delivery(entry_, DeliveryState::PROTECTED);
++}
++
++
++// --- ServerQueryCache -------------------------------------------------------
++
++ServerQueryCache::ServerQueryCache(size_t max_size_bytes,
++                                   std::chrono::nanoseconds protection_ttl)
++      : max_size_bytes_(max_size_bytes),
++        protection_ttl_(protection_ttl) {}
++
++std::pair<std::shared_ptr<std::promise<ServerQueryCache::ResultPtr>>,
++          std::shared_ptr<ServerQueryCache::Entry>>
++ServerQueryCache::make_pending_entry(const std::string &key) {
++    auto producer = std::make_shared<std::promise<ResultPtr>>();
++    auto entry = std::make_shared<Entry>();
++    entry->key = key;
++    entry->future = producer->get_future().share();
++    entry->waiters.store(1, std::memory_order_relaxed);
++    return { std::move(producer), std::move(entry) };
++}
++
++ServerQueryCache::Handle ServerQueryCache::acquire(const std::string &key) {
++    if (max_size_bytes_ == 0) {
++        // Disabled-cache fast path: every caller gets a fresh, detached
++        // entry. No dedup, no retention, no LRU bookkeeping.
++        auto [producer, entry] = make_pending_entry(key);
++        return Handle(this, std::move(entry), std::move(producer));
++    }
++
++    std::lock_guard<std::mutex> lock(mutex_);
++
++    auto it = map_.find(key);
++    if (it != map_.end()) {
++        // Hit. Bump waiters, move to MRU.
++        auto &entry = it->second;
++        entry->waiters.fetch_add(1, std::memory_order_relaxed);
++        touch_lru_locked(entry);
++        // Sliding retention window: a hit on a PROTECTED entry is
++        // direct evidence the upstream is still retrying, so we
++        // refresh ready_at to extend the priority window.
++        if (entry->delivery.load(std::memory_order_acquire) == DeliveryState::PROTECTED) {
++            entry->ready_at = std::chrono::steady_clock::now();
++        }
++        return Handle(this, entry, /* producer = */ nullptr);
++    }
++
++    // Miss. Create a fresh entry, attach it to the cache, and hand the
++    // promise to the caller (the producer) to fulfil via set_result().
++    // Eviction-bookkeeping (size accounting) happens later in
++    // on_result_ready, when the producer publishes.
++    auto [producer, entry] = make_pending_entry(key);
++    entry->in_cache = true;
++    lru_.push_front(entry);
++    entry->lru_pos = lru_.begin();
++    map_.emplace(key, entry);
++    return Handle(this, std::move(entry), std::move(producer));
++}
++
++void ServerQueryCache::release_waiter(const std::shared_ptr<Entry> &entry) {
++    int prev = entry->waiters.fetch_sub(1, std::memory_order_acq_rel);
++    if (prev > 1)
++        return;  // Still has other waiters.
++
++    // Last waiter dropped: this entry — and possibly other entries that
++    // were skipped during a previous insert because they had waiters —
++    // are now evictable. Run the sweep so the cache settles back under
++    // budget without waiting for the next insert.
++    std::lock_guard<std::mutex> lock(mutex_);
++    evict_under_pressure_locked();
++}
++
++bool ServerQueryCache::on_result_ready(const std::shared_ptr<Entry> &entry,
++                                       size_t size) {
++    // Called by the producer after publishing the value. Records when it became
++    // available, registers its size in the byte budget, and runs the
++    // size-pressure sweep — the just-inserted entry itself is protected
++    // from eviction in this pass because its producer's Handle is still
++    // alive (waiters ≥ 1).
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!entry->in_cache)
++        return false;  // Detached entry from the disabled-cache path.
++    entry->ready_at = std::chrono::steady_clock::now();
++    // Charge both stored keys, the response allocation and an estimate of
++    // entry/container bookkeeping, so even empty responses consume budget.
++    size_t charged_size = size + 2 * (entry->key.capacity() + 1)
++                          + sizeof(Entry) + sizeof(decltype(map_)::value_type)
++                          + sizeof(std::string) + 8 * sizeof(void *);
++    // An entry that cannot fit would evict useful results, then itself.
++    if (charged_size > max_size_bytes_) {
++        discard_locked(entry);
++        return false;
++    }
++    entry->size_bytes = charged_size;
++    total_size_bytes_ += entry->size_bytes;
++    evict_under_pressure_locked();
++    return true;
++}
++
++void ServerQueryCache::discard(const std::shared_ptr<Entry> &entry) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    discard_locked(entry);
++}
++
++void ServerQueryCache::discard_locked(const std::shared_ptr<Entry> &entry) {
++    if (!entry->in_cache)
++        return;
++    total_size_bytes_ -= entry->size_bytes;
++    map_.erase(entry->key);
++    lru_.erase(entry->lru_pos);
++    entry->in_cache = false;
++}
++
++void ServerQueryCache::on_delivery(const std::shared_ptr<Entry> &entry,
++                                   DeliveryState state) {
++    if (state == DeliveryState::DELIVERED) {
++        entry->delivery.store(DeliveryState::DELIVERED, std::memory_order_release);
++    } else {
++        // A failed delivery cannot undo an earlier success, even concurrently.
++        auto expected = DeliveryState::PENDING;
++        entry->delivery.compare_exchange_strong(expected, DeliveryState::PROTECTED,
++                                                 std::memory_order_acq_rel);
++    }
++}
++
++void ServerQueryCache::touch_lru_locked(const std::shared_ptr<Entry> &entry) {
++    if (!entry->in_cache)
++        return;
++    if (entry->lru_pos != lru_.begin())
++        lru_.splice(lru_.begin(), lru_, entry->lru_pos);
++    entry->lru_pos = lru_.begin();
++}
++
++void ServerQueryCache::evict_under_pressure_locked() {
++    auto now = std::chrono::steady_clock::now();
++    auto is_within_protection_window = [&](const Entry &e) {
++        // PROTECTED entries within the retention window have *higher*
++        // priority than DELIVERED ones — they're sacrificed only when
++        // there's nothing else to give up.
++        return e.delivery.load(std::memory_order_acquire) == DeliveryState::PROTECTED
++               && e.ready_at.time_since_epoch().count() != 0
++               && now - e.ready_at <= protection_ttl_;
++    };
++
++    // Each pass walks oldest first, skipping entries still in use.
++    auto evict = [&](bool keep_protected) {
++        for (auto it = lru_.end(); total_size_bytes_ > max_size_bytes_ && it != lru_.begin();) {
++            --it;
++            auto &entry = *it;
++            if (entry->waiters.load(std::memory_order_relaxed) != 0
++                    || (keep_protected && is_within_protection_window(*entry)))
++                continue;
++            total_size_bytes_ -= entry->size_bytes;
++            map_.erase(entry->key);
++            entry->in_cache = false;
++            it = lru_.erase(it);
++        }
++    };
++    // Prefer keeping failed deliveries, but evict them too if needed to fit.
++    evict(true);
++    evict(false);
++}
++
++size_t ServerQueryCache::size_bytes() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return total_size_bytes_;
++}
++
++size_t ServerQueryCache::entry_count() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return map_.size();
++}
++
++bool ServerQueryCache::contains(const std::string &key) const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return map_.count(key) != 0;
++}
++
++
++// --- key construction -------------------------------------------------------
++
++std::string make_search_cache_key(const SearchRequest &request,
++                                  const std::string &graph_identity) {
++    // Keep complete FASTA so hash collisions cannot return another request's result.
++    const auto &fasta = request.fasta;
++    const auto &config = request.config;
++    std::ostringstream oss;
++    oss.imbue(std::locale::classic());
++    oss << std::setprecision(std::numeric_limits<double>::max_digits10);
++    oss << "g:" << graph_identity.size() << ':' << graph_identity << '|'
++        << "m:" << config.query_mode << '|'
++        << "df:" << config.discovery_fraction << '|'
++        << "ame:" << config.alignment_min_exact_match << '|'
++        << "amn:" << config.alignment_max_nodes_per_seq_char << '|'
++        << "tl:" << config.num_top_labels << '|'
++        << "al:" << (request.align ? '1' : '0') << '|'
++        << "f:" << fasta.size() << ':' << fasta;
++    return oss.str();
++}
++
++} // namespace cli
++} // namespace mtg
+diff --git a/metagraph/src/cli/server_cache.hpp b/metagraph/src/cli/server_cache.hpp
+new file mode 100644
+index 0000000000..88a71510f7
+--- /dev/null
++++ b/metagraph/src/cli/server_cache.hpp
+@@ -0,0 +1,188 @@
++#ifndef __SERVER_CACHE_HPP__
++#define __SERVER_CACHE_HPP__
++
++#include <atomic>
++#include <chrono>
++#include <future>
++#include <list>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++
++namespace mtg {
++namespace cli {
++
++struct SearchRequest;
++
++/**
++ * Cache serialized /search responses and share in-flight computations.
++ * The producer publishes a result or exception; failed entries leave lookup
++ * immediately so later requests can retry. Handles pin entries until delivery.
++ *
++ * Under memory pressure, evict unpinned entries in LRU order. Failed deliveries
++ * get preference for protection_ttl after publication or their last cache hit,
++ * but are still evicted if necessary. A successful delivery ends that preference
++ * permanently, even if another delivery fails later.
++ *
++ * The budget estimates string allocations and entry overhead. Pinned entries
++ * can temporarily exceed it. Oversized results are shared with existing waiters
++ * but not retained. A zero budget disables retention and deduplication.
++ * Compression is applied per response, after reading the cached JSON body.
++ */
++class ServerQueryCache {
++  public:
++    enum class DeliveryState { PENDING, DELIVERED, PROTECTED };
++
++    // The cache value is the serialized JSON response body.
++    using ResultPtr = std::shared_ptr<const std::string>;
++    using ResultFuture = std::shared_future<ResultPtr>;
++
++  private:
++    // Defined here so `Handle` can refer to `Entry` before its full body.
++    struct Entry;
++
++  public:
++    /**
++     * RAII handle returned by `acquire()`. The handle holds one waiter
++     * count on the entry and drops it in the destructor.
++     *
++     * On a miss (is_miss() == true) this caller is the producer and
++     * must call exactly one of `set_result(...)` / `set_exception(...)`
++     * to release any concurrent duplicate waiters. On a hit just call
++     * `get()` to read the cached value.
++     *
++     * After the response has been written to the wire, the on_sent
++     * callback is expected to call mark_delivered() or mark_protected()
++     * exactly once.
++     */
++    class Handle {
++      public:
++        Handle() = default;
++        Handle(const Handle &) = delete;
++        Handle &operator=(const Handle &) = delete;
++        Handle(Handle &&) noexcept;
++        Handle &operator=(Handle &&) noexcept;
++        ~Handle();
++
++        // True if this handle holds an entry (i.e. acquire() ran).
++        explicit operator bool() const { return static_cast<bool>(entry_); }
++
++        // True if this caller is responsible for computing the result.
++        bool is_miss() const { return static_cast<bool>(producer_); }
++
++        // Wait for the result. Throws whatever the producer set via
++        // set_exception(). On a miss must be called only after
++        // set_result/set_exception, otherwise it deadlocks the producer.
++        ResultPtr get() const;
++
++        // Producer-only: publish the result (or thrown exception) to
++        // all current and future waiters of this entry's shared_future.
++        // Returns whether the result fits the retention budget.
++        bool set_result(std::string response);
++        void set_exception(std::exception_ptr eptr);
++
++        // Record delivery success or failure. Success is permanent; failures
++        // get retention preference without extending the window on their own.
++        void mark_delivered();
++        void mark_protected();
++
++      private:
++        friend class ServerQueryCache;
++
++        Handle(ServerQueryCache *cache,
++               std::shared_ptr<Entry> entry,
++               std::shared_ptr<std::promise<ResultPtr>> producer);
++
++        void release();
++
++        ServerQueryCache *cache_ = nullptr;
++        std::shared_ptr<Entry> entry_;
++        std::shared_ptr<std::promise<ResultPtr>> producer_;  // non-null on miss only
++    };
++
++    explicit ServerQueryCache(size_t max_size_bytes,
++                              std::chrono::nanoseconds protection_ttl = std::chrono::hours(2));
++
++    /**
++     * Look up `key` and bump its waiter count.
++     *
++     * On a miss the returned handle's `is_miss()` is true and the
++     * caller must produce the result.
++     *
++     * On a hit of a PROTECTED entry, the entry's retention window is
++     * also refreshed — the hit is direct evidence the upstream is
++     * still retrying.
++     *
++     * If the cache is disabled (max_size_bytes == 0) every call is a
++     * miss and the entry is not retained after the handle drops.
++     */
++    Handle acquire(const std::string &key);
++
++    // Diagnostics / tests.
++    size_t size_bytes() const;
++    size_t entry_count() const;
++    bool contains(const std::string &key) const;
++
++  private:
++    friend class ServerQueryCacheTestAccess;
++
++    struct Entry {
++        std::string key;
++        // Hinge of the dedup mechanism: producer publishes via promise,
++        // every waiter (including late arrivals) reads via .get().
++        ResultFuture future;
++        // RAII-managed by Handle: producer + each reader contributes 1.
++        // An entry with waiters > 0 is never evicted.
++        std::atomic<int>      waiters{0};
++        // Set when the producer publishes a result (on_result_ready),
++        // and refreshed on every cache hit while
++        // the entry is in PROTECTED state (sliding retention window).
++        // Used to compute "within protection_ttl" for eviction priority.
++        std::chrono::steady_clock::time_point ready_at{};
++        std::atomic<DeliveryState> delivery{DeliveryState::PENDING};
++        // Charged string allocations and estimated entry overhead.
++        // Set once in on_result_ready; used without touching shared_future.
++        size_t                size_bytes = 0;
++        // Iterator into ServerQueryCache::lru_; valid iff in_cache.
++        std::list<std::shared_ptr<Entry>>::iterator lru_pos{};
++        // false means this entry is detached (evicted, or made by the
++        // disabled-cache fast path); accounting/eviction skip it.
++        bool in_cache = false;
++    };
++
++    // Allocate a new Entry + paired promise/future. Caller decides
++    // whether to attach it to the cache (in_cache, lru_, map_) or use
++    // it as a one-shot detached entry (disabled-cache fast path).
++    std::pair<std::shared_ptr<std::promise<ResultPtr>>, std::shared_ptr<Entry>>
++        make_pending_entry(const std::string &key);
++
++    void release_waiter(const std::shared_ptr<Entry> &entry);
++    bool on_result_ready(const std::shared_ptr<Entry> &entry, size_t size);
++    void discard(const std::shared_ptr<Entry> &entry);
++    void discard_locked(const std::shared_ptr<Entry> &entry);
++    void on_delivery(const std::shared_ptr<Entry> &entry, DeliveryState state);
++    void evict_under_pressure_locked();
++    void touch_lru_locked(const std::shared_ptr<Entry> &entry);
++
++    const size_t max_size_bytes_;
++    const std::chrono::nanoseconds protection_ttl_;
++
++    mutable std::mutex mutex_;
++    std::unordered_map<std::string, std::shared_ptr<Entry>> map_;
++    // LRU: front = MRU, back = LRU candidate.
++    std::list<std::shared_ptr<Entry>> lru_;
++    size_t total_size_bytes_ = 0;
++};
++
++
++// Key the same resolved options used to execute the search. Transport encoding
++// and graph-loading strategy do not change the result and are excluded.
++std::string make_search_cache_key(const SearchRequest &request,
++                                  const std::string &graph_identity);
++
++} // namespace cli
++} // namespace mtg
++
++#endif // __SERVER_CACHE_HPP__
+diff --git a/metagraph/src/cli/server_request.cpp b/metagraph/src/cli/server_request.cpp
+new file mode 100644
+index 0000000000..db00719520
+--- /dev/null
++++ b/metagraph/src/cli/server_request.cpp
+@@ -0,0 +1,51 @@
++#include "server_request.hpp"
++
++#include <stdexcept>
++
++
++namespace mtg {
++namespace cli {
++
++SearchRequest parse_search_request(const Json::Value &json, const Config &server_config) {
++    if (json["FASTA"].isNull())
++        throw std::invalid_argument("No input sequences received from client");
++
++    SearchRequest request{json["FASTA"].asString(), server_config,
++                          json.get("align", false).asBool()};
++    auto &config = request.config;
++    config.discovery_fraction
++            = json.get("discovery_fraction", config.discovery_fraction).asDouble();
++    config.alignment_min_exact_match
++            = json.get("min_exact_match", config.alignment_min_exact_match).asDouble();
++    config.alignment_max_nodes_per_seq_char = json.get(
++            "max_num_nodes_per_seq_char", config.alignment_max_nodes_per_seq_char).asDouble();
++
++    if (config.discovery_fraction < 0.0 || config.discovery_fraction > 1.0) {
++        throw std::invalid_argument(
++                "Discovery fraction should be within [0, 1.0]. Instead got "
++                + std::to_string(config.discovery_fraction));
++    }
++    if (config.alignment_min_exact_match < 0.0
++            || config.alignment_min_exact_match > 1.0) {
++        throw std::invalid_argument(
++                "Minimum exact match should be within [0, 1.0]. Instead got "
++                + std::to_string(config.alignment_min_exact_match));
++    }
++
++    config.num_top_labels = json.get("top_labels", config.num_top_labels).asInt();
++    if (json.get("query_coords", false).asBool()) {
++        config.query_mode = COORDS;
++    } else if (json.get("query_counts", false).asBool()) {
++        config.query_mode = COUNTS;
++    } else if (json.get("with_signature", false).asBool()) {
++        config.query_mode = SIGNATURE;
++    } else if (json.get("abundance_sum", false).asBool()) {
++        config.query_mode = COUNTS_SUM;
++    } else {
++        config.query_mode = MATCHES;
++    }
++    return request;
++}
++
++} // namespace cli
++} // namespace mtg
+diff --git a/metagraph/src/cli/server_request.hpp b/metagraph/src/cli/server_request.hpp
+new file mode 100644
+index 0000000000..243555e062
+--- /dev/null
++++ b/metagraph/src/cli/server_request.hpp
+@@ -0,0 +1,24 @@
++#ifndef __SERVER_REQUEST_HPP__
++#define __SERVER_REQUEST_HPP__
++
++#include <json/json.h>
++
++#include "config/config.hpp"
++
++
++namespace mtg {
++namespace cli {
++
++// Resolve request overrides once for both query execution and cache identity.
++struct SearchRequest {
++    std::string fasta;
++    Config config;
++    bool align;
++};
++
++SearchRequest parse_search_request(const Json::Value &json, const Config &server_config);
++
++} // namespace cli
++} // namespace mtg
++
++#endif // __SERVER_REQUEST_HPP__
+diff --git a/metagraph/src/cli/server_utils.cpp b/metagraph/src/cli/server_utils.cpp
+index acedb591c2..62f7e9cd55 100644
+--- a/metagraph/src/cli/server_utils.cpp
++++ b/metagraph/src/cli/server_utils.cpp
+@@ -84,20 +84,21 @@ std::string json_str_with_error_msg(const std::string &msg) {
+ void process_request(std::shared_ptr<HttpServer::Response> &response,
+                      const std::shared_ptr<HttpServer::Request> &request,
+                      size_t request_id,
+-                     const std::function<Json::Value(const std::string &)> &process) {
++                     const std::function<std::string(const std::string &)> &process,
++                     std::function<void(const SimpleWeb::error_code &)> on_sent) {
+     logger->info("[Server] {} request {} from {}", request->path, request_id,
+                  request->remote_endpoint().address().to_string());
+     Timer timer;
+-    // Retrieve string:
+     std::string content = request->content.string();
+     SimpleWeb::CaseInsensitiveMultimap header({ { "Content-Type", "application/json" } });
+     SimpleWeb::StatusCode status;
+     std::string ret;
+ 
+     try {
+-        // Return JSON string
+         status = SimpleWeb::StatusCode::success_ok;
+-        ret = Json::writeString(Json::StreamWriterBuilder(), process(content));
++        // process() is expected to return the response body already
++        // serialized as JSON (a std::string).
++        ret = process(content);
+         if (is_compression_requested(request)) {
+             ret = compress_string(ret);
+             header.insert(std::make_pair("Content-Encoding", "deflate"));
+@@ -119,10 +120,12 @@ void process_request(std::shared_ptr<HttpServer::Response> &response,
+     }
+     double processing_time = timer.elapsed();
+     response->write(status, ret, header);
++    response->send(std::move(on_sent));
+     logger->info("[Server] Request {} processing time: {:.3f} sec, response size: {:.1f} KB, "
+                  "finished in {:.3f} sec",
+                  request_id, processing_time, (double)ret.size() / 1000, timer.elapsed());
+ }
+ 
++
+ } // namespace cli
+ } // namespace mtg
+diff --git a/metagraph/src/cli/server_utils.hpp b/metagraph/src/cli/server_utils.hpp
+index 5cfce14bf5..07394f7bfa 100644
+--- a/metagraph/src/cli/server_utils.hpp
++++ b/metagraph/src/cli/server_utils.hpp
+@@ -9,10 +9,17 @@ namespace cli {
+ 
+ using HttpServer = SimpleWeb::Server<SimpleWeb::HTTP>;
+ 
++/**
++ * Run a handler returning serialized JSON, then write the response.
++ * on_sent receives the socket write's error code; success does not confirm
++ * receipt by the client application. /search uses failures to prioritize
++ * retaining results for retries.
++ */
+ void process_request(std::shared_ptr<HttpServer::Response> &response,
+                      const std::shared_ptr<HttpServer::Request> &request,
+                      size_t request_id,
+-                     const std::function<Json::Value(const std::string &)> &process);
++                     const std::function<std::string(const std::string &)> &process,
++                     std::function<void(const SimpleWeb::error_code &)> on_sent = nullptr);
+ 
+ class CurrentlyInitializingError : public std::runtime_error {
+   public:
+diff --git a/metagraph/tests/cli/test_server_cache.cpp b/metagraph/tests/cli/test_server_cache.cpp
+new file mode 100644
+index 0000000000..f6971ae811
+--- /dev/null
++++ b/metagraph/tests/cli/test_server_cache.cpp
+@@ -0,0 +1,665 @@
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <future>
++#include <locale>
++#include <thread>
++
++#include "gtest/gtest.h"
++
++#include "cli/server_cache.hpp"
++#include "cli/server_request.hpp"
++#include "cli/config/config.hpp"
++
++
++namespace mtg {
++namespace cli {
++
++// Set up expired windows without sleeps or a clock hook in the production path.
++class ServerQueryCacheTestAccess {
++  public:
++    static void expire(ServerQueryCache &cache, const std::string &key) {
++        std::lock_guard<std::mutex> lock(cache.mutex_);
++        cache.map_.at(key)->ready_at = std::chrono::steady_clock::now()
++                                      - cache.protection_ttl_ - std::chrono::hours(1);
++    }
++};
++
++} // namespace cli
++} // namespace mtg
++
++
++namespace {
++
++using namespace mtg::cli;
++using namespace std::chrono_literals;
++
++// Build a placeholder response string of the requested size in KiB. The
++// cache value is the serialized JSON body — for the eviction-policy
++// tests we only care about its size, so the contents are arbitrary.
++std::string response_of_kib(size_t kib) {
++    return std::string(kib * 1024, '\0');
++}
++
++
++TEST(ServerQueryCache, MissThenHit) {
++    ServerQueryCache cache(1ull << 20);
++    auto h1 = cache.acquire("k1");
++    ASSERT_TRUE(h1.is_miss());
++    h1.set_result(response_of_kib(100));
++    auto val1 = h1.get();
++    ASSERT_NE(val1, nullptr);
++
++    auto h2 = cache.acquire("k1");
++    EXPECT_FALSE(h2.is_miss());
++    auto val2 = h2.get();
++    EXPECT_EQ(val1.get(), val2.get());  // both handles share the same response object
++}
++
++
++TEST(ServerQueryCache, ConcurrentDeduplication) {
++    ServerQueryCache cache(1ull << 20);
++
++    // Producer thread acquires first, holds the handle, then publishes.
++    std::atomic<int> compute_count = 0;
++    std::promise<void> waiter_can_start;
++    std::promise<void> waiter_attached;
++    auto producer = std::thread([&]() {
++        auto h = cache.acquire("dedup");
++        EXPECT_TRUE(h.is_miss());
++        compute_count.fetch_add(1);
++        // Let the waiter run while we're still computing.
++        waiter_can_start.set_value();
++        waiter_attached.get_future().wait();
++        h.set_result(response_of_kib(42));
++        h.get();  // ensure the future is observed before destruction
++    });
++
++    waiter_can_start.get_future().wait();
++    auto h = cache.acquire("dedup");
++    // Second arrival must NOT be a miss — first computation owns the slot.
++    EXPECT_FALSE(h.is_miss());
++    waiter_attached.set_value();
++    auto val = h.get();  // blocks until producer publishes
++    EXPECT_EQ(val->size(), 42 * 1024u);
++    producer.join();
++
++    // Single computation despite two acquires.
++    EXPECT_EQ(compute_count.load(), 1);
++}
++
++
++TEST(ServerQueryCache, EvictionUnderSizePressure) {
++    ServerQueryCache cache(/* max */ 104 * 1024);
++
++    {
++        auto h1 = cache.acquire("a");
++        h1.set_result(response_of_kib(60));
++    }
++    {
++        auto h2 = cache.acquire("b");
++        h2.set_result(response_of_kib(60));
++    }
++    // The budget fits one 60 KiB result plus metadata, but not two.
++    EXPECT_FALSE(cache.contains("a"));
++    EXPECT_TRUE(cache.contains("b"));
++    EXPECT_LE(cache.size_bytes(), 104 * 1024u);
++}
++
++
++TEST(ServerQueryCache, NeverEvictsEntryWithWaiters) {
++    ServerQueryCache cache(/* max */ 104 * 1024);
++
++    // "a" has a live waiter — should never be evicted even under pressure.
++    auto h_a = cache.acquire("a");
++    h_a.set_result(response_of_kib(60));
++
++    // Insert "b" and let it become evictable (waiters drop to 0).
++    {
++        auto h_b = cache.acquire("b");
++        h_b.set_result(response_of_kib(60));
++    }
++    // The held entry survives pressure; waiterless entries are evicted.
++    {
++        auto h_c = cache.acquire("c");
++        h_c.set_result(response_of_kib(60));
++    }
++    EXPECT_TRUE(cache.contains("a"));
++    EXPECT_FALSE(cache.contains("b"));
++}
++
++
++TEST(ServerQueryCache, ProtectedWithinWindowPreservedOverDelivered) {
++    // Pass 1 should evict the DELIVERED entry before touching the
++    // PROTECTED entry that's still inside its retention window.
++    ServerQueryCache cache(/* max */ 104 * 1024, /* protection_ttl */ 1h);
++
++    {
++        auto h_failed = cache.acquire("failed");
++        h_failed.set_result(response_of_kib(60));
++        h_failed.mark_protected();
++    }
++    {
++        auto h_ok = cache.acquire("ok");
++        h_ok.set_result(response_of_kib(40));
++        h_ok.mark_delivered();
++    }
++    // Both fit with metadata. A third result forces eviction.
++    {
++        auto h_extra = cache.acquire("extra");
++        h_extra.set_result(response_of_kib(40));  // exceeds the budget with three results
++        h_extra.mark_delivered();
++    }
++    EXPECT_TRUE(cache.contains("failed"));   // protected
++    EXPECT_FALSE(cache.contains("ok"));      // sacrificed first
++    EXPECT_TRUE(cache.contains("extra"));
++}
++
++
++TEST(ServerQueryCache, ProtectedEntriesEvictedUnderHeavyPressure) {
++    // When all waiterless entries are PROTECTED-within-window and the cache is
++    // overfull, pass 2 must still evict — otherwise the cache grows without
++    // bound.
++    ServerQueryCache cache(/* max */ 104 * 1024, /* protection_ttl */ 1h);
++
++    auto store_failed = [&](const std::string &key, size_t bytes) {
++        auto h = cache.acquire(key);
++        h.set_result(response_of_kib(bytes));
++        h.mark_protected();
++    };
++
++    store_failed("f1", 60);
++    store_failed("f2", 60);  // two results exceed the budget
++    // f1 was protected during f2's set_result (f2 had waiters); f1 is now
++    // the only waiterless entry, and pass 2 lets us evict it despite TTL.
++    EXPECT_FALSE(cache.contains("f1"));
++    EXPECT_TRUE(cache.contains("f2"));
++    EXPECT_LE(cache.size_bytes(), 104 * 1024u);
++}
++
++
++TEST(ServerQueryCache, ProtectedPastWindowGraduatesToMainCache) {
++    ServerQueryCache cache(104 * 1024, 1h);
++    {
++        auto h = cache.acquire("aged");
++        h.set_result(response_of_kib(40));
++        h.mark_protected();
++    }
++    {
++        auto h = cache.acquire("delivered");
++        h.set_result(response_of_kib(40));
++        h.mark_delivered();
++    }
++    ServerQueryCacheTestAccess::expire(cache, "aged");
++    EXPECT_TRUE(cache.contains("aged"));
++    {
++        auto h = cache.acquire("new");
++        h.set_result(response_of_kib(40));
++    }
++    // Without expiration, the newer delivered entry would be evicted instead.
++    EXPECT_FALSE(cache.contains("aged"));
++    EXPECT_TRUE(cache.contains("delivered"));
++    EXPECT_TRUE(cache.contains("new"));
++}
++
++TEST(ServerQueryCache, ProtectedHitRefreshesPriorityWindow) {
++    ServerQueryCache cache(104 * 1024, 1h);
++    {
++        auto h = cache.acquire("retried");
++        h.set_result(response_of_kib(40));
++        h.mark_protected();
++    }
++    {
++        auto h = cache.acquire("filler");
++        h.set_result(response_of_kib(40));
++        h.mark_delivered();
++    }
++    ServerQueryCacheTestAccess::expire(cache, "retried");
++    {
++        auto h = cache.acquire("retried");
++        ASSERT_FALSE(h.is_miss());
++        h.get();
++    }
++    // Make retried the LRU entry again, so recency alone cannot save it.
++    { auto h = cache.acquire("filler"); }
++    {
++        auto h = cache.acquire("intruder");
++        h.set_result(response_of_kib(40));
++    }
++    EXPECT_TRUE(cache.contains("retried"));
++    EXPECT_FALSE(cache.contains("filler"));
++    EXPECT_TRUE(cache.contains("intruder"));
++}
++
++
++TEST(ServerQueryCache, ProtectedWithinWindowIsKept) {
++    ServerQueryCache cache(/* max */ 1ull << 20, /* protection_ttl */ 1h);
++
++    {
++        auto h = cache.acquire("kept");
++        h.set_result(response_of_kib(10));
++        h.mark_protected();
++    }
++    EXPECT_TRUE(cache.contains("kept"));
++    auto h = cache.acquire("kept");
++    EXPECT_FALSE(h.is_miss());
++    EXPECT_EQ(h.get()->size(), 10 * 1024u);
++}
++
++
++TEST(ServerQueryCache, DeliveredIsSinkStateAgainstLaterFailure) {
++    ServerQueryCache cache(/* max */ 104 * 1024, /* protection_ttl */ 1h);
++    {
++        auto h = cache.acquire("protected");
++        h.set_result(response_of_kib(40));
++        h.mark_protected();
++    }
++    {
++        auto h = cache.acquire("delivered");
++        h.set_result(response_of_kib(40));
++        h.mark_delivered();
++        h.mark_protected();  // must not downgrade DELIVERED
++    }
++    {
++        auto h = cache.acquire("other");
++        h.set_result(response_of_kib(40));
++        h.mark_delivered();
++    }
++    // A downgrade would make pass 2 evict the older protected entry instead.
++    EXPECT_TRUE(cache.contains("protected"));
++    EXPECT_FALSE(cache.contains("delivered"));
++    EXPECT_TRUE(cache.contains("other"));
++}
++
++TEST(ServerQueryCache, EvictsMultipleEntriesPastPinnedAndProtectedEntries) {
++    ServerQueryCache cache(/* max */ 104 * 1024, /* protection_ttl */ 1h);
++    auto pinned = cache.acquire("pinned");
++    pinned.set_result(response_of_kib(16));
++    {
++        auto h = cache.acquire("protected");
++        h.set_result(response_of_kib(20));
++        h.mark_protected();
++    }
++    for (const char *key : {"a", "b", "c"}) {
++        auto h = cache.acquire(key);
++        h.set_result(response_of_kib(20));
++        h.mark_delivered();
++    }
++    {
++        auto h = cache.acquire("large");
++        h.set_result(response_of_kib(60));
++    }
++    EXPECT_TRUE(cache.contains("pinned"));
++    EXPECT_TRUE(cache.contains("protected"));
++    EXPECT_TRUE(cache.contains("large"));
++    for (const char *key : {"a", "b", "c"})
++        EXPECT_FALSE(cache.contains(key));
++    EXPECT_LE(cache.size_bytes(), 104 * 1024u);
++}
++
++
++TEST(ServerQueryCache, OversizedResponsePreservesCachedResultsAndWaiters) {
++    ServerQueryCache cache(64 * 1024);
++    {
++        auto h = cache.acquire("small");
++        ASSERT_TRUE(h.set_result(response_of_kib(20)));
++    }
++    auto producer = cache.acquire("large");
++    auto waiter = cache.acquire("large");
++    ASSERT_FALSE(waiter.is_miss());
++    EXPECT_FALSE(producer.set_result(response_of_kib(128)));
++    EXPECT_EQ(producer.get(), waiter.get());
++    EXPECT_EQ(waiter.get()->size(), 128 * 1024u);
++    EXPECT_FALSE(cache.contains("large"));
++    EXPECT_TRUE(cache.contains("small"));
++    EXPECT_LE(cache.size_bytes(), 64 * 1024u);
++    producer = ServerQueryCache::Handle();
++    waiter = ServerQueryCache::Handle();
++    EXPECT_TRUE(cache.contains("small"));
++}
++
++
++TEST(ServerQueryCache, DeliveredEntryStaysUntilSizePressure) {
++    ServerQueryCache cache(/* max */ 1ull << 20, /* protection_ttl */ 1ms);
++
++    {
++        auto h = cache.acquire("ok");
++        h.set_result(response_of_kib(10));
++        h.mark_delivered();
++    }
++    std::this_thread::sleep_for(20ms);
++    // Even though the protection TTL has elapsed, DELIVERED entries are
++    // immune — only LRU pressure can evict them.
++    auto h = cache.acquire("ok");
++    EXPECT_FALSE(h.is_miss());
++}
++
++
++TEST(ServerQueryCache, DisabledCacheRecomputesEveryTime) {
++    ServerQueryCache cache(/* max */ 0);
++
++    auto h1 = cache.acquire("x");
++    EXPECT_TRUE(h1.is_miss());
++    h1.set_result(response_of_kib(10));
++
++    // Disabled cache: nothing is retained, second acquire is also a miss.
++    auto h2 = cache.acquire("x");
++    EXPECT_TRUE(h2.is_miss());
++    EXPECT_EQ(cache.entry_count(), 0u);
++    EXPECT_FALSE(cache.contains("x"));
++}
++
++
++TEST(ServerQueryCache, ProducerExceptionPropagatesToWaiters) {
++    ServerQueryCache cache(1ull << 20);
++
++    std::promise<void> waiter_ready;
++    std::promise<void> waiter_attached;
++    auto producer = std::thread([&]() {
++        auto h = cache.acquire("boom");
++        EXPECT_TRUE(h.is_miss());
++        waiter_ready.set_value();
++        waiter_attached.get_future().wait();
++        h.set_exception(std::make_exception_ptr(std::runtime_error("kaboom")));
++    });
++
++    waiter_ready.get_future().wait();
++    auto h = cache.acquire("boom");
++    EXPECT_FALSE(h.is_miss());
++    waiter_attached.set_value();
++    EXPECT_THROW(h.get(), std::runtime_error);
++    producer.join();
++}
++
++
++TEST(ServerQueryCache, AbandonedProducerUnblocksWaiters) {
++    ServerQueryCache cache(1ull << 20);
++
++    std::promise<void> waiter_ready;
++    std::promise<void> waiter_attached;
++    auto producer = std::thread([&]() {
++        auto h = cache.acquire("orphan");
++        EXPECT_TRUE(h.is_miss());
++        waiter_ready.set_value();
++        waiter_attached.get_future().wait();
++        // Drop the handle without ever calling set_result — destructor must
++        // satisfy the promise with an exception so waiters don't hang.
++    });
++
++    waiter_ready.get_future().wait();
++    auto h = cache.acquire("orphan");
++    EXPECT_FALSE(h.is_miss());
++    waiter_attached.set_value();
++    EXPECT_THROW(h.get(), std::runtime_error);
++    producer.join();
++}
++
++TEST(ServerQueryCache, FailedComputationCanBeRetriedWhileWaitersRemain) {
++    ServerQueryCache cache(1024);
++    auto producer = cache.acquire("retry");
++    auto waiter = cache.acquire("retry");
++    producer.set_exception(std::make_exception_ptr(std::runtime_error("temporary")));
++
++    EXPECT_THROW(producer.get(), std::runtime_error);
++    EXPECT_THROW(waiter.get(), std::runtime_error);
++    EXPECT_FALSE(cache.contains("retry"));
++
++    auto retry = cache.acquire("retry");
++    ASSERT_TRUE(retry.is_miss());
++    retry.set_result("success");
++    // Late callbacks and destruction from the failed attempt must not affect
++    // the new entry with the same key.
++    waiter.mark_protected();
++    producer.mark_delivered();
++    waiter = ServerQueryCache::Handle();
++    producer = ServerQueryCache::Handle();
++    auto hit = cache.acquire("retry");
++    EXPECT_FALSE(hit.is_miss());
++    EXPECT_EQ(*hit.get(), "success");
++    EXPECT_EQ(cache.entry_count(), 1u);
++    EXPECT_GT(cache.size_bytes(), 7u);
++}
++
++TEST(ServerQueryCache, AbandonedProducerCanBeRetried) {
++    ServerQueryCache cache(1024);
++    ServerQueryCache::Handle waiter;
++    {
++        auto producer = cache.acquire("orphan");
++        waiter = cache.acquire("orphan");
++    }
++    EXPECT_THROW(waiter.get(), std::runtime_error);
++    auto retry = cache.acquire("orphan");
++    ASSERT_TRUE(retry.is_miss());
++    retry.set_result("success");
++    EXPECT_EQ(*retry.get(), "success");
++}
++
++TEST(ServerQueryCache, MoveAssignmentAbandonsPreviousComputation) {
++    ServerQueryCache cache(1024);
++    auto producer = cache.acquire("old");
++    auto waiter = cache.acquire("old");
++    auto replacement = cache.acquire("new");
++    replacement.set_result("new result");
++
++    producer = std::move(replacement);
++    EXPECT_THROW(waiter.get(), std::runtime_error);
++    EXPECT_EQ(*producer.get(), "new result");
++    auto retry = cache.acquire("old");
++    ASSERT_TRUE(retry.is_miss());
++    retry.set_result("retried");
++    EXPECT_EQ(cache.entry_count(), 2u);
++}
++
++TEST(ServerQueryCache, FailedComputationsDoNotAccumulate) {
++    for (size_t budget : {0u, 1024u}) {
++        ServerQueryCache cache(budget);
++        for (size_t i = 0; i < 100; ++i) {
++            auto h = cache.acquire(std::to_string(i));
++            h.set_exception(std::make_exception_ptr(std::runtime_error("temporary")));
++            EXPECT_EQ(cache.entry_count(), 0u);
++            EXPECT_EQ(cache.size_bytes(), 0u);
++        }
++    }
++}
++
++TEST(ServerQueryCache, CacheKeyPreservesFloatingPointParameters) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value request;
++    request["FASTA"] = ">query\nACGTACGT\n";
++    for (const char *parameter : {"discovery_fraction", "min_exact_match",
++                                  "max_num_nodes_per_seq_char"}) {
++        SCOPED_TRACE(parameter);
++        auto first = request, second = request;
++        first[parameter] = 0.12345641;
++        second[parameter] = std::nextafter(0.12345641, 1.0);
++        EXPECT_NE(make_search_cache_key(parse_search_request(first, config), "graph"),
++                  make_search_cache_key(parse_search_request(second, config), "graph"));
++    }
++}
++
++TEST(ServerQueryCache, CacheKeyDoesNotDependOnLocale) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value request;
++    request["FASTA"] = ">query\nACGTACGT\n";
++    request["discovery_fraction"] = 0.25;
++    auto key = make_search_cache_key(parse_search_request(request, config), "graph");
++    struct CommaDecimal : std::numpunct<char> {
++        char do_decimal_point() const override { return ','; }
++    };
++    struct RestoreLocale {
++        std::locale previous = std::locale();
++        ~RestoreLocale() { std::locale::global(previous); }
++    } restore;
++    std::locale::global(std::locale(std::locale::classic(), new CommaDecimal));
++    EXPECT_EQ(make_search_cache_key(parse_search_request(request, config), "graph"), key);
++}
++
++TEST(ServerSearchRequest, ResolvesDefaultsAndOverridesWithoutChangingServerConfig) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    config.discovery_fraction = 0.25;
++    config.alignment_min_exact_match = 0.5;
++    config.alignment_max_nodes_per_seq_char = 3.0;
++    config.num_top_labels = 7;
++    config.query_mode = COORDS;  // HTTP mode defaults to MATCHES, independently of CLI mode.
++    config.tmp_dir = "/tmp/request-test";
++    Json::Value json;
++    json["FASTA"] = ">q\nACGT\n";
++    auto defaults = parse_search_request(json, config);
++    EXPECT_EQ(defaults.fasta, json["FASTA"].asString());
++    EXPECT_DOUBLE_EQ(defaults.config.discovery_fraction, 0.25);
++    EXPECT_DOUBLE_EQ(defaults.config.alignment_min_exact_match, 0.5);
++    EXPECT_DOUBLE_EQ(defaults.config.alignment_max_nodes_per_seq_char, 3.0);
++    EXPECT_EQ(defaults.config.num_top_labels, 7u);
++    EXPECT_EQ(defaults.config.query_mode, MATCHES);
++    EXPECT_EQ(defaults.config.tmp_dir, config.tmp_dir);
++    EXPECT_FALSE(defaults.align);
++
++    json["discovery_fraction"] = 0.75;
++    json["min_exact_match"] = 0.125;
++    json["max_num_nodes_per_seq_char"] = 9.0;
++    json["top_labels"] = 2;
++    json["align"] = true;
++    auto overrides = parse_search_request(json, config);
++    EXPECT_DOUBLE_EQ(overrides.config.discovery_fraction, 0.75);
++    EXPECT_DOUBLE_EQ(overrides.config.alignment_min_exact_match, 0.125);
++    EXPECT_DOUBLE_EQ(overrides.config.alignment_max_nodes_per_seq_char, 9.0);
++    EXPECT_EQ(overrides.config.num_top_labels, 2u);
++    EXPECT_TRUE(overrides.align);
++    EXPECT_DOUBLE_EQ(config.discovery_fraction, 0.25);
++    EXPECT_EQ(config.num_top_labels, 7u);
++    EXPECT_EQ(config.query_mode, COORDS);
++}
++
++TEST(ServerSearchRequest, ModePrecedenceAndIgnoredFlagsShareCacheIdentity) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value json;
++    json["FASTA"] = ">q\nACGT\n";
++    const char *flags[] = {"query_coords", "query_counts", "with_signature", "abundance_sum"};
++    const QueryMode modes[] = {COORDS, COUNTS, SIGNATURE, COUNTS_SUM};
++    for (size_t i = 0; i < 4; ++i) {
++        auto one = json, several = json;
++        one[flags[i]] = true;
++        for (size_t j = i; j < 4; ++j)
++            several[flags[j]] = true;
++        auto request = parse_search_request(several, config);
++        EXPECT_EQ(request.config.query_mode, modes[i]);
++        EXPECT_EQ(make_search_cache_key(request, "graph"),
++                  make_search_cache_key(parse_search_request(one, config), "graph"));
++        EXPECT_NE(make_search_cache_key(request, "graph"),
++                  make_search_cache_key(parse_search_request(json, config), "graph"));
++    }
++}
++
++TEST(ServerSearchRequest, EffectiveDefaultsAndTransportFieldsShareCacheIdentity) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value json;
++    json["FASTA"] = ">q\nACGT\n";
++    const auto key = make_search_cache_key(parse_search_request(json, config), "graph");
++    json["discovery_fraction"] = config.discovery_fraction;
++    json["min_exact_match"] = config.alignment_min_exact_match;
++    json["max_num_nodes_per_seq_char"] = config.alignment_max_nodes_per_seq_char;
++    json["top_labels"] = Json::UInt64(config.num_top_labels);
++    json["align"] = false;
++    json["in_ram"] = true;
++    EXPECT_EQ(make_search_cache_key(parse_search_request(json, config), "graph"), key);
++    json["align"] = true;
++    EXPECT_NE(make_search_cache_key(parse_search_request(json, config), "graph"), key);
++    json["align"] = false;
++    json["top_labels"] = 1;
++    EXPECT_NE(make_search_cache_key(parse_search_request(json, config), "graph"), key);
++}
++
++TEST(ServerSearchRequest, RejectsInvalidOptionsBeforeCacheLookup) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value json;
++    EXPECT_THROW(parse_search_request(json, config), std::invalid_argument);
++    json["FASTA"] = ">q\nACGT\n";
++    for (const char *field : {"discovery_fraction", "min_exact_match"}) {
++        for (double value : {-0.1, 1.1}) {
++            auto invalid = json;
++            invalid[field] = value;
++            EXPECT_THROW(parse_search_request(invalid, config), std::invalid_argument);
++        }
++    }
++    for (const char *field : {"top_labels", "max_num_nodes_per_seq_char", "align"}) {
++        auto invalid = json;
++        invalid[field] = Json::Value(Json::arrayValue);
++        EXPECT_THROW(parse_search_request(invalid, config), std::exception);
++    }
++}
++
++
++TEST(ServerQueryCache, EmptyResultsConsumeBudget) {
++    ServerQueryCache cache(4096);
++    for (size_t i = 0; i < 1000; ++i) {
++        auto h = cache.acquire(std::to_string(i));
++        h.set_result("");
++    }
++    EXPECT_GT(cache.size_bytes(), 0u);
++    EXPECT_LE(cache.size_bytes(), 4096u);
++    EXPECT_LT(cache.entry_count(), 128u);
++}
++
++TEST(ServerQueryCache, LargeKeysConsumeBudget) {
++    ServerQueryCache cache(4096);
++    {
++        auto h = cache.acquire(std::string(4096, 'A'));
++        h.set_result("small");
++        EXPECT_EQ(cache.size_bytes(), 0u);  // too large to retain
++        EXPECT_EQ(*h.get(), "small");
++    }
++    EXPECT_EQ(cache.entry_count(), 0u);
++    EXPECT_EQ(cache.size_bytes(), 0u);
++}
++
++TEST(ServerQueryCache, DistinctFastaHeadersDoNotShareResults) {
++    char program[] = "metagraph", command[] = "server_query", input[] = "fixture.csv";
++    char *argv[] = {program, command, input};
++    Config config(3, argv);
++    Json::Value first, second;
++    // Equal-length headers that collide under 64-bit libstdc++ std::hash.
++    first["FASTA"] = ">aaaaaaabbbbbbbb\nACGTACGT\n";
++    second["FASTA"] = ">y23O=^QD5fntS2F\nACGTACGT\n";
++    EXPECT_NE(make_search_cache_key(parse_search_request(first, config), "graph"),
++              make_search_cache_key(parse_search_request(second, config), "graph"));
++}
++
++#ifndef _NO_DEATH_TEST
++TEST(ServerCacheConfig, RejectsInvalidSizes) {
++    for (const char *value : {"-1", "nan", "inf", "1e309", "1e20", "1GB", "bad"}) {
++        SCOPED_TRACE(value);
++        char program[] = "metagraph", command[] = "server_query";
++        char option[] = "--cache-size", input[] = "fixture.csv";
++        char *argv[] = {program, command, option, const_cast<char *>(value), input};
++        EXPECT_EXIT({
++            Config config(5, argv);
++            exit(0);
++        }, ::testing::ExitedWithCode(1), "--cache-size must be");
++    }
++}
++#endif
++
++TEST(ServerCacheConfig, AcceptsZeroAndFractionalSizes) {
++    for (const char *value : {"0", "0.5", "1"}) {
++        char program[] = "metagraph", command[] = "server_query";
++        char option[] = "--cache-size", input[] = "fixture.csv";
++        char *argv[] = {program, command, option, const_cast<char *>(value), input};
++        Config config(5, argv);
++        EXPECT_DOUBLE_EQ(config.server_cache_size, std::stod(value));
++    }
++}
++
++
++} // namespace

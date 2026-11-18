@@ -1,0 +1,433 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index d7fd3db6..9e025c7b 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -9,6 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ * {func}`ep.tl.kaplan_meier <ehrapy.tools.kaplan_meier>` estimates the cumulative incidence of an `event_of_interest` with the Aalen-Johansen estimator when the event column holds competing events, {func}`ep.tl.nelson_aalen <ehrapy.tools.nelson_aalen>` its cause-specific cumulative hazard, and {func}`ep.pl.kaplan_meier <ehrapy.plot.kaplan_meier>` plots the cumulative incidence ([#1155](https://github.com/theislab/ehrapy/pull/1155)) @Zethson
+ 
+   Without `event_of_interest`, the univariate survival models raise an error for event columns with more than one event type instead of silently treating every event type as the same event.
++* {func}`ep.pp.pca <ehrapy.preprocessing.pca>` and {func}`ep.tl.famd <ehrapy.tools.famd>` run on longitudinal data by unfolding every variable and timepoint into a feature, store loadings per variable and timepoint in `varm`, and {func}`ep.pp.neighbors <ehrapy.preprocessing.neighbors>` uses the resulting `X_pca` for longitudinal `.X` ([#1158](https://github.com/theislab/ehrapy/pull/1158)) @Zethson
+ * Models of time series in `ep.ml` measure the time since the last observation with the times of the timepoints in `edata.tem[time_key]`, a new argument of {func}`ep.ml.fit <ehrapy.ml.fit>`, instead of counting timepoints, so that irregular timepoints are spaced correctly ([#1151](https://github.com/theislab/ehrapy/pull/1151)) @Zethson
+ * {class}`ep.ml.Task <ehrapy.ml.Task>` with `rolling=True` predicts a longitudinal variable, such as the hourly sepsis label of PhysioNet 2019, at every timepoint from the timepoints before it, and every function of `ep.ml` fits, stores, evaluates, calibrates and explains these predictions per timepoint while keeping patients together ([#1152](https://github.com/theislab/ehrapy/pull/1152)) @Zethson
+ 
+diff --git a/ehrapy/_compat.py b/ehrapy/_compat.py
+index e11d63b2..c7be0e7e 100644
+--- a/ehrapy/_compat.py
++++ b/ehrapy/_compat.py
+@@ -116,6 +116,13 @@ def _var_axes(X: Array | CSBase) -> tuple[int, ...]:
+     return (1,) if X.ndim == 2 else (1, 2)
+ 
+ 
++def _unfold_time(X: Array) -> Array:
++    """Unfold `(n_obs, n_vars, n_timepoints)` data into `(n_obs, n_vars * n_timepoints)`, keeping the timepoints of every variable next to each other."""
++    if isinstance(X, DaskArray):
++        X = X.rechunk(dict.fromkeys(_var_axes(X), -1))
++    return X.reshape(X.shape[0], -1)
++
++
+ def _broadcast_var_stat(stat, X):
+     """Reshape a per-variable statistic of shape `(n_vars,)` or per-row statistics `(n_obs, n_vars)` to broadcast against `X`."""
+     xp = array_namespace(stat)
+diff --git a/ehrapy/preprocessing/_neighbors.py b/ehrapy/preprocessing/_neighbors.py
+index b10c060f..bea6472e 100644
+--- a/ehrapy/preprocessing/_neighbors.py
++++ b/ehrapy/preprocessing/_neighbors.py
+@@ -69,6 +69,7 @@ def neighbors(
+                  If `None`, the representation is chosen automatically:
+                  For `.n_vars` < 50, `.X` is used, otherwise 'X_pca' is used.
+                  If 'X_pca' is not present, it's computed with default parameters or `n_pcs` if present.
++                 For longitudinal data, `None` uses 'X_pca', which :func:`~ehrapy.preprocessing.pca` computes from all timepoints.
+                  For time series metrics (`metric='dtw'`, `'soft_dtw'`, `'gak'`), `None` uses `.X`, keys for `.layers` are valid as well, and the representation must be a 3D array with shape (n_obs, n_vars, n_timepoints).
+         knn: If `True`, use a hard threshold to restrict the number of neighbors to `n_neighbors`, that is, consider a knn graph.
+              Otherwise, use a Gaussian Kernel to assign low weights to neighbors more distant than the `n_neighbors` nearest neighbor.
+@@ -145,6 +146,8 @@ def neighbors(
+             raise ValueError(f"use_rep must be None when metric is {metric}")
+         edata.obsm[TEMPORARY_TIMESERIES_NEIGHBORS_USE_REP_KEY] = np.arange(edata.shape[0])
+         use_rep = TEMPORARY_TIMESERIES_NEIGHBORS_USE_REP_KEY
++    elif use_rep is None and np.ndim(edata.X) == 3 and "X_pca" in edata.obsm:
++        use_rep = "X_pca"
+     elif use_rep in {None, "X"}:
+         _raise_if_3D(edata.X, "neighbors", "edata.X")
+ 
+diff --git a/ehrapy/preprocessing/_scanpy_pp_api.py b/ehrapy/preprocessing/_scanpy_pp_api.py
+index 6eb37515..a06fc696 100644
+--- a/ehrapy/preprocessing/_scanpy_pp_api.py
++++ b/ehrapy/preprocessing/_scanpy_pp_api.py
+@@ -12,7 +12,7 @@
+ from fast_array_utils.types import DaskArray
+ from numpy.typing import NDArray
+ 
+-from ehrapy._compat import _like_obs, _raise_if_sparse, function_2D_only
++from ehrapy._compat import _like_obs, _raise_if_3D, _raise_if_sparse, _unfold_time, function_2D_only
+ from ehrapy._types import _empty
+ 
+ if TYPE_CHECKING:
+@@ -26,7 +26,6 @@
+     type Array = np.ndarray | DaskArray
+ 
+ 
+-@function_2D_only()
+ def pca(
+     edata: EHRData | np.ndarray | spmatrix,
+     *,
+@@ -48,6 +47,8 @@ def pca(
+ 
+     Computes PCA coordinates, loadings and variance decomposition.
+     Uses the implementation of *scikit-learn*.
++    Longitudinal data is unfolded so that every combination of variable and timepoint is a feature, which is known as unfolded or multiway PCA.
++    PCA requires data without missing values, so impute them first, for example with :func:`~ehrapy.preprocessing.locf_impute`.
+ 
+     Args:
+         edata: Central data object.
+@@ -97,7 +98,7 @@ def pca(
+ 
+         `.obsm['X_pca' | key_added]` : :class:`~scipy.sparse.csr_matrix` | :class:`~scipy.sparse.csc_matrix` | :class:`~numpy.ndarray` (shape `(edata.n_obs, n_comps)`)
+             PCA representation of data.
+-        `.varm['PCs' | key_added]` : :class:`~numpy.ndarray` (shape `(edata.n_vars, n_comps)`)
++        `.varm['PCs' | key_added]` : :class:`~numpy.ndarray` (shape `(edata.n_vars, n_comps)`, or `(edata.n_vars, edata.n_t, n_comps)` for data with several timepoints)
+             The principal components containing the loadings when `obsm=None`.
+         `.uns['pca' | key_added]['components']` : :class:`~numpy.ndarray` (shape `(edata.obsm[obsm].shape[1], n_comps)`)
+             The principal components containing the loadings when `obsm` is passed.
+@@ -113,23 +114,52 @@ def pca(
+         >>> edata = ed.dt.mimic_2(columns_obs_only=["service_unit", "day_icu_intime"])
+         >>> ep.pp.simple_impute(edata, strategy="median")
+         >>> ep.pp.pca(edata)
++
++        Longitudinal data:
++
++        >>> edata = ed.dt.ehrdata_blobs(n_variables=10, n_observations=100, base_timepoints=5)
++        >>> ep.pp.pca(edata, n_comps=10)
++        >>> edata.varm["PCs"].shape
++        (10, 5, 10)
+     """
+-    return sc.pp.pca(
+-        data=edata,
+-        n_comps=n_comps,
+-        layer=layer,
+-        obsm=obsm,
+-        zero_center=zero_center,
+-        svd_solver=svd_solver,
+-        random_state=random_state,
+-        return_info=return_info,
+-        dtype=dtype,
+-        key_added=key_added,
+-        copy=copy,
+-        chunked=chunked,
+-        chunk_size=chunk_size,
+-        **({} if mask_var is _empty else {"mask_var": mask_var}),
+-    )
++    params = {
++        "n_comps": n_comps,
++        "zero_center": zero_center,
++        "svd_solver": svd_solver,
++        "random_state": random_state,
++        "dtype": dtype,
++        "chunked": chunked,
++        "chunk_size": chunk_size,
++    }
++    if not isinstance(edata, EHRData):
++        _raise_if_3D(edata, "pca", "the input")
++    X = (edata.X if layer is None else edata.layers[layer]) if isinstance(edata, EHRData) else None
++    mask_kwargs = {} if mask_var is _empty else {"mask_var": mask_var}
++    if obsm is not None or getattr(X, "ndim", 2) != 3:
++        return sc.pp.pca(
++            data=edata,
++            layer=layer,
++            obsm=obsm,
++            return_info=return_info,
++            key_added=key_added,
++            copy=copy,
++            **params,
++            **mask_kwargs,
++        )
++
++    edata = edata.copy() if copy else edata
++    n_vars, n_timepoints = X.shape[1:]
++    var = edata.var.iloc[np.repeat(np.arange(n_vars), n_timepoints)].reset_index(drop=True)
++    var.index = var.index.astype(str)
++    if not (mask_var is _empty or mask_var is None or isinstance(mask_var, str)):
++        mask_kwargs["mask_var"] = np.repeat(np.asarray(mask_var, dtype=bool), n_timepoints)
++    unfolded = EHRData(X=_unfold_time(X), obs=edata.obs[[]], var=var)
++    unfolded.uns = edata.uns
++    sc.pp.pca(unfolded, key_added=key_added, **params, **mask_kwargs)
++    edata.obsm[key_added or "X_pca"] = unfolded.obsm[key_added or "X_pca"]
++    loadings = unfolded.varm[key_added or "PCs"]
++    edata.varm[key_added or "PCs"] = loadings if n_timepoints == 1 else loadings.reshape(n_vars, n_timepoints, -1)
++    return edata if copy else None
+ 
+ 
+ def _residuals(X: Array, design: np.ndarray, *, keep_constant: bool) -> Array:
+diff --git a/ehrapy/tools/embedding/_embeddings.py b/ehrapy/tools/embedding/_embeddings.py
+index e04ad74a..b4f4d979 100644
+--- a/ehrapy/tools/embedding/_embeddings.py
++++ b/ehrapy/tools/embedding/_embeddings.py
+@@ -13,7 +13,13 @@
+ from scipy.linalg import svd
+ from scipy.sparse import spmatrix  # noqa
+ 
+-from ehrapy._compat import _as_scanpy_input, _materialize, _raise_array_type_not_implemented, function_2D_only
++from ehrapy._compat import (
++    _as_scanpy_input,
++    _materialize,
++    _raise_array_type_not_implemented,
++    _unfold_time,
++    function_2D_only,
++)
+ from ehrapy.core._constants import TEMPORARY_TIMESERIES_NEIGHBORS_USE_REP_KEY
+ from ehrapy.tools import _method_options  # noqa
+ 
+@@ -402,9 +408,11 @@ def famd(
+     It maximizes the sum of squared correlations with quantitative variables and squared correlation ratios with qualitative variables,
+     treating both types equally with each variable's contribution bounded by 1.
+     The method produces factor scores for individuals, correlation circles for quantitative variables, and category centroids for qualitative variables.
++    Longitudinal data is unfolded so that every combination of variable and timepoint is a feature.
++    Missing values of quantitative features are set to their mean.
+ 
+     Args:
+-        edata: Central data object or a 2D array with quantitative and qualitative variables.
++        edata: Central data object or an array with quantitative and qualitative variables.
+         layer: The layer to perform the computation on.
+         n_components: Number of dimensions to retain in the reduced space. Must be less than min(n_obs, n_vars).
+         key_added: Key under which to store the results in `.obsm`, `.varm` and `.uns`. Defaults to 'famd'.
+@@ -430,7 +438,7 @@ def famd(
+         Factor scores of shape `(n_obs, n_components)`.
+ 
+         `{key_added}_loadings` : :class:`numpy.ndarray` (`edata.varm`)
+-        Loadings of the quantitative variables.
++        Loadings of the quantitative variables of shape `(n_vars, n_components)`, or `(n_vars, n_t, n_components)` for data with several timepoints.
+         Rows of qualitative variables are `NaN` because their loadings are per category.
+ 
+         `{key_added}` : `dict` (`edata.uns`)
+@@ -441,8 +449,7 @@ def famd(
+ 
+ 
+ @famd.register(EHRData)
+-@function_2D_only(allow_single_timepoint=True)
+-def _famd_ehrdata(  # named because function_2D_only puts __name__ into its error message
++def _(
+     edata: EHRData,
+     /,
+     *,
+@@ -461,12 +468,13 @@ def _famd_ehrdata(  # named because function_2D_only puts __name__ into its erro
+     factor_scores, loadings, metadata = famd(arr, n_components=n_components, var_names=edata.var_names)
+ 
+     quant_mask = metadata["quant_mask"]
+-    var_loadings = np.full((edata.n_vars, loadings.shape[1]), np.nan)
++    n_timepoints = arr.shape[2] if arr.ndim == 3 else 1
++    var_loadings = np.full((edata.n_vars, n_timepoints, loadings.shape[1]), np.nan)
+     # quantitative features come first in the transformed matrix
+-    var_loadings[quant_mask] = loadings[: quant_mask.sum()]
++    var_loadings[quant_mask] = loadings[: quant_mask.sum() * n_timepoints].reshape(-1, *var_loadings.shape[1:])
+ 
+     edata.obsm[f"X_{key_added}"] = factor_scores
+-    edata.varm[f"{key_added}_loadings"] = var_loadings
++    edata.varm[f"{key_added}_loadings"] = var_loadings[:, 0] if n_timepoints == 1 else var_loadings
+     edata.uns[key_added] = {
+         "params": {
+             "n_components": n_components,
+@@ -493,20 +501,26 @@ def _(
+     arr: np.ndarray, /, *, n_components: int = 2, var_names: Sequence[str] | None = None, **kwargs
+ ) -> tuple[np.ndarray, np.ndarray, dict]:
+     data = arr[:, :, 0] if arr.ndim == 3 and arr.shape[2] == 1 else arr
+-    if data.ndim != 2:
+-        raise ValueError(f"famd() only supports 2D data, got an array with shape {arr.shape}")
++    if data.ndim not in {2, 3}:
++        raise ValueError(f"famd() only supports 2D and 3D data, got an array with shape {arr.shape}")
+ 
+     n_vars = data.shape[1]
++    n_timepoints = data.shape[2] if data.ndim == 3 else 1
+ 
+     if var_names is None:
+         var_names = [f"var_{i}" for i in range(n_vars)]
+ 
+     quant_mask = np.zeros(n_vars, dtype=bool)
+     for i in range(n_vars):
+-        col = pd.Series(data[:, i], name=var_names[i])
++        col = pd.Series(data[:, i].ravel(), name=var_names[i])
+         feature_type, _ = _detect_feature_type(col)
+         quant_mask[i] = feature_type == "numeric"
+ 
++    variable_quant_mask = quant_mask
++    if data.ndim == 3:
++        data = _unfold_time(data)
++        var_names = [f"{name}_t{t}" for name in var_names for t in range(n_timepoints)]
++        quant_mask = np.repeat(quant_mask, n_timepoints)
+     qual_mask = ~quant_mask
+     n_obs = data.shape[0]
+     transformed_cols = []
+@@ -524,7 +538,7 @@ def _(
+ 
+         for idx in quant_indices:
+             feature_names.append(f"{var_names[idx]}")
+-            feature_to_original.append(idx)
++            feature_to_original.append(idx // n_timepoints)
+ 
+     if qual_mask.any():
+         qual_indices = np.where(qual_mask)[0]
+@@ -543,7 +557,7 @@ def _(
+ 
+             for cat in categories.categories:
+                 feature_names.append(f"{var_names[idx]}_{cat}")
+-                feature_to_original.append(idx)
++                feature_to_original.append(idx // n_timepoints)
+ 
+     X_transformed = np.hstack(transformed_cols)
+     X_transformed = np.nan_to_num(X_transformed)
+@@ -557,7 +571,7 @@ def _(
+     metadata = {
+         "variance": S[:n_components] ** 2 / n_obs,
+         "variance_ratio": (S[:n_components] ** 2) / (S**2).sum(),
+-        "quant_mask": quant_mask,
++        "quant_mask": variable_quant_mask,
+         "n_components": n_components,
+         "feature_names": feature_names,
+         "feature_to_original": feature_to_original,
+diff --git a/tests/preprocessing/test_scanpy_pp_api.py b/tests/preprocessing/test_scanpy_pp_api.py
+index b080dfc4..8f5b966e 100644
+--- a/tests/preprocessing/test_scanpy_pp_api.py
++++ b/tests/preprocessing/test_scanpy_pp_api.py
+@@ -6,6 +6,7 @@
+ import scanpy as sc
+ from ehrdata.core.constants import DEFAULT_TEM_LAYER_NAME
+ from fast_array_utils.conv import to_dense
++from sklearn.decomposition import PCA
+ from testing.fast_array_utils import Flags
+ 
+ import ehrapy as ep
+@@ -50,10 +51,80 @@ def test_pca_key_added(edata_blob_small):
+     assert "X_pca" not in edata_blob_small.obsm
+ 
+ 
+-def test_pca_3D_edata(edata_blob_small):
+-    ep.pp.pca(edata_blob_small, layer="layer_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
+-        ep.pp.pca(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME)
++def test_pca_3D_unfolds_timepoints(edata_blob_small):
++    X = edata_blob_small.layers[DEFAULT_TEM_LAYER_NAME]
++    n_obs, n_vars, n_timepoints = X.shape
++    expected = PCA(n_components=5, svd_solver="full").fit(X.reshape(n_obs, -1))
++
++    ep.pp.pca(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME, n_comps=5, svd_solver="full", dtype="float64")
++
++    loadings = edata_blob_small.varm["PCs"]
++    assert loadings.shape == (n_vars, n_timepoints, 5)
++    signs = np.sign(np.sum(loadings.reshape(-1, 5) * expected.components_.T, axis=0))
++    np.testing.assert_allclose(
++        loadings * signs, np.moveaxis(expected.components_.reshape(5, n_vars, n_timepoints), 0, -1)
++    )
++    np.testing.assert_allclose(
++        edata_blob_small.obsm["X_pca"] * signs, expected.transform(X.reshape(n_obs, -1)), atol=1e-10
++    )
++    np.testing.assert_allclose(edata_blob_small.uns["pca"]["variance_ratio"], expected.explained_variance_ratio_)
++
++
++def test_pca_3D_mask_var(edata_blob_small):
++    edata_blob_small.var["highly_variable"] = [True] * 5 + [False] * 5
++
++    ep.pp.pca(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME, n_comps=2, key_added="pca_3D")
++
++    used = np.abs(edata_blob_small.varm["pca_3D"]).sum(axis=2) > 0
++    np.testing.assert_array_equal(used, np.repeat(edata_blob_small.var[["highly_variable"]].to_numpy(), 10, axis=1))
++    assert edata_blob_small.obsm["pca_3D"].shape == (edata_blob_small.n_obs, 2)
++    assert edata_blob_small.uns["pca_3D"]["params"]["mask_var"] == "highly_variable"
++    assert edata_blob_small.uns["pca_3D"]["params"]["use_highly_variable"] is True
++
++    ep.pp.pca(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME, n_comps=2, mask_var=np.arange(10) < 3)
++    used = np.abs(edata_blob_small.varm["PCs"]).sum(axis=2) > 0
++    np.testing.assert_array_equal(used, np.repeat((np.arange(10) < 3)[:, None], 10, axis=1))
++
++
++def test_pca_3D_single_timepoint_and_arrays(edata_blob_small):
++    edata_blob_small.layers["single"] = edata_blob_small.layers[DEFAULT_TEM_LAYER_NAME][:, :, :1]
++
++    ep.pp.pca(edata_blob_small, layer="single", n_comps=2)
++
++    assert edata_blob_small.varm["PCs"].shape == (edata_blob_small.n_vars, 2)
++    with pytest.raises(ValueError, match="only supports 2D data"):
++        ep.pp.pca(edata_blob_small.layers[DEFAULT_TEM_LAYER_NAME])
++
++
++@pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu | Flags.Sparse)
++def test_pca_3D_array_types(array_type, edata_blob_small):
++    X = edata_blob_small.layers[DEFAULT_TEM_LAYER_NAME]
++    expected = ed.EHRData(X=X)
++    ep.pp.pca(expected, n_comps=3)
++    edata = ed.EHRData(X=array_type(X))
++
++    with forbid_dask_compute(allowed=1):
++        ep.pp.pca(edata, n_comps=3)
++
++    assert isinstance(edata.obsm["X_pca"], array_type.cls)
++    np.testing.assert_allclose(
++        np.abs(to_dense(edata.obsm["X_pca"], to_cpu_memory=True)), np.abs(expected.obsm["X_pca"]), atol=1e-4
++    )
++    np.testing.assert_allclose(np.abs(edata.varm["PCs"]), np.abs(expected.varm["PCs"]), atol=1e-4)
++
++
++def test_pca_3D_neighbors_umap_leiden(edata_blob_small):
++    edata = edata_blob_small
++    edata.X = edata.layers[DEFAULT_TEM_LAYER_NAME]
++
++    ep.pp.pca(edata, n_comps=5)
++    ep.pp.neighbors(edata)
++    ep.tl.umap(edata)
++    ep.tl.leiden(edata)
++
++    assert edata.uns["neighbors"]["params"]["use_rep"] == "X_pca"
++    assert edata.obsm["X_umap"].shape == (edata.n_obs, 2)
++    assert edata.obs["leiden"].nunique() > 1
+ 
+ 
+ def test_regress_out(edata_blob_small):
+diff --git a/tests/tools/test_embeddings.py b/tests/tools/test_embeddings.py
+index 94392e70..3c10e926 100644
+--- a/tests/tools/test_embeddings.py
++++ b/tests/tools/test_embeddings.py
+@@ -104,11 +104,42 @@ def test_famd_ehrdata_2d_mixed(mixed_data_array: np.ndarray) -> None:
+     assert loadings.shape == (len(edata.uns["famd"]["feature_names"]), 2)
+ 
+ 
+-def test_famd_3d_raises(edata_blobs_timeseries_small: ed.EHRData) -> None:
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        ep.tl.famd(edata_blobs_timeseries_small, layer=DEFAULT_TEM_LAYER_NAME)
+-    with pytest.raises(ValueError, match="only supports 2D data"):
+-        ep.tl.famd(edata_blobs_timeseries_small.layers[DEFAULT_TEM_LAYER_NAME])
++def test_famd_3d_unfolds_timepoints(rng: np.random.Generator) -> None:
++    X = np.empty((30, 3, 4), dtype=object)
++    X[:, 0] = rng.standard_normal((30, 4))
++    X[:, 1] = rng.choice(["A", "B"], (30, 4))
++    X[:, 2] = rng.standard_normal((30, 4))
++    X[0, 0, 1] = np.nan
++    edata = ed.EHRData(X=X)
++    expected = ed.EHRData(X=X[:, [0, 2, 1]].reshape(30, -1))
++    expected.var_names = [f"{name}_t{t}" for name in ["0", "2", "1"] for t in range(4)]
++
++    ep.tl.famd(edata, n_components=3)
++    ep.tl.famd(expected, n_components=3)
++
++    loadings = edata.varm["famd_loadings"]
++    assert loadings.shape == (3, 4, 3)
++    assert np.isnan(loadings[1]).all()
++    np.testing.assert_allclose(loadings[[0, 2]].reshape(8, 3), expected.varm["famd_loadings"][:8])
++    np.testing.assert_allclose(edata.obsm["X_famd"], expected.obsm["X_famd"])
++    np.testing.assert_array_equal(edata.uns["famd"]["quant_mask"], [True, False, True])
++    assert edata.uns["famd"]["feature_names"] == expected.uns["famd"]["feature_names"]
++    np.testing.assert_array_equal(edata.uns["famd"]["feature_to_original"], [0] * 4 + [2] * 4 + [1] * 8)
++
++
++@pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu | Flags.Sparse)
++def test_famd_3d_array_types(array_type, edata_blobs_timeseries_small: ed.EHRData) -> None:
++    X = np.asarray(edata_blobs_timeseries_small.layers[DEFAULT_TEM_LAYER_NAME])
++    expected = ed.EHRData(X=X)
++    ep.tl.famd(expected)
++    edata = ed.EHRData(X=array_type(X))
++
++    with forbid_dask_compute(allowed=1):
++        ep.tl.famd(edata)
++
++    assert edata.varm["famd_loadings"].shape == (X.shape[1], X.shape[2], 2)
++    np.testing.assert_allclose(edata.obsm["X_famd"], expected.obsm["X_famd"])
++    np.testing.assert_allclose(edata.varm["famd_loadings"], expected.varm["famd_loadings"])
+ 
+ 
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu)

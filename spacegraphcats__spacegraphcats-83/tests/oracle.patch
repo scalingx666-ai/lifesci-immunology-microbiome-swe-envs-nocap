@@ -1,0 +1,377 @@
+diff --git a/Makefile b/Makefile
+index ab1786f7..8e331644 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+ lint:
+-	mypy spacegraphcats/*.py --ignore-missing-imports
++	mypy spacegraphcats/*.py search/*.py --ignore-missing-imports
+ 
+ test:
+ 	py.test spacegraphcats
+diff --git a/search/analyze_profile.py b/search/analyze_profile.py
+new file mode 100644
+index 00000000..ec83bf8c
+--- /dev/null
++++ b/search/analyze_profile.py
+@@ -0,0 +1,7 @@
++import pstats
++
++if __name__ == '__main__':
++    p = pstats.Stats('search_stats')
++    p.strip_dirs()
++    p.sort_stats('time')  # also try: time, cumulative
++    p.print_stats('search')  # pass in string to limit. e.g. 'search'
+diff --git a/search/frontier_search.py b/search/frontier_search.py
+index 2d5386fe..fe700e3e 100755
+--- a/search/frontier_search.py
++++ b/search/frontier_search.py
+@@ -1,26 +1,25 @@
+ #! /usr/bin/env python
++import argparse
+ import os
+ import sys
+-import argparse
+-from sourmash_lib import MinHash
+-from collections import defaultdict
+-from spacegraphcats.catlas import CAtlas
+-import time
++
+ import sourmash_lib
+-from sourmash_lib.sbt import SBT, GraphFactory
+-from sourmash_lib.sbtmh import search_minhashes, SigLeaf
+-from sourmash_lib import signature
+-import screed
+-import pickle
+-from typing import List
++from sourmash_lib import MinHash, signature
++from typing import Dict, List, Set
+ 
++from .memoize import memoize
+ from .search_catlas_with_minhash import load_dag, load_minhash
+ 
+ 
+-def find_shadow(nodes: List[int], dag) -> List[int]:
++def find_shadow(nodes: List[int], dag: Dict[int, List[int]]) -> List[int]:
+     shadow = []
+ 
+-    def add_to_shadow(node_id):
++    seen_nodes = set()  # type: Set[int]
++
++    def add_to_shadow(node_id: int):
++        if node_id in seen_nodes:
++            return
++
+         children_ids = dag[node_id]
+ 
+         if len(children_ids) == 0:
+@@ -34,20 +33,47 @@ def add_to_shadow(node_id):
+ 
+     return shadow
+ 
+-
+-def compute_overhead(node_minhash, query_minhash) -> float:
++def compute_overhead(node_minhash: MinHash, query_minhash: MinHash) -> float:
+     """ Compute the relative overhead of minhashes. """
+     node_length = len(node_minhash.get_mins())
+     return (node_length - node_minhash.count_common(query_minhash)) / node_length
+ 
+ 
+-def frontier_search(query_sig, top_node_id, dag, minhash_dir, max_overhead):
++def frontier_search(query_sig, top_node_id: int, dag, minhash_dir: str, max_overhead: float):
+     # expand the frontier where the child nodes together have more than x% overhead
+ 
++    query_mh = query_sig.minhash
+     frontier = []
+-    seen_nodes = set()
++    frontier_minhash = None
++    seen_nodes = set()  # type: Set[int]
++
++    num_leaves = 0
++
++    @memoize
++    def load_and_downsample_minhash(node_id: int):
++        nonlocal query_mh
++        minhash = load_minhash(node_id, minhash_dir)
++        if minhash:
++            minhash = minhash.downsample_max_hash(query_mh)
++            query_mh = query_mh.downsample_max_hash(minhash)
++        return minhash
++
++    @memoize
++    def node_overhead(minhash):
++        return compute_overhead(minhash, query_mh)
++
++    @memoize
++    def node_containment(minhash):
++        return query_mh.containment(minhash)
++
++    def add_node(node_id: int, minhash):
++        nonlocal frontier_minhash
++        frontier.append(node_id)
++        if frontier_minhash:
++            frontier_minhash.merge(minhash)
++        else:
++            frontier_minhash = minhash
+ 
+-    num_leaves = [0]
+ 
+     def add_to_frontier(node_id: int):
+         """
+@@ -56,33 +82,30 @@ def add_to_frontier(node_id: int):
+         if node_id in seen_nodes:
+             # we have added this node or its children to the frontier
+             return
+-        
+-        seen_nodes.add(node_id)
++        else:
++            seen_nodes.add(node_id)
+ 
+         children_ids = dag[node_id]
+ 
++        minhash = load_and_downsample_minhash(node_id)
++            
+         if len(children_ids) == 0:
+             # leaf
+-            frontier.append(node_id)
+-            num_leaves[0] += 1
++            nonlocal num_leaves
++            add_node(node_id, minhash)
++            num_leaves += 1
+             return
+ 
+         # check whether the node has more than x% overhead
+-        minhash = load_minhash(node_id, minhash_dir)
+-        if not minhash:
+-            return
+ 
+-        query_mh = query_sig.minhash.downsample_max_hash(minhash)
+-        against_mh = minhash.downsample_max_hash(query_sig.minhash)
+-
+-        containment = query_mh.containment(against_mh)
++        containment = node_containment(minhash)
+ 
+         if containment == 0:
+             # ignore nodes that have no containment
+             # sanity check, should not get here
+             raise Exception("No containment")
+ 
+-        overhead = compute_overhead(against_mh, query_mh)
++        overhead = node_overhead(minhash)
+ 
+         # print("{} Overhead {}".format(node_id, overhead))
+  
+@@ -92,18 +115,15 @@ def add_to_frontier(node_id: int):
+             overheads = []
+ 
+             for child in children_ids:
+-                child_mh = load_minhash(child, minhash_dir)
++                child_mh = load_and_downsample_minhash(child)
+                 if not child_mh:
+                     continue
+ 
+-                child_mh = child_mh.downsample_max_hash(query_mh)
+-                query_mh = query_mh.downsample_max_hash(child_mh)
+-
+                 # ignore children without any containment
+-                if query_mh.containment(child_mh) == 0:
++                if node_containment(child_mh) == 0:
+                     continue
+ 
+-                child_oh = compute_overhead(child_mh, query_mh)
++                child_oh = node_overhead(child_mh)
+                 overheads.append((child_oh, child, child_mh))
+ 
+             overheads.sort()
+@@ -121,12 +141,12 @@ def add_to_frontier(node_id: int):
+                     return
+ 
+         else:
+-            # print("low overhead")
+-            frontier.append(node_id)
++            # low overhead node
++            add_node(node_id, minhash)
+ 
+     add_to_frontier(top_node_id)
+ 
+-    return frontier, num_leaves[0]
++    return frontier, num_leaves, frontier_minhash
+ 
+ 
+ def main():
+@@ -151,25 +171,16 @@ def main():
+     query_sig = list(query_sig)[0]
+     print('loaded query sig {}'.format(query_sig.name()))
+ 
+-    frontier, num_leaves = frontier_search(query_sig, top_node_id, dag, minhash_dir, args.overhead)
++    frontier, num_leaves, frontier_mh = frontier_search(query_sig, top_node_id, dag, minhash_dir, args.overhead)
+ 
+     top_mh = load_minhash(top_node_id, minhash_dir)
+     query_mh = query_sig.minhash.downsample_max_hash(top_mh)
+     top_mh = top_mh.downsample_max_hash(query_sig.minhash)
+     print("Root containment: {}".format(query_mh.containment(top_mh)))
+     print("Root similarity: {}".format(query_mh.similarity(top_mh)))
+-    
+-    # TODO: we can move this up into the frontier search if it's expensive
+-    union = load_minhash(frontier.pop(), minhash_dir)
+-    for node in frontier:
+-        mh = load_minhash(node, minhash_dir)
+-        union.merge(mh)
+ 
+-    query_mh = query_sig.minhash.downsample_max_hash(union)
+-    union_mh = union.downsample_max_hash(query_sig.minhash)
+-
+-    print("Containment of frontier: {}".format(query_mh.containment(union_mh)))
+-    print("Similarity of frontier: {}".format(query_mh.similarity(union_mh)))
++    print("Containment of frontier: {}".format(query_mh.containment(frontier_mh)))
++    print("Similarity of frontier: {}".format(query_mh.similarity(frontier_mh)))
+     print("Size of frontier: {} of {} ({:.3}%)".format(len(frontier), len(dag), 100 * len(frontier) / len(dag)))
+     print("Number of leaves in the frontier: {}".format(num_leaves))
+ 
+@@ -181,4 +192,7 @@ def main():
+ 
+ 
+ if __name__ == '__main__':
++    # import cProfile
++    # cProfile.run('main()', 'search_stats')
++
+     main()
+diff --git a/search/frontier_search_batch.py b/search/frontier_search_batch.py
+index 0dfb527a..3fa3dd49 100644
+--- a/search/frontier_search_batch.py
++++ b/search/frontier_search_batch.py
+@@ -1,21 +1,20 @@
+ #! /usr/bin/env python
++import argparse
+ import os
++import pickle
+ import sys
+-import argparse
+-from sourmash_lib import MinHash
+-from collections import defaultdict
+-from spacegraphcats.catlas import CAtlas
+ import time
++from collections import defaultdict
++
++import screed
+ import sourmash_lib
++from sourmash_lib import MinHash, signature
+ from sourmash_lib.sbt import SBT, GraphFactory
+-from sourmash_lib.sbtmh import search_minhashes, SigLeaf
+-from sourmash_lib import signature
+-import screed
+-import pickle
++from sourmash_lib.sbtmh import SigLeaf, search_minhashes
+ from typing import List
+ 
+-from .search_catlas_with_minhash import load_dag, load_minhash
+ from .frontier_search import frontier_search
++from .search_catlas_with_minhash import load_dag, load_minhash
+ 
+ 
+ def main():
+@@ -39,18 +38,10 @@ def main():
+         query_sig = list(query_sig)[0]
+         print('loaded query sig {}'.format(query_sig.name()), file=sys.stderr)
+         
+-        frontier, num_leaves = frontier_search(query_sig, top_node_id, dag, minhash_dir, args.overhead)
+-
+-        union = load_minhash(frontier.pop(), minhash_dir)
+-        for node in frontier:
+-            mh = load_minhash(node, minhash_dir)
+-            union.merge(mh)
+-
+-        query_mh = query_sig.minhash.downsample_max_hash(union)
+-        union_mh = union.downsample_max_hash(query_sig.minhash)
++        frontier, num_leaves, frontier_mh = frontier_search(query_sig, top_node_id, dag, minhash_dir, args.overhead)
+ 
+-        containment = query_mh.containment(union_mh)
+-        similarity = query_mh.similarity(union_mh)
++        containment = query_mh.containment(frontier_mh)
++        similarity = query_mh.similarity(frontier_mh)
+ 
+         print(filename, containment, similarity)
+     
+diff --git a/search/make_catlas_minhashes.py b/search/make_catlas_minhashes.py
+index b8eb2e5b..f82f0806 100755
+--- a/search/make_catlas_minhashes.py
++++ b/search/make_catlas_minhashes.py
+@@ -1,17 +1,16 @@
+ #! /usr/bin/env python
++import argparse
+ import os
++import pickle
+ import sys
+-import argparse
+-from sourmash_lib import MinHash
+-from collections import defaultdict
+-from spacegraphcats.catlas import CAtlas
+ import time
++from collections import defaultdict
++
++import screed
+ import sourmash_lib
++from sourmash_lib import MinHash, signature
+ from sourmash_lib.sbt import SBT, GraphFactory
+-from sourmash_lib.sbtmh import search_minhashes, SigLeaf
+-from sourmash_lib import signature
+-import screed
+-import pickle
++from sourmash_lib.sbtmh import SigLeaf, search_minhashes
+ 
+ 
+ class MinHashFactory(object):
+@@ -31,7 +30,7 @@ def make_contig_minhashes(contigfile, factory):
+     for record in screed.open(contigfile):
+         if total_bp >= watermark:
+             print('... {:5.2e} bp thru contigs'.format(int(watermark)),
+-                  file=sys.stderr)
++                file=sys.stderr)
+             watermark += 1e7
+ 
+         # the FASTA header/record name is the cDBG node ID output by
+diff --git a/search/memoize.py b/search/memoize.py
+new file mode 100644
+index 00000000..31c42375
+--- /dev/null
++++ b/search/memoize.py
+@@ -0,0 +1,11 @@
++import functools
++
++def memoize(func):
++    cache = func.cache = {}
++    @functools.wraps(func)
++    def memoized_func(*args, **kwargs):
++        key = str(args) + str(kwargs)
++        if key not in cache:
++            cache[key] = func(*args, **kwargs)
++        return cache[key]
++    return memoized_func
+diff --git a/search/search_catlas_with_minhash.py b/search/search_catlas_with_minhash.py
+index a8263502..1a7cd138 100755
+--- a/search/search_catlas_with_minhash.py
++++ b/search/search_catlas_with_minhash.py
+@@ -1,17 +1,14 @@
+ #! /usr/bin/env python
++import argparse
+ import os
++import pickle
+ import sys
+-import argparse
+-from sourmash_lib import MinHash
+-from collections import defaultdict
+-from spacegraphcats.catlas import CAtlas
+ import time
+-import sourmash_lib
+-from sourmash_lib.sbt import SBT, GraphFactory
+-from sourmash_lib.sbtmh import search_minhashes, SigLeaf
+-from sourmash_lib import signature
++from collections import defaultdict
++
+ import screed
+-import pickle
++import sourmash_lib
++from sourmash_lib import MinHash, signature
+ 
+ 
+ def load_dag(catlas_file):

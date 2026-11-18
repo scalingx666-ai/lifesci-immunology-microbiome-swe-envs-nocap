@@ -1,0 +1,630 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 448412250..1fe0c43ca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [#1062](https://github.com/nf-core/mag/pull/1062) - Remove grouping to prevent bin QC blocking by waiting for all binners (by @dialvarezs)
+ - [#1063](https://github.com/nf-core/mag/pull/1063) - Run ALE with `--metagenome` and disable its per-base output by default (by @dialvarezs)
+ - [#1065](https://github.com/nf-core/mag/pull/1065) - Improved efficiency by removing usage of per-bin GUNZIP module for bins and unbinned contigs and allowing gzip support for all modules (by @dialvarezs)
++- [#1066](https://github.com/nf-core/mag/pull/1066) - Improved efficiency by removing channel "locks" on Seqkit, QUAST, and GTDB-Tk (by @dialvarezs)
+ 
+ ### `Fixed`
+ 
+diff --git a/conf/base.config b/conf/base.config
+index ba9c25dfa..ea0ac2b8c 100644
+--- a/conf/base.config
++++ b/conf/base.config
+@@ -188,4 +188,8 @@ process {
+         cpus   = 1
+         memory = { 1.GB * task.attempt }
+     }
++    withName: SEQKIT_STATS {
++        cpus   = 1
++        memory = { 1.GB * task.attempt }
++    }
+ }
+diff --git a/conf/modules.config b/conf/modules.config
+index 5bdf4d1b0..bffb92977 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -1027,6 +1027,8 @@ process {
+     }
+ 
+     withName: SEQKIT_STATS {
++        tag        = { "${meta.assembler}-${meta.binner}-${meta.id}" }
++        ext.prefix = { "${meta.assembler}-${meta.binner}-${meta.id}" }
+         ext.args   = ""
+         maxForks   = params.bin_seqkit_stats_max_forks
+         publishDir = [enabled: false]
+diff --git a/subworkflows/local/bin_qc/main.nf b/subworkflows/local/bin_qc/main.nf
+index 26e24cb78..c0b82953c 100644
+--- a/subworkflows/local/bin_qc/main.nf
++++ b/subworkflows/local/bin_qc/main.nf
+@@ -21,11 +21,10 @@ include { UNTAR as CHECKM_UNTAR             } from '../../../modules/nf-core/unt
+ 
+ workflow BIN_QC {
+     take:
+-    ch_bins // [val(meta), path(fasta)], input bins (mandatory)
++    ch_bins // [val(meta), [path(fasta)]], input bins (mandatory)
+ 
+     main:
+-    ch_qc_summaries = channel.empty()
+-    ch_input_bins_for_qc = ch_bins.transpose()
++    ch_qc_metrics = channel.empty()
+     ch_versions = channel.empty()
+     ch_multiqc_files = channel.empty()
+     ch_busco_final_summaries = channel.empty()
+@@ -116,16 +115,15 @@ workflow BIN_QC {
+         ch_busco_final_summaries = ch_busco_final_summaries.mix(
+             CONCAT_BUSCO_TSV.out.csv.map { _meta, csv -> csv }
+         )
+-        ch_qc_summaries = ch_qc_summaries.mix(
+-            CONCAT_BUSCO_TSV.out.csv.splitCsv(header: true, sep: '\t').map { _meta, summary -> [bin_qc_tool: 'busco'] + summary }
++        ch_qc_metrics = ch_qc_metrics.mix(
++            BUSCO_BUSCO.out.batch_summary.map { meta, summary -> [meta, 'busco', summary] }
+         )
+     }
+     if (params.run_checkm) {
+         /*
+          * CheckM
+          */
+-        ch_bins_for_checkmlineagewf = ch_input_bins_for_qc
+-            .groupTuple()
++        ch_bins_for_checkmlineagewf = ch_bins
+             .filter { meta, _bins ->
+                 meta.domain != "eukarya"
+             }
+@@ -161,15 +159,15 @@ workflow BIN_QC {
+         ch_checkm_final_summaries = ch_checkm_final_summaries.mix(
+             CONCAT_CHECKM_TSV.out.csv.map { _meta, csv -> csv }
+         )
+-        ch_qc_summaries = ch_qc_summaries.mix(
+-            CONCAT_CHECKM_TSV.out.csv.splitCsv(header: true, sep: '\t').map { _meta, summary -> [bin_qc_tool: 'checkm'] + summary }
++        ch_qc_metrics = ch_qc_metrics.mix(
++            CHECKM_QA.out.output.map { meta, summary -> [meta, 'checkm', summary] }
+         )
+     }
+     if (params.run_checkm2) {
+         /*
+          * CheckM2
+          */
+-        CHECKM2_PREDICT(ch_input_bins_for_qc.groupTuple(), ch_checkm2_db)
++        CHECKM2_PREDICT(ch_bins, ch_checkm2_db)
+ 
+         ch_checkm2_summaries = CHECKM2_PREDICT.out.checkm2_tsv
+             .map { _meta, summary -> [[id: 'checkm2'], summary] }
+@@ -182,8 +180,8 @@ workflow BIN_QC {
+         ch_checkm2_final_summaries = ch_checkm2_final_summaries.mix(
+             CONCAT_CHECKM2_TSV.out.csv.map { _meta, csv -> csv }
+         )
+-        ch_qc_summaries = ch_qc_summaries.mix(
+-            CONCAT_CHECKM2_TSV.out.csv.splitCsv(header: true, sep: '\t').map { _meta, summary -> [bin_qc_tool: 'checkm2'] + summary }
++        ch_qc_metrics = ch_qc_metrics.mix(
++            CHECKM2_PREDICT.out.checkm2_tsv.map { meta, summary -> [meta, 'checkm2', summary] }
+         )
+     }
+ 
+@@ -226,7 +224,7 @@ workflow BIN_QC {
+     }
+ 
+     emit:
+-    qc_summaries    = ch_qc_summaries
++    qc_metrics      = ch_qc_metrics
+     busco_summary   = ch_busco_final_summaries
+     checkm_summary  = ch_checkm_final_summaries
+     checkm2_summary = ch_checkm2_final_summaries
+diff --git a/subworkflows/local/binning/main.nf b/subworkflows/local/binning/main.nf
+index 3f3ea484a..fed650a0c 100644
+--- a/subworkflows/local/binning/main.nf
++++ b/subworkflows/local/binning/main.nf
+@@ -76,15 +76,14 @@ workflow BINNING {
+         }
+     }
+ 
+-    // per-bin channel for length filtering via seqkit stats
++    // per-binner-output channel for length filtering via seqkit stats
+     ch_bins_for_seqkit = channel.empty()
+ 
+     // MetaBAT2
+     if (!params.skip_metabat2) {
+         METABAT2_METABAT2(ch_metabat2_input)
+ 
+-        // transpose to get one bin per element for per-bin seqkit stats
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(METABAT2_METABAT2.out.fasta.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(METABAT2_METABAT2.out.fasta)
+         ch_input_splitfasta = ch_input_splitfasta.mix(METABAT2_METABAT2.out.unbinned)
+     }
+ 
+@@ -96,7 +95,7 @@ workflow BINNING {
+         ADJUST_MAXBIN2_EXT(MAXBIN2.out.binned_fastas)
+         ch_versions = ch_versions.mix(ADJUST_MAXBIN2_EXT.out.versions)
+ 
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(ADJUST_MAXBIN2_EXT.out.renamed_bins.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(ADJUST_MAXBIN2_EXT.out.renamed_bins)
+         ch_input_splitfasta = ch_input_splitfasta.mix(MAXBIN2.out.unbinned_fasta)
+     }
+ 
+@@ -115,7 +114,7 @@ workflow BINNING {
+ 
+         FASTA_BINNING_CONCOCT(ch_concoct_input.bins, ch_concoct_input.bams)
+ 
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(FASTA_BINNING_CONCOCT.out.bins.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(FASTA_BINNING_CONCOCT.out.bins)
+     }
+ 
+     // COMEBin
+@@ -128,7 +127,7 @@ workflow BINNING {
+         COMEBIN_RUNCOMEBIN(ch_comebin_input)
+         ch_versions = ch_versions.mix(COMEBIN_RUNCOMEBIN.out.versions)
+ 
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(COMEBIN_RUNCOMEBIN.out.bins.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(COMEBIN_RUNCOMEBIN.out.bins)
+     }
+ 
+     // MetaBinner
+@@ -141,7 +140,7 @@ workflow BINNING {
+         )
+         ch_versions = ch_versions.mix(BINNING_METABINNER.out.versions)
+ 
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(BINNING_METABINNER.out.bins.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(BINNING_METABINNER.out.bins)
+         ch_input_splitfasta = ch_input_splitfasta.mix(BINNING_METABINNER.out.unbinned)
+     }
+ 
+@@ -163,7 +162,7 @@ workflow BINNING {
+             [meta_new, bins]
+         }
+ 
+-        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(ch_semibin_bins.transpose())
++        ch_bins_for_seqkit = ch_bins_for_seqkit.mix(ch_semibin_bins)
+     }
+ 
+     // Performance note: grouping seqkit jobs by sample across binners locks
+@@ -172,23 +171,18 @@ workflow BINNING {
+     SEQKIT_STATS(ch_bins_for_seqkit)
+     ch_versions = ch_versions.mix(SEQKIT_STATS.out.versions)
+ 
+-    ch_seqkitstats_results = SEQKIT_STATS.out.stats
+-        .splitCsv(sep: '\t', header: true, strip: true)
+-        .map { _meta, row ->
+-            [[filename: row.file], [bin_total_length: row.sum_len.toInteger()]]
+-        }
+-
+     //
+     // Logic: Gather all the bin lengths, then check if the number of bins after length
+     //        filtering is 0. Error if so, but only if we had bins to begin with.
+     //
+-    ch_seqkitstats_results
+-        .map { _meta, stats -> stats.bin_total_length }
++    SEQKIT_STATS.out.stats
++        .splitCsv(sep: '\t', header: true, strip: true)
++        .map { _meta, row -> row.sum_len.toInteger() }
+         .collect()
+         .ifEmpty([])
+-        .subscribe { stats ->
+-            def n_bins = stats.size()
+-            def n_filtered_bins = stats
++        .subscribe { lengths ->
++            def n_bins = lengths.size()
++            def n_filtered_bins = lengths
+                 .findAll { bin_size ->
+                     bin_size >= val_bin_min_size && (val_bin_max_size ? bin_size <= val_bin_max_size : true)
+                 }
+@@ -200,22 +194,23 @@ workflow BINNING {
+             }
+         }
+ 
+-    // filter out too-short/too-long bins by total length, then re-group per sample
++    // filter out too-short/too-long bins by total length within each binner output;
++    // joining per binner-sample keeps bin QC unblocked by the slowest binner
+     ch_binning_results = ch_bins_for_seqkit
+-        .map { meta, bin ->
+-            [[filename: bin.name], meta, bin]
+-        }
+-        .join(ch_seqkitstats_results)
+-        .map { _key, meta, bin, stats ->
+-            [meta + stats, bin]
+-        }
+-        .filter { meta, _bin ->
+-            meta.bin_total_length >= val_bin_min_size && (val_bin_max_size ? meta.bin_total_length <= val_bin_max_size : true)
+-        }
+-        .map { meta, bin ->
+-            [meta.minus([bin_total_length: meta.bin_total_length]), bin]
++        .join(SEQKIT_STATS.out.stats)
++        .map { meta, bins, stats ->
++            def lengths = stats
++                .splitCsv(sep: '\t', header: true, strip: true)
++                .collectEntries { row -> [(row.file): row.sum_len.toInteger()] }
++            def kept_bins = [bins]
++                .flatten()
++                .findAll { bin ->
++                    def bin_total_length = lengths[bin.name]
++                    bin_total_length >= val_bin_min_size && (val_bin_max_size ? bin_total_length <= val_bin_max_size : true)
++                }
++            [meta, kept_bins]
+         }
+-        .groupTuple(by: 0)
++        .filter { _meta, bins -> bins }
+ 
+     // remove too-short contigs from unbinned contigs
+     SPLIT_FASTA(ch_input_splitfasta)
+diff --git a/subworkflows/local/gtdbtk/main.nf b/subworkflows/local/gtdbtk/main.nf
+index d837d712c..4d4c05b34 100644
+--- a/subworkflows/local/gtdbtk/main.nf
++++ b/subworkflows/local/gtdbtk/main.nf
+@@ -9,65 +9,69 @@ include { GTDBTK_SUMMARY        } from '../../../modules/local/gtdbtk_summary/ma
+ 
+ workflow GTDBTK {
+     take:
+-    ch_bins           // [val(meta), path(fasta)]
+-    ch_bin_qc_summary // path
+-    val_gtdb          // path
++    ch_bins // [val(meta), [path(fasta)]]  bins grouped per binner-sample
++    ch_qc_metrics // [val(meta), val(tool), path(summary)]  per-group, per-tool QC summary
++    val_gtdb // path
+ 
+     main:
+     ch_versions = channel.empty()
+ 
+-    // Collect bin quality metrics
++    // QC summary columns per tool: [bin name, completeness, contamination/duplication]
+     qc_columns = [
+-        busco: ['bin_qc_tool', 'Input_file', 'Complete', 'Duplicated'],
+-        checkm: ['bin_qc_tool', 'Bin Id', 'Completeness', 'Contamination'],
+-        checkm2: ['bin_qc_tool', 'Name', 'Completeness', 'Contamination'],
++        busco: ['Input_file', 'Complete', 'Duplicated'],
++        checkm: ['Bin Id', 'Completeness', 'Contamination'],
++        checkm2: ['Name', 'Completeness', 'Contamination'],
+     ]
+ 
+-    // 1. Take the pre-split CSV, and select just the relevant columns
+-    // 2. Reorder columns to: bin name, tool, completeness, contamination/duplication
+-    // 3. Convert completeness/contamination to double for consistency
+-    //4. add .fa back to bin name if missing
+-    ch_bin_metrics = ch_bin_qc_summary
+-        .map { row -> qc_columns[row.bin_qc_tool].collect { col -> row[col] } }
+-        .map { row ->
+-            // Initial order
+-            // row[0] = bin_qc_tool
+-            // row[1] = bin name
+-            // row[2] = completeness
+-            // row[3] = contamination (Checkm*)/duplication (busco)
+-            def row_reordered = [row[1], row[0]] + row[2..3].collect { value -> "${value}".toDouble() }
+-            // CheckM / CheckM2 removes the .fa extension from the bin name
+-            if (row_reordered[1] in ['checkm', 'checkm2']) {
+-                row_reordered[0] = row_reordered[0] + '.fa'
+-            }
+-            return row_reordered
+-        }
++    // number of QC tools that emit one summary per bin group, used to release each
++    // group's metrics as soon as its own QC finishes instead of waiting for all groups
++    def n_qc_tools = [params.run_busco, params.run_checkm, params.run_checkm2].count { enabled -> enabled }
+ 
+-    // Filter bins based on collected metrics: completeness, contamination
+-    // 1. Generate key name from bin file name
+-    // 2. Join with metrics (but drop bin_name)
+-    // 3. Group all metrics files per bin (in case multiple QC tools were used)
+-    // 3. Branch based on completeness/contamination
++    // gather the per-tool summaries for each bin group (non-blocking via groupKey)
++    // remainder: true flushes groups whose QC tool failed (fewer summaries than
++    // n_qc_tools) at channel close, so a surviving tool can still classify them
++    ch_group_metrics = ch_qc_metrics
++        .map { meta, tool, summary -> [groupKey(meta, n_qc_tools), meta, tool, summary] }
++        .groupTuple(by: 0, remainder: true)
++        .map { _key, metas, tools, summaries -> [metas[0], [tools, summaries].transpose()] }
++
++    // Filter bins within each group by completeness/contamination across QC tools.
+     ch_filtered_bins = ch_bins
+-        .transpose()
+-        .map { meta, bin -> [bin.getName() - ~/\.gz$/, bin, meta] }
+-        .join(ch_bin_metrics)
+-        .map { bin_name, bin, meta, _bin_qc_tool, completeness, contamination ->
+-            [bin_name, meta, bin, completeness, contamination]
+-        }
+-        .groupTuple(by: 0)
+-        .branch { _bin_name, meta, bin, completeness, contamination ->
+-            passed: (
+-                completeness.any { bin_completeness -> bin_completeness != -1 } &&
+-                completeness.any { bin_completeness -> bin_completeness >= params.gtdbtk_min_completeness } &&
+-                contamination.any { bin_contamination -> bin_contamination != -1 } &&
+-                contamination.any { bin_contamination -> bin_contamination <= params.gtdbtk_max_contamination }
+-            )
+-                return [meta[0], bin[0]]
+-            discarded: true
+-                return [meta[0], bin[0]]
++        .join(ch_group_metrics)
++        .map { meta, bins, tool_summaries ->
++            // build per-bin metrics: bin name -> [ [completeness, contamination], ... ] (one reading per QC tool)
++            def metrics = [:]
++            tool_summaries.each { tool, summary ->
++                def cols = qc_columns[tool]
++                summary
++                    .splitCsv(header: true, sep: '\t')
++                    .each { row ->
++                        // CheckM / CheckM2 strip the .fa extension from the bin name
++                        def bin_name = tool == 'busco' ? row[cols[0]] : row[cols[0]] + '.fa'
++                        def completeness = "${row[cols[1]]}".toDouble()
++                        def contamination = "${row[cols[2]]}".toDouble()
++
++                        def readings = metrics.get(bin_name, [])
++                        // a negative value means the tool could not assess the bin, so we drop the whole reading
++                        if (completeness >= 0 && contamination >= 0) {
++                            readings << [completeness: completeness, contamination: contamination]
++                        }
++                        metrics[bin_name] = readings
++                    }
++            }
++
++            // drop bins with no QC metric, then split the rest:
++            // a bin passes if any single tool clears both thresholds together
++            def (passed, discarded) = bins
++                .findAll { bin -> metrics[bin.getName() - ~/\.gz$/] != null }
++                .split { bin ->
++                    metrics[bin.getName() - ~/\.gz$/].any { reading ->
++                        reading.completeness >= params.gtdbtk_min_completeness && reading.contamination <= params.gtdbtk_max_contamination
++                    }
++                }
++
++            [meta, passed, discarded]
+         }
+-    // Note we have to call `meta[0], bin[0]` because of the groupTuple above
+ 
+     if (val_gtdb.extension == 'gz') {
+         // Expects to be tar.gz!
+@@ -78,22 +82,38 @@ workflow GTDBTK {
+         ch_db_for_gtdbtk = [val_gtdb.simpleName, val_gtdb]
+     }
+     else {
+-        error("Unsupported object given to --gtdb, database must be supplied as either a directory or a .tar.gz file!")
++        error("Unsupported object given to --gtdb_db, database must be supplied as either a directory or a .tar.gz file!")
+     }
+ 
+     // Warn if no QC data was available (all QC tools likely failed)
+-    ch_bin_qc_summary
++    ch_qc_metrics
+         .count()
+         .filter { count -> count == 0 }
+         .subscribe { _count ->
+             log.warn("[nf-core/mag] No bin QC results were available. Skipping GTDB-Tk classification.")
+         }
+ 
++    ch_passed_bins = ch_filtered_bins
++        .map { meta, passed, _discarded -> [meta, passed] }
++        .filter { _meta, passed -> passed }
++    ch_passed_flat = ch_passed_bins.flatMap { _meta, passed -> passed }
++    ch_discarded_bins = ch_filtered_bins.flatMap { _meta, _passed, discarded -> discarded }
++
+     // Optionally combine all bins into a single GTDB-Tk job, instead of one job
+     // per bin group, which can be more efficient for very large bin counts
+-    ch_bins_for_classifywf = params.gtdbtk_single_job
+-        ? ch_filtered_bins.passed.map { _meta, bin -> [[id: 'all_bins', assembler: 'all', binner: 'all', domain: 'all', refinement: 'all'], bin] }.groupTuple()
+-        : ch_filtered_bins.passed.groupTuple()
++    if (params.gtdbtk_single_job) {
++        ch_bins_for_classifywf = ch_passed_flat
++            .map { bin ->
++                [
++                    [id: 'all_bins', assembler: 'all', binner: 'all', domain: 'all', refinement: 'all'],
++                    bin,
++                ]
++            }
++            .groupTuple()
++    }
++    else {
++        ch_bins_for_classifywf = ch_passed_bins
++    }
+ 
+     GTDBTK_CLASSIFYWF(
+         ch_bins_for_classifywf,
+@@ -102,9 +122,9 @@ workflow GTDBTK {
+     )
+ 
+     // Print warning why GTDB-TK summary empty if passed channel gets no files
+-    ch_filtered_bins.passed
++    ch_passed_flat
+         .count()
+-        .combine(ch_filtered_bins.discarded.count())
++        .combine(ch_discarded_bins.count())
+         .subscribe { passed, failed ->
+             if ((passed + failed) > 0 && passed == 0) {
+                 log.warn("[nf-core/mag] No contigs passed GTDB-TK min. completeness filters. GTDB-Tk will not be executed.")
+@@ -112,7 +132,7 @@ workflow GTDBTK {
+         }
+ 
+     GTDBTK_SUMMARY(
+-        ch_filtered_bins.discarded.map { _meta, bin -> bin }.collect().ifEmpty([]),
++        ch_discarded_bins.collect().ifEmpty([]),
+         GTDBTK_CLASSIFYWF.out.summary.map { _meta, summary -> summary }.collect(),
+         [],
+         [],
+diff --git a/tests/default.nf.test.snap b/tests/default.nf.test.snap
+index 76042e394..3b8b8c888 100644
+--- a/tests/default.nf.test.snap
++++ b/tests/default.nf.test.snap
+@@ -523,7 +523,7 @@
+     },
+     "-profile test": {
+         "content": [
+-            195,
++            190,
+             {
+                 "ADJUST_MAXBIN2_EXT": {
+                     "coreutils": 9.5
+@@ -667,7 +667,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:06:43.547383072",
++        "timestamp": "2026-07-03T03:28:12.882135185",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_alternatives.nf.test.snap b/tests/test_alternatives.nf.test.snap
+index 5fd83a5aa..a6ed81e1c 100644
+--- a/tests/test_alternatives.nf.test.snap
++++ b/tests/test_alternatives.nf.test.snap
+@@ -1,7 +1,7 @@
+ {
+     "-profile test_alternatives": {
+         "content": [
+-            33,
++            32,
+             {
+                 "BIN_SUMMARY": {
+                     "pandas": "1.4.3",
+@@ -94,7 +94,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:08:00.14337692",
++        "timestamp": "2026-07-03T03:27:43.992492694",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_assembly_input.nf.test.snap b/tests/test_assembly_input.nf.test.snap
+index 95b21ad10..3dbdcb4fe 100644
+--- a/tests/test_assembly_input.nf.test.snap
++++ b/tests/test_assembly_input.nf.test.snap
+@@ -65,7 +65,7 @@
+     },
+     "-profile assembly_input": {
+         "content": [
+-            283,
++            194,
+             {
+                 "ADJUST_MAXBIN2_EXT": {
+                     "coreutils": 9.5
+@@ -169,7 +169,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:04:37.208948677",
++        "timestamp": "2026-07-03T03:23:47.433515064",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_hybrid.nf.test.snap b/tests/test_hybrid.nf.test.snap
+index 2a62c282e..9301ee07d 100644
+--- a/tests/test_hybrid.nf.test.snap
++++ b/tests/test_hybrid.nf.test.snap
+@@ -122,7 +122,7 @@
+     },
+     "-profile hybrid": {
+         "content": [
+-            73,
++            71,
+             {
+                 "ADJUST_MAXBIN2_EXT": {
+                     "coreutils": 9.5
+@@ -265,7 +265,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:09:32.864578047",
++        "timestamp": "2026-07-03T03:30:14.663381411",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_longreadonly.nf.test.snap b/tests/test_longreadonly.nf.test.snap
+index d3685be14..e2f71fb9f 100644
+--- a/tests/test_longreadonly.nf.test.snap
++++ b/tests/test_longreadonly.nf.test.snap
+@@ -476,7 +476,7 @@
+     },
+     "-profile longreadonly": {
+         "content": [
+-            55,
++            53,
+             {
+                 "ADJUST_MAXBIN2_EXT": {
+                     "coreutils": 9.5
+@@ -587,7 +587,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:11:08.744334968",
++        "timestamp": "2026-07-03T03:31:59.611589496",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_longreadonly_alternatives.nf.test.snap b/tests/test_longreadonly_alternatives.nf.test.snap
+index 7b816c0e5..f55242e4c 100644
+--- a/tests/test_longreadonly_alternatives.nf.test.snap
++++ b/tests/test_longreadonly_alternatives.nf.test.snap
+@@ -152,7 +152,7 @@
+     },
+     "-profile longreadonly_alternatives": {
+         "content": [
+-            31,
++            30,
+             {
+                 "ADJUST_MAXBIN2_EXT": {
+                     "coreutils": 9.5
+@@ -248,7 +248,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:05:50.025115976",
++        "timestamp": "2026-07-03T03:26:31.945525279",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/tests/test_single_end.nf.test.snap b/tests/test_single_end.nf.test.snap
+index dc8a45301..0c81e1366 100644
+--- a/tests/test_single_end.nf.test.snap
++++ b/tests/test_single_end.nf.test.snap
+@@ -2001,7 +2001,7 @@
+     },
+     "-profile test_single_end": {
+         "content": [
+-            155,
++            132,
+             {
+                 "ADAPTERREMOVAL_SE": {
+                     "adapterremoval": "2.3.2"
+@@ -2177,7 +2177,7 @@
+                 }
+             }
+         ],
+-        "timestamp": "2026-07-02T09:06:08.551830601",
++        "timestamp": "2026-07-03T03:26:49.465360928",
+         "meta": {
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+diff --git a/workflows/mag.nf b/workflows/mag.nf
+index 4a02e289c..b47f8a57d 100644
+--- a/workflows/mag.nf
++++ b/workflows/mag.nf
+@@ -471,11 +471,11 @@ workflow MAG {
+         * Bin QC subworkflows: for checking bin completeness with either BUSCO, CHECKM, CHECKM2, and/or GUNC
+         */
+ 
+-        ch_bin_qc_summary = channel.empty()
++        ch_bin_qc_metrics = channel.empty()
+         if (!params.skip_binqc) {
+             BIN_QC(ch_input_for_postbinning)
+             ch_versions = ch_versions.mix(BIN_QC.out.versions)
+-            ch_bin_qc_summary = BIN_QC.out.qc_summaries
++            ch_bin_qc_metrics = BIN_QC.out.qc_metrics
+             ch_busco_summary = BIN_QC.out.busco_summary
+             ch_checkm_summary = BIN_QC.out.checkm_summary
+             ch_checkm2_summary = BIN_QC.out.checkm2_summary
+@@ -484,9 +484,8 @@ workflow MAG {
+         ch_quast_bins_summary = channel.empty()
+         if (!params.skip_quast) {
+             ch_input_for_quast_bins = ch_input_for_postbinning
+-                .groupTuple()
+                 .map { meta, bins ->
+-                    [meta, bins.flatten().sort { a, b -> a.getBaseName() <=> b.getBaseName() }]
++                    [meta, [bins].flatten().sort { a, b -> a.getBaseName() <=> b.getBaseName() }]
+                 }
+ 
+             QUAST_BINS(ch_input_for_quast_bins)
+@@ -529,7 +528,7 @@ workflow MAG {
+ 
+                 GTDBTK(
+                     ch_gtdb_bins,
+-                    ch_bin_qc_summary,
++                    ch_bin_qc_metrics,
+                     gtdb,
+                 )
+                 ch_versions = ch_versions.mix(GTDBTK.out.versions)

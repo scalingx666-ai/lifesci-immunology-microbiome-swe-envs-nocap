@@ -1,0 +1,1085 @@
+diff --git a/anvio/cli/gen_structure_database.py b/anvio/cli/gen_structure_database.py
+index 0fc800f0c3..e671b0c9c9 100755
+--- a/anvio/cli/gen_structure_database.py
++++ b/anvio/cli/gen_structure_database.py
+@@ -23,9 +23,9 @@
+ __requires__ = ['contigs-db']
+ __can_use__ = ['pdb-db', 'genes-of-interest-txt']
+ __provides__ = ['structure-db']
+-__description__ = ("Creates a database of protein structures. Predict protein structures using "
+-                   "template-based homology modelling of genes in your contigs database, or import "
+-                   "pre-computed PDB structures you already have.")
++__description__ = ("Creates a database of protein structures. Predict protein structures for genes in "
++                   "your contigs database using either template-based homology modelling (MODELLER) or "
++                   "AlphaFold2 (ColabFold), or import pre-computed PDB structures you already have.")
+ 
+ 
+ @terminal.time_program
+@@ -59,7 +59,7 @@ def get_args():
+                         created a database and b) it exists in a custom location. In this case,
+                         please provide that path here. Otherwise we vibing.""")
+ 
+-    groupG = parser.add_argument_group('GENES', 'Specifying which genes you want to be modelled.')
++    groupG = parser.add_argument_group('GENES', 'Specifying which genes you want structures for.')
+     groupG.add_argument(*anvio.A('genes-of-interest'), **anvio.K('genes-of-interest'))
+     groupG.add_argument(*anvio.A('gene-caller-ids'), **anvio.K('gene-caller-ids'))
+ 
+@@ -67,20 +67,34 @@ def get_args():
+     groupO.add_argument(*anvio.A('output-db-path'), **anvio.K('output-db-path'))
+     groupO.add_argument(*anvio.A('dump-dir'), **anvio.K('dump-dir'))
+ 
+-    groupI = parser.add_argument_group('NON-MODELLER OPTIONS', 'Alternatives to using MODELLER')
+-    groupI.add_argument(*anvio.A('external-structures'), **anvio.K('external-structures'))
+-
+-    groupM = parser.add_argument_group('MODELLER PARAMS', 'Parameters for MODELLER\'s homology modeling.')
+-    groupM.add_argument("--num-models", "-N", type=int, default=1, help =
+-                        """This parameter determines the number of predicted structures that are
+-                        solved for a given protein.  The original atomic positions for each model
+-                        are perturbed by an amount defined by --deviation, which leads to
+-                        differences between each model. Therefore, whichever of the N models is
+-                        chosen to be the "best" model is more likely to be accurate when
+-                        --num-models is high, since more of the solution space is searched. It
+-                        should be kept in mind that the largest determinant of a model's accuracy is
+-                        determined by the protein templates used, so no need to go overboard with an
+-                        excessively large --num-models. The default is %(default)d.""")
++    groupN = parser.add_argument_group('ENGINE', 'Which structure-prediction engine should anvi\'o use?')
++    groupN.add_argument("--engine", type=str, default='modeller', choices=['modeller', 'colabfold'], help =
++                        """The structure-prediction engine to use. 'modeller' (the default) predicts
++                        structures with template-based homology modelling. 'colabfold' predicts structures
++                        with AlphaFold2 via ColabFold. Each engine has its own set of parameters (see the
++                        MODELLER PARAMS and COLABFOLD PARAMS groups), while a few parameters apply to both
++                        (see SHARED PREDICTION PARAMS). This has no effect if you import structures with
++                        --external-structures instead of predicting them.""")
++
++    groupS = parser.add_argument_group('SHARED PREDICTION PARAMS', 'Parameters that apply to whichever '
++                                       'prediction engine you selected with --engine.')
++    groupS.add_argument("--num-models", "-N", type=int, default=1, help =
++                        """The number of structures ("models") to compute per protein; the best one is
++                        kept. For the MODELLER engine, each of the N models perturbs the initial atomic
++                        positions (by an amount set with --deviation) and is optimized independently, so a
++                        larger N searches more of the solution space (though template quality matters most,
++                        so there is no need to go overboard). For the ColabFold engine, this is the number
++                        of AlphaFold2 models (1-5) to run, and the highest-confidence one is kept. In both
++                        cases, fewer models is faster but explores less. The default is %(default)d.""")
++    groupS.add_argument("--skip-DSSP", action = "store_true", help =
++                        """Dictionary of Secondary Structure of Proteins (DSSP) is a program that takes
++                        as its input a protein structure file and outputs predicted secondary
++                        structure (alpha helix, beta strand, etc.), measures of solvent
++                        accessibility, and hydrogen bonds for each residue in the protein. If for
++                        some reason you don't want this, provide this flag.""")
++
++    groupM = parser.add_argument_group('MODELLER PARAMS', 'Parameters for MODELLER\'s homology modeling. '
++                                       'These only apply when `--engine modeller` (the default) is set.')
+     groupM.add_argument("--deviation", "-d", type=float, default=4.0, help =
+                         """Deviation (angstroms)""")
+     groupM.add_argument("--modeller-database", "-D", type=str, default="pdb_95", help =
+@@ -129,18 +143,10 @@ def get_args():
+                         process all the templates that differ substantially from each other, if they
+                         share approximately the same overall similarity to the target sequence.' The
+                         default is %(default)d.""")
+-
+-    groupE = parser.add_argument_group('EXTRA', 'Everything else.')
+-    groupE.add_argument("--skip-DSSP", action = "store_true", help =
+-                        """Dictionary of Secondary Structure of Proteins (DSSP) is a program that takes
+-                        as its input a protein structure file and outputs predicted secondary
+-                        structure (alpha helix, beta strand, etc.), measures of solvent
+-                        accessibility, and hydrogen bonds for each residue in the protein. If for
+-                        some reason you don't want this, provide this flag.""")
+-    groupE.add_argument("--modeller-executable", type=str, help =
++    groupM.add_argument("--modeller-executable", type=str, help =
+                         """The MODELLER program to use. For example, `mod9.19`. Anvi'o will try and find
+                         it if not provided""")
+-    groupE.add_argument("--offline-mode", action = "store_true", help =
++    groupM.add_argument("--offline-mode", action = "store_true", help =
+                         """Anvi'o first tries to obtain template structures from a database (see
+                         --pdb-db for details). If the requested template does not exist in the
+                         database, its structure will be downloaded from the RCSB PDB server.
+@@ -148,6 +154,44 @@ def get_args():
+                         provide this flag so that all operations of this program remain offline. If
+                         the template structure is not in the database, then no template structure
+                         for you.""")
++
++    groupC = parser.add_argument_group('COLABFOLD PARAMS', 'Parameters for structure prediction with ColabFold '
++                                       '(AlphaFold2). These only apply when `--engine colabfold` is set. ColabFold '
++                                       'is not assumed to be on your $PATH: provide the name of the conda environment '
++                                       'it is installed in with --colabfold-conda-env.')
++    groupC.add_argument("--colabfold-conda-env", type=str, default=None, metavar='ENV_NAME', help =
++                        """The name of the conda environment in which ColabFold (colabfold_batch /
++                        colabfold_search) is installed. Anvi'o will run every ColabFold command via
++                        `conda run -n ENV_NAME`. If you leave this blank, anvi'o will assume the ColabFold
++                        programs are directly available (e.g. on your $PATH).""")
++    groupC.add_argument("--colabfold-msa-server", action='store_true', help =
++                        """Use the public MMseqs2 MSA server hosted by the ColabFold team to generate the
++                        multiple sequence alignment (MSA) step online. This requires an internet connection
++                        and is fine for a handful of sequences. Mutually exclusive with --colabfold-db. You
++                        must choose one of the two.""")
++    groupC.add_argument("--colabfold-db", type=str, default=None, metavar='DB_DIR', help =
++                        """Generate the MSA step locally instead of using the public server, by searching a
++                        local ColabFold database in this directory (the one you set up with ColabFold's
++                        `setup_databases.sh`). Recommended when you have many sequences. Mutually exclusive
++                        with --colabfold-msa-server. You must choose one of the two.""")
++    groupC.add_argument("--num-recycle", type=int, default=None, metavar='INT', help =
++                        """Number of prediction recycles for ColabFold. Increasing this can improve prediction
++                        quality at the cost of runtime. If not set, ColabFold's default is used.""")
++    groupC.add_argument("--amber", action='store_true', help =
++                        """Relax the best predicted structure with OpenMM/Amber. This can improve the quality of
++                        side-chains at the cost of longer runtime.""")
++    groupC.add_argument("--colabfold-additional-parameters", type=str, default=None, metavar='CMD LINE PARAMS', help =
++                        """Additional parameters to pass verbatim to `colabfold_batch`, for anything not exposed
++                        as a dedicated flag above. Because the value itself begins with dashes, you must attach
++                        it with an equals sign so it is not mistaken for anvi'o's own flags, e.g.
++                        --colabfold-additional-parameters="--num-seeds 2 --use-dropout". Anvi'o does not validate
++                        these, so use with care.""")
++
++    groupImport = parser.add_argument_group('IMPORT STRUCTURES', 'Instead of predicting structures, import '
++                                            'pre-computed ones. This bypasses the --engine choice entirely.')
++    groupImport.add_argument(*anvio.A('external-structures'), **anvio.K('external-structures'))
++
++    groupE = parser.add_argument_group('EXTRA', 'Everything else.')
+     groupE.add_argument(*anvio.A('num-threads'), **anvio.K('num-threads'))
+ 
+     params = {
+diff --git a/anvio/docs/artifacts/structure-db.md b/anvio/docs/artifacts/structure-db.md
+index bf686058e6..7a4614648d 100644
+--- a/anvio/docs/artifacts/structure-db.md
++++ b/anvio/docs/artifacts/structure-db.md
+@@ -1,6 +1,8 @@
+ 
+ This database contains the protein structural data for genes in a corresponding %(contigs-db)s and can be generated with %(anvi-gen-structure-database)s.
+ 
++The structures can be predicted with either template-based homology modelling (MODELLER) or AlphaFold2 (ColabFold), or imported from pre-computed structures you provide. The database records which engine was used, along with that engine's confidence metrics: MODELLER's DOPE/GA341/molpdf scores, or ColabFold's per-residue pLDDT and model-level pTM.
++
+ 
+ Currently, this database is best utilized for visualizing 3D structures with %(anvi-display-structure)s.
+ 
+diff --git a/anvio/docs/programs/anvi-gen-structure-database.md b/anvio/docs/programs/anvi-gen-structure-database.md
+index 21cd8429db..d0d4a196c8 100644
+--- a/anvio/docs/programs/anvi-gen-structure-database.md
++++ b/anvio/docs/programs/anvi-gen-structure-database.md
+@@ -1,9 +1,9 @@
+ 
+-This program creates a %(structure-db)s either by (a) attempting to solve for the 3D structures of proteins encoded by genes in your %(contigs-db)s using DIAMOND and MODELLER, or (b) importing pre-existing structures provided by the user using an %(external-structures)s file.
++This program creates a %(structure-db)s by predicting the 3D structures of proteins encoded by genes in your %(contigs-db)s. You can choose between two prediction engines with the `--engine` flag: (a) `modeller` (the default), which uses template-based homology modelling with DIAMOND and MODELLER, or (b) `colabfold`, which uses AlphaFold2 via [ColabFold](https://github.com/sokrypton/ColabFold). Alternatively, you can (c) import pre-existing structures you already have using an %(external-structures)s file.
+ 
+-### The basics of the pipeline
++### The basics of the MODELLER pipeline
+ 
+-This section covers option (a), where the user is interested in having structures predicted for them.
++This section covers the default `modeller` engine, where structures are predicted with homology modelling.
+ 
+ DIAMOND first searches your sequence(s) against a database of proteins with a known structure.  This database is downloaded from the [Sali lab](https://salilab.org/modeller/supplemental.html), who created and maintain MODELLER, and contains all of the PDB sequences clustered at 95%% identity.
+ 
+@@ -34,6 +34,41 @@ anvi-gen-structure-database -c %(contigs-db)s \
+ 
+ To quickly get a very rough estimate for your structures, you can run with the flag `--very-fast`.
+ 
++### Predicting structures with ColabFold (AlphaFold2)
++
++Instead of homology modelling, you can predict structures with AlphaFold2 via [ColabFold](https://github.com/sokrypton/ColabFold) by setting `--engine colabfold`. This does not require good templates to exist for your proteins.
++
++Anvi'o does not assume ColabFold is on your `$PATH`. If you installed it in a conda environment (for example, one named `colabfold`), tell anvi'o its name and every ColabFold command will be run via `conda run -n <name>`:
++
++ColabFold generates a multiple sequence alignment (MSA) and then predicts the structure. You must explicitly choose how the MSA step is done. The simplest option is to use the public MMseqs2 MSA server hosted by the ColabFold team with `--colabfold-msa-server` (this requires an internet connection and is appropriate for a handful of sequences):
++
++{{ codestart }}
++anvi-gen-structure-database -c %(contigs-db)s \
++                            --engine colabfold \
++                            --colabfold-conda-env colabfold \
++                            --colabfold-msa-server \
++                            --gene-caller-ids 1,2,3 \
++                            -o STRUCTURE.db
++{{ codestop }}
++
++{:.notice}
++The public MSA server is a limited shared resource. If you have many sequences, please set up a local ColabFold database instead (see below).
++
++If you have set up a local ColabFold database (with ColabFold's `setup_databases.sh`), generate the MSA locally by pointing anvi'o to that directory with `--colabfold-db` instead of `--colabfold-msa-server`:
++
++{{ codestart }}
++anvi-gen-structure-database -c %(contigs-db)s \
++                            --engine colabfold \
++                            --colabfold-conda-env colabfold \
++                            --colabfold-db /path/to/colabfold_db \
++                            --gene-caller-ids 1,2,3 \
++                            -o STRUCTURE.db
++{{ codestop }}
++
++All genes of interest are predicted together in a single ColabFold run, which is far more efficient on a GPU than predicting one gene at a time. ColabFold reports its own confidence metrics (per-residue pLDDT and model-level pTM), which anvi'o stores in the resulting %(structure-db)s.
++
++You can tune the prediction with `--num-models` (how many AlphaFold2 models to run per gene), `--num-recycle` (more recycles can improve quality at the cost of runtime), and `--amber` (relax the best model with OpenMM/Amber for better side-chains). Anything not exposed as a dedicated flag can be passed straight through to `colabfold_batch` with `--colabfold-additional-parameters` (because its value starts with dashes, attach it with an equals sign, e.g. `--colabfold-additional-parameters="--num-seeds 2"`). As with the MODELLER engine, you can provide a `--dump-dir` to keep all of the raw ColabFold output.
++
+ ### Basic import run
+ 
+ If you already possess structures and would like to create a %(structure-db)s for downstream anvi'o uses such as %(anvi-display-structure)s, you should create a %(external-structures)s file. Then, create the database as follows:
+diff --git a/anvio/drivers/colabfold.py b/anvio/drivers/colabfold.py
+new file mode 100644
+index 0000000000..ac4ac4617e
+--- /dev/null
++++ b/anvio/drivers/colabfold.py
+@@ -0,0 +1,328 @@
++"""Interface to ColabFold (AlphaFold2 protein structure prediction).
++
++ColabFold exposes two command-line programs:
++
++    - colabfold_search : CPU-heavy multiple sequence alignment (MSA) generation against a
++                         local database. Produces `.a3m` files.
++    - colabfold_batch  : the predictor. In online mode it generates the MSA using the public
++                         MMseqs2 server AND predicts the structure in one call. Given a
++                         directory of `.a3m` files it skips the MSA and only predicts.
++
++So the MSA step runs either online (public server) or locally (colabfold_search against a
++downloaded database). This driver handles both. ColabFold is not assumed to be on the $PATH:
++if the user provides a conda environment name, every command is prefixed with
++`conda run -n <NAME>`; otherwise the colabfold programs are expected to be directly callable
++(e.g. on the $PATH).
++
++This driver is a thin wrapper around the two programs. Locating and parsing the per-gene output
++files (best model PDB and confidence scores) happens in anvio.structureops, which orchestrates
++a single batched run over all genes of interest.
++"""
++
++import os
++import glob
++import shlex
++
++import anvio
++import anvio.utils as utils
++import anvio.terminal as terminal
++import anvio.filesnpaths as filesnpaths
++
++from anvio.errors import ConfigError
++
++
++__copyright__ = "Copyleft 2015-2024, The Anvi'o Project (http://anvio.org/)"
++__credits__ = []
++__license__ = "GPL 3.0"
++__version__ = anvio.__version__
++__authors__ = ['Florian_Trigodet']
++
++
++run = terminal.Run()
++progress = terminal.Progress()
++
++
++class ColabFold:
++    def __init__(self, args, run=run, progress=progress, skip_sanity_check=False):
++        self.run = run
++        self.progress = progress
++        self.args = args
++
++        A = lambda x, t: t(args.__dict__[x]) if x in args.__dict__ and args.__dict__[x] is not None else None
++        null = lambda x: x
++
++        self.conda_env = A('colabfold_conda_env', str)
++        self.use_msa_server = A('colabfold_msa_server', bool)
++        self.local_db = A('colabfold_db', null)
++        self.num_models = A('num_models', int)
++        self.num_recycle = A('num_recycle', int)
++        self.amber = A('amber', bool)
++        self.additional_params = A('colabfold_additional_parameters', str)
++
++        # anvi'o's --num-threads is authoritative: it is always forwarded to the colabfold programs,
++        # overriding their own defaults (e.g. colabfold_search defaults to 64 threads). So if the user
++        # leaves anvi'o's default of 1, colabfold_search is run with a single thread too.
++        self.num_threads = A('num_threads', int)
++
++        self.citation = ("ColabFold: Mirdita et al. 2022 (doi:10.1038/s41592-022-01488-1); "
++                         "AlphaFold2: Jumper et al. 2021 (doi:10.1038/s41586-021-03819-2)")
++        self.web = "https://github.com/sokrypton/ColabFold"
++
++        # every colabfold command is run inside the user's conda environment. when no environment
++        # name is given, the programs are expected to be directly available (e.g. on the $PATH).
++        self.command_prefix = ['conda', 'run', '--no-capture-output', '-n', self.conda_env] if self.conda_env else []
++
++        # the MSA is generated either locally (colabfold_search against self.local_db) or online
++        # (colabfold_batch queries the public MMseqs2 server)
++        self.msa_source = 'local' if self.local_db else 'server'
++
++        self.search_program = 'colabfold_search'
++        self.batch_program = 'colabfold_batch'
++
++        if not skip_sanity_check:
++            self.sanity_check()
++
++
++    def sanity_check(self):
++        if self.num_models is not None and not (1 <= self.num_models <= 5):
++            raise ConfigError("ColabFold can predict between 1 and 5 models per protein, but you asked for %d with "
++                              "--num-models. Please pick a value in that range." % self.num_models)
++
++        if self.local_db and self.use_msa_server:
++            raise ConfigError("You asked ColabFold to use both a local database (--colabfold-db) and the "
++                              "public MSA server (--colabfold-msa-server) for the MSA step. Please pick only one.")
++
++        if not self.local_db and not self.use_msa_server:
++            raise ConfigError("ColabFold needs to know how to generate the multiple sequence alignment (MSA). "
++                              "Please use either --colabfold-msa-server to query the public MMseqs2 server (fine "
++                              "for a handful of sequences), or --colabfold-db to point to a local ColabFold "
++                              "database directory (recommended for many sequences).")
++
++        if self.local_db:
++            if not filesnpaths.is_file_exists(self.local_db, dont_raise=True) or not os.path.isdir(self.local_db):
++                raise ConfigError("The ColabFold database path you provided with --colabfold-db does not seem to be a "
++                                  "directory that exists: '%s'. This should be the directory you set up with ColabFold's "
++                                  "`setup_databases.sh` script." % self.local_db)
++
++        self.check_program(self.batch_program)
++        if self.msa_source == 'local':
++            self.check_program(self.search_program)
++
++        self.check_gpu()
++
++
++    def check_program(self, program):
++        """Confirm a colabfold program is callable (inside the conda env, if one was given)"""
++
++        log_file_path = filesnpaths.get_temp_file_path()
++
++        try:
++            ret_val = utils.run_command(self.command_prefix + [program, '--help'], log_file_path)
++        except ConfigError:
++            ret_val = -1
++
++        if ret_val != 0:
++            env_msg = (" inside the conda environment '%s'" % self.conda_env) if self.conda_env else \
++                      (". Since you did not provide a --colabfold-conda-env, anvi'o looked for it on your $PATH")
++            raise ConfigError("Anvi'o could not run ColabFold's '%s' program%s. If ColabFold is installed in a conda "
++                              "environment, provide its name with --colabfold-conda-env so anvi'o can run it via "
++                              "`conda run -n <NAME>`. The command anvi'o tried to run is in this log file, in case it "
++                              "helps: %s" % (program, env_msg, log_file_path))
++
++        os.remove(log_file_path) if filesnpaths.is_file_exists(log_file_path, dont_raise=True) else None
++
++
++    def check_gpu(self):
++        """Best-effort, pre-run check of whether ColabFold will see a GPU, so the user is not surprised
++        by a slow CPU-only run.
++
++        We ask the JAX runtime (the same one colabfold_batch uses) which devices it can see. This is a
++        best-effort check: if we can't run it (e.g. JAX is not importable from the python we reach), we
++        say so and rely on the post-run log check (see report_gpu_usage_from_log) instead. It never
++        raises.
++        """
++
++        # a one-liner that asks JAX what devices it sees and prints a token we can parse
++        probe = ("import jax; "
++                 "devices = jax.devices(); "
++                 "gpus = [d for d in devices if d.platform != 'cpu']; "
++                 "print('ANVIO_GPU_CHECK|%d|%s' % (len(gpus), ','.join(sorted({d.platform for d in devices}))))")
++
++        try:
++            output = utils.run_command_and_get_output(self.command_prefix + ['python', '-c', probe], raise_on_error=False)
++        except Exception:
++            output = ''
++
++        token = None
++        for line in (output or '').splitlines():
++            if line.startswith('ANVIO_GPU_CHECK|'):
++                token = line.strip()
++                break
++
++        if token is None:
++            self.run.warning("Anvi'o could not check ahead of time whether ColabFold will use a GPU (it was not able "
++                             "to query the JAX runtime that ColabFold uses). No worries: the structure prediction will "
++                             "still run, and anvi'o will tell you at the end whether a GPU or the CPU was actually "
++                             "used.", header="GPU CHECK: COULD NOT DETERMINE", lc="yellow")
++            return
++
++        _, num_gpus, platforms = token.split('|')
++
++        if int(num_gpus) > 0:
++            self.run.info_single("ColabFold's runtime sees %s GPU device(s) (%s), so the structure prediction should "
++                                 "run on the GPU. Nice." % (num_gpus, platforms), mc='green', nl_before=1, nl_after=1)
++        else:
++            self.run.warning("ColabFold's runtime does not see a GPU, so the structure prediction will run on the CPU. "
++                             "This works, but it is *much* slower -- a single protein can take many minutes. If you do "
++                             "have a GPU, make sure ColabFold (and its JAX installation) can see it before running. "
++                             "Press CTRL+C now if you would like to stop.", header="GPU CHECK: NO GPU DETECTED")
++
++
++    def report_gpu_usage_from_log(self, log_file_path):
++        """After a run, report from ColabFold's own log whether it used a GPU or fell back to the CPU.
++
++        ColabFold logs `no GPU detected, will be using CPU` when it falls back to the CPU; the absence
++        of that message means it used the GPU. This is best-effort and never raises.
++        """
++
++        if not filesnpaths.is_file_exists(log_file_path, dont_raise=True):
++            return
++
++        try:
++            with open(log_file_path) as log_file:
++                log_content = log_file.read().lower()
++        except Exception:
++            return
++
++        if 'no gpu detected' in log_content:
++            self.run.warning("Heads up: ColabFold reported that no GPU was detected, so this run used the CPU. That is "
++                             "why it may have been slow. If you expected a GPU to be used, check that ColabFold and its "
++                             "JAX installation can see your GPU.", header="COLABFOLD USED THE CPU")
++        else:
++            self.run.info_single("ColabFold did not report falling back to the CPU, so the GPU was used for this run.",
++                                 mc='green', nl_before=1, nl_after=1)
++
++
++    def run_search(self, fasta_path, msa_dir, log_file_path):
++        """Generate MSAs locally with colabfold_search. Produces .a3m files in msa_dir.
++
++        Kept as a distinct step so a future PR can expose an --only-msa / --only-predict checkpoint.
++        """
++
++        cmd_line = self.command_prefix + [self.search_program, fasta_path, self.local_db, msa_dir]
++
++        if self.num_threads is not None:
++            cmd_line += ['--threads', str(self.num_threads)]
++
++        self.run.info('ColabFold MSA source', 'local database (%s)' % self.local_db)
++        self.run.info('ColabFold search cmd', ' '.join([str(x) for x in cmd_line]), quiet=(not anvio.DEBUG))
++
++        self.progress.new('ColabFold')
++        self.progress.update('Generating MSAs locally with %s (this is CPU-heavy) ...' % self.search_program)
++        # append so we don't clobber a log the prediction step will also write to (see process())
++        ret_val = utils.run_command(cmd_line, log_file_path, remove_log_file_if_exists=False)
++        self.progress.end()
++
++        if ret_val != 0 or not len(glob.glob(os.path.join(msa_dir, '*.a3m'))):
++            raise ConfigError("Something went wrong while ColabFold was generating MSAs with '%s'. Please take a look at "
++                              "the log file to find out what happened: %s" % (self.search_program, log_file_path))
++
++        return msa_dir
++
++
++    def run_batch(self, input_path, out_dir, log_file_path):
++        """Run colabfold_batch to predict structures.
++
++        When self.msa_source is 'server', input_path is the query FASTA and the MSA is generated on the
++        fly via the public server. When it is 'local', input_path is the directory of .a3m files
++        produced by run_search.
++        """
++
++        # colabfold_batch has no threads flag: the prediction is GPU-bound and manages its own device
++        # parallelism. The only case where a CPU thread count matters is a CPU-only run, which respects
++        # OMP_NUM_THREADS, so we set it via `env` (it has no effect when a GPU is used).
++        thread_env = ['env', 'OMP_NUM_THREADS=%d' % self.num_threads] if self.num_threads is not None else []
++
++        cmd_line = self.command_prefix + thread_env + [self.batch_program, input_path, out_dir]
++
++        if self.msa_source == 'server':
++            cmd_line += ['--msa-mode', 'mmseqs2_uniref_env']
++
++        if self.num_models is not None:
++            cmd_line += ['--num-models', str(self.num_models)]
++
++        if self.num_recycle is not None:
++            cmd_line += ['--num-recycle', str(self.num_recycle)]
++
++        if self.amber:
++            cmd_line += ['--amber', '--num-relax', '1']
++
++        if self.additional_params:
++            # shlex.split (not str.split) so quoted values with spaces, e.g. paths, survive intact
++            cmd_line += shlex.split(self.additional_params)
++
++        self.run.info('ColabFold predict cmd', ' '.join([str(x) for x in cmd_line]), quiet=(not anvio.DEBUG))
++
++        self.progress.new('ColabFold')
++        self.progress.update('Predicting structures with %s (this is GPU-heavy) ...' % self.batch_program)
++        # append so we don't clobber the MSA step's log (both steps share one log; see process())
++        ret_val = utils.run_command(cmd_line, log_file_path, remove_log_file_if_exists=False)
++        self.progress.end()
++
++        if ret_val != 0:
++            raise ConfigError("Something went wrong while ColabFold was predicting structures with '%s'. Please take a "
++                              "look at the log file to find out what happened: %s" % (self.batch_program, log_file_path))
++
++        return out_dir
++
++
++    def process(self, fasta_path, out_dir):
++        """Run ColabFold end-to-end over a (multi-sequence) FASTA and return the results directory.
++
++        Per-gene output parsing is done by the caller (anvio.structureops) via get_output_paths.
++        """
++
++        filesnpaths.gen_output_directory(out_dir, delete_if_exists=False, dont_warn=True)
++        log_file_path = os.path.join(out_dir, '00_log.txt')
++
++        # the MSA and prediction steps both append to this single log (each writing its own command
++        # header + output), so we start it fresh here in case a previous run left one behind (e.g.
++        # when reusing a --dump-dir)
++        if filesnpaths.is_file_exists(log_file_path, dont_raise=True):
++            os.remove(log_file_path)
++
++        self.run.info('Log file path', log_file_path)
++
++        if self.msa_source == 'local':
++            msa_dir = os.path.join(out_dir, 'msas')
++            self.run_search(fasta_path, msa_dir, log_file_path)
++            self.run_batch(msa_dir, out_dir, log_file_path)
++        else:
++            self.run_batch(fasta_path, out_dir, log_file_path)
++
++        # report from ColabFold's own log whether it used the GPU or fell back to the CPU
++        self.report_gpu_usage_from_log(log_file_path)
++
++        return out_dir
++
++
++    def get_output_paths(self, out_dir, jobname):
++        """Locate the best-model PDB and its scores JSON for a given jobname in a results directory.
++
++        ColabFold names the best model `rank_001` and writes a relaxed variant when --amber is used.
++        Returns a (pdb_path, scores_path) tuple, or (None, None) if the prediction is not found.
++        """
++
++        tag = 'relaxed' if self.amber else 'unrelaxed'
++
++        pdb_hits = sorted(glob.glob(os.path.join(out_dir, '%s_%s_rank_001_*.pdb' % (jobname, tag))))
++        if not pdb_hits:
++            # fall back to the unrelaxed model in case relaxation was skipped for this query
++            pdb_hits = sorted(glob.glob(os.path.join(out_dir, '%s_unrelaxed_rank_001_*.pdb' % jobname)))
++
++        scores_hits = sorted(glob.glob(os.path.join(out_dir, '%s_scores_rank_001_*.json' % jobname)))
++
++        pdb_path = pdb_hits[0] if pdb_hits else None
++        scores_path = scores_hits[0] if scores_hits else None
++
++        return pdb_path, scores_path
+diff --git a/anvio/migrations/structure/v2_to_v3.py b/anvio/migrations/structure/v2_to_v3.py
+new file mode 100644
+index 0000000000..f92e04f378
+--- /dev/null
++++ b/anvio/migrations/structure/v2_to_v3.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python
++
++import sys
++import argparse
++
++import anvio.db as db
++import anvio.utils as utils
++import anvio.terminal as terminal
++
++from anvio.errors import ConfigError
++
++run = terminal.Run()
++progress = terminal.Progress()
++
++current_version, next_version = [x[1:] for x in __name__.split('_to_')]
++
++# new columns introduced in v3 to accommodate a second structure-prediction engine (ColabFold).
++# ColabFold reports confidence metrics (per-residue pLDDT and model-level pTM) rather than
++# MODELLER's DOPE/GA341/molpdf scores, so these columns are simply left NULL for existing
++# (MODELLER or external) structures.
++new_columns = {
++    'models':       [('mean_plddt', 'real'), ('ptm', 'real')],
++    'residue_info': [('plddt', 'real')],
++}
++
++
++def determine_engine(structure_db):
++    """Figure out whether a pre-v3 database was made with MODELLER or from external structures.
++
++    A pre-v3 database is either a MODELLER run or an import of external structures (ColabFold did not
++    exist before v3, so it is never a possibility here). External structures were stored through a code
++    path that filled every MODELLER-specific value with a null/zero placeholder: the self table stores
++    `scoring_method` as NULL, and every row in the `templates` table has `pdb_id = 'none'`. A real
++    MODELLER run always has a scoring method and at least one genuine template, so the two are cleanly
++    distinguishable.
++    """
++
++    scoring_method = structure_db.get_meta_value('scoring_method', try_as_type_int=False, return_none_if_not_in_table=True)
++
++    distinct_template_ids = structure_db.get_single_column_from_table('templates', 'pdb_id', unique=True)
++    all_templates_are_none = all(pdb_id == 'none' for pdb_id in distinct_template_ids) if distinct_template_ids else True
++
++    if scoring_method is None and all_templates_are_none:
++        return 'external'
++    else:
++        return 'modeller'
++
++
++def migrate(db_path):
++    if db_path is None:
++        raise ConfigError("No database path is given.")
++
++    # make sure someone is not being funny
++    utils.is_structure_db(db_path)
++
++    structure_db = db.DB(db_path, None, ignore_version = True)
++    if str(structure_db.get_version()) != current_version:
++        structure_db.disconnect()
++        raise ConfigError("Version of this structure database is not %s (hence, this script cannot really do anything)." % current_version)
++
++    progress.new("Migrating structure database to v%s" % next_version)
++
++    progress.update("Recording the structure-prediction engine")
++    # figure out whether these structures came from MODELLER or from external structures BEFORE we add
++    # the new columns, so the detection only sees the original (pre-v3) schema
++    engine = determine_engine(structure_db)
++    structure_db.set_meta_value('engine', engine)
++
++    progress.update("Adding new columns for ColabFold confidence metrics")
++    for table_name, columns in new_columns.items():
++        for column_name, column_type in columns:
++            structure_db._exec('''ALTER TABLE %s ADD COLUMN %s %s''' % (table_name, column_name, column_type))
++
++    progress.update("Updating the version")
++    structure_db.remove_meta_key_value_pair('version')
++    structure_db.set_version(next_version)
++
++    structure_db.disconnect()
++    progress.end()
++
++    run.info_single("Your structure db is now version %s. It gained a few columns to store ColabFold "
++                    "confidence metrics, and now records which engine was used to make its structures "
++                    "(anvi'o determined this database's engine to be '%s')." % (next_version, engine),
++                    nl_after=1, nl_before=1, mc='green')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description='A simple script to upgrade structure database from version %s to version %s' % (current_version, next_version))
++    parser.add_argument('structure_db', metavar = 'STRUCTURE_DB', help = "An anvi'o structure database of version %s" % current_version)
++    args, unknown = parser.parse_known_args()
++
++    try:
++        migrate(args.structure_db)
++    except ConfigError as e:
++        print(e)
++        sys.exit(-1)
+diff --git a/anvio/structureops.py b/anvio/structureops.py
+index 001de3a8d7..c6c914627c 100755
+--- a/anvio/structureops.py
++++ b/anvio/structureops.py
+@@ -2,6 +2,7 @@
+ """Classes to make sense of genes and variability within the context of protein structure"""
+ 
+ import os
++import json
+ import time
+ import numpy as np
+ import shutil
+@@ -30,6 +31,7 @@
+ import anvio.constants as constants
+ import anvio.filesnpaths as filesnpaths
+ import anvio.drivers.MODELLER as MODELLER
++import anvio.drivers.colabfold as colabfold
+ 
+ from anvio.errors import ConfigError, FilesNPathsError
+ from anvio.dbops import ContigsSuperclass
+@@ -344,7 +346,11 @@ def __init__(self, args, create=False, run=terminal.Run(), progress=terminal.Pro
+         self.list_modeller_params = A('list_modeller_params', null)
+         self.full_modeller_output = A('dump_dir', null)
+ 
+-        self.run_mode = 'modeller' if not self.external_structures_path else 'external'
++        # self.run_mode is determined further below, once the structure db is available (for updates,
++        # the engine is read back from the db). self.engine records which prediction engine produced
++        # (or will produce) the structures in the db: 'modeller', 'colabfold', or 'external'.
++        self.run_mode = None
++        self.engine = None
+ 
+         self.num_threads = A('num_threads', int)
+         self.queue_size = self.num_threads * 2
+@@ -377,6 +383,31 @@ def __init__(self, args, create=False, run=terminal.Run(), progress=terminal.Pro
+         # init StructureDatabase
+         self.structure_db = StructureDatabase(self.structure_db_path, self.contigs_db_hash, create_new=create)
+ 
++        # determine the engine and the resulting run mode
++        if self.create:
++            engine = (A('engine', null) or 'modeller')
++            if self.external_structures_path and engine == 'colabfold':
++                raise ConfigError("You asked for the ColabFold engine (--engine colabfold) but also provided "
++                                  "--external-structures. These are mutually exclusive: either predict structures "
++                                  "with ColabFold, or import your own pre-computed structures, not both.")
++            if self.external_structures_path:
++                self.run_mode = 'external'
++            elif engine == 'colabfold':
++                self.run_mode = 'colabfold'
++            else:
++                self.run_mode = 'modeller'
++            self.engine = self.run_mode
++        else:
++            # updating an existing db: honor whatever engine it was created with
++            self.engine = self.structure_db.db.get_meta_value('engine', return_none_if_not_in_table=True) or 'modeller'
++
++            if self.engine == 'colabfold':
++                raise ConfigError("This structure database was created with the ColabFold engine. Updating ColabFold "
++                                  "structure databases (adding or re-running genes) is not supported yet. Please create "
++                                  "a new database with anvi-gen-structure-database instead.")
++
++            self.run_mode = 'external' if self.external_structures_path else 'modeller'
++
+         if self.list_modeller_params:
+             params_dict = self.structure_db.get_run_params_dict()
+             for param, value in params_dict.items():
+@@ -387,10 +418,14 @@ def __init__(self, args, create=False, run=terminal.Run(), progress=terminal.Pro
+         # NOTE self.skip_DSSP is down here because get_modeller_params has the potential to
+         # overwrite self.args.skip_DSSP if create=False
+         self.modeller_params = self.get_modeller_params()
++        self.colabfold_params = self.get_colabfold_params() if self.run_mode == 'colabfold' else None
+         self.skip_DSSP = A('skip_DSSP', bool)
+ 
+         if self.create:
++            self.structure_db.db.set_meta_value('engine', self.engine)
+             self.structure_db.store_modeller_params(self.modeller_params)
++            if self.colabfold_params is not None:
++                self.structure_db.store_modeller_params(self.colabfold_params)
+             self.structure_db.db.set_meta_value('skip_DSSP', self.skip_DSSP)
+ 
+         # init annotation sources
+@@ -444,6 +479,25 @@ def get_modeller_params(self):
+             }
+ 
+ 
++    def get_colabfold_params(self):
++        """Parses self.args to return a dictionary of ColabFold parameters to store in the db
++
++        The conda environment name and local database path are intentionally not stored: they are
++        machine-specific and not part of the scientific provenance of the structures.
++        """
++
++        A = lambda x, t: t(self.args.__dict__[x]) if x in self.args.__dict__ and self.args.__dict__[x] is not None else None
++        null = lambda x: x
++
++        return {
++            'num_models': A('num_models', null),
++            'num_recycle': A('num_recycle', null),
++            'amber': A('amber', bool),
++            'colabfold_msa_source': 'local' if A('colabfold_db', null) else 'server',
++            'colabfold_additional_parameters': A('colabfold_additional_parameters', null),
++        }
++
++
+     def set_prior_modeller_params(self):
+         """Add the previous run parameters used during database creation into self.args
+ 
+@@ -484,6 +538,23 @@ def sanity_check(self):
+ 
+             # Check and populate modeller databases if required
+             MODELLER.MODELLER(self.args, filesnpaths.get_temp_file_path(), check_db_only=True)
++        elif self.run_mode == 'colabfold':
++            # refuse to overwrite an existing --dump-dir (it is where ColabFold's raw output will go)
++            if self.full_modeller_output and filesnpaths.is_file_exists(self.full_modeller_output, dont_raise=True):
++                raise ConfigError("The --dump-dir you provided ('%s') already exists. Anvi'o will not overwrite it. "
++                                  "Please provide a path that does not exist yet." % self.full_modeller_output)
++
++            # instantiating the driver validates the conda env / ColabFold programs and the MSA source
++            # choice, so we do it up front (once) and reuse it during the batched run. We pass our own
++            # run/progress (not quiet ones) so the user sees the driver's messages -- notably the GPU
++            # check and the ColabFold prediction progress.
++            self.colabfold = colabfold.ColabFold(self.args, run=self.run, progress=self.progress)
++
++            self.run.warning("Anvi'o will use ColabFold to predict protein structures. If you publish your findings, "
++                             "please do not forget to properly credit the work behind it -- %s" % self.colabfold.citation,
++                             lc='green', header="CITATION")
++            self.run.info_single("Anvi'o is set up to predict structures with ColabFold using the %s MSA source"
++                                 % self.colabfold.msa_source, nl_after=1, nl_before=1, mc='green')
+         elif self.run_mode == 'external':
+             self.run.info_single("Anvi'o will attempt to generate a database using external structures", nl_after=1, nl_before=1, mc='green')
+ 
+@@ -612,6 +683,12 @@ def _run(self):
+                 self.run.info(param, value)
+             self.run.info('dump_dir', self.full_modeller_output, nl_after=1)
+ 
++        if self.run_mode == 'colabfold':
++            self.run.warning('', header='ColabFold parameters', nl_after=0, lc='green')
++            for param, value in self.colabfold_params.items():
++                self.run.info(param, value)
++            self.run.info('dump_dir', self.full_modeller_output, nl_after=1)
++
+         if not anvio.DEBUG:
+             self.run.warning("Do you want live info about how the modelling procedure is going for "
+                              "each gene? Then restart this process with the --debug flag", lc='yellow')
+@@ -648,7 +725,186 @@ def _run(self):
+                                                                                 len(genes_already_in_db),
+                                                                                 genes_already_in_db[:5]))
+ 
+-        self.run_multi_thread(genes_of_interest) if self.num_threads > 1 else self.run_single_thread(genes_of_interest)
++        if self.run_mode == 'colabfold':
++            # ColabFold predicts all genes in a single batched run (best GPU utilization), so it does
++            # not use the per-gene threading path that MODELLER/external structures use
++            self.run_colabfold_batch(genes_of_interest)
++        else:
++            self.run_multi_thread(genes_of_interest) if self.num_threads > 1 else self.run_single_thread(genes_of_interest)
++
++
++    def run_colabfold_batch(self, genes_of_interest):
++        """Predict structures for all genes of interest in a single ColabFold run, then store them.
++
++        Unlike MODELLER (one process per gene), ColabFold is run once over a multi-sequence FASTA. The
++        predictor batches internally and reuses the compiled model across sequences, which is far more
++        efficient on a GPU. Per-gene output files are then located, parsed, and stored.
++        """
++
++        genes_of_interest = list(genes_of_interest)
++
++        # export all genes of interest to a single amino acid FASTA; the header of each sequence is its
++        # gene caller id, which becomes the ColabFold 'jobname' and thus the prefix of its output files
++        self.progress.new('ColabFold')
++        self.progress.update('Preparing amino acid sequences ...')
++        _, aa_sequences = self.contigs_super.get_sequences_for_gene_callers_ids(genes_of_interest, report_aa_sequences=True)
++        self.progress.end()
++
++        fasta_path = os.path.join(filesnpaths.get_temp_directory_path(), 'genes_of_interest.fa')
++
++        clean_genes = []
++        with open(fasta_path, 'w') as fasta:
++            for gene in genes_of_interest:
++                sequence = aa_sequences[gene]['aa_sequence']
++                if not sequence:
++                    self.run.warning("Anvi'o could not find an amino acid sequence for gene ID %d, so it will be "
++                                     "skipped." % gene)
++                    continue
++                if self.skip_gene_if_not_clean(gene, sequence=sequence):
++                    continue
++                fasta.write('>%d\n%s\n' % (gene, sequence))
++                clean_genes.append(gene)
++
++        if not clean_genes:
++            raise ConfigError("None of your genes of interest passed anvi'o's 'clean gene' checks, so there is nothing "
++                              "for ColabFold to predict. Bye :'(")
++
++        # ColabFold writes its output files here. If the user provided a --dump-dir we use it so they
++        # can inspect the raw ColabFold output, otherwise a temporary directory is used
++        out_dir = self.full_modeller_output or filesnpaths.get_temp_directory_path()
++
++        # run ColabFold end-to-end (MSA + prediction) over all clean genes at once
++        self.colabfold.process(fasta_path, out_dir)
++
++        # parse each gene's output and store it
++        num_with_structure = 0
++        self.progress.new('Storing ColabFold results', progress_total_items=len(clean_genes))
++        for i, gene in enumerate(clean_genes):
++            self.progress.increment(i + 1)
++            self.progress.update('Processing gene %d ...' % gene)
++
++            self.structure_db.genes_queried.add(gene)
++
++            structure_info = self.process_colabfold_gene(gene, out_dir)
++            self.store_gene(structure_info)
++
++            if structure_info['has_structure']:
++                num_with_structure += 1
++                self.structure_db.genes_with_structure.add(gene)
++            else:
++                self.structure_db.genes_without_structure.add(gene)
++
++            self.structure_db.update_genes_with_and_without_structure()
++        self.progress.end()
++
++        # genes that were skipped for not being 'clean' were still attempted, so record them as queried
++        # but without a structure
++        for gene in genes_of_interest:
++            if gene not in clean_genes:
++                self.structure_db.genes_queried.add(gene)
++                self.structure_db.genes_without_structure.add(gene)
++        self.structure_db.update_genes_with_and_without_structure()
++
++        if not num_with_structure:
++            raise ConfigError("Well this is really sad. ColabFold did not produce a structure for any of your genes, so "
++                              "there is nothing to do. Please check the ColabFold log file in the output directory to "
++                              "find out what happened. Bye :'(")
++
++        # clean up temporary files, unless the user is debugging. The query FASTA always lives in a temp
++        # directory; the ColabFold output directory is temporary only when the user did not ask to keep
++        # it with --dump-dir
++        if not anvio.DEBUG:
++            fasta_tmp_dir = os.path.dirname(fasta_path)
++            if filesnpaths.is_file_exists(fasta_tmp_dir, dont_raise=True):
++                shutil.rmtree(fasta_tmp_dir, ignore_errors=True)
++            if not self.full_modeller_output and filesnpaths.is_file_exists(out_dir, dont_raise=True):
++                shutil.rmtree(out_dir, ignore_errors=True)
++
++        self.structure_db.disconnect()
++        self.run.info("Structure database", self.structure_db_path)
++
++
++    def process_colabfold_gene(self, corresponding_gene_call, out_dir):
++        """Locate and parse a single gene's ColabFold output into a structure_info dict"""
++
++        structure_info = {
++            'corresponding_gene_call': corresponding_gene_call,
++            'has_structure': False,
++        }
++
++        pdb_path, scores_path = self.colabfold.get_output_paths(out_dir, str(corresponding_gene_call))
++
++        if not pdb_path:
++            self.run.warning("ColabFold did not produce a structure for gene ID %d. Anvi'o will move on to the next "
++                             "gene." % corresponding_gene_call)
++            return structure_info
++
++        # parse the scores JSON once here and pass the dict to both consumers below
++        scores = self.read_colabfold_scores(scores_path)
++
++        structure_info['results'] = self.create_results_dict_for_colabfold_structure(corresponding_gene_call, pdb_path, scores)
++        structure_info['has_structure'] = True
++
++        residue_info = self.get_gene_contribution_to_residue_info_table(
++            corresponding_gene_call=corresponding_gene_call,
++            pdb_filepath=pdb_path,
++        )
++        structure_info['residue_info'] = self.add_plddt_to_residue_info(residue_info, scores)
++
++        return structure_info
++
++
++    def create_results_dict_for_colabfold_structure(self, corresponding_gene_call, pdb_path, scores):
++        """Build a results dict (mirroring the MODELLER/external contract) for a ColabFold structure
++
++        ColabFold reports confidence with per-residue pLDDT and model-level pTM instead of MODELLER's
++        DOPE/GA341/molpdf scores. Here we record the model-level metrics; per-residue pLDDT is added to
++        the residue_info table separately (see add_plddt_to_residue_info). `scores` is the parsed
++        ColabFold scores dict (or None if it was missing).
++        """
++
++        mean_plddt, ptm = None, None
++        if scores is not None:
++            plddt = scores.get('plddt', [])
++            if len(plddt):
++                mean_plddt = float(np.mean(plddt))
++            if scores.get('ptm', None) is not None:
++                ptm = float(scores['ptm'])
++
++        return {
++            'templates': {'pdb_id': ['none'], 'chain_id': ['none'], 'proper_percent_similarity': [0], 'percent_similarity': [0], 'align_fraction': [0]},
++            'models': {'mean_plddt': [mean_plddt], 'ptm': [ptm], 'picked_as_best': [True]},
++            'corresponding_gene_call': corresponding_gene_call,
++            'structure_exists': True,
++            'best_model_path': pdb_path,
++            'best_score': mean_plddt,
++        }
++
++
++    def add_plddt_to_residue_info(self, residue_info, scores):
++        """Attach ColabFold's per-residue pLDDT to the residue_info dataframe, aligned by codon_order_in_gene
++
++        `scores` is the parsed ColabFold scores dict (or None if it was missing).
++        """
++
++        if scores is None:
++            return residue_info
++
++        plddt = scores.get('plddt', [])
++        plddt_per_codon_order = {codon_order: value for codon_order, value in enumerate(plddt)}
++        residue_info['plddt'] = residue_info['codon_order_in_gene'].map(plddt_per_codon_order)
++
++        return residue_info
++
++
++    def read_colabfold_scores(self, scores_path):
++        """Load a ColabFold scores JSON file, or return None if it is missing"""
++
++        if not scores_path or not filesnpaths.is_file_exists(scores_path, dont_raise=True):
++            return None
++
++        with open(scores_path) as f:
++            return json.load(f)
+ 
+ 
+     def run_multi_thread(self, genes_of_interest):
+@@ -950,7 +1206,7 @@ def run_residue_identity_annotation(self, corresponding_gene_call, pdb_filepath)
+                     "codon":               [],
+                     "amino_acid":          []}
+ 
+-        last_codon = nt_sequence[:-3]
++        last_codon = nt_sequence[-3:]
+         if last_codon in ['TAA', 'TAG', 'TGA']:
+             gene_length_in_codons = len(nt_sequence)//3 - 1 # subtract 1 because it's the stop codon
+         else:
+@@ -1026,9 +1282,13 @@ def store_gene(self, structure_info):
+         # entries that are only added if a structure was modelled
+         if results['structure_exists']:
+ 
+-            # models
++            # models. Different engines populate different score columns (MODELLER: molpdf/GA341/DOPE;
++            # ColabFold: mean_plddt/ptm), so any column the engine did not produce is filled with NULL
+             models = pd.DataFrame(results['models'])
+             models.insert(0, 'corresponding_gene_call', corresponding_gene_call)
++            for column in t.models_table_structure:
++                if column not in models.columns:
++                    models[column] = None
+             self.structure_db.entries[t.models_table_name] = \
+                 pd.concat([self.structure_db.entries[t.models_table_name], models])
+             self.structure_db.store(t.models_table_name)
+@@ -1041,9 +1301,14 @@ def store_gene(self, structure_info):
+             self.structure_db.entries[t.pdb_data_table_name].append(pdb_table_entry)
+             self.structure_db.store(t.pdb_data_table_name)
+ 
+-            # residue_info
++            # residue_info. The per-residue plddt column is only produced by ColabFold, so it is filled
++            # with NULL for other engines
++            residue_info = structure_info['residue_info']
++            for column in t.residue_info_table_structure:
++                if column not in residue_info.columns:
++                    residue_info[column] = None
+             self.structure_db.entries[t.residue_info_table_name] = \
+-                pd.concat([self.structure_db.entries[t.residue_info_table_name], structure_info['residue_info']])
++                pd.concat([self.structure_db.entries[t.residue_info_table_name], residue_info])
+             self.structure_db.store(t.residue_info_table_name)
+ 
+ 
+diff --git a/anvio/tables/__init__.py b/anvio/tables/__init__.py
+index 59e1a91324..53d3cf2fcb 100644
+--- a/anvio/tables/__init__.py
++++ b/anvio/tables/__init__.py
+@@ -310,13 +310,16 @@
+ templates_table_structure  = ['corresponding_gene_call' , 'pdb_id' , 'chain_id' , 'proper_percent_similarity', 'percent_similarity', 'align_fraction']
+ templates_table_types      = ['integer'                 , 'text'   , 'text'     , 'real',                      'real',               'real']
+ 
++# the MODELLER-specific score columns (molpdf, GA341_score, DOPE_score) are left NULL for structures
++# predicted with ColabFold, whose native model-level metrics (mean_plddt, ptm) are stored instead
+ models_table_name       = 'models'
+-models_table_structure  = ['corresponding_gene_call' , 'molpdf' , 'GA341_score' , 'DOPE_score' , 'picked_as_best']
+-models_table_types      = ['integer'                 , 'real'   , 'real'        , 'real'       , 'integer']
++models_table_structure  = ['corresponding_gene_call' , 'molpdf' , 'GA341_score' , 'DOPE_score' , 'mean_plddt' , 'ptm'  , 'picked_as_best']
++models_table_types      = ['integer'                 , 'real'   , 'real'        , 'real'       , 'real'       , 'real' , 'integer']
+ 
++# `plddt` holds the per-residue ColabFold confidence (NULL for MODELLER/external structures)
+ residue_info_table_name       = 'residue_info'
+-residue_info_table_structure  = ['corresponding_gene_call', 'codon_order_in_gene', 'contact_numbers', 'codon', 'amino_acid', 'codon_number', 'sec_struct' , 'rel_solvent_acc' , 'phi'  , 'psi'  , 'NH_O_1_index' , 'NH_O_1_energy' , 'O_NH_1_index' , 'O_NH_1_energy' , 'NH_O_2_index' , 'NH_O_2_energy' , 'O_NH_2_index' , 'O_NH_2_energy']
+-residue_info_table_types      = [        'integer'        ,        'integer'     ,   'text'          , 'text',  'text',       'integer',      'text'       , 'real'            , 'real' , 'real' , 'integer'      , 'real'          , 'integer'      , 'real'          , 'integer'      , 'real'          , 'integer'      , 'real']
++residue_info_table_structure  = ['corresponding_gene_call', 'codon_order_in_gene', 'contact_numbers', 'codon', 'amino_acid', 'codon_number', 'sec_struct' , 'rel_solvent_acc' , 'phi'  , 'psi'  , 'plddt' , 'NH_O_1_index' , 'NH_O_1_energy' , 'O_NH_1_index' , 'O_NH_1_energy' , 'NH_O_2_index' , 'NH_O_2_energy' , 'O_NH_2_index' , 'O_NH_2_energy']
++residue_info_table_types      = [        'integer'        ,        'integer'     ,   'text'          , 'text',  'text',       'integer',      'text'       , 'real'            , 'real' , 'real' , 'real'  , 'integer'      , 'real'          , 'integer'      , 'real'          , 'integer'      , 'real'          , 'integer'      , 'real']
+ 
+ ####################################################################################################
+ #
+diff --git a/anvio/tests/run_component_tests_for_SCVs_SAAVs_structure.sh b/anvio/tests/run_component_tests_for_SCVs_SAAVs_structure.sh
+index 06d90d440a..db7dca0d0c 100755
+--- a/anvio/tests/run_component_tests_for_SCVs_SAAVs_structure.sh
++++ b/anvio/tests/run_component_tests_for_SCVs_SAAVs_structure.sh
+@@ -13,6 +13,21 @@ make_structure_db() {
+                                 --num-threads 2 \
+                                 --num-models 1
+ }
++# Predict structures with ColabFold instead of MODELLER. This is NOT part of the default routines
++# because it requires ColabFold to be installed (pass its conda env with --colabfold-conda-env) and,
++# for a real run, a GPU and either internet access (--colabfold-msa-server) or a local ColabFold
++# database (--colabfold-db). Invoke it manually when you want to exercise the ColabFold engine.
++make_structure_db_colabfold() {
++    anvi-gen-structure-database -c test-output/one_contig_five_genes.db \
++                                --engine colabfold \
++                                --colabfold-msa-server \
++                                --skip-DSSP \
++                                --gene-caller-ids 2 \
++                                --num-models 1 \
++                                --dump-dir test-output/RAW_COLABFOLD_OUTPUT \
++                                --output-db-path test-output/STRUCTURE_COLABFOLD.db \
++                                --debug
++}
+ gen_var_profile1() {
+     anvi-gen-variability-profile -p test-output/SAMPLES-MERGED/PROFILE.db \
+                                  -c test-output/one_contig_five_genes.db \
+diff --git a/anvio/version.py b/anvio/version.py
+index e6fdc7509d..1c06ca89ba 100644
+--- a/anvio/version.py
++++ b/anvio/version.py
+@@ -23,7 +23,7 @@
+ pan_db_version = "21"
+ pangraph_db_version = "7"
+ auxiliary_data_version = "2"
+-structure_db_version = "2"
++structure_db_version = "3"
+ genomes_storage_version = "8"
+ trnaseq_db_version = "2"
+ workflow_config_version = "6"

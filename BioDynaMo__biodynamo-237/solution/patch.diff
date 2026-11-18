@@ -1,0 +1,304 @@
+diff --git a/src/core/param/param.cc b/src/core/param/param.cc
+index 11e4a52e4..bf8c2cc42 100644
+--- a/src/core/param/param.cc
++++ b/src/core/param/param.cc
+@@ -363,6 +363,7 @@ void Param::AssignFromConfig(const std::shared_ptr<cpptoml::table>& config) {
+   BDM_ASSIGN_CONFIG_VALUE(debug_numa, "development.debug_numa");
+   BDM_ASSIGN_CONFIG_VALUE(show_simulation_step,
+                           "development.show_simulation_step");
++  BDM_ASSIGN_CONFIG_VALUE(use_progress_bar, "development.use_progress_bar");
+ 
+   // experimental group
+   BDM_ASSIGN_CONFIG_VALUE(compute_target, "experimental.compute_target");
+diff --git a/src/core/param/param.h b/src/core/param/param.h
+index fee538eab..ec844c8a1 100644
+--- a/src/core/param/param.h
++++ b/src/core/param/param.h
+@@ -601,6 +601,18 @@ struct Param {
+   ///     show_simulation_step = 0
+   uint64_t show_simulation_step = 0;
+ 
++  /// Use a progress bar to visualize the simulation progress. The progress bar
++  /// also gives an estimate of the remaining simulation time assuming that the
++  /// following simulations steps are as computationally expensive as the
++  /// previous ones. It is not recommended to use the ProgressBar when you
++  /// write information to std::cout in Simulate() because the ProgressBar uses
++  /// '\r' in its print statements.
++  /// Default value: `false`\n
++  /// TOML config file:
++  ///     [development]
++  ///     use_progress_bar = false
++  bool use_progress_bar = false;
++
+   // ---------------------------------------------------------------------------
+   // experimental group
+ 
+diff --git a/src/core/scheduler.cc b/src/core/scheduler.cc
+index bf57a6641..1efc79a9a 100644
+--- a/src/core/scheduler.cc
++++ b/src/core/scheduler.cc
+@@ -124,6 +124,7 @@ Scheduler::~Scheduler() {
+   }
+   delete backup_;
+   delete root_visualization_;
++  delete progress_bar_;
+ }
+ 
+ void Scheduler::Simulate(uint64_t steps) {
+@@ -131,7 +132,7 @@ void Scheduler::Simulate(uint64_t steps) {
+     return;
+   }
+ 
+-  Initialize();
++  Initialize(steps);
+   for (unsigned step = 0; step < steps; step++) {
+     Execute();
+ 
+@@ -354,8 +355,12 @@ void Scheduler::RunPostScheduledOps() {
+ 
+ void Scheduler::Execute() {
+   auto* param = Simulation::GetActive()->GetParam();
+-  if (param->show_simulation_step != 0 &&
+-      total_steps_ % param->show_simulation_step == 0) {
++  if (param->use_progress_bar) {
++    assert(progress_bar_ != nullptr);
++    progress_bar_->Step();
++    progress_bar_->PrintProgressBar();
++  } else if (param->show_simulation_step != 0 &&
++             total_steps_ % param->show_simulation_step == 0) {
+     std::cout << "Time step: " << total_steps_ << std::endl;
+   }
+   ScheduleOps();
+@@ -435,7 +440,7 @@ void Scheduler::UpdateSimulatedTime() {
+ // TODO(lukas, ahmad) After https://trello.com/c/0D6sHCK4 has been resolved
+ // think about a better solution, because some operations are executed twice
+ // if Simulate is called with one timestep.
+-void Scheduler::Initialize() {
++void Scheduler::Initialize(uint64_t steps) {
+   auto* sim = Simulation::GetActive();
+   auto* env = sim->GetEnvironment();
+   auto* rm = sim->GetResourceManager();
+@@ -450,6 +455,14 @@ void Scheduler::Initialize() {
+     rm->ForEachAgentParallel(*bound_space);
+     delete bound_space;
+   }
++
++  // If users select the progress bar, we create the appropriate object.
++  if (param->use_progress_bar) {
++    delete progress_bar_;
++    progress_bar_ = nullptr;
++    progress_bar_ = new ProgressBar(steps);
++  }
++
+   // We force-update the environment in this function because users may apply
+   // certain operations such as shifting them in space in between two Simulate()
+   // or SimulateUntil() calls. In contrast to adding or removing agents, such
+diff --git a/src/core/scheduler.h b/src/core/scheduler.h
+index 223b6201a..aeade18c9 100644
+--- a/src/core/scheduler.h
++++ b/src/core/scheduler.h
+@@ -26,6 +26,7 @@
+ #include "core/functor.h"
+ #include "core/operation/operation.h"
+ #include "core/param/param.h"
++#include "core/util/progress_bar.h"
+ #include "core/util/timing_aggregator.h"
+ 
+ namespace bdm {
+@@ -126,6 +127,7 @@ class Scheduler {
+   uint64_t restore_point_;
+   std::chrono::time_point<Clock> last_backup_ = Clock::now();
+   RootAdaptor* root_visualization_ = nullptr;  //!
++  ProgressBar* progress_bar_ = nullptr;
+ 
+   /// List of all operations that have been add either as default
+   /// or by a call to Scheduler::ScheduleOp.
+@@ -169,7 +171,7 @@ class Scheduler {
+   // TODO(lukas, ahmad) After https://trello.com/c/0D6sHCK4 has been resolved
+   // think about a better solution, because some operations are executed twice
+   // if Simulate is called with one timestep.
+-  void Initialize();
++  void Initialize(uint64_t steps = 0);
+ 
+   /// Runs a lambda for each operation in the specified list of operations
+   template <typename Lambda>
+diff --git a/src/core/util/progress_bar.cc b/src/core/util/progress_bar.cc
+new file mode 100644
+index 000000000..6151bb3e5
+--- /dev/null
++++ b/src/core/util/progress_bar.cc
+@@ -0,0 +1,100 @@
++// -----------------------------------------------------------------------------
++//
++// Copyright (C) 2021 CERN & University of Surrey for the benefit of the
++// BioDynaMo collaboration. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++//
++// See the LICENSE file distributed with this work for details.
++// See the NOTICE file distributed with this work for additional information
++// regarding copyright ownership.
++//
++// -----------------------------------------------------------------------------
++
++#include "core/util/progress_bar.h"
++#include <unistd.h>
++#include <cassert>
++#include <iomanip>
++#include <string>
++#include "core/util/timing.h"
++
++namespace bdm {
++
++ProgressBar::ProgressBar() : ProgressBar(0){};
++
++ProgressBar::ProgressBar(int total_steps)
++    : total_steps_(total_steps),
++      executed_steps_(0),
++      start_time_(Timing::Timestamp()),
++      first_iter_(true),
++      n_digits_time_(0),
++      write_to_file_(false) {}
++
++void ProgressBar::Step(uint64_t steps) { executed_steps_ += steps; }
++
++void ProgressBar::PrintProgressBar(std::ostream &out) {
++  // Do not write to file because it does not handle "\r" well.
++  if (write_to_file_) {
++    return;
++  }
++
++  // Print empty line at first iteration to compensate for "\r" below.
++  if (first_iter_) {
++    // Determine if we write to file or terminal.
++    if (!isatty(fileno(stdout))) {
++      std::cout << "<ProgressBar::PrintProgressBar> omits output because you "
++                   "write to file."
++                << std::endl;
++      write_to_file_ = true;
++      return;
++    }
++    out << "ET = Elapsed Time; TR = Time Remaining" << std::endl;
++    first_iter_ = false;
++  }
++
++  // If total_steps_ is not set, we fall back to simple step printing. This can
++  // be the case if someone uses SimulateUntil where we do not know the number
++  // of steps in advance.
++  if (total_steps_ == 0) {
++    out << "Time step: " << total_steps_ << std::endl;
++  }
++
++  // 1. Get current and compute elapsed time
++  int64_t current_time = Timing::Timestamp();
++  double elapsed_time = static_cast<double>(current_time - start_time_);
++
++  // 2. Compute ETA
++  double fraction_computed =
++      static_cast<double>(executed_steps_) / static_cast<double>(total_steps_);
++  assert(fraction_computed <= 1);
++  double remaining_time = elapsed_time / fraction_computed - elapsed_time;
++
++  // 3. Print progress bar
++  size_t n_steps_computed = std::floor(fraction_computed / 0.02);
++  int n_digits_steps = std::ceil(std::log10(total_steps_));
++  n_digits_time_ =
++      std::max({static_cast<int>(std::ceil(std::log10(elapsed_time))),
++                static_cast<int>(std::ceil(std::log10(remaining_time))),
++                n_digits_time_});
++
++  // Progress bar
++  out << "[" << std::string(n_steps_computed, '#')
++      << std::string(50 - n_steps_computed, ' ') << "] ";
++  // Print number of executed steps
++  out << std::setw(n_digits_steps) << executed_steps_ << " / "
++      << std::setw(n_digits_steps) << total_steps_ << " ";
++  // Print remaining time
++  out << "( ET: " << std::setw(n_digits_time_) << elapsed_time
++      << ", TR:" << std::setw(n_digits_time_) << std::ceil(remaining_time)
++      << ")[ms]";
++  // Override lines in next step
++  out << "\r";
++
++  // 3. Go to new line once we've reached the last step
++  if (executed_steps_ == total_steps_) {
++    out << "\n";
++  }
++}
++
++}  // namespace bdm
+\ No newline at end of file
+diff --git a/src/core/util/progress_bar.h b/src/core/util/progress_bar.h
+new file mode 100644
+index 000000000..3f807ca09
+--- /dev/null
++++ b/src/core/util/progress_bar.h
+@@ -0,0 +1,54 @@
++// -----------------------------------------------------------------------------
++//
++// Copyright (C) 2021 CERN & University of Surrey for the benefit of the
++// BioDynaMo collaboration. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++//
++// See the LICENSE file distributed with this work for details.
++// See the NOTICE file distributed with this work for additional information
++// regarding copyright ownership.
++//
++// -----------------------------------------------------------------------------
++
++#ifndef PROGRESS_BAR_H_
++#define PROGRESS_BAR_H_
++
++#include <cstdint>
++#include <iostream>
++
++namespace bdm {
++
++class ProgressBar {
++ private:
++  /// Total number of steps to be executed.
++  uint64_t total_steps_;
++  /// Number of steps that have already been executed.
++  uint64_t executed_steps_;
++  /// Timestamp when to when the progress bar was initialized.
++  int64_t start_time_;
++  /// Boolean variable to print certain informatoin only once in the first
++  /// iteration.
++  bool first_iter_;
++  /// Keep track of space that is needed for printing elapsed and remaining time
++  /// for nicer output.
++  int n_digits_time_;
++  /// Variable to detect if we write to a file or not. ProgressBar is not
++  /// visible if we write to file.
++  bool write_to_file_;
++
++ public:
++  ProgressBar();
++  ProgressBar(int total_steps);
++
++  /// Inceases the counter `executed_steps_` by `steps`.
++  void Step(uint64_t steps = 1);
++
++  /// Prints the progress bar.
++  void PrintProgressBar(std::ostream &out = std::cout);
++};
++
++}  // namespace bdm
++
++#endif  // PROGRESS_BAR_H_
+\ No newline at end of file
+diff --git a/src/core/util/timing.h b/src/core/util/timing.h
+index 4beb37f97..108e82665 100644
+--- a/src/core/util/timing.h
++++ b/src/core/util/timing.h
+@@ -20,6 +20,7 @@
+ #include <string>
+ 
+ #include "core/param/param.h"
++#include "core/scheduler.h"
+ #include "core/simulation.h"
+ #include "core/util/timing_aggregator.h"
+ 

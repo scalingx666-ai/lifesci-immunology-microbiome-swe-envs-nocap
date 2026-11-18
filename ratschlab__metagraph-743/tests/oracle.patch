@@ -1,0 +1,283 @@
+diff --git a/metagraph/integration_tests/test_remap_anno.py b/metagraph/integration_tests/test_remap_anno.py
+index 0bd1089526..3a9268dbbf 100644
+--- a/metagraph/integration_tests/test_remap_anno.py
++++ b/metagraph/integration_tests/test_remap_anno.py
+@@ -281,6 +281,50 @@ def test_row_map_from_extraction(self, mode, anno_repr, convert):
+                              self._query(target, prefix + anno_file_extension[anno_repr],
+                                          query_mode))
+ 
++    @parameterized.expand([
++        ('plain', False, 1, '', ''),
++        ('plain_threads', False, NUM_THREADS, '', ''),
++        ('masked', True, 1, '', ''),
++        ('masked_threads', True, NUM_THREADS, '', ''),
++        # extractions that do not write the whole graph
++        ('pruned', False, NUM_THREADS, '', '--prune-tips 30'),
++        ('counts', False, NUM_THREADS, '--count-kmers', ''),
++        ('filtered', False, NUM_THREADS, '--count-kmers', '--min-count 2'),
++    ])
++    def test_convert_basic_succinct(self, name, clear_dummy, num_threads, build_flags, flags):
++        """A basic succinct graph converts to the SSHash graph that a build from
++        its contigs gives. Debug builds also compare the succ/pred bitmaps taken
++        from the succinct graph with the ones SSHash computes."""
++        prefix = f'{self.tempdir.name}/basic_{name}'
++        self._build_graph(INPUT, prefix + '.dbg', K, 'succinct', 'basic', build_flags)
++        source = prefix + '.dbg'
++        if clear_dummy:
++            self._run_command(
++                f'{METAGRAPH} transform -p {NUM_THREADS} --clear-dummy'
++                f' -o {prefix}_masked {source}', 'Transform command', shell=True)
++            source = prefix + '_masked.dbg'
++        self._run_command(
++            f'{METAGRAPH} transform -p {num_threads} --graph sshash {flags}'
++            f' -o {prefix}_converted {source}', 'Transform command', shell=True)
++        self._run_command(
++            f'{METAGRAPH} transform -p {num_threads} --to-fasta {flags}'
++            f' -o {prefix}_contigs {source}', 'Transform command', shell=True)
++        self._run_command(
++            f'{METAGRAPH} build -p {NUM_THREADS} --mode basic --graph sshash'
++            f' -k {K} -o {prefix}_built.sshashdbg {prefix}_contigs.fasta.gz',
++            'Build command', shell=True)
++
++        # the unitigs of an SSHash graph follow from its succ/pred bitmaps
++        unitigs = []
++        for graph in [f'{prefix}_converted', f'{prefix}_built']:
++            self._run_command(
++                f'{METAGRAPH} transform -p {NUM_THREADS} --to-fasta --unitigs'
++                f' -o {graph}_unitigs {graph}.sshashdbg', 'Transform command', shell=True)
++            with gzip.open(f'{graph}_unitigs.fasta.gz', 'rt') as f:
++                unitigs.append(sorted(line for line in f if not line.startswith('>')))
++        self.assertEqual(unitigs[0], unitigs[1])
++        self.assertGreater(len(unitigs[0]), 0)
++
+     @parameterized.expand(['--to-fasta --row-map', '--graph sshash'])
+     def test_row_map_rejects_canonical(self, flags):
+         prefix = self.tempdir.name + '/canonical'
+diff --git a/metagraph/src/cli/clean.cpp b/metagraph/src/cli/clean.cpp
+index 52f0e95544..cf46e5bb5c 100644
+--- a/metagraph/src/cli/clean.cpp
++++ b/metagraph/src/cli/clean.cpp
+@@ -42,7 +42,8 @@ int clean_graph(Config *config) {
+     return clean_graph(config, load_critical_dbg(config->fnames.at(0)));
+ }
+ 
+-int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
++int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph,
++                std::pair<sdsl::bit_vector, sdsl::bit_vector> *succ_pred) {
+     assert(config);
+ 
+     const auto &files = config->fnames;
+@@ -139,6 +140,14 @@ int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
+ 
+     timer.reset();
+ 
++    // The degrees in the source graph are those in the SSHash graph only if all
++    // k-mers of a basic graph are written: no subgraph, no k-mer counts to filter
++    // by, no pruned tips.
++    auto *dbg_succ = dynamic_cast<const graph::DBGSuccinct*>(graph.get());
++    if (!dbg_succ || node_weights || config->min_tip_size > 1
++            || graph->get_mode() != graph::DeBruijnGraph::BASIC)
++        succ_pred = nullptr;
++
+     auto call_clean_contigs = [&](auto callback, size_t num_threads) {
+         if (config->min_unitig_median_kmer_abundance != 1) {
+             assert(node_weights);
+@@ -189,14 +198,68 @@ int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
+                                                             2 * graph->max_index(),
+                                                             row_map_tmp_dir);
+         }
++        const graph::boss::BOSS *boss = nullptr;
++        const bit_vector *boss_mask = nullptr;
++        if (succ_pred) {
++            boss = &dbg_succ->get_boss();
++            boss_mask = dbg_succ->get_mask();
++            // resized to the number of written k-mers after the extraction
++            succ_pred->first = sdsl::bit_vector(graph->max_index() + 1, false);
++            succ_pred->second = sdsl::bit_vector(graph->max_index() + 1, false);
++        }
+         // `first` is the number of k-mers written before this contig
+         auto add_rows = [&](const auto &path, uint64_t first) {
+             if (row_map) {
++                uint64_t target = first;
+                 for (auto node : path) {
+-                    row_map->add(node - 1, ++first);
++                    row_map->add(node - 1, ++target);
++                }
++            }
++            if (succ_pred) {
++                // K-mer j of this contig is SSHash node first + 1 + j. Edge path[j + 1]
++                // leaves the BOSS node that edge path[j] enters, so the degrees of
++                // that node are read here without fwd or bwd.
++                for (size_t j = 0; j + 1 < path.size(); ++j) {
++                    if (boss->is_single_outgoing(path[j + 1]))
++                        set_bit(succ_pred->first.data(), first + 1 + j, true);
++
++                    auto w = boss->get_W(path[j]);
++                    bool single_incoming;
++                    if (w < boss->alph_size) {
++                        // path[j] is the first edge incoming to that node
++                        single_incoming = boss->is_single_incoming(path[j], w);
++                    } else if (!boss_mask) {
++                        single_incoming = false;
++                    } else {
++                        // single if the only other incoming edge is a masked dummy
++                        auto d = w - boss->alph_size;
++                        auto x = boss->pred_W(path[j], d);
++                        single_incoming = !(*boss_mask)[x]
++                                    && boss->num_incoming_to_target(x, d) == 2;
++                    }
++                    if (single_incoming)
++                        set_bit(succ_pred->second.data(), first + 2 + j, true);
+                 }
+             }
+         };
++        // the end of the last written contig, for the edge between two contigs
++        std::string prev_suffix;
++        bool prev_single_outgoing = false;
++        // call under the lock, before num_kmers is advanced
++        auto link_contigs = [&](const std::string &contig, bool single_incoming,
++                                bool single_outgoing) {
++            if (!succ_pred)
++                return;
++            const size_t overlap = graph->get_k() - 1;
++            if (num_kmers && prev_suffix == std::string_view(contig).substr(0, overlap)) {
++                if (prev_single_outgoing)
++                    set_bit(succ_pred->first.data(), num_kmers, true);
++                if (single_incoming)
++                    set_bit(succ_pred->second.data(), num_kmers + 1, true);
++            }
++            prev_suffix = contig.substr(contig.size() - overlap);
++            prev_single_outgoing = single_outgoing;
++        };
+ 
+         if (node_weights) {
+             if (!node_weights->is_compatible(*graph)) {
+@@ -239,9 +302,12 @@ int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
+ 
+             call_contigs([&](const std::string &contig, const auto &path) {
+                 uint64_t first;
++                const bool single_incoming = succ_pred && graph->has_single_incoming(path.front());
++                const bool single_outgoing = succ_pred && graph->has_single_outgoing(path.back());
+                 {
+                     std::lock_guard<std::mutex> lock(seq_mutex);
+                     writer.write(contig);
++                    link_contigs(contig, single_incoming, single_outgoing);
+                     num_bp += contig.size();
+                     first = num_kmers;
+                     num_kmers += contig.size() - graph->get_k() + 1;
+@@ -254,6 +320,11 @@ int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph) {
+         logger->trace("Extracted {} bp of sequences with {} k-mers and wrote to {}",
+                       num_bp, num_kmers, fasta_fname);
+ 
++        if (succ_pred) {
++            succ_pred->first.resize(num_kmers + 1);
++            succ_pred->second.resize(num_kmers + 1);
++        }
++
+         if (row_map) {
+             const std::string row_map_fname = outfbase + ".rowmap";
+             try {
+diff --git a/metagraph/src/cli/clean.hpp b/metagraph/src/cli/clean.hpp
+index cdf16b6569..9205c2fb39 100644
+--- a/metagraph/src/cli/clean.hpp
++++ b/metagraph/src/cli/clean.hpp
+@@ -3,6 +3,9 @@
+ 
+ 
+ #include <memory>
++#include <utility>
++
++#include <sdsl/int_vector.hpp>
+ 
+ 
+ namespace mtg {
+@@ -18,7 +21,11 @@ class Config;
+ int clean_graph(Config *config);
+ 
+ // Same, for a graph that is already loaded from config->fnames[0]
+-int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph);
++// With |succ_pred|, also fill the succ_is_next and pred_is_prev bitmaps of the SSHash
++// graph built from the written sequences. They are left empty unless all k-mers of
++// a basic succinct graph are written.
++int clean_graph(Config *config, std::shared_ptr<graph::DeBruijnGraph> graph,
++                std::pair<sdsl::bit_vector, sdsl::bit_vector> *succ_pred = nullptr);
+ 
+ } // namespace cli
+ } // namespace mtg
+diff --git a/metagraph/src/cli/transform_graph.cpp b/metagraph/src/cli/transform_graph.cpp
+index 8857840da3..2bb010857f 100644
+--- a/metagraph/src/cli/transform_graph.cpp
++++ b/metagraph/src/cli/transform_graph.cpp
+@@ -47,12 +47,17 @@ static int convert_to_sshash(Config *config, std::shared_ptr<graph::DeBruijnGrap
+     extract.to_fasta = true;
+     extract.row_map = true;
+     extract.outfbase = tmp_dir / "contigs";
+-    clean_graph(&extract, std::move(graph));
++    // For a basic succinct graph, the node degrees read during the extraction give
++    // the succ/pred bitmaps, which SSHash otherwise computes with k-mer lookups.
++    std::pair<sdsl::bit_vector, sdsl::bit_vector> succ_pred;
++    clean_graph(&extract, std::move(graph), &succ_pred);
++    const bool shortcut = !succ_pred.first.empty();
+ 
+     Timer timer;
+     try {
+         DBGSSHash sshash(extract.outfbase + ".fasta.gz", k, mode,
+-                         config->num_chars, config->memory_available);
++                         config->num_chars, config->memory_available,
++                         shortcut ? &succ_pred : nullptr);
+         logger->trace("SSHash graph built in {} sec", timer.elapsed());
+         sshash.serialize(config->outfbase);
+ 
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index b8b83ea332..0c415cfde6 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -196,7 +196,8 @@ DBGSSHash::DBGSSHash(const std::string& input_filename,
+                      size_t k,
+                      Mode mode,
+                      size_t num_chars,
+-                     double ram_limit_gb)
++                     double ram_limit_gb,
++                     std::pair<sdsl::bit_vector, sdsl::bit_vector> *succ_pred)
+     : DBGSSHash(k, mode) {
+     if (k <= 1)
+         throw std::domain_error("k must be at least 2");
+@@ -262,6 +263,22 @@ DBGSSHash::DBGSSHash(const std::string& input_filename,
+ 
+     num_nodes_ = dict_size();
+ 
++    if (succ_pred) {
++        if (succ_pred->first.size() != num_nodes_ + 1 || succ_pred->second.size() != num_nodes_ + 1)
++            throw std::invalid_argument("succ/pred bitmaps do not match the SSHash graph");
++#ifndef NDEBUG
++        auto [succ, pred, has_duplicates] = generate_succ_pred(*this, num_nodes_);
++        assert(!has_duplicates);
++        for (uint64_t i = 0; i <= num_nodes_; ++i) {
++            assert(succ[i] == succ_pred->first[i]);
++            assert(pred[i] == succ_pred->second[i]);
++        }
++#endif
++        succ_is_next_ = bit_vector_smart(std::move(succ_pred->first));
++        pred_is_prev_ = bit_vector_smart(std::move(succ_pred->second));
++        return;
++    }
++
+     bool has_duplicates;
+     std::tie(succ_is_next_, pred_is_prev_, has_duplicates) = generate_succ_pred(*this, num_nodes_);
+     if (has_duplicates) {
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.hpp b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+index ee9fc7f00c..4377d769fa 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.hpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+@@ -40,7 +40,10 @@ class DBGSSHash : public DeBruijnGraph {
+               size_t k,
+               Mode mode = BASIC,
+               size_t num_chars = 0,
+-              double ram_limit_gb = 0);
++              double ram_limit_gb = 0,
++              // succ_is_next and pred_is_prev (num k-mers + 1 bits each) to move
++              // from if the caller already knows them, e.g., from another graph
++              std::pair<sdsl::bit_vector, sdsl::bit_vector> *succ_pred = nullptr);
+ 
+     // SequenceGraph overrides
+     void add_sequence(

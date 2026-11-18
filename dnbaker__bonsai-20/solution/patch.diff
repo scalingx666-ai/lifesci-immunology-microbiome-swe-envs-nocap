@@ -1,0 +1,213 @@
+diff --git a/hll b/hll
+index a9041fc5..056b43c6 160000
+--- a/hll
++++ b/hll
+@@ -1 +1 @@
+-Subproject commit a9041fc5de2909158f506d5075c09281f438be4c
++Subproject commit 056b43c662b844d52483ccc09da023fa98de2819
+diff --git a/include/bonsai/encoder.h b/include/bonsai/encoder.h
+index 0ff57429..fc8b99cb 100755
+--- a/include/bonsai/encoder.h
++++ b/include/bonsai/encoder.h
+@@ -109,7 +109,7 @@ class Encoder {
+ private:
+     u64         pos_; // Current position within the string s_ we're working with.
+     void      *data_; // A void pointer for using with scoring. Needed for hash_score.
+-    QueueMap<KmerT, uint64_t> qmap_; // queue of max scores and std::map which keeps kmers, scores, and counts so that we can select the top kmer for a window.
++    QueueMap<KmerT, KmerT> qmap_; // queue of max scores and std::map which keeps kmers, scores, and counts so that we can select the top kmer for a window.
+     const ScoreType  scorer_; // scoring struct
+     bool canonicalize_;
+     static constexpr KmerT ENCODE_OVERFLOW = static_cast<KmerT>(-1);
+@@ -246,21 +246,21 @@ class Encoder {
+         unsigned filled;
+         CircusEnt &ent = *(static_cast<CircusEnt *>(data_));
+         windowed_loop_start:
++        ent.clear();
+         filled = min = 0;
+         while(likely(pos_ < l_)) {
+             while(filled < sp_.k_ && likely(pos_ < l_)) {
+                 min <<= 2;
+-                if(unlikely((min |= cstr_lut[s_[pos_]]) == ENCODE_OVERFLOW) && likely(sp_.k_ < 31 || cstr_lut[s_[pos_]] != 'T')) {
++                if(unlikely((min |= cstr_lut[s_[pos_]]) == ENCODE_OVERFLOW) && likely(sp_.k_ < (sizeof(KmerT) * 4 - 1) || cstr_lut[s_[pos_]] != 'T')) {
+                     ++pos_;
+                     goto windowed_loop_start;
+                 }
+-                ent.push(s_[pos_]);
+-                ++pos_;
++                ent.push(s_[pos_++]);
+                 ++filled;
+             }
+             if(likely(filled == sp_.k_)) {
+                 min &= mask;
+-                if((kmer = qmap_.next_value(min, ent.score())) != ENCODE_OVERFLOW) func(kmer);
++                if((kmer = qmap_.next_value(min, min / (ent.value() + .001))) != ENCODE_OVERFLOW) func(kmer);
+                 --filled;
+             }
+         }
+@@ -482,6 +482,7 @@ class Encoder {
+             delete static_cast<CircusEnt *>(data_);
+         }
+     }
++    size_t n_in_queue() const {return qmap_.n_in_queue();}
+ };
+ 
+ enum RollingHashingType {
+@@ -708,6 +709,8 @@ struct RollingHasher {
+         if(destroy) kseq_destroy(ks);
+     }
+     void reset() {hasher_.reset(); rchasher_.reset();}
++    size_t n_in_queue() const {return qmap_.n_in_queue();}
++    auto max_in_queue() const {return qmap_.begin()->first;}
+ };
+ 
+ template<typename IType>
+diff --git a/include/bonsai/entropy.h b/include/bonsai/entropy.h
+index 10da187c..bf49c590 100755
+--- a/include/bonsai/entropy.h
++++ b/include/bonsai/entropy.h
+@@ -1,65 +1,49 @@
+ #pragma once
+ #include "circularqueue/cq.h"
+ #include "bonsai/kmerutil.h"
+-#include "circularqueue/cq.h"
++#include "flat_hash_map/flat_hash_map.hpp"
+ 
+ namespace bns {
+ 
+ class CircusEnt {
++    using CountT = uint64_t;
+     circ::deque<char> q_;
+-    uint8_t   counts_[4];
+-    uint8_t        cqsz_;
+-    const uint8_t   qsz_;
++    size_t        cqsz_;
++    const size_t   qsz_;
+     const double qszinv_;
++    ska::flat_hash_map<char, size_t> counts_;
+ public:
+     static constexpr double NOT_FULL = -1.;
+-    CircusEnt(unsigned qsz): q_(qsz), counts_{0}, cqsz_(0), qsz_(qsz), qszinv_(1./qsz) {
+-        if(qsz == 0 || qsz > 255) RUNTIME_ERROR(std::string("Illegal queue size with qsz = " + std::to_string(qsz) + " and maximum value " + std::to_string(std::numeric_limits<uint8_t>::max())));
++    CircusEnt(size_t qsz): q_(qsz), cqsz_(0), qsz_(qsz), qszinv_(1./qsz) {
+     }
+-    CircusEnt(const CircusEnt &other): q_(other.q_), cqsz_(other.cqsz_), qsz_(other.qsz_), qszinv_(other.qszinv_) {
+-        std::memcpy(counts_, other.counts_, sizeof(counts_));
++    CircusEnt(const CircusEnt &other): q_(other.q_), cqsz_(other.cqsz_), qsz_(other.qsz_), qszinv_(other.qszinv_), counts_(other.counts_) {
+     }
+     CircusEnt(CircusEnt &&other) = default;
+     void clear() {
+-        *(reinterpret_cast<uint32_t *>(counts_)) = cqsz_ = 0;
++        counts_.clear();
++        cqsz_ = 0;
+         q_.clear();
+     }
+     void push(char c) {
+-#if !NDEBUG
+-        if(cqsz_ == qsz_) {
+-            auto to_pop = cstr_lut[q_.pop()];
+-            assert(to_pop != static_cast<int8_t>(-1));
+-            assert(counts_[to_pop]);
+-            --counts_[to_pop];
+-        }
+-        q_.push(c);
+-        assert(cstr_lut[c] != static_cast<int8_t>(-1));
+-        ++counts_[cstr_lut[c]];
+-        static_assert(std::is_unsigned<typename std::decay<decltype(q_.size())>::type>::value, "q's size should be unsigned.");
+-        assert(unsigned(counts_[0] + counts_[1] + counts_[2] + counts_[3]) == q_.size());
+-#else
+         // Increment count of added nucleotide
+-        // If not fu
+-        ++counts_[cstr_lut[c]];
++        // If not full
++        auto it = counts_.find(c);
++        if(it == counts_.end()) it = counts_.emplace(c, 1).first;
++        else ++it->second;
+         if(cqsz_ == qsz_) {
+-            --counts_[cstr_lut[q_.pop()]]; // Pop and decrement
+-        } else {
+-            ++cqsz_;                       // Or just keep filling the window
+-        }
++            it = counts_.find(q_.pop());
++            assert(it != counts_.end());
++            if(--it->second == 0)
++                counts_.erase(it);
++            // Pop and decrement
++        } else
++            ++cqsz_; // Or just keep filling the window
+         q_.push(c);
+-#endif
+     }
+     double value() const {
+         if(unlikely(cqsz_ < qsz_)) return NOT_FULL;
+-        assert(cqsz_ == q_.size());
+-        double tmp(qszinv_ * (counts_[0])), sum(tmp * std::log2(tmp));
+-        tmp = qszinv_ * counts_[1], sum += tmp * std::log2(tmp);
+-        tmp = qszinv_ * counts_[2], sum += tmp * std::log2(tmp);
+-        tmp = qszinv_ * counts_[3], sum += tmp * std::log2(tmp);
+-        return sum;
+-    }
+-    u64 score() const {
+-        return UINT64_MAX - static_cast<u64>(UINT64_C(7958933093282078720) * value());
++        return std::accumulate(counts_.begin(), counts_.end(), 0.,
++               [qi=qszinv_](double s, auto v) {return s + v.second * qi * std::log(v.second * qi);});
+     }
+     double next_ent(char c) {
+         push(c);
+diff --git a/include/bonsai/feature_min.h b/include/bonsai/feature_min.h
+index 94ce5aff..e09157f8 100755
+--- a/include/bonsai/feature_min.h
++++ b/include/bonsai/feature_min.h
+@@ -70,7 +70,13 @@ size_t fill_set_genome(const char *path, const Spacer &sp, khash_t(all) *ret, si
+     LOG_DEBUG("Filling from genome at path %s. kseq is pre-allocated ? %s. %p\n", path, ks ? "true": "false", (void *)ks);
+ 
+     Encoder<ScoreType> enc(0, 0, sp, data, canon);
+-    enc.add(ret, path, ks);
++    enc.for_each([&](auto x) {
++        auto it = kh_get(all, ret, x);
++        if(it == kh_end(ret)) {
++            int khr;
++            kh_put(all, ret, x, &khr);
++        }
++    }, path, ks);
+     LOG_DEBUG("Set of size %lu filled from genome at path %s\n", kh_size(ret), path);
+     return index;
+ }
+diff --git a/include/bonsai/qmap.h b/include/bonsai/qmap.h
+index d9627c6c..f4bf377c 100755
+--- a/include/bonsai/qmap.h
++++ b/include/bonsai/qmap.h
+@@ -76,17 +76,17 @@ class QueueMap {
+     map_iterator       end()       {return map_.end();}
+     const_map_iterator end() const {return map_.cend();}
+     // Do a std::enable_if that involves moving the element if it's by reference?
+-    u64 next_value(const T el, const u64 score) {
++    T next_value(const T el, const T score) {
+         add(list_.emplace_back(el, score));
+         if(list_.size() > wsz_) del(list_.pop_front());
+-        return list_.size() == wsz_ ? map_.begin()->first.el_: BF;
++        return list_.size() == wsz_ ? map_.begin()->first.el_: std::numeric_limits<T>::max();
+         // Signal a window that is not filled by 0xFFFFFFFFFFFFFFFF
+     }
+     void reset() {
+-        list_.clear();
+-        map_.clear();
++        list_.clear(); map_.clear();
+     }
+     size_t size() const {return wsz_;}
++    size_t n_in_queue() const {return list_.size();}
+ };
+ 
+ using qmap_t = QueueMap<u64, u64>;
+diff --git a/test/encoding.cpp b/test/encoding.cpp
+index e5a635a8..214eab9e 100755
+--- a/test/encoding.cpp
++++ b/test/encoding.cpp
+@@ -139,7 +139,7 @@ TEST_CASE( "Spacer encodes and decodes contiguous, unminimized seeds correctly."
+             }
+             kseq_rewind(ks);
+             gzrewind(fp);
+-            enc.set_canonicalize(false);
++            enc.canonicalize(false);
+             enc.for_each([&](auto km) {okmers.insert(canonical_representation(km, 31));}, ks);
+             size_t olap(0);
+             for(const auto k: kmers) olap += (okmers.find(k) != okmers.end());

@@ -1,0 +1,111 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 6ff5a9e2..560451fe 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -4,6 +4,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ## The future
+ 
++### 🐛 Bug Fixes
++
++- {func}`ep.pp.filter_observations <ehrapy.preprocessing.filter_observations>` applies criteria in `query` on `obs` columns also when `X`, or the given `layer`, is `None`, so that a cohort can be defined before any variables are set up; criteria on variables, `min_vars`, `max_vars` and `tem_names` need data and raise a `ValueError` without it, as does {func}`ep.pp.filter_features <ehrapy.preprocessing.filter_features>` ([#1216](https://github.com/theislab/ehrapy/pull/1216)) [@eroell](https://github.com/eroell)
++
+ ## v0.16.0
+ 
+ ### 🚀 Features
+diff --git a/ehrapy/preprocessing/_filter.py b/ehrapy/preprocessing/_filter.py
+index e37df3a5..9de6f5a8 100644
+--- a/ehrapy/preprocessing/_filter.py
++++ b/ehrapy/preprocessing/_filter.py
+@@ -88,6 +88,8 @@ def filter_features(
+         raise ValueError("prop must be set to a value between 0 and 1 when time_mode is 'proportion'")
+ 
+     arr = edata.X if layer is None else edata.layers[layer]
++    if arr is None:
++        raise ValueError("min_obs and max_obs need data in X or in the given layer.")
+     is_3d = arr.ndim == 3 and arr.shape[2] > 1
+ 
+     (missing_counts,) = _materialize(_compute_missing_values(arr, axis=0))
+@@ -159,6 +161,7 @@ def filter_observations(
+         prop: Proportion of time points in which the observation must pass the filtering criteria. Only relevant if `time_mode='proportion'`.
+         query: One or several inclusion criteria on `obs` columns and variables, which are applied in order.
+             Names that are not valid Python identifiers are enclosed in backticks.
++            Criteria on `obs` columns also work when `X`, or the given `layer`, is `None`, for instance before any variables are set up.
+         tem_names: Labels of `edata.tem.index` or a positional slice that select the timepoints of 3D data that the missing data thresholds and criteria consider.
+             If `None` (default), all timepoints are used.
+         agg: How variables in `query` are reduced over the selected timepoints of 3D data, one of the statistics of :func:`~ehrapy.preprocessing.summarize_measurements`.
+@@ -199,15 +202,25 @@ def filter_observations(
+         raise ValueError("prop must be set to a value between 0 and 1 when time_mode is 'proportion'")
+ 
+     arr = edata.X if layer is None else edata.layers[layer]
+-    is_3d = arr.ndim == 3 and arr.shape[2] > 1
+-    if arr.ndim == 3:
+-        tem_pos, _ = _resolve_axis(pd.Index(edata.tem.index), tem_names, "tem_names")
+-        arr = arr[:, :, tem_pos]
+-    elif tem_names is not None:
+-        raise ValueError("tem_names needs 3D data with a time axis.")
++    if arr is None:
++        # Criteria on obs columns need no data, so a cohort can be defined before any variables are set up.
++        if has_threshold:
++            raise ValueError("min_vars and max_vars need data in X or in the given layer.")
++        if tem_names is not None:
++            raise ValueError("tem_names needs data in X or in the given layer.")
++        is_3d = False
++    else:
++        is_3d = arr.ndim == 3 and arr.shape[2] > 1
++        if arr.ndim == 3:
++            tem_pos, _ = _resolve_axis(pd.Index(edata.tem.index), tem_names, "tem_names")
++            arr = arr[:, :, tem_pos]
++        elif tem_names is not None:
++            raise ValueError("tem_names needs 3D data with a time axis.")
+ 
+     criteria = [query] if isinstance(query, str) else list(query or ())
+     var_names = _referenced_var_names(edata, criteria)
++    if arr is None and var_names:
++        raise ValueError(f"Criteria on the variables {var_names} need data in X or in the given layer.")
+     lazy = [_compute_missing_values(arr, axis=1)] if has_threshold else []
+     if var_names:
+         lazy.append(_variable_values(arr, _var_indices(edata, var_names), agg))
+diff --git a/tests/preprocessing/test_filter.py b/tests/preprocessing/test_filter.py
+index 3bde78bd..6785ea43 100644
+--- a/tests/preprocessing/test_filter.py
++++ b/tests/preprocessing/test_filter.py
+@@ -271,3 +271,38 @@ def test_filter_obs_query_array_types(array_type, ndim, cohort_edata):
+     assert list(result.obs_names) == [f"patient_{i}" for i in expected]
+     assert isinstance(result.X, array_type.cls)
+     np.testing.assert_array_equal(to_dense(result.X, to_cpu_memory=True), X[expected])
++
++
++def test_filter_obs_query_without_data(cohort_edata):
++    """A cohort can be defined by criteria on obs columns before any variables are set up."""
++    edata = ed.EHRData(obs=cohort_edata.obs.copy())
++    tracker = ep.tl.CohortTracker(edata, columns=["age"])
++
++    filtered = ep.pp.filter_observations(edata, query="age >= 18", copy=True)
++    ep.pp.filter_observations(edata, query=["age >= 18", "sex == 'm'"], tracker=tracker)
++
++    assert list(filtered.obs_names) == list(cohort_edata.obs_names[cohort_edata.obs["age"] >= 18])
++    assert filtered.X is None
++    assert list(edata.obs_names) == ["patient_3", "patient_4"]
++    assert tracker._tracked_text == ["Cohort 0\n (n=5)", "age >= 18\n (n=4)", "sex == 'm'\n (n=2)"]
++
++
++@pytest.mark.parametrize(
++    ("kwargs", "match"),
++    [
++        ({"min_vars": 1}, "min_vars and max_vars need data"),
++        ({"max_vars": 1}, "min_vars and max_vars need data"),
++        ({"query": "age >= 18", "tem_names": ["0"]}, "tem_names needs data"),
++        ({"query": "glucose > 5"}, r"Criteria on the variables \['glucose'\] need data"),
++    ],
++)
++def test_filter_obs_without_data_raises(cohort_edata, kwargs, match):
++    edata = ed.EHRData(obs=cohort_edata.obs.copy(), var=pd.DataFrame(index=["glucose"]))
++    with pytest.raises(ValueError, match=match):
++        ep.pp.filter_observations(edata, **kwargs)
++
++
++def test_filter_features_without_data_raises(cohort_edata):
++    edata = ed.EHRData(obs=cohort_edata.obs.copy(), var=pd.DataFrame(index=["glucose"]))
++    with pytest.raises(ValueError, match="min_obs and max_obs need data"):
++        ep.pp.filter_features(edata, min_obs=1)

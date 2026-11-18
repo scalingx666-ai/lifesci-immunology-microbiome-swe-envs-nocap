@@ -1,0 +1,1102 @@
+diff --git a/TODO.md b/TODO.md
+index ab5fb807..299301b9 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -16,3 +16,8 @@ if more genomes labeled with that taxid occur.
+      for the 'stem' nodes.
+ 3. Come up with a metric for how much is gained/lost vs Kraken and vs full CDBG.
+ 4. Is HLL or bloom filter sketching an option for getting at kmer set overlaps with smaller memory requirements?
++5. Investigate frequency based minimizers (absolute kmer frequencies rather than minimizing by number of genomes or taxonomic depth)
++6. universal hitting sets as a compression scheme
++
++*/
++
+diff --git a/hll b/hll
+index e7f9ba8f..3307cef5 160000
+--- a/hll
++++ b/hll
+@@ -1 +1 @@
+-Subproject commit e7f9ba8f0b585c12e07e146681ab92e1bc5aeb0f
++Subproject commit 3307cef54c26f559158ad6f7dbf83de310808e10
+diff --git a/lib/bitcmp.h b/lib/bitcmp.h
+index 77d31e9c..2ff069b5 100644
+--- a/lib/bitcmp.h
++++ b/lib/bitcmp.h
+@@ -14,61 +14,49 @@ enum BitCmp {
+ inline int veccmp(const void *a, const void *b, size_t nbytes) {
+ #if __AVX2__
+     __m256i aentry, bentry;
+-    const __m256i *va = reinterpret_cast<const __m256i*>(a),
+-                  *vb = reinterpret_cast<const __m256i*>(b);
++    const __m256i *pa = reinterpret_cast<const __m256i*>(a),
++                  *pb = reinterpret_cast<const __m256i*>(b);
+     size_t n255(nbytes >> 5), nlo(nbytes & 31u);
+     int aparent(1), bparent(1); // a could be parent of b, b could be parent of a.
+     while(n255--) {
+-        aentry = _mm256_loadu_si256(va++);
+-        bentry = _mm256_loadu_si256(vb++);
++        aentry = _mm256_loadu_si256(pa++);
++        bentry = _mm256_loadu_si256(pb++);
+         bparent &= _mm256_testz_si256(aentry, ~bentry);
+         aparent &= _mm256_testz_si256(bentry, ~aentry);
+-        if((aparent & bparent) == 0) return BitCmp::INCOMPARABLE;
++        if((aparent | bparent) == 0) return BitCmp::INCOMPARABLE;
+     }
+-    u8 *eba((u8 *)va), *ebb((u8 *)vb);
+ #elif __SSE2__
+     __m128i aentry, bentry;
+-    const __m128i *va = reinterpret_cast<const __m128i*>(a),
+-                  *vb = reinterpret_cast<const __m128i*>(b);
++    const __m128i *pa = reinterpret_cast<const __m128i*>(a),
++                  *pb = reinterpret_cast<const __m128i*>(b);
+     size_t n127(nbytes >> 4), nlo(nbytes & 15u);
+     int aparent(1), bparent(1); // a could be parent of b, b could be parent of a.
+     while(n127--) {
+-        aentry = _mm_loadu_si128(va++);
+-        bentry = _mm_loadu_si128(vb++);
++        aentry = _mm_loadu_si128(pa++);
++        bentry = _mm_loadu_si128(pb++);
+         bparent &= _mm_testz_si128(aentry, ~bentry);
+         aparent &= _mm_testz_si128(bentry, ~aentry);
+-        if((aparent & bparent) == 0) return BitCmp::INCOMPARABLE;
++        if((aparent | bparent) == 0) return BitCmp::INCOMPARABLE;
+     }
+-    u8 *eba((u8 *)va), *ebb((u8 *)vb);
+ #else
+     size_t n64(nbytes >> 3), nlo(nbytes & 7u);
+     const u64 *pa((const u64 *)a), *pb((const u64 *)b);
+     while(n64--) {
+         bparent &= !(*pa & (~*pb));
+         aparent &= !(*pb & (~*pa));
+-        if((aparent & bparent) == 0) return BitCmp::INCOMPARABLE;
++        if((aparent | bparent) == 0) return BitCmp::INCOMPARABLE;
+         ++pa, ++pb;
+     }
+-    u8 *eba((u8 *)pa), u8 *ebb((u8 *)pb);
+ #endif
++    u8 *eba((u8 *)pa), *ebb((u8 *)pb);
+     while(nlo--) {
+         bparent &= !(*eba & (~*ebb));
+         aparent &= !(*ebb & (~*eba));
+-        if((aparent & bparent) == 0) return BitCmp::INCOMPARABLE;
++        if((aparent | bparent) == 0) return BitCmp::INCOMPARABLE;
+         ++eba, ++ebb;
+     }
+-#if VECCMP_USE_SWITCH
+-    // Variant (should benchmark)
+-    switch((aparent << 1) | bparent) {
+-        case 3: return BitCmp::EQUAL;
+-        case 2: return BitCmp::FIRST_PARENT;
+-        case 1: return BitCmp::SECOND_PARENT;
+-        case 0: return BitCmp::INCOMPARABLE;
+-    }
+-#else
+     static const u8 retcodes[] {BitCmp::INCOMPARABLE, BitCmp::SECOND_PARENT, BitCmp::FIRST_PARENT, BitCmp::EQUAL};
+     return retcodes[(aparent << 1) | bparent];
+-#endif
+ }
+ 
+ // Vector comparison function
+diff --git a/lib/bits.h b/lib/bits.h
+index 209d9390..8ed8c5d4 100644
+--- a/lib/bits.h
++++ b/lib/bits.h
+@@ -1,7 +1,7 @@
+ #ifndef _BITS_H__
+ #define _BITS_H__
+ #include <type_traits>
+-#include "lib/util.h"
++#include "lib/kmerutil.h"
+ 
+ namespace emp {
+ 
+@@ -69,6 +69,7 @@ INLINE auto vec_bitdiff(const T &a, const T &b) {
+ } //namespace popcnt
+ 
+ 
++
+ } // namespace emp
+ 
+ #endif
+diff --git a/lib/classifier.cpp b/lib/classifier.cpp
+index 42678502..7f0e51fa 100644
+--- a/lib/classifier.cpp
++++ b/lib/classifier.cpp
+@@ -8,14 +8,15 @@ void kt_for_helper(void *data_, long index, int tid) {
+     size_t retstr_size(0);
+     const int inc(!!data->is_paired_ + 1);
+     Encoder<score::Lex> enc(data->c_.enc_);
++    std::vector<tax_t> taxa;
+     for(unsigned i(index * data->per_set_),end(std::min(i + data->per_set_, data->total_));
+         i < end;
+         i += inc)
+-            retstr_size += classify_seq(data->c_, enc, data->taxmap, data->bs_ + i, data->is_paired_);
++            retstr_size += classify_seq(data->c_, enc, data->taxmap, data->bs_ + i, data->is_paired_, taxa);
+     data->retstr_size_ += retstr_size;
+ }
+ 
+-void append_fastq_classification(const std::map<tax_t, u32> &hit_counts,
++void append_fastq_classification(const tax_counter &hit_counts,
+                                  const std::vector<tax_t> &taxa,
+                                  const tax_t taxon, const u32 ambig_count, const u32 missing_count,
+                                  bseq1_t *bs, kstring_t *bks, const int verbose, const int is_paired) {
+@@ -52,18 +53,17 @@ void append_fastq_classification(const std::map<tax_t, u32> &hit_counts,
+     bks->s[bks->l] = 0;
+ }
+ 
+-void append_kraken_classification(const std::map<tax_t, u32> &hit_counts,
++void append_kraken_classification(const tax_counter &hit_counts,
+                                   const std::vector<tax_t> &taxa,
+                                   const tax_t taxon, const u32 ambig_count, const u32 missing_count,
+                                   bseq1_t *bs, kstring_t *bks) {
+-    kputc((taxon == 0) * ('U' - 'C') + 'C', bks);
+-    //kputc(taxon ? 'C': 'U', bks); Equivalent to above but without a branch.
+-    //Probably meaningless in practice, but....
+-    kputc('\t', bks);
++    const char tbl[]{'C', 'U'};
++    kputc_(tbl[!taxon], bks);
++    kputc_('\t', bks);
+     kputs(bs->name, bks);
+-    kputc('\t', bks);
++    kputc_('\t', bks);
+     kputuw_(taxon, bks);
+-    kputc('\t', bks);
++    kputc_('\t', bks);
+     kputw(bs->l_seq, bks);
+     kputc('\t', bks);
+     append_counts(missing_count, 'M', bks);
+diff --git a/lib/classifier.h b/lib/classifier.h
+index fe79c2c8..1da4b12c 100644
+--- a/lib/classifier.h
++++ b/lib/classifier.h
+@@ -1,6 +1,5 @@
+ #ifndef _DB_H__
+ #define _DB_H__
+-
+ #include <atomic>
+ #include <zlib.h>
+ #include "kspp/ks.h"
+@@ -10,11 +9,13 @@
+ #include "lib/util.h"
+ 
+ namespace emp {
+-void append_kraken_classification(const std::map<tax_t, u32> &hit_counts,
++using tax_counter = linear::counter<tax_t, u16>;
++
++void append_kraken_classification(const tax_counter &hit_counts,
+                                   const std::vector<tax_t> &taxa,
+                                   const tax_t taxon, const u32 ambig_count, const u32 missing_count,
+                                   bseq1_t *bs, kstring_t *bks);
+-void append_fastq_classification(const std::map<tax_t, u32> &hit_counts,
++void append_fastq_classification(const tax_counter &hit_counts,
+                                  const std::vector<u32> &taxa,
+                                  const tax_t taxon, const u32 ambig_count, const u32 missing_count,
+                                  bseq1_t *bs, kstring_t *bks, const int verbose, const int is_paired);
+@@ -33,8 +34,7 @@ struct ClassifierGeneric {
+     Encoder<ScoreType> enc_;
+     int nt_;
+     int output_flag_;
+-    std::atomic<u64> n_classified_;
+-    std::atomic<u64> n_unclassified_;
++    std::atomic<u64> classified_[2];
+     public:
+     void set_emit_all(bool setting) {
+         if(setting) output_flag_ |= output_format::EMIT_ALL;
+@@ -57,8 +57,7 @@ struct ClassifierGeneric {
+         sp_(k, wsz, spaces),
+         enc_(sp_),
+         nt_(num_threads > 0 ? num_threads: 16),
+-        n_classified_(0),
+-        n_unclassified_(0)
++        classified_{0, 0}
+     {
+         set_emit_all(emit_all);
+         set_emit_fastq(emit_fastq);
+@@ -67,6 +66,8 @@ struct ClassifierGeneric {
+     ClassifierGeneric(const char *dbpath, spvec_t &spaces, u8 k, std::uint16_t wsz, int num_threads=16,
+                       bool emit_all=true, bool emit_fastq=true, bool emit_kraken=false):
+         ClassifierGeneric(khash_load<khash_t(c)>(dbpath), spaces, k, wsz, num_threads, emit_all, emit_fastq, emit_kraken) {}
++    u64 n_classified()   const {return classified_[0];}
++    u64 n_unclassified() const {return classified_[1];}
+ };
+ 
+ INLINE void append_taxa_run(const tax_t last_taxa,
+@@ -96,17 +97,16 @@ INLINE void append_counts(u32 count, const char character, kstring_t *ks) {
+ 
+ using Classifier = ClassifierGeneric<score::Lex>;
+ template<typename ScoreType>
+-unsigned classify_seq(ClassifierGeneric<ScoreType> &c, Encoder<ScoreType> &enc, khash_t(p) *taxmap, bseq1_t *bs, const int is_paired) {
++unsigned classify_seq(ClassifierGeneric<ScoreType> &c,
++                      Encoder<ScoreType> &enc,
++                      const khash_t(p) *taxmap, bseq1_t *bs, const int is_paired, std::vector<tax_t> &taxa) {
+     u64 kmer;
+     khiter_t ki;
+-    std::map<tax_t, u32> hit_counts;
+-    std::map<tax_t, u32>::iterator it;
++    linear::counter<tax_t, u16> hit_counts;
+     u32 ambig_count(0), missing_count(0);
+     tax_t taxon(0);
+     ks::string bks(bs->sam);
+-    const size_t reslen(bs->l_seq - c.sp_.c_ + 1);
+-    std::vector<tax_t> taxa;
+-    taxa.reserve(reslen > 0 ? reslen: 0); // Reserve memory without initializing
++    taxa.clear();
+ 
+     enc.assign(bs->seq, bs->l_seq);
+     while(enc.has_next_kmer()) {
+@@ -116,14 +116,9 @@ unsigned classify_seq(ClassifierGeneric<ScoreType> &c, Encoder<ScoreType> &enc,
+             if((ki = kh_get(c, c.db_, kmer)) == kh_end(c.db_)) ++missing_count, taxa.push_back(0);
+             //If the kmer is missing from our database, just say we don't know what it is.
+             else {
+-                // Check map for presence of the hit.
+-                // If it's not there, insert it with a hint.
+                 // Otherwise, increment the count.
+                 taxa.push_back(kh_val(c.db_, ki));
+-                if((it = hit_counts.lower_bound(kh_val(c.db_, ki))) == hit_counts.end() ||
+-                        it->first != kh_val(c.db_, ki)) {
+-                    hit_counts.emplace_hint(it, kh_val(c.db_, ki), 1);
+-                } else ++it->second;
++                hit_counts.add(kh_val(c.db_, ki));
+             }
+         }
+     }
+@@ -139,26 +134,20 @@ unsigned classify_seq(ClassifierGeneric<ScoreType> &c, Encoder<ScoreType> &enc,
+                     // Check map for presence of the hit.
+                     // If it's not there, insert it with a hint.
+                     // Otherwise, increment the count.
+-                    if((it = hit_counts.lower_bound(kh_val(c.db_, ki))) == hit_counts.end() ||
+-                            it->first != kh_val(c.db_, ki))
+-                        hit_counts.emplace_hint(it, kh_val(c.db_, ki), 1);
+-                    else ++it->second;
+-                    taxa.push_back(0);
++                    taxa.push_back(kh_val(c.db_, ki));
++                    hit_counts.add(kh_val(c.db_, ki));
+                 }
+             }
+         }
+     }
+ 
+-    if((taxon = resolve_tree(hit_counts, taxmap))) ++c.n_classified_;
+-    else                                           ++c.n_unclassified_;
++    ++c.classified_[!(taxon = resolve_tree(hit_counts, taxmap))];
+     if(c.get_emit_all() || taxon) {
+         if(c.get_emit_fastq()) {
+             append_fastq_classification(hit_counts, taxa, taxon, ambig_count, missing_count, bs, kspp2ks(bks), c.get_emit_kraken(), is_paired);
+         } else if(c.get_emit_kraken()) {
+             append_kraken_classification(hit_counts, taxa, taxon, ambig_count, missing_count, bs, kspp2ks(bks));
+         }
+-        // Else just increase quantitation... But that requires some kind of lock-free hash table for counting.
+-        // Use Jellyfish?
+     }
+     bs->sam   = bks.release();
+     return bs->l_sam = bks.size();
+diff --git a/lib/flextree.h b/lib/flextree.h
+index f66ebed9..b3b30a2d 100644
+--- a/lib/flextree.h
++++ b/lib/flextree.h
+@@ -5,7 +5,7 @@
+ #include "lib/bits.h"
+ #include "lib/counter.h"
+ #include "lib/bitcmp.h"
+-#include "lib/linearset.h"
++#include "lib/linear.h"
+ 
+ namespace emp {
+ 
+diff --git a/lib/kmerutil.h b/lib/kmerutil.h
+index 16db2ab5..95b30681 100644
+--- a/lib/kmerutil.h
++++ b/lib/kmerutil.h
+@@ -24,9 +24,6 @@
+ #ifndef BF
+ #    define BF BINFINITY
+ #endif
+-#ifndef XOR_MASK
+-#    define XOR_MASK 0xe37e28c4271b5a2dULL
+-#endif
+ #define __kmask_init(k) (BF >> (64 - (k << 1)))
+ 
+ #define rc_string  "\0NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNTNGNNNCNNNNNNNNNNNNANNNNNNNNNNNNtNgNNNcNNNNNNNNNNNNaNNNNNNNNNNN"
+diff --git a/lib/linearset.h b/lib/linear.h
+similarity index 62%
+rename from lib/linearset.h
+rename to lib/linear.h
+index 16cbe576..01546176 100644
+--- a/lib/linearset.h
++++ b/lib/linear.h
+@@ -3,6 +3,7 @@
+ #include <type_traits>
+ #include <stdexcept>
+ #include <cstring>
++#include <cstdint>
+ #include <ratio>
+ #include <memory>
+ #include <cstdlib>
+@@ -31,29 +32,26 @@ class set {
+     using difference_type = std::make_signed_t<size_type>;
+ 
+     template<typename... FactoryArgs>
+-    set(size_type n=0, bool init=!std::is_pod_v<T>, FactoryArgs &&...args): n_{0}, m_{n}, data_{static_cast<T *>(std::malloc(sizeof(T) * n))} {
++    set(size_type n=0, bool init=!std::is_pod_v<T>,
++        FactoryArgs &&...args):
++            n_{0}, m_{n}, data_{static_cast<T *>(std::malloc(sizeof(T) * n))} {
+         if(data_ == nullptr)
+             throw std::bad_alloc();
+-        if (init)
+-            for(size_type i(0); i < n_; ++i)
+-                new(data_.get() + i) T(std::forward<FactoryArgs>(args)...);
+     }
+     set(std::initializer_list<T> l): n_(l.size()), m_(n_), data_{static_cast<T *>(std::malloc(sizeof(T) * n_))} {
+         if(data_ == nullptr)
+             throw std::bad_alloc();
+         std::copy(l.begin(), l.end(), data_);
+     }
+-    set(set &&other): n_(0), m_(0), data_(nullptr) {
+-        std::swap(*this, other);
+-    }
++    set(set &&other): n_(0), m_(0), data_(nullptr) {std::swap(*this, other);}
+     set(const set &other): n_(other.n_), m_(other.m_), data_(std::malloc(sizeof(T) * m_)) {
+         if(data_ == nullptr)
+             throw std::bad_alloc();
+         std::copy(other.begin(), other.end(), begin());
+     }
+-    const T *cbegin() const {return data_;}
++    const T *cbegin() const {return data_.get();}
+     const T *cend()   const {return data_.get() + n_;}
+-    const T *begin()  const {return data_;}
++    const T *begin()  const {return data_.get();}
+     const T *end()    const {return data_.get() + n_;}
+     T *begin()        {return data_.get();}
+     T *end()          {return data_.get() + n_;}
+@@ -63,9 +61,12 @@ class set {
+     const T &back()    const {return data_.get()[n_ - 1];}
+     T &front() {return data_.get()[0];}
+     const T &front() const {return data_.get()[0];}
+-    auto size() const {return n_;}
++    auto size()     const {return n_;}
+     auto capacity() const {return m_;}
+-    auto find(const T &val) {
++    T *find(const T &val) {
++        return std::find(begin(), end(), val);
++    }
++    const T *find(const T &val) const {
+         return std::find(begin(), end(), val);
+     }
+     template<typename Predicate>
+@@ -81,50 +82,38 @@ class set {
+     }
+     // Note: push_back and emplace_back are the same *except* that push_back changes size multiplicatively.
+     template<typename... Args>
+-    auto &emplace_back(Args&& ... args) {
+-        if(n_ + 1 > m_) {
+-            m_ = std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1);
+-            auto tmp(static_cast<T *>(std::realloc(data_, sizeof(T) * (m_))));
+-            if(tmp == nullptr) throw  std::bad_alloc();
+-            data_.release();
+-            data_.reset(tmp);
+-        }
++    T &emplace_back(Args&& ... args) {
++        if(n_ + 1 > m_)
++            reserve(std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1));
+         new(data_ + n_++) T(std::forward<Args>(args)...);
+         return back();
+     }
+     template<typename... Args>
+-    auto &emplace_front(Args&& ... args) {
+-        if(n_ + 1 > m_) {
+-            m_ = std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1);
+-            auto tmp(static_cast<T *>(std::realloc(data_, sizeof(T) * (m_))));
+-            if(tmp == nullptr) throw  std::bad_alloc();
+-            data_.release();
+-            data_.reset(tmp);
+-        }
++    T &emplace_front(Args&& ... args) {
++        if(n_ + 1 > m_)
++            reserve(std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1));
+         std::memmove(data_.get() + sizeof(T), data_, n_ * sizeof(T));
+         new(data_) T(std::forward<Args>(args)...);
+         ++n_;
+         return front();
+     }
+-    auto &push_back(const T &val) {
+-        if(n_ + 1 > m_) {
+-            m_ = std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1);
+-            auto tmp(static_cast<T *>(std::realloc(data_.get(), sizeof(T) * (m_))));
+-            if(tmp == nullptr) throw std::bad_alloc();
+-            data_.release();
+-            data_.reset(tmp);
+-        }
++    T &push_back(const T &val) {
++        if(n_ + 1 > m_)
++            reserve(std::max(static_cast<size_type>(m_ * RESIZE_FACTOR), m_ + 1));
+         data_.get()[n_++] = val;
+         return back();
+     }
+     
+-    void zero() {std::memset(data_.get(), 0, sizeof(T) * n_);} // DOES NOT CALL DESTRUCTORS
++    void zero()  {std::memset(data_.get(), 0, sizeof(T) * n_);} // DOES NOT CALL DESTRUCTORS
++    void clear() {n_ = 0;}
++    bool empty() const {return size() == 0;}
+     void reserve(size_t newsize) {
+         if(newsize > m_) {
+             auto tmp(static_cast<T*>(std::realloc(data_.get(), sizeof(T) * newsize)));
+             if(tmp == nullptr) throw std::bad_alloc();
+             data_.release();
+             data_.reset(tmp);
++            m_ = newsize;
+         }
+     }
+     template<typename... Args>
+@@ -152,6 +141,35 @@ class set {
+     }
+ };
+ 
++template<typename K, typename SizeType=std::uint32_t>
++class counter {
++    // Simple class for a linear-search dictionary for tables of up to ~100 integers.
++    // This outperforms trees and hash tables for small numbers of elements.
++    // This is ideal for our taxonomic resolution at classification time, where the number of kmers and therefore assigned taxids is limited.
++    std::vector<K> keys_;
++    std::vector<SizeType> vals_;
++public:
++    using size_type = SizeType;
++    unsigned add(const K &key) {
++        if(auto it(std::find(keys_.begin(), keys_.end(), key)); it == keys_.end()) {
++            vals_.push_back(1);
++            keys_.push_back(key);
++            return keys_.size() - 1;
++        } else {
++            ++vals_[it - keys_.begin()];
++            return it - keys_.begin();
++        }
++    }
++    unsigned get_count(const K &key) const {
++        if(auto it(std::find(keys_.begin(), keys_.end(), key)); it != keys_.end())
++            return vals_[it - keys_.begin()];
++        else return 0;
++    }
++    size_type size() const { return keys_.size();}
++    const std::vector<K> &keys() const {return keys_;}
++    const std::vector<K> &vals() const {return vals_;}
++};
++
+ }
+ 
+ #endif // #ifndef _LINEAR_SET_H__
+diff --git a/lib/spacer.h b/lib/spacer.h
+index 9a8e7683..5570b901 100644
+--- a/lib/spacer.h
++++ b/lib/spacer.h
+@@ -4,8 +4,7 @@
+ #include <vector>
+ #include <string>
+ #include <algorithm>
+-#include "kmerutil.h"
+-#include "logutil.h"
++#include "bits.h"
+ 
+ namespace emp {
+ 
+diff --git a/lib/tx.h b/lib/tx.h
+index 5b2a1ddb..79dd9e3d 100644
+--- a/lib/tx.h
++++ b/lib/tx.h
+@@ -8,7 +8,7 @@
+ #include "lib/feature_min.h"
+ #include "lib/counter.h"
+ #include "lib/bits.h"
+-#include "lib/linearset.h"
++#include "lib/linear.h"
+ #include "lib/diskarray.h"
+ 
+ 
+@@ -155,8 +155,8 @@ class TaxonomyReformation {
+     }
+     void write_name_map(const char *fn) {
+         gzFile fp(gzopen(fn, "wb"));
+-        gzbuffer(fp, 1 << 18);
+         if(fp == nullptr) throw std::runtime_error(ks::sprintf("Could not open file at %s for writing", fn).data());
++        gzbuffer(fp, 1 << 18);
+         for(const auto &pair: newid_path_map) {
+             gzprintf(fp, "%s\t%u\n", pair.second.data(), pair.first);
+         }
+@@ -187,9 +187,7 @@ class TaxonomyReformation {
+         STLFREE(path_map);
+         STLFREE(newid_path_map);
+     }
+-    ~TaxonomyReformation() {
+-        clear();
+-    }
++    ~TaxonomyReformation() {clear();}
+ };
+ using concise_tax_t = TaxonomyReformation;
+ std::vector<tax_t> build_new2old_map(const char *str, size_t bufsz=1<<16);
+diff --git a/lib/util.cpp b/lib/util.cpp
+index b3d067de..07b16fdc 100644
+--- a/lib/util.cpp
++++ b/lib/util.cpp
+@@ -179,12 +179,12 @@ std::map<tax_t, tax_t> build_kraken_tax(const std::string &fname) {
+ tax_t lca(const std::map<tax_t, tax_t> &parent_map, tax_t a, tax_t b)
+ {
+   std::map<tax_t, tax_t>::const_iterator m;
+-  if (a == 0 || b == 0) return a ? a : b;
++  if(a == 0 || b == 0) return a ? a : b;
+ 
+   std::set<uint32_t> a_path;
+   while (a) a_path.insert(a), a = parent_map.find(a)->second;
+   while (b) {
+-    if (a_path.find(b) != a_path.end())
++    if(a_path.find(b) != a_path.end())
+       return b;
+     b = parent_map.find(b)->second;
+   }
+@@ -230,45 +230,75 @@ void kset_union(khash_t(all) *a, khash_t(all) *b) noexcept {
+ 
+  // Tree resolution: take all hit taxa (plus ancestors), then
+  // return leaf of highest weighted leaf-to-root path.
+- // Taken, slightly modified from Kraken
+-tax_t resolve_tree(std::map<tax_t, tax_t> &hit_counts,
+-                      khash_t(p) *parent_map) noexcept
++ // Taken, modified from Kraken with new, faster containers.
++tax_t resolve_tree(const std::map<tax_t, tax_t> &hit_counts,
++                   const khash_t(p) *parent_map) noexcept
+ {
+-  std::set<tax_t> max_taxa;
++  linear::set<tax_t> max_taxa;
+   tax_t max_taxon(0), max_score(0);
+ 
+   // Sum each taxon's LTR path
+   for(auto it(hit_counts.cbegin()), e(hit_counts.cend()); it != e; ++it) {
+     tax_t taxon(it->first), node(taxon), score(0);
++    // Instead of while node > 0
++    while(node)
++        score += hit_counts.at(node), node = kh_val(parent_map, kh_get(p, parent_map, node));
++    if(score > max_score) {
++      max_taxa.clear();
++      max_score = score;
++      max_taxon = taxon;
++      //LOG_DEBUG("max score: %u. max taxon: %u\n", max_score, max_taxon);
++    } else if(score == max_score) {
++      if(max_taxa.empty()) // Is this check needed?
++        max_taxa.insert(max_taxon);
++      max_taxa.insert(taxon);
++    }
++  }
++  // If two LTR paths are tied for max, return LCA of all
++  if(max_taxa.size()) {
++    auto sit(max_taxa.begin());
++    for(max_taxon = *sit++;sit != max_taxa.end(); max_taxon = lca(parent_map, max_taxon, *sit++));
++  }
++
++  return max_taxon;
++}
++tax_t resolve_tree(const linear::counter<tax_t, u16> &hit_counts,
++                   const khash_t(p) *parent_map) noexcept
++{
++  linear::set<tax_t> max_taxa;
++  tax_t max_taxon(0), max_score(0);
++
++  // Sum each taxon's LTR path
++  for(unsigned i(0); i < hit_counts.size(); ++i) {
++    tax_t taxon(hit_counts.keys()[i]), node(taxon), score(0);
+     khiter_t ki;
+     // Instead of while node > 0
+     while(node) {
+-        score += hit_counts[node];
++        score += hit_counts.get_count(node);
+         ki = kh_get(p, parent_map, node);
+         node = kh_val(parent_map, ki);
+     }
+-    if (score > max_score) {
++    if(score > max_score) {
+       max_taxa.clear();
+       max_score = score;
+       max_taxon = taxon;
+       //LOG_DEBUG("max score: %u. max taxon: %u\n", max_score, max_taxon);
+-    } else if (score == max_score) {
+-      if (max_taxa.empty()) // Is this check needed?
++    } else if(score == max_score) {
++      if(max_taxa.empty()) // Is this check needed?
+         max_taxa.insert(max_taxon);
+       max_taxa.insert(taxon);
+     }
+   }
+   // If two LTR paths are tied for max, return LCA of all
+   if(max_taxa.size()) {
+-    //LOG_DEBUG("Ambiguous. Get the lca of all of these. Size: %zu\n", max_taxa.size());
+     auto sit(max_taxa.begin());
+-    max_taxon = *sit;
+-    for(++sit; sit != max_taxa.end(); ++sit) max_taxon = lca(parent_map, max_taxon, *sit);
++    for(max_taxon = *sit++;sit != max_taxa.end(); max_taxon = lca(parent_map, max_taxon, *sit++));
+   }
+ 
+   return max_taxon;
+ }
+ 
++
+ std::string rand_string(size_t n) {
+     std::string ret;
+     ret.reserve(n);
+diff --git a/lib/util.h b/lib/util.h
+index 78558206..8276d188 100644
+--- a/lib/util.h
++++ b/lib/util.h
+@@ -21,6 +21,7 @@
+ #include "lib/sample_gen.h"
+ #include "lib/rand.h"
+ #include "lib/lazyvec.h"
++#include "lib/linear.h"
+ 
+ #ifdef __GNUC__
+ #  ifndef likely
+@@ -78,8 +79,14 @@
+ #define kputuw_ kputuw
+ #endif
+ 
+-#ifndef STLFREE
+-#define STLFREE(x) do {decltype(x) tmp##x; std::swap(x, tmp##x);} while(0)
++template<typename T>
++void STLFREE(T &container) {
++    T tmp;
++    std::swap(tmp, container);
++}
++
++#ifndef XOR_MASK
++#    define XOR_MASK 0xe37e28c4271b5a2dULL
+ #endif
+ 
+ #define TIME_CODE(code, name) do             \
+@@ -92,15 +99,15 @@
+ 
+ namespace emp {
+ 
+-using u32 = std::uint32_t;
+-using tax_t = u32;
+-using u64 = std::uint64_t;
+ using i32 = std::int32_t;
+ using i64 = std::int64_t;
+-using std::size_t;
++using u16 = std::uint16_t;
++using u32 = std::uint32_t;
++using u64 = std::uint64_t;
+ using u8 = std::uint8_t;
++using std::size_t;
++using tax_t = u32;
+ using std::forward_list;
+-using std::unordered_map;
+ using strlist = forward_list<std::string>;
+ using cpslist = forward_list<std::string*>;
+ using bitvec_t = std::vector<u64>;
+@@ -143,8 +150,10 @@ std::vector<tax_t> get_all_descendents(const std::unordered_map<tax_t, std::vect
+ std::vector<tax_t> get_desc_lca(tax_t a, tax_t, const std::unordered_map<tax_t, std::vector<tax_t>> &parent_map);
+ // Resolve_tree is modified from Kraken 1 source code, which
+ // is MIT-licensed. https://github.com/derrickwood/kraken
+-tax_t resolve_tree(std::map<tax_t, tax_t> &hit_counts,
+-                   khash_t(p) *parent_map) noexcept;
++tax_t resolve_tree(const std::map<tax_t, tax_t> &hit_counts,
++                   const khash_t(p) *parent_map) noexcept;
++tax_t resolve_tree(const linear::counter<tax_t, u16> &hit_counts,
++                   const khash_t(p) *parent_map) noexcept;
+ 
+ 
+ const char *bool2str(bool val);
+@@ -336,22 +345,51 @@ inline bool has_key(const Key &key, const Map &map) {
+     return map.find(key) != map.end();
+ }
+ 
+-#if !NDEBUG
+-template<typename T, class Compare=std::less<typename T::value_type>>
+-void assert_sorted_impl(const T &container, Compare cmp=Compare{}) {
+-    using std::begin;
+-    auto it(begin(container)), it2(begin(container));
+-    if(it2 != end(container)) ++it2;
+-    while(it2 != end(container)) {
+-        assert(cmp(*it, *it2));
+-        ++it, ++it2;
++INLINE u32 nuccount(u64 kmer, unsigned k) {
++    kmer ^= XOR_MASK;
++    u32 counts(0);
++    static const u32 lut4 [] {
++        67108864, 50397184, 50331904, 50331649, 50397184, 33685504, 33620224, 33619969, 50331904, 33620224, 33554944, 33554689, 50331649, 33619969, 33554689, 33554434,
++        50397184, 33685504, 33620224, 33619969, 33685504, 16973824, 16908544, 16908289, 33620224, 16908544, 16843264, 16843009, 33619969, 16908289, 16843009, 16842754,
++        50331904, 33620224, 33554944, 33554689, 33620224, 16908544, 16843264, 16843009, 33554944, 16843264, 16777984, 16777729, 33554689, 16843009, 16777729, 16777474,
++        50331649, 33619969, 33554689, 33554434, 33619969, 16908289, 16843009, 16842754, 33554689, 16843009, 16777729, 16777474, 33554434, 16842754, 16777474, 16777219,
++        50397184, 33685504, 33620224, 33619969, 33685504, 16973824, 16908544, 16908289, 33620224, 16908544, 16843264, 16843009, 33619969, 16908289, 16843009, 16842754,
++        33685504, 16973824, 16908544, 16908289, 16973824, 262144, 196864, 196609, 16908544, 196864, 131584, 131329, 16908289, 196609, 131329, 131074,
++        33620224, 16908544, 16843264, 16843009, 16908544, 196864, 131584, 131329, 16843264, 131584, 66304, 66049, 16843009, 131329, 66049, 65794,
++        33619969, 16908289, 16843009, 16842754, 16908289, 196609, 131329, 131074, 16843009, 131329, 66049, 65794, 16842754, 131074, 65794, 65539,
++        50331904, 33620224, 33554944, 33554689, 33620224, 16908544, 16843264, 16843009, 33554944, 16843264, 16777984, 16777729, 33554689, 16843009, 16777729, 16777474,
++        33620224, 16908544, 16843264, 16843009, 16908544, 196864, 131584, 131329, 16843264, 131584, 66304, 66049, 16843009, 131329, 66049, 65794,
++        33554944, 16843264, 16777984, 16777729, 16843264, 131584, 66304, 66049, 16777984, 66304, 1024, 769, 16777729, 66049, 769, 514,
++        33554689, 16843009, 16777729, 16777474, 16843009, 131329, 66049, 65794, 16777729, 66049, 769, 514, 16777474, 65794, 514, 259,
++        50331649, 33619969, 33554689, 33554434, 33619969, 16908289, 16843009, 16842754, 33554689, 16843009, 16777729, 16777474, 33554434, 16842754, 16777474, 16777219,
++        33619969, 16908289, 16843009, 16842754, 16908289, 196609, 131329, 131074, 16843009, 131329, 66049, 65794, 16842754, 131074, 65794, 65539,
++        33554689, 16843009, 16777729, 16777474, 16843009, 131329, 66049, 65794, 16777729, 66049, 769, 514, 16777474, 65794, 514, 259,
++        33554434, 16842754, 16777474, 16777219, 16842754, 131074, 65794, 65539, 16777474, 65794, 514, 259, 16777219, 65539, 259, 4,
++    };
++    static const u32 lut3 [] {
++        50331648, 33619968, 33554688, 33554433, 33619968, 16908288, 16843008, 16842753, 33554688, 16843008, 16777728, 16777473, 33554433, 16842753, 16777473, 16777218,
++        33619968, 16908288, 16843008, 16842753, 16908288, 196608, 131328, 131073, 16843008, 131328, 66048, 65793, 16842753, 131073, 65793, 65538,
++        33554688, 16843008, 16777728, 16777473, 16843008, 131328, 66048, 65793, 16777728, 66048, 768, 513, 16777473, 65793, 513, 258,
++        33554433, 16842753, 16777473, 16777218, 16842753, 131073, 65793, 65538, 16777473, 65793, 513, 258, 16777218, 65538, 258, 3,
++    };
++    static const u32 lut2 [] {
++        33554432, 16842752, 16777472, 16777217, 16842752, 131072, 65792, 65537, 16777472, 65792, 512, 257, 16777217, 65537, 257, 2,
++    };
++    static const u32 lut1 [] {16777216, 65536, 256, 1};
++    static const u32 lut0 [] {0};
++    static const u32 *luts[] {lut0, lut1, lut2, lut3};
++    switch(k >> 2) {
++        case 8: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 7: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 6: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 5: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 4: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 3: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 2: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4; [[fallthrough]]
++        case 1: counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4;
+     }
++    return counts += luts[k][kmer];
+ }
+-#define assert_sorted(container, ...) ::emp::assert_sorted_impl(container, ##__VA_ARGS__)
+-#else
+-#define assert_sorted(container, ...)
+-#endif
+-
+ 
+ #if 0
+ superkingdom
+@@ -457,319 +495,9 @@ inline constexpr int log2_64(uint64_t value)
+     value |= value >> 32;
+     return tab64[((uint64_t)((value - (value >> 1))*0x07EDD5E59A4E28C2)) >> 58];
+ }
++
+ INLINE double kmer_entropy(uint64_t kmer, unsigned k) {
+-    if(kmer == UINT64_C(-1) || kmer == UINT64_C(0)) return 0.; // Whooooooo
+-    u32 counts(0);
+-#ifdef LUT6
+-    static const u32 lut6 [] {
+-        100663296, 83951616, 83886336, 83886081, 83951616, 67239936, 67174656, 67174401, 83886336, 67174656, 67109376, 67109121, 83886081, 67174401, 67109121, 67108866,
+-        83951616, 67239936, 67174656, 67174401, 67239936, 50528256, 50462976, 50462721, 67174656, 50462976, 50397696, 50397441, 67174401, 50462721, 50397441, 50397186,
+-        83886336, 67174656, 67109376, 67109121, 67174656, 50462976, 50397696, 50397441, 67109376, 50397696, 50332416, 50332161, 67109121, 50397441, 50332161, 50331906,
+-        83886081, 67174401, 67109121, 67108866, 67174401, 50462721, 50397441, 50397186, 67109121, 50397441, 50332161, 50331906, 67108866, 50397186, 50331906, 50331651,
+-        83951616, 67239936, 67174656, 67174401, 67239936, 50528256, 50462976, 50462721, 67174656, 50462976, 50397696, 50397441, 67174401, 50462721, 50397441, 50397186,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        83886336, 67174656, 67109376, 67109121, 67174656, 50462976, 50397696, 50397441, 67109376, 50397696, 50332416, 50332161, 67109121, 50397441, 50332161, 50331906,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        83886081, 67174401, 67109121, 67108866, 67174401, 50462721, 50397441, 50397186, 67109121, 50397441, 50332161, 50331906, 67108866, 50397186, 50331906, 50331651,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        83951616, 67239936, 67174656, 67174401, 67239936, 50528256, 50462976, 50462721, 67174656, 50462976, 50397696, 50397441, 67174401, 50462721, 50397441, 50397186,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        50528256, 33816576, 33751296, 33751041, 33816576, 17104896, 17039616, 17039361, 33751296, 17039616, 16974336, 16974081, 33751041, 17039361, 16974081, 16973826,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        83886336, 67174656, 67109376, 67109121, 67174656, 50462976, 50397696, 50397441, 67109376, 50397696, 50332416, 50332161, 67109121, 50397441, 50332161, 50331906,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50332416, 33620736, 33555456, 33555201, 33620736, 16909056, 16843776, 16843521, 33555456, 16843776, 16778496, 16778241, 33555201, 16843521, 16778241, 16777986,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        83886081, 67174401, 67109121, 67108866, 67174401, 50462721, 50397441, 50397186, 67109121, 50397441, 50332161, 50331906, 67108866, 50397186, 50331906, 50331651,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        50331651, 33619971, 33554691, 33554436, 33619971, 16908291, 16843011, 16842756, 33554691, 16843011, 16777731, 16777476, 33554436, 16842756, 16777476, 16777221,
+-        83951616, 67239936, 67174656, 67174401, 67239936, 50528256, 50462976, 50462721, 67174656, 50462976, 50397696, 50397441, 67174401, 50462721, 50397441, 50397186,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        50528256, 33816576, 33751296, 33751041, 33816576, 17104896, 17039616, 17039361, 33751296, 17039616, 16974336, 16974081, 33751041, 17039361, 16974081, 16973826,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        67239936, 50528256, 50462976, 50462721, 50528256, 33816576, 33751296, 33751041, 50462976, 33751296, 33686016, 33685761, 50462721, 33751041, 33685761, 33685506,
+-        50528256, 33816576, 33751296, 33751041, 33816576, 17104896, 17039616, 17039361, 33751296, 17039616, 16974336, 16974081, 33751041, 17039361, 16974081, 16973826,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50528256, 33816576, 33751296, 33751041, 33816576, 17104896, 17039616, 17039361, 33751296, 17039616, 16974336, 16974081, 33751041, 17039361, 16974081, 16973826,
+-        33816576, 17104896, 17039616, 17039361, 17104896, 393216, 327936, 327681, 17039616, 327936, 262656, 262401, 17039361, 327681, 262401, 262146,
+-        33751296, 17039616, 16974336, 16974081, 17039616, 327936, 262656, 262401, 16974336, 262656, 197376, 197121, 16974081, 262401, 197121, 196866,
+-        33751041, 17039361, 16974081, 16973826, 17039361, 327681, 262401, 262146, 16974081, 262401, 197121, 196866, 16973826, 262146, 196866, 196611,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        33751296, 17039616, 16974336, 16974081, 17039616, 327936, 262656, 262401, 16974336, 262656, 197376, 197121, 16974081, 262401, 197121, 196866,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        33751041, 17039361, 16974081, 16973826, 17039361, 327681, 262401, 262146, 16974081, 262401, 197121, 196866, 16973826, 262146, 196866, 196611,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        33751296, 17039616, 16974336, 16974081, 17039616, 327936, 262656, 262401, 16974336, 262656, 197376, 197121, 16974081, 262401, 197121, 196866,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33620736, 16909056, 16843776, 16843521, 16909056, 197376, 132096, 131841, 16843776, 132096, 66816, 66561, 16843521, 131841, 66561, 66306,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        33751041, 17039361, 16974081, 16973826, 17039361, 327681, 262401, 262146, 16974081, 262401, 197121, 196866, 16973826, 262146, 196866, 196611,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33619971, 16908291, 16843011, 16842756, 16908291, 196611, 131331, 131076, 16843011, 131331, 66051, 65796, 16842756, 131076, 65796, 65541,
+-        83886336, 67174656, 67109376, 67109121, 67174656, 50462976, 50397696, 50397441, 67109376, 50397696, 50332416, 50332161, 67109121, 50397441, 50332161, 50331906,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50332416, 33620736, 33555456, 33555201, 33620736, 16909056, 16843776, 16843521, 33555456, 16843776, 16778496, 16778241, 33555201, 16843521, 16778241, 16777986,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        67174656, 50462976, 50397696, 50397441, 50462976, 33751296, 33686016, 33685761, 50397696, 33686016, 33620736, 33620481, 50397441, 33685761, 33620481, 33620226,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50462976, 33751296, 33686016, 33685761, 33751296, 17039616, 16974336, 16974081, 33686016, 16974336, 16909056, 16908801, 33685761, 16974081, 16908801, 16908546,
+-        33751296, 17039616, 16974336, 16974081, 17039616, 327936, 262656, 262401, 16974336, 262656, 197376, 197121, 16974081, 262401, 197121, 196866,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33620736, 16909056, 16843776, 16843521, 16909056, 197376, 132096, 131841, 16843776, 132096, 66816, 66561, 16843521, 131841, 66561, 66306,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        67109376, 50397696, 50332416, 50332161, 50397696, 33686016, 33620736, 33620481, 50332416, 33620736, 33555456, 33555201, 50332161, 33620481, 33555201, 33554946,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        50332416, 33620736, 33555456, 33555201, 33620736, 16909056, 16843776, 16843521, 33555456, 16843776, 16778496, 16778241, 33555201, 16843521, 16778241, 16777986,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50397696, 33686016, 33620736, 33620481, 33686016, 16974336, 16909056, 16908801, 33620736, 16909056, 16843776, 16843521, 33620481, 16908801, 16843521, 16843266,
+-        33686016, 16974336, 16909056, 16908801, 16974336, 262656, 197376, 197121, 16909056, 197376, 132096, 131841, 16908801, 197121, 131841, 131586,
+-        33620736, 16909056, 16843776, 16843521, 16909056, 197376, 132096, 131841, 16843776, 132096, 66816, 66561, 16843521, 131841, 66561, 66306,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        50332416, 33620736, 33555456, 33555201, 33620736, 16909056, 16843776, 16843521, 33555456, 16843776, 16778496, 16778241, 33555201, 16843521, 16778241, 16777986,
+-        33620736, 16909056, 16843776, 16843521, 16909056, 197376, 132096, 131841, 16843776, 132096, 66816, 66561, 16843521, 131841, 66561, 66306,
+-        33555456, 16843776, 16778496, 16778241, 16843776, 132096, 66816, 66561, 16778496, 66816, 1536, 1281, 16778241, 66561, 1281, 1026,
+-        33555201, 16843521, 16778241, 16777986, 16843521, 131841, 66561, 66306, 16778241, 66561, 1281, 1026, 16777986, 66306, 1026, 771,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33555201, 16843521, 16778241, 16777986, 16843521, 131841, 66561, 66306, 16778241, 66561, 1281, 1026, 16777986, 66306, 1026, 771,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33555201, 16843521, 16778241, 16777986, 16843521, 131841, 66561, 66306, 16778241, 66561, 1281, 1026, 16777986, 66306, 1026, 771,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        33554691, 16843011, 16777731, 16777476, 16843011, 131331, 66051, 65796, 16777731, 66051, 771, 516, 16777476, 65796, 516, 261,
+-        83886081, 67174401, 67109121, 67108866, 67174401, 50462721, 50397441, 50397186, 67109121, 50397441, 50332161, 50331906, 67108866, 50397186, 50331906, 50331651,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        50331651, 33619971, 33554691, 33554436, 33619971, 16908291, 16843011, 16842756, 33554691, 16843011, 16777731, 16777476, 33554436, 16842756, 16777476, 16777221,
+-        67174401, 50462721, 50397441, 50397186, 50462721, 33751041, 33685761, 33685506, 50397441, 33685761, 33620481, 33620226, 50397186, 33685506, 33620226, 33619971,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        50462721, 33751041, 33685761, 33685506, 33751041, 17039361, 16974081, 16973826, 33685761, 16974081, 16908801, 16908546, 33685506, 16973826, 16908546, 16908291,
+-        33751041, 17039361, 16974081, 16973826, 17039361, 327681, 262401, 262146, 16974081, 262401, 197121, 196866, 16973826, 262146, 196866, 196611,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33619971, 16908291, 16843011, 16842756, 16908291, 196611, 131331, 131076, 16843011, 131331, 66051, 65796, 16842756, 131076, 65796, 65541,
+-        67109121, 50397441, 50332161, 50331906, 50397441, 33685761, 33620481, 33620226, 50332161, 33620481, 33555201, 33554946, 50331906, 33620226, 33554946, 33554691,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        50397441, 33685761, 33620481, 33620226, 33685761, 16974081, 16908801, 16908546, 33620481, 16908801, 16843521, 16843266, 33620226, 16908546, 16843266, 16843011,
+-        33685761, 16974081, 16908801, 16908546, 16974081, 262401, 197121, 196866, 16908801, 197121, 131841, 131586, 16908546, 196866, 131586, 131331,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        50332161, 33620481, 33555201, 33554946, 33620481, 16908801, 16843521, 16843266, 33555201, 16843521, 16778241, 16777986, 33554946, 16843266, 16777986, 16777731,
+-        33620481, 16908801, 16843521, 16843266, 16908801, 197121, 131841, 131586, 16843521, 131841, 66561, 66306, 16843266, 131586, 66306, 66051,
+-        33555201, 16843521, 16778241, 16777986, 16843521, 131841, 66561, 66306, 16778241, 66561, 1281, 1026, 16777986, 66306, 1026, 771,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        33554691, 16843011, 16777731, 16777476, 16843011, 131331, 66051, 65796, 16777731, 66051, 771, 516, 16777476, 65796, 516, 261,
+-        67108866, 50397186, 50331906, 50331651, 50397186, 33685506, 33620226, 33619971, 50331906, 33620226, 33554946, 33554691, 50331651, 33619971, 33554691, 33554436,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        50331651, 33619971, 33554691, 33554436, 33619971, 16908291, 16843011, 16842756, 33554691, 16843011, 16777731, 16777476, 33554436, 16842756, 16777476, 16777221,
+-        50397186, 33685506, 33620226, 33619971, 33685506, 16973826, 16908546, 16908291, 33620226, 16908546, 16843266, 16843011, 33619971, 16908291, 16843011, 16842756,
+-        33685506, 16973826, 16908546, 16908291, 16973826, 262146, 196866, 196611, 16908546, 196866, 131586, 131331, 16908291, 196611, 131331, 131076,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33619971, 16908291, 16843011, 16842756, 16908291, 196611, 131331, 131076, 16843011, 131331, 66051, 65796, 16842756, 131076, 65796, 65541,
+-        50331906, 33620226, 33554946, 33554691, 33620226, 16908546, 16843266, 16843011, 33554946, 16843266, 16777986, 16777731, 33554691, 16843011, 16777731, 16777476,
+-        33620226, 16908546, 16843266, 16843011, 16908546, 196866, 131586, 131331, 16843266, 131586, 66306, 66051, 16843011, 131331, 66051, 65796,
+-        33554946, 16843266, 16777986, 16777731, 16843266, 131586, 66306, 66051, 16777986, 66306, 1026, 771, 16777731, 66051, 771, 516,
+-        33554691, 16843011, 16777731, 16777476, 16843011, 131331, 66051, 65796, 16777731, 66051, 771, 516, 16777476, 65796, 516, 261,
+-        50331651, 33619971, 33554691, 33554436, 33619971, 16908291, 16843011, 16842756, 33554691, 16843011, 16777731, 16777476, 33554436, 16842756, 16777476, 16777221,
+-        33619971, 16908291, 16843011, 16842756, 16908291, 196611, 131331, 131076, 16843011, 131331, 66051, 65796, 16842756, 131076, 65796, 65541,
+-        33554691, 16843011, 16777731, 16777476, 16843011, 131331, 66051, 65796, 16777731, 66051, 771, 516, 16777476, 65796, 516, 261,
+-        33554436, 16842756, 16777476, 16777221, 16842756, 131076, 65796, 65541, 16777476, 65796, 516, 261, 16777221, 65541, 261, 6,
+-    };
+-#endif
+-    static const u32 lut4 [] {
+-        67108864, 50397184, 50331904, 50331649, 50397184, 33685504, 33620224, 33619969, 50331904, 33620224, 33554944, 33554689, 50331649, 33619969, 33554689, 33554434,
+-        50397184, 33685504, 33620224, 33619969, 33685504, 16973824, 16908544, 16908289, 33620224, 16908544, 16843264, 16843009, 33619969, 16908289, 16843009, 16842754,
+-        50331904, 33620224, 33554944, 33554689, 33620224, 16908544, 16843264, 16843009, 33554944, 16843264, 16777984, 16777729, 33554689, 16843009, 16777729, 16777474,
+-        50331649, 33619969, 33554689, 33554434, 33619969, 16908289, 16843009, 16842754, 33554689, 16843009, 16777729, 16777474, 33554434, 16842754, 16777474, 16777219,
+-        50397184, 33685504, 33620224, 33619969, 33685504, 16973824, 16908544, 16908289, 33620224, 16908544, 16843264, 16843009, 33619969, 16908289, 16843009, 16842754,
+-        33685504, 16973824, 16908544, 16908289, 16973824, 262144, 196864, 196609, 16908544, 196864, 131584, 131329, 16908289, 196609, 131329, 131074,
+-        33620224, 16908544, 16843264, 16843009, 16908544, 196864, 131584, 131329, 16843264, 131584, 66304, 66049, 16843009, 131329, 66049, 65794,
+-        33619969, 16908289, 16843009, 16842754, 16908289, 196609, 131329, 131074, 16843009, 131329, 66049, 65794, 16842754, 131074, 65794, 65539,
+-        50331904, 33620224, 33554944, 33554689, 33620224, 16908544, 16843264, 16843009, 33554944, 16843264, 16777984, 16777729, 33554689, 16843009, 16777729, 16777474,
+-        33620224, 16908544, 16843264, 16843009, 16908544, 196864, 131584, 131329, 16843264, 131584, 66304, 66049, 16843009, 131329, 66049, 65794,
+-        33554944, 16843264, 16777984, 16777729, 16843264, 131584, 66304, 66049, 16777984, 66304, 1024, 769, 16777729, 66049, 769, 514,
+-        33554689, 16843009, 16777729, 16777474, 16843009, 131329, 66049, 65794, 16777729, 66049, 769, 514, 16777474, 65794, 514, 259,
+-        50331649, 33619969, 33554689, 33554434, 33619969, 16908289, 16843009, 16842754, 33554689, 16843009, 16777729, 16777474, 33554434, 16842754, 16777474, 16777219,
+-        33619969, 16908289, 16843009, 16842754, 16908289, 196609, 131329, 131074, 16843009, 131329, 66049, 65794, 16842754, 131074, 65794, 65539,
+-        33554689, 16843009, 16777729, 16777474, 16843009, 131329, 66049, 65794, 16777729, 66049, 769, 514, 16777474, 65794, 514, 259,
+-        33554434, 16842754, 16777474, 16777219, 16842754, 131074, 65794, 65539, 16777474, 65794, 514, 259, 16777219, 65539, 259, 4,
+-    };
+-    static const u32 lut3 [] {
+-        50331648, 33619968, 33554688, 33554433, 33619968, 16908288, 16843008, 16842753, 33554688, 16843008, 16777728, 16777473, 33554433, 16842753, 16777473, 16777218,
+-        33619968, 16908288, 16843008, 16842753, 16908288, 196608, 131328, 131073, 16843008, 131328, 66048, 65793, 16842753, 131073, 65793, 65538,
+-        33554688, 16843008, 16777728, 16777473, 16843008, 131328, 66048, 65793, 16777728, 66048, 768, 513, 16777473, 65793, 513, 258,
+-        33554433, 16842753, 16777473, 16777218, 16842753, 131073, 65793, 65538, 16777473, 65793, 513, 258, 16777218, 65538, 258, 3,
+-    };
+-    static const u32 lut2 [] {
+-        33554432, 16842752, 16777472, 16777217, 16842752, 131072, 65792, 65537, 16777472, 65792, 512, 257, 16777217, 65537, 257, 2,
+-    };
+-    static const u32 lut1 [] {
+-        16777216, 65536, 256, 1,
+-    };
+-#ifdef LUT6
+-    while(k > 6) counts += lut6[kmer & 0xFFF], kmer >>= 12, k -= 6;
+-    switch(k) {
+-        case 5: counts += lut1[kmer >> 8];
+-            [[fallthrough]]
+-        case 4: counts += lut4[kmer]; break;
+-        case 3: counts += lut3[kmer]; break;
+-        case 2: counts += lut2[kmer]; break;
+-        case 1: counts += lut1[kmer]; break;
+-        case 0: break;
+-    }
+-#else
+-    while(k > 4) counts += lut4[kmer & 0xFF], kmer >>= 8, k -= 4;
+-    switch(k) {
+-        case 0: break;
+-        case 1: counts += lut1[kmer]; break;
+-        case 2: counts += lut2[kmer]; break;
+-        case 3: counts += lut3[kmer]; break;
+-    }
+-#endif
++    const u32 counts(nuccount(kmer, k));
+     const double div(1./k);
+     double tmp(div * (counts >> 24)), sum(tmp * std::log2(tmp));
+     tmp = div * ((counts >> 16) & 0xFF), sum += tmp * std::log2(tmp);
+@@ -804,7 +532,10 @@ namespace detail {
+ 
+ class zlib_error: public std::runtime_error {
+ public:
+-    zlib_error(int c, const char *fn=nullptr): std::runtime_error(ks::sprintf("zlib error code %u (%s).", c, detail::zerr2str.find(c)->second).data()) {}
++    zlib_error(int c, const char *fn=nullptr):
++        std::runtime_error(ks::sprintf("zlib error code %u (%s) accessing file %s.", c,
++                                       detail::zerr2str.at(c), fn ? fn: "<no file provided>").data())
++    {}
+ };
+ 
+ } // namespace emp

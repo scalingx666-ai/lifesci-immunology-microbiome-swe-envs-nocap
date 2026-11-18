@@ -1,0 +1,318 @@
+diff --git a/test/test_cluster.py b/test/test_cluster.py
+index 27bbf64b..b6efc57f 100644
+--- a/test/test_cluster.py
++++ b/test/test_cluster.py
+@@ -1,8 +1,6 @@
+ import unittest
+ import numpy as np
+ from hashlib import md5
+-import random
+-import string
+ 
+ import vamb
+ 
+@@ -91,39 +89,3 @@ def test_normalization(self):
+     def test_cluster(self):
+         x = next(vamb.cluster.ClusterGenerator(self.data, self.lens))
+         self.assertIsInstance(x.members, np.ndarray)
+-        med, st = x.as_tuple()
+-        self.assertIsInstance(st, set)
+-        self.assertEqual(set(x.members), st)
+-        self.assertIn(med, st)
+-
+-
+-class TestPairs(unittest.TestCase):
+-    rng = np.random.RandomState(6)
+-    n_samples = 1024
+-    data = rng.random((n_samples, 40)).astype(np.float32)
+-    lens = rng.randint(500, 1000, size=1024)
+-
+-    @staticmethod
+-    def randstring(len):
+-        return "".join(random.choices(string.ascii_letters, k=len))
+-
+-    def test_too_few_names(self):
+-        clstr = vamb.cluster.ClusterGenerator(self.data, self.lens)
+-        nameset = {self.randstring(10) for i in range(len(self.data) - 1)}
+-        with self.assertRaises(ValueError):
+-            list(vamb.cluster.pairs(clstr, list(nameset)))
+-
+-    def test_pairs(self):
+-        clstr = vamb.cluster.ClusterGenerator(self.data, self.lens)
+-        nameset = {self.randstring(10) for i in range(len(self.data))}
+-        pairs = list(vamb.cluster.pairs(clstr, list(nameset)))
+-
+-        medoid, members = pairs[0]
+-        self.assertIsInstance(medoid, str)
+-        self.assertIsInstance(members, set)
+-        self.assertTrue(all(len(i[1]) > 0 for i in pairs))
+-        self.assertTrue(sum(map(lambda i: len(i[1]), pairs)), len(nameset))
+-        allmembers = set()
+-        for medoid, mems in pairs:
+-            allmembers.update(mems)
+-        self.assertEqual(allmembers, nameset)
+diff --git a/test/test_results.py b/test/test_results.py
+index d38ccf55..5e0a8580 100644
+--- a/test/test_results.py
++++ b/test/test_results.py
+@@ -147,7 +147,8 @@ def test_result(self):
+             # Uncomment when updating this test.
+             # lens = list()
+             for cluster in vamb.cluster.ClusterGenerator(self.latent.copy()):
+-                medoid, points = cluster.as_tuple()
++                medoid = cluster.metadata.medoid
++                points = set(cluster.members)
+                 # Set hashing may differ from run to run, so turn into sorted arrays
+                 arr = np.array(list(points))
+                 arr.sort()
+diff --git a/vamb/__main__.py b/vamb/__main__.py
+index ecae3aa6..267a5f9e 100755
+--- a/vamb/__main__.py
++++ b/vamb/__main__.py
+@@ -13,7 +13,7 @@
+ import pycoverm
+ import itertools
+ from math import isfinite
+-from typing import Optional, Tuple, Union
++from typing import Optional, Tuple, Union, cast
+ from pathlib import Path
+ from collections.abc import Sequence
+ from collections import defaultdict
+@@ -757,17 +757,30 @@ def cluster_and_write_files(
+         cuda=vamb_options.cuda,
+         rng_seed=vamb_options.seed,
+     )
+-
+-    renamed = (
+-        (str(cluster_index + 1), {sequence_names[i] for i in members})
+-        for (cluster_index, (_, members)) in enumerate(
+-            map(lambda x: x.as_tuple(), cluster_generator)
+-        )
+-    )
+-
+     # This also works correctly when max_clusters is None
+-    first_clusters = itertools.islice(renamed, cluster_options.max_clusters)
+-    unsplit_clusters = dict(first_clusters)
++    clusters = itertools.islice(cluster_generator, cluster_options.max_clusters)
++    cluster_dict: dict[str, set[str]] = dict()
++
++    # Write the cluster metadata to file
++    with open(Path(base_clusters_name + "_metadata.tsv"), "w") as file:
++        print("name\tradius\tpeak valley ratio\tkind\tbp\tncontigs", file=file)
++        for i, cluster in enumerate(clusters):
++            cluster_dict[str(i + 1)] = {
++                sequence_names[cast(int, i)] for i in cluster.members
++            }
++            print(
++                str(i + 1),
++                None if cluster.radius is None else round(cluster.radius, 3),
++                None
++                if cluster.observed_pvr is None
++                else round(cluster.observed_pvr, 2),
++                cluster.kind_str,
++                sum(sequence_lens[i] for i in cluster.members),
++                len(cluster.members),
++                file=file,
++                sep="\t",
++            )
++
+     elapsed = round(time.time() - begintime, 2)
+ 
+     write_clusters_and_bins(
+@@ -776,7 +789,7 @@ def cluster_and_write_files(
+         base_clusters_name,
+         bins_dir,
+         fasta_catalogue,
+-        unsplit_clusters,
++        cluster_dict,
+         sequence_names,
+         sequence_lens,
+     )
+diff --git a/vamb/cluster.py b/vamb/cluster.py
+index d9bb3cbd..107bc0c0 100644
+--- a/vamb/cluster.py
++++ b/vamb/cluster.py
+@@ -7,8 +7,7 @@
+ from math import ceil as _ceil
+ from torch.functional import Tensor as _Tensor
+ import vamb.vambtools as _vambtools
+-from typing import TypeVar, Union, cast
+-from collections.abc import Sequence, Iterable
++from typing import TypeVar, Union, Optional, cast
+ 
+ _DEFAULT_RADIUS = 0.12
+ # _DEFAULT_RADIUS = 0.06
+@@ -77,7 +76,8 @@ class Cluster:
+         "medoid",
+         "seed",
+         "members",
+-        "pvr",
++        "maximal_pvr",
++        "observed_pvr",
+         "radius",
+         "isdefault",
+         "successes",
+@@ -89,45 +89,32 @@ def __init__(
+         medoid: int,
+         seed: int,
+         members: _np.ndarray,
+-        pvr: float,
+-        radius: float,
+-        isdefault: bool,
++        maximal_pvr: float,
++        # If loner or default: None
++        observed_pvr: Optional[float],
++        # If loner: None. If default, _DEFAULT_RADIUS
++        radius: Optional[float],
+         successes: int,
+         attempts: int,
+     ):
+         self.medoid = medoid
+         self.seed = seed
+         self.members = members
+-        self.pvr = pvr
++        self.maximal_pvr = maximal_pvr
++        self.observed_pvr = observed_pvr
+         self.radius = radius
+-        self.isdefault = isdefault
+         self.successes = successes
+         self.attempts = attempts
+ 
+-    def __repr__(self) -> str:
+-        return f"<Cluster of medoid {self.medoid}, {len(self.members)} members>"
+-
+-    def as_tuple(self) -> tuple[int, set[int]]:
+-        return (self.medoid, {i for i in self.members})
+-
+-    def dump(self) -> str:
+-        return (
+-            f"{self.medoid}\t{self.seed}\t{self.pvr}\t{self.radius}\t{self.isdefault}"
+-            f"\t{self.successes}\t{self.attempts}\t"
+-        ) + ",".join([str(i) for i in self.members])
+-
+-    def __str__(self) -> str:
+-        radius = f"{self.radius:.3f}"
+-        if self.isdefault:
+-            radius += " (fallback)"
+-
+-        return f"""Cluster of medoid {self.medoid}
+-  N members: {len(self.members)}
+-  seed:      {self.seed}
+-  radius:    {radius}
+-  successes: {self.successes} / {self.attempts}
+-  pvr:       {self.pvr:.1f}
+-  """
++    @property
++    def kind_str(self) -> str:
++        if self.observed_pvr is not None:
++            return "normal"
++        else:
++            if self.radius is None:
++                return "loner"
++            else:
++                return "fallback"
+ 
+ 
+ class ClusterGenerator:
+@@ -452,7 +439,9 @@ def wander_medoid(self, seed) -> tuple[int, _Tensor]:
+ 
+         return (medoid, distances)
+ 
+-    def find_threshold(self, distances: _Tensor) -> Union[Loner, NoThreshold, float]:
++    def find_threshold(
++        self, distances: _Tensor
++    ) -> Union[Loner, NoThreshold, tuple[float, float]]:
+         # If the point is a loner, immediately return a threshold in where only
+         # that point is contained.
+         if _torch.count_nonzero(distances < 0.05) == 1:
+@@ -503,7 +492,8 @@ def find_threshold(self, distances: _Tensor) -> Union[Loner, NoThreshold, float]
+         # Analyze the point densities to find the valley
+         x = 0
+         density_at_minimum = 0.0
+-        for density in densities:
++        for density_ in densities:
++            density = cast(float, density_.item())
+             # Define the first "peak" in point density. That's simply the max until
+             # the peak is defined as being over.
+             if not peak_over and density > peak_density:
+@@ -539,7 +529,8 @@ def find_threshold(self, distances: _Tensor) -> Union[Loner, NoThreshold, float]
+             if threshold > 0.2 + self.peak_valley_ratio:
+                 return NoThreshold()
+             else:
+-                return threshold
++                observed_pvr = density_at_minimum / peak_density
++                return (threshold, observed_pvr)
+ 
+     def find_cluster(self) -> tuple[Cluster, int, _Tensor]:
+         while True:
+@@ -552,8 +543,8 @@ def find_cluster(self) -> tuple[Cluster, int, _Tensor]:
+                     seed,
+                     _np.array([self.indices[medoid].item()]),
+                     self.peak_valley_ratio,
+-                    _DEFAULT_RADIUS,
+-                    False,
++                    None,
++                    None,
+                     self.successes,
+                     len(self.attempts),
+                 )
+@@ -571,8 +562,8 @@ def find_cluster(self) -> tuple[Cluster, int, _Tensor]:
+                         seed,
+                         self.indices[points].numpy(),
+                         self.peak_valley_ratio,
++                        None,
+                         _DEFAULT_RADIUS,
+-                        True,
+                         self.successes,
+                         len(self.attempts),
+                     )
+@@ -580,7 +571,8 @@ def find_cluster(self) -> tuple[Cluster, int, _Tensor]:
+                 else:
+                     self.update_successes(False)
+ 
+-            elif isinstance(threshold, float):
++            elif isinstance(threshold, tuple):
++                (threshold, observed_pvr) = threshold
+                 points = _smaller_indices(
+                     distances, self.kept_mask, threshold, self.cuda
+                 )
+@@ -589,8 +581,8 @@ def find_cluster(self) -> tuple[Cluster, int, _Tensor]:
+                     seed,
+                     self.indices[points].numpy(),
+                     self.peak_valley_ratio,
++                    observed_pvr,
+                     threshold,
+-                    False,
+                     self.successes,
+                     len(self.attempts),
+                 )
+@@ -663,29 +655,3 @@ def _calc_distances(matrix: _Tensor, index: int) -> _Tensor:
+     dists = 0.5 - matrix.matmul(matrix[index])
+     dists[index] = 0.0  # avoid float rounding errors
+     return dists
+-
+-
+-def pairs(
+-    clustergenerator: ClusterGenerator, labels: Sequence[str]
+-) -> Iterable[tuple[str, set[str]]]:
+-    """Create an iterable of (N, {label1, label2 ...}) for each
+-    cluster in a ClusterGenerator, where N is "1", "2", "3", etc.
+-    Useful to pass to e.g. vambtools.writer_clusters.
+-
+-    Inputs:
+-        clustergenerator: A ClusterGenerator object
+-        labels: List or array of cluster labels
+-    Output:
+-        Generator yielding ("1", {label1, label2 ... }) for each cluster
+-    """
+-    maxindex = clustergenerator.indices.max()
+-    if len(labels) <= maxindex:
+-        raise ValueError(
+-            f"Cluster generator contains point with index {maxindex}, "
+-            f"but was given only {len(labels)} labels"
+-        )
+-
+-    return (
+-        (str(i + 1), {labels[j] for j in c.as_tuple()[1]})
+-        for (i, c) in enumerate(clustergenerator)
+-    )

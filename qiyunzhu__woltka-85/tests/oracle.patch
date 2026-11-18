@@ -1,0 +1,596 @@
+diff --git a/doc/cli.md b/doc/cli.md
+index 67b5fee..d4026c5 100644
+--- a/doc/cli.md
++++ b/doc/cli.md
+@@ -81,8 +81,8 @@ Option | Description
+ Option | Description
+ --- | ---
+ `--chunk` | Number of alignment lines to read and parse in each chunk. Default: 1,000 for plain mapping, or 1,000,000 for ordinal mapping.
+-`--cache` | Number of recent classification results to cache for faster subsequent classifications. Default: 128.
+-
++`--cache` | Number of recent classification results to cache for faster subsequent classifications. Default: 1024.
++`--no-exe` | Disable calling external programs (`gzip`, `bzip2` and `xz`) for decompression. Otherwise, Woltka will use them if available for faster processing, or switch back to Python if not.
+ 
+ ## Tools
+ 
+diff --git a/woltka/align.py b/woltka/align.py
+index 2633b40..3968677 100644
+--- a/woltka/align.py
++++ b/woltka/align.py
+@@ -24,6 +24,7 @@
+ """
+ 
+ from collections import deque
++from itertools import chain
+ from functools import lru_cache
+ 
+ 
+@@ -54,7 +55,7 @@ def plain_mapper(fh, fmt=None, n=1000):
+     proceeds.
+     """
+     # determine alignment file format
+-    fmt = fmt or infer_align_format(fh)
++    fmt, head = (fmt, []) if fmt else infer_align_format(fh)
+ 
+     # assign parser for given format
+     parser = assign_parser(fmt)
+@@ -68,7 +69,7 @@ def plain_mapper(fh, fmt=None, n=1000):
+     # parse alignment file
+     this = None  # current query Id
+     target = n   # target line number at end of current chunk
+-    for i, line in enumerate(fh):
++    for i, line in enumerate(chain(iter(head), fh)):
+ 
+         # parse current alignment line
+         try:
+@@ -122,6 +123,8 @@ def infer_align_format(fh):
+     -------
+     str
+         Alignment file format (map, b6o or sam).
++    list of str
++        Lines that are read in order to infer format.
+ 
+     Raises
+     ------
+@@ -134,6 +137,11 @@ def infer_align_format(fh):
+     --------
+     parse_b6o_line
+     parse_sam_line
++
++    TODO
++    ----
++    Currently this function guesses format only based on the first line.
++    This can be more robust.
+     """
+     # read first line of file
+     try:
+@@ -143,29 +151,26 @@ def infer_align_format(fh):
+     except StopIteration:
+         raise ValueError('Cannot read alignment file.')
+ 
+-    # move pointer back to beginning of file
+-    fh.seek(0)
+-
+     # SAM file header
+     if line.split()[0] in ('@HD', '@PG'):
+-        return 'sam'
++        return 'sam', [line]
+ 
+     # tab-delimited row
+     row = line.rstrip().split('\t')
+ 
+     # simple query-to-subject map
+     if len(row) == 2:
+-        return 'map'
++        return 'map', [line]
+ 
+     # BLAST standard tabular format
+     if len(row) >= 12:
+         if all(row[i].isdigit() for i in range(3, 10)):
+-            return 'b6o'
++            return 'b6o', [line]
+ 
+     # SAM format
+     if len(row) >= 11:
+         if all(row[i].isdigit() for i in (1, 3, 4)):
+-            return 'sam'
++            return 'sam', [line]
+ 
+     # cannot determine
+     raise ValueError('Cannot determine alignment file format.')
+diff --git a/woltka/cli.py b/woltka/cli.py
+index 8d26f34..2c0d9e5 100644
+--- a/woltka/cli.py
++++ b/woltka/cli.py
+@@ -179,6 +179,9 @@ def gotu_cmd(ctx, **kwargs):
+ @click.option(
+     '--cache', type=click.INT, default=128,
+     help='Number of recent results to cache for faster classification.')
++@click.option(
++    '--no-exe', is_flag=True,
++    help='Disable calling external programs for decompression.')
+ def classify_cmd(**kwargs):
+     """Generate a profile of samples based on a classification system.
+     """
+diff --git a/woltka/file.py b/woltka/file.py
+index 9cd6b21..d186b75 100644
+--- a/woltka/file.py
++++ b/woltka/file.py
+@@ -13,14 +13,17 @@
+ 
+ from os import listdir
+ from os.path import basename, dirname, splitext, isfile, join
++from shutil import which
++from subprocess import Popen, PIPE
+ import gzip
+ import bz2
+ import lzma
+ 
+ 
+-ZIPDIC = {'.gz': gzip, '.gzip': gzip,
+-          '.bz2': bz2, '.bzip2': bz2,
+-          '.xz': lzma, '.lz': lzma, '.lzma': lzma}
++zipfmts = {'.gz':   'gzip', '.gzip':   'gzip',
++           '.bz2': 'bzip2', '.bzip2': 'bzip2',
++           '.xz':     'xz', '.lz':       'xz', '.lzma': 'xz'}
++ziplibs = {'gzip': gzip, 'bzip2': bz2, 'xz': lzma}
+ 
+ 
+ def openzip(fp, mode='rt'):
+@@ -38,10 +41,90 @@ def openzip(fp, mode='rt'):
+     -------
+     file handle
+         Text stream ready to be read.
++
++    Notes
++    -----
++    This is a simple and universal solution which uses Python's built-in
++    compression modules. It supports reading and writing. However it is not as
++    fast as `readzip` in reading compressed files.
++
++    See Also
++    --------
++    readzip
++    """
++    ext = splitext(fp)[1]
++    zipper = getattr(ziplibs[zipfmts[ext]], 'open') if ext in zipfmts else open
++    return zipper(fp, mode)
++
++
++def readzip(fp, zippers=None):
++    """Open a regular or compressed file by matching filename extension to
++    proper library.
++
++    Parameters
++    ----------
++    fp : str
++        Input filepath.
++    zippers : dict of bool, optional
++        Available external compression programs.
++
++    Returns
++    -------
++    file handle
++        Text stream ready to be read.
++
++    Notes
++    -----
++    This function attempts to call external compression programs to read the
++    compressed file. This is typically faster than using Python's built-in
++    compression modules, because it saves the overhead in the Python wrapper,
++    and utilizes additional thread(s) for decompression.
++
++    The function checks the availability of a certain compression program at
++    its first use, and stores this information in the parameter `zippers` which
++    is shared across the program.
++
++    If the external compression program is not available, or disabled (when
++    `parameter` is not provided), the function will call Python's built-in
++    modules instead.
++
++    In addition to this method, a pure Python method for accelerating reading
++    compression files is to use the buffered reader:
++
++    >>> with gzip.open(fp, 'rb') as fh:
++    >>>     with io.BufferedReader(fh, 1048576) as buf:
++    >>>         for line in buf:
++    >>>             res = line.decode()
++    >>>             ...
++
++    See Also
++    --------
++    openzip
+     """
++    # filename extension
+     ext = splitext(fp)[1]
+-    zipfunc = getattr(ZIPDIC[ext], 'open') if ext in ZIPDIC else open
+-    return zipfunc(fp, mode)
++
++    # not a compressed file
++    if ext not in zipfmts:
++        return open(fp, 'r')
++
++    fmt = zipfmts[ext]
++
++    # external programs are disabled
++    if zippers is None:
++        return ziplibs[fmt].open(fp, 'rt')
++
++    # check whether specific external program exists
++    if fmt not in zippers:
++        zippers[fmt] = bool(which(fmt))
++
++    # use external program
++    if zippers[fmt]:
++        return Popen([fmt, '-cdfq', fp], stdout=PIPE, encoding='utf-8').stdout
++
++    # external program does not exist
++    else:
++        return ziplibs[fmt].open(fp, 'rt')
+ 
+ 
+ def file2stem(fname, ext=None):
+@@ -73,7 +156,7 @@ def file2stem(fname, ext=None):
+         return fname[:-len(ext)]
+     else:
+         stem, ext = splitext(fname)
+-        if ext in ZIPDIC:
++        if ext in zipfmts:
+             stem, ext = splitext(stem)
+         return stem
+ 
+diff --git a/woltka/ordinal.py b/woltka/ordinal.py
+index 42b8f79..9eda676 100644
+--- a/woltka/ordinal.py
++++ b/woltka/ordinal.py
+@@ -12,6 +12,7 @@
+ """
+ 
+ from collections import defaultdict
++from itertools import chain
+ from operator import itemgetter
+ 
+ from .align import infer_align_format, assign_parser
+@@ -47,7 +48,7 @@ def ordinal_mapper(fh, coords, fmt=None, n=1000000, th=0.8, prefix=False):
+         Subject(s) queue.
+     """
+     # determine file format
+-    fmt = fmt or infer_align_format(fh)
++    fmt, head = (fmt, []) if fmt else infer_align_format(fh)
+ 
+     # assign parser for given format
+     parser = assign_parser(fmt)
+@@ -106,7 +107,7 @@ def flush():
+     target = n   # target line number at end of current chunk
+ 
+     # parse alignment file
+-    for i, line in enumerate(fh):
++    for i, line in enumerate(chain(iter(head), fh)):
+ 
+         # parse current alignment line
+         try:
+diff --git a/woltka/tests/test_align.py b/woltka/tests/test_align.py
+index 6badf54..a099a5d 100644
+--- a/woltka/tests/test_align.py
++++ b/woltka/tests/test_align.py
+@@ -109,19 +109,21 @@ def test_infer_align_format(self):
+         # simple cases
+         # map
+         line = 'S1/1	NC_123456'
+-        self.assertEqual(infer_align_format(StringIO(line)), 'map')
++        obs = infer_align_format(StringIO(line))
++        self.assertEqual(obs[0], 'map')
++        self.assertListEqual(obs[1], [line])
+ 
+         # b6o
+         line = 'S1/1	NC_123456	100	100	0	0	1	100	25	124	0.1	100'
+-        self.assertEqual(infer_align_format(StringIO(line)), 'b6o')
++        self.assertEqual(infer_align_format(StringIO(line))[0], 'b6o')
+ 
+         # sam
+         line = 'S1	77	NC_123456	26	0	100M	*	0	0	*	*'
+-        self.assertEqual(infer_align_format(StringIO(line)), 'sam')
++        self.assertEqual(infer_align_format(StringIO(line))[0], 'sam')
+ 
+         # sam header
+         line = '@HD	VN:1.0	SO:unsorted'
+-        self.assertEqual(infer_align_format(StringIO(line)), 'sam')
++        self.assertEqual(infer_align_format(StringIO(line))[0], 'sam')
+ 
+         # empty file
+         with self.assertRaises(ValueError) as ctx:
+@@ -146,11 +148,11 @@ def test_infer_align_format(self):
+         # real files
+         # Bowtie2 (sam)
+         with openzip(join(self.datdir, 'align', 'bowtie2', 'S01.sam.xz')) as f:
+-            self.assertEqual(infer_align_format(f), 'sam')
++            self.assertEqual(infer_align_format(f)[0], 'sam')
+ 
+         # BURST (b6o)
+         with openzip(join(self.datdir, 'align', 'burst', 'S01.b6.bz2')) as f:
+-            self.assertEqual(infer_align_format(f), 'b6o')
++            self.assertEqual(infer_align_format(f)[0], 'b6o')
+ 
+     def test_assign_parser(self):
+         self.assertEqual(assign_parser('map'), parse_map_line)
+diff --git a/woltka/tests/test_cli.py b/woltka/tests/test_cli.py
+index ee382f9..c55ce15 100644
+--- a/woltka/tests/test_cli.py
++++ b/woltka/tests/test_cli.py
+@@ -64,7 +64,7 @@ def test_classify(self):
+         output_fp = join(self.tmpdir, 'output.tsv')
+ 
+         def _test_params(params, exp):
+-            res = self.runner.invoke(classify_cmd, params)
++            res = self.runner.invoke(classify_cmd, params + ['--no-exe'])
+             self.assertEqual(res.exit_code, 0)
+             self.assertTrue(cmp(output_fp, join(self.outdir, exp)))
+ 
+diff --git a/woltka/tests/test_file.py b/woltka/tests/test_file.py
+index ff154d4..73244b9 100644
+--- a/woltka/tests/test_file.py
++++ b/woltka/tests/test_file.py
+@@ -17,9 +17,8 @@
+ import bz2
+ 
+ from woltka.file import (
+-    openzip, file2stem, path2stem, read_ids, id2file_from_dir,
+-    id2file_from_map, read_map_uniq, read_map_1st, read_map_all,
+-    write_readmap)
++    openzip, readzip, file2stem, path2stem, read_ids, id2file_from_dir,
++    id2file_from_map, read_map_uniq, read_map_1st, read_map_all, write_readmap)
+ 
+ 
+ class FileTests(TestCase):
+@@ -67,6 +66,46 @@ def test_openzip(self):
+         self.assertEqual(obs, 'Here I am!')
+         remove(fpb)
+ 
++    def test_readzip(self):
++        text = 'Hello World!'
++
++        # read regular file
++        fp = join(self.tmpdir, 'test.txt')
++        with open(fp, 'w') as f:
++            f.write(text)
++        with readzip(fp) as f:
++            obs = f.read()
++        self.assertEqual(obs, text)
++
++        # read gzip file using builti-in Python module
++        fpz = join(self.tmpdir, 'test.txt.gz')
++        with gzip.open(fpz, 'wb') as f:
++            f.write(text.encode())
++        with readzip(fpz) as f:
++            obs = f.read()
++        self.assertEqual(obs, text)
++
++        # read gzip file using auto-identified gzip program
++        zippers = {}
++        with readzip(fpz, zippers) as f:
++            obs = f.read()
++        self.assertEqual(obs, text)
++        self.assertDictEqual(zippers, {'gzip': True})
++
++        # read gzip file using already-identified gzip program
++        with readzip(fpz, zippers) as f:
++            obs = f.read()
++        self.assertEqual(obs, text)
++        self.assertTrue(zippers['gzip'])
++
++        # disable gzip program
++        zippers['gzip'] = False
++        with readzip(fpz, zippers) as f:
++            obs = f.read()
++        self.assertEqual(obs, text)
++        self.assertFalse(zippers['gzip'])
++        remove(fpz)
++
+     def test_file2stem(self):
+         self.assertEqual(file2stem('input.txt'), 'input')
+         self.assertEqual(file2stem('input.gz'), 'input')
+diff --git a/woltka/workflow.py b/woltka/workflow.py
+index 5927759..21183eb 100644
+--- a/woltka/workflow.py
++++ b/woltka/workflow.py
+@@ -25,8 +25,8 @@
+ 
+ from .util import update_dict, allkeys, sum_dict, intize
+ from .file import (
+-    openzip, path2stem, read_ids, id2file_from_dir, id2file_from_map,
+-    read_map_uniq, read_map_1st, write_readmap)
++    openzip, readzip, path2stem, read_ids, id2file_from_dir,
++    id2file_from_map, read_map_uniq, read_map_1st, write_readmap)
+ from .align import plain_mapper
+ from .classify import (
+     assign_none, assign_free, assign_rank, count, count_strata)
+@@ -74,7 +74,8 @@ def workflow(input_fp:      str,
+              outmap_zip:    str = 'gz',
+              # performance
+              chunk:         int = None,
+-             cache:         int = 128) -> dict:
++             cache:         int = 1024,
++             no_exe:       bool = False) -> dict:
+     """Main classification workflow which accepts command-line arguments.
+ 
+     Returns
+@@ -93,6 +94,9 @@ def workflow(input_fp:      str,
+     .cli.classify
+         Command-line arguments and help information.
+     """
++    # available external compressors
++    zippers = None if no_exe else {}
++
+     # parse input samples
+     samples, files, demux = parse_samples(
+         input_fp, input_ext, samples, demux)
+@@ -103,10 +107,10 @@ def workflow(input_fp:      str,
+     # build classification system
+     tree, rankdic, namedic, root = build_hierarchy(
+         names_fps, nodes_fp, newick_fp, lineage_fp, rank_table_fp, map_fps,
+-        map_as_rank)
++        map_as_rank, zippers)
+ 
+     # build mapping module
+-    mapper, chunk = build_mapper(coords_fp, overlap, chunk)
++    mapper, chunk = build_mapper(coords_fp, overlap, chunk, zippers)
+ 
+     # target classification ranks
+     ranks, rank2dir = prepare_ranks(ranks, outmap_dir, tree)
+@@ -115,7 +119,7 @@ def workflow(input_fp:      str,
+     data = classify(
+         mapper, files, samples, input_fmt, demux, trimsub, tree, rankdic,
+         namedic if name_as_id else None, root, ranks, rank2dir, outmap_zip,
+-        uniq, major, above, subok, unassigned, stratmap, chunk, cache)
++        uniq, major, above, subok, unassigned, stratmap, chunk, cache, zippers)
+ 
+     # write output profiles
+     write_profiles(
+@@ -146,7 +150,8 @@ def classify(mapper:  object,
+              unasgd:    bool = False,
+              stratmap:  dict = None,
+              chunk:      int = None,
+-             cache:      int = 128) -> dict:
++             cache:      int = 1024,
++             zippers:   dict = None) -> dict:
+     """Core of the classification workflow.
+ 
+     Parameters
+@@ -204,6 +209,8 @@ def classify(mapper:  object,
+         Number of lines per chunk to read from alignment file.
+     cache : int, optional
+         LRU cache size for classification results at each rank.
++    zippers : dict, optional
++        External compression programs.
+ 
+     Returns
+     -------
+@@ -236,7 +243,7 @@ def classify(mapper:  object,
+         click.echo(f'Parsing alignment file {basename(fp)} ', nl=False)
+ 
+         # read alignment file into query-to-subject(s) map
+-        with openzip(fp) as fh:
++        with readzip(fp, zippers) as fh:
+ 
+             # query and progress counters
+             nqry, nstep = 0, -1
+@@ -258,8 +265,8 @@ def classify(mapper:  object,
+ 
+                     # (optional) read strata of current sample into cache
+                     if stratmap and sample != csample:
+-                        with openzip(stratmap[sample]) as fh:
+-                            kwargs['strata'] = dict(read_map_uniq(fh))
++                        with readzip(stratmap[sample], zippers) as fhs:
++                            kwargs['strata'] = dict(read_map_uniq(fhs))
+                         csample = sample
+ 
+                     # call assignment workflow for each rank
+@@ -422,7 +429,8 @@ def parse_strata(fp:       str = None,
+ 
+ def build_mapper(coords_fp: str = None,
+                  overlap:   int = None,
+-                 chunk:     int = None) -> (callable, int):
++                 chunk:     int = None,
++                 zippers:  dict = None) -> (callable, int):
+     """Build mapper function (plain or ordinal).
+ 
+     Parameters
+@@ -433,6 +441,8 @@ def build_mapper(coords_fp: str = None,
+         Read/gene overlapping percentage threshold.
+     chunk : int, optional
+         Number of lines per chunk to read from alignment file.
++    zippers : dict, optional
++        External compression programs.
+ 
+     Returns
+     -------
+@@ -454,7 +464,7 @@ def build_mapper(coords_fp: str = None,
+     """
+     if coords_fp:
+         click.echo('Reading gene coordinates...', nl=False)
+-        with openzip(coords_fp) as fh:
++        with readzip(coords_fp, zippers) as fh:
+             coords = read_gene_coords(fh, sort=True)
+         click.echo(' Done.')
+         click.echo(f'  Total number of host sequences: {len(coords)}.')
+@@ -525,7 +535,8 @@ def build_hierarchy(names_fps:    list = [],
+                     lineage_fp:    str = None,
+                     rank_table_fp: str = None,
+                     map_fps:      list = [],
+-                    map_as_rank:  bool = False) -> (dict, dict, dict, str):
++                    map_as_rank:  bool = False,
++                    zippers:      dict = None) -> (dict, dict, dict, str):
+     """Construct hierarchical classification system.
+ 
+     Parameters
+@@ -544,6 +555,8 @@ def build_hierarchy(names_fps:    list = [],
+         Mapping file(s).
+     map_as_rank : bool, optional
+         Treat mapping filename stem as rank.
++    zippers : dict, optional
++        External compression programs.
+ 
+     Returns
+     -------
+@@ -567,7 +580,7 @@ def build_hierarchy(names_fps:    list = [],
+     # taxonomy names
+     for fp in names_fps:
+         click.echo(f'  Parsing taxonomy names file: {fp}...', nl=False)
+-        with openzip(fp) as f:
++        with readzip(fp, zippers) as f:
+             names = read_names(f)
+         update_dict(namedic, names)
+         click.echo(' Done.')
+@@ -575,7 +588,7 @@ def build_hierarchy(names_fps:    list = [],
+     # taxonomy nodes
+     if nodes_fp:
+         click.echo(f'  Parsing taxonomy nodes file: {nodes_fp}...', nl=False)
+-        with openzip(nodes_fp) as f:
++        with readzip(nodes_fp, zippers) as f:
+             tree_, rankdic_ = read_nodes(f)
+         update_dict(tree, tree_)
+         update_dict(rankdic, rankdic_)
+@@ -584,14 +597,14 @@ def build_hierarchy(names_fps:    list = [],
+     # Newick-format tree
+     if newick_fp:
+         click.echo(f'  Parsing Newick tree file: {newick_fp}...', nl=False)
+-        with openzip(newick_fp) as f:
++        with readzip(newick_fp, zippers) as f:
+             update_dict(tree, read_newick(f))
+         click.echo(' Done.')
+ 
+     # lineage strings file
+     if lineage_fp:
+         click.echo(f'  Parsing lineage file: {lineage_fp}...', nl=False)
+-        with openzip(lineage_fp) as f:
++        with readzip(lineage_fp, zippers) as f:
+             tree_, rankdic_ = read_lineage(f)
+         update_dict(tree, tree_)
+         update_dict(rankdic, rankdic_)
+@@ -600,7 +613,7 @@ def build_hierarchy(names_fps:    list = [],
+     # rank table file
+     if rank_table_fp:
+         click.echo(f'  Parsing rank table file: {rank_table_fp}...', nl=False)
+-        with openzip(rank_table_fp) as f:
++        with readzip(rank_table_fp, zippers) as f:
+             tree_, rankdic_ = read_rank_table(f)
+             update_dict(tree, tree_)
+             update_dict(rankdic, rankdic_)
+@@ -609,7 +622,7 @@ def build_hierarchy(names_fps:    list = [],
+     # plain mapping files
+     for fp in map_fps:
+         click.echo(f'  Parsing simple map file: {fp}...', nl=False)
+-        with openzip(fp) as f:
++        with readzip(fp, zippers) as f:
+             map_ = dict(read_map_1st(f))
+         update_dict(tree, map_)
+ 
+@@ -732,7 +745,7 @@ def assign_readmap(qryque:    list,
+                    rank:       str,
+                    sample:     str,
+                    assigners: dict,
+-                   cache:      int = 128,
++                   cache:      int = 1024,
+                    rank2dir:  dict = None,
+                    outzip:     str = None,
+                    tree:      dict = None,

@@ -1,0 +1,1193 @@
+diff --git a/empress/core.py b/empress/core.py
+index 254096331..daf873c5b 100644
+--- a/empress/core.py
++++ b/empress/core.py
+@@ -188,7 +188,11 @@ def _validate_and_match_data(self, ignore_missing_samples,
+                                  shear_to_feature_metadata):
+ 
+         if self.is_community_plot:
+-            self.table, self.samples, self.tip_md, self.int_md = match_inputs(
++            # Hack to unpack long tuples: https://stackoverflow.com/q/26036143
++            (
++                self.table, self.samples, self.tip_md, self.int_md,
++                self.tax_cols
++            ) = match_inputs(
+                 self.tree, self.table, self.samples, self.features,
+                 self.ordination, ignore_missing_samples, filter_extra_samples,
+                 filter_missing_features
+@@ -229,9 +233,9 @@ def _validate_and_match_data(self, ignore_missing_samples,
+                         "the tree are present in the feature metadata."
+                     )
+                 self.tree = self.tree.shear(features)
+-            self.tip_md, self.int_md = match_tree_and_feature_metadata(
+-                self.tree, self.features
+-            )
++            (
++                self.tip_md, self.int_md, self.tax_cols
++            ) = match_tree_and_feature_metadata(self.tree, self.features)
+         validate_tree(self.tree)
+ 
+     def copy_support_files(self, target=None):
+@@ -367,6 +371,7 @@ def to_dict(self):
+             'compressed_sample_metadata': compressed_sm,
+             # feature metadata
+             'feature_metadata_columns': fm_cols,
++            'split_taxonomy_columns': self.tax_cols,
+             'compressed_tip_metadata': compressed_tm,
+             'compressed_int_metadata': compressed_im,
+             # Emperor integration
+diff --git a/empress/support_files/css/empress.css b/empress/support_files/css/empress.css
+index 7c792e172..80543faec 100644
+--- a/empress/support_files/css/empress.css
++++ b/empress/support_files/css/empress.css
+@@ -598,7 +598,7 @@ p.side-header button:hover,
+ #legend-main {
+     margin: 20px;
+     min-width: 150px;
+-    max-width: 40vh;
++    max-width: 33vw;
+     min-height: 30px;
+     max-height: 85vh;
+     resize: both;
+diff --git a/empress/support_files/js/empress.js b/empress/support_files/js/empress.js
+index a0424d231..4105bce38 100644
+--- a/empress/support_files/js/empress.js
++++ b/empress/support_files/js/empress.js
+@@ -42,6 +42,13 @@ define([
+      *                      when generating an Empress visualization, this
+      *                      parameter should be [] (and tipMetadata and
+      *                      intMetadata should be {}s).
++     * @param {Array} splitTaxonomyColumns Columns of the feature metadata
++     *                                     corresponding to explicitly
++     *                                     specified levels of a taxonomy, if
++     *                                     available. Should be [] if not
++     *                                     applicable. Every value in this
++     *                                     Array must also be present in
++     *                                     featureMetadataColumns.
+      * @param {Object} tipMetadata Feature metadata for tips in the tree.
+      *                 Note: This should map tip names to an array of feature
+      *                       metadata values. Each array should have the same
+@@ -55,6 +62,7 @@ define([
+         tree,
+         biom,
+         featureMetadataColumns,
++        splitTaxonomyColumns,
+         tipMetadata,
+         intMetadata,
+         canvas
+@@ -169,12 +177,22 @@ define([
+         this.isCommunityPlot = !_.isNull(this._biom);
+ 
+         /**
+-         * @type{Array}
++         * @type {Array}
+          * Feature metadata column names.
+          * @private
+          */
+         this._featureMetadataColumns = featureMetadataColumns;
+ 
++        /**
++         * @type {Array}
++         * Taxonomy column names. Should be handled specially when coloring
++         * by these, or using them in feature metadata barplots -- see
++         * https://github.com/biocore/empress/issues/473 and
++         * https://github.com/biocore/empress/pull/482 for details/discussion.
++         * @private
++         */
++        this._splitTaxonomyColumns = splitTaxonomyColumns;
++
+         /**
+          * @type{Object}
+          * Feature metadata: keys are tree node names, and values are arrays
+@@ -1942,6 +1960,17 @@ define([
+         } else {
+             halfAngleRange = Math.PI / this._tree.numleaves();
+         }
++        // NOTE that, for drawing a barplot layer representing a taxonomy
++        // column, we are essentially doing the work here of "reassembling"
++        // the ancestor taxonomy with the child taxonomy info twice -- once
++        // when we call this.getUniqueFeatureMetadataInfo() above, and again
++        // as we go through this loop and look at each tip (this is done for
++        // each tip by the "retrieval function" mentioned below).
++        //
++        // It would be ideal to use the mapping information returned by
++        // this.getUniqueFeatureMetadataInfo() to avoid having to repeat this
++        // work, although this would likely require restructuring the rest
++        // of this function -- might be too much work for its own good.
+         for (var node of this._tree.postorderTraversal()) {
+             if (this._tree.isleaf(this._tree.postorderselect(node))) {
+                 var name = this.getNodeInfo(node, "name");
+@@ -1949,8 +1978,15 @@ define([
+                 // Assign this tip's bar a color
+                 var color;
+                 if (layer.colorByFM) {
++                    // Get a function that'll retrieve feature metadata from
++                    // this field for us. As of writing, only does anything
++                    // special for certain taxonomy columns.
++                    var getValFromColorFM = this._getFMValRetrievalFunction(
++                        layer.colorByFMField
++                    );
++
+                     if (_.has(this._tipMetadata, node)) {
+-                        fm = this._tipMetadata[node][colorFMIdx];
++                        fm = getValFromColorFM(this._tipMetadata[node]);
+                         if (_.has(fm2color, fm)) {
+                             color = fm2color[fm];
+                         } else {
+@@ -1973,8 +2009,19 @@ define([
+                 // Assign this tip's bar a length
+                 var length;
+                 if (layer.scaleLengthByFM) {
++                    // Get a function that'll retrieve feature metadata from
++                    // this field for us. As of writing, this currently is
++                    // not especially useful for length scaling, since this
++                    // function only does something special for taxonomy
++                    // columns -- and those shouldn't be numeric. However,
++                    // using this function as the middle-man here ensures
++                    // consistency with how the other uses of feature metadata
++                    // work (in case we define further special cases later on).
++                    var getValFromLengthFM = this._getFMValRetrievalFunction(
++                        layer.scaleLengthByFMField
++                    );
+                     if (_.has(this._tipMetadata, node)) {
+-                        fm = this._tipMetadata[node][lengthFMIdx];
++                        fm = getValFromLengthFM(this._tipMetadata[node]);
+                         if (_.has(fm2length, fm)) {
+                             length = fm2length[fm];
+                         } else {
+@@ -2211,12 +2258,94 @@ define([
+         return keyInfo;
+     };
+ 
++    /**
++     * Returns a function that retrieves values for a feature metadata column.
++     *
++     * The returned function takes as input an Array specifying a "row" in the
++     * feature metadata (where each value corresponds to a different feature
++     * metadata column: e.g. one very simple row might be
++     * ["Bacteria", "Firmicutes", "1.25"], if the only feature metadata columns
++     * are "Level 1", "Level 2", and "SomeRandomNumber").
++     *
++     * The "basic" case is that the returned function just retrieves a single
++     * value from this row (e.g. if fmCol is "SomeRandomNumber", then the
++     * returned function should retrieve "1.25" from the aforementioned example
++     * row). However, it's possible for the returned function to behave
++     * differently in special cases. As of writing, the only "special case" is
++     * when fmCol is a non-highest-rank taxonomy column EMPress' Python code
++     * produced (e.g. "Level 2" in the example above) -- in this case, the
++     * returned function will retrieve and combine multiple values, producing
++     * a merged taxonomy string down to a given level (e.g.
++     * "Bacteria; Firmicutes").
++     *
++     * @param {String} fmCol Column in the feature metadata.
++     * @return {Function} Takes as input a row of feature metadata (an Array),
++     *                    and retrieves the "value" for fmCol from this row
++     *                    (which may just mean returning a single element from
++     *                    the row, or combining multiple columns' values) --
++     *                    the behavior is dependent on fmCol.
++     * @throws {Error} If fmCol is not present in this._featureMetadataColumns.
++     */
++    Empress.prototype._getFMValRetrievalFunction = function (fmCol) {
++        var getValFromFM;
++        var taxIdx = _.indexOf(this._splitTaxonomyColumns, fmCol);
++        var fmIdx = _.indexOf(this._featureMetadataColumns, fmCol);
++        if (fmIdx < 0) {
++            throw 'Feature metadata column "' + cat + '" not present in data.';
++        }
++        if (taxIdx <= 0) {
++            // If this feature metadata column is not in the "split taxonomy
++            // columns" (i.e. taxIdx is -1), or if this feature metadata column
++            // corresponds to the highest (and therefore first) taxonomy level
++            // (e.g. "Kingdom" -- in this case taxIdx will be 0), then, when
++            // extracting feature metadata from a given row, we can just get
++            // this column's single value in that row.
++            return function (fmRow) {
++                return fmRow[fmIdx];
++            };
++        } else {
++            // If this feature metadata column corresponds to a taxonomy level
++            // below the highest one (e.g. phylum, or class, ...) then we want
++            // to handle it specially -- see #473 on GitHub. We'll do this by
++            // recording all the "indices" of the feature metadata columns
++            // corresponding to the ancestors above this feature metadata
++            // column (and then this column itself). This makes it easier to
++            // identify all the ancestral information for a given taxonomy
++            // entry.
++            var ancestorFMIndices = [];
++            // We can use a basic for loop starting at 0 because
++            // this._splitTaxonomyColumns are in order
++            for (var i = 0; i < taxIdx; i++) {
++                var currTaxCol = this._splitTaxonomyColumns[i];
++                var currTaxColFMIdx = _.indexOf(
++                    this._featureMetadataColumns,
++                    currTaxCol
++                );
++                ancestorFMIndices.push(currTaxColFMIdx);
++            }
++            // We already know the index of the column we end at, so just put
++            // it here at the end manually. (Saving this extra work probably
++            // won't make an appreciable time difference, but it feels nice :)
++            ancestorFMIndices.push(fmIdx);
++            return function (fmRow) {
++                var totalFMVal = "";
++                _.each(ancestorFMIndices, function (ancestorFMIdx, ii) {
++                    // Separate adjacent levels in the resulting f.m. value
++                    // shown: e.g. "k__Bacteria; p__Cyanobacteria"
++                    if (ii > 0) {
++                        totalFMVal += "; ";
++                    }
++                    totalFMVal += fmRow[ancestorFMIdx];
++                });
++                return totalFMVal;
++            };
++        }
++    };
++
+     /**
+      * Retrieve unique value information for a feature metadata field.
+      *
+      * @param {String} cat The feature metadata column to find information for.
+-     *                     Must be present in this._featureMetadataColumns or
+-     *                     an error will be thrown.
+      * @param {String} method Defines what feature metadata to check.
+      *                        If this is "tip", then only tip-level feature
+      *                        metadata will be used. If this is "all", then
+@@ -2230,6 +2359,9 @@ define([
+      *                  -uniqueValueToFeatures: maps to an Object which maps
+      *                   the unique values in this feature metadata column to
+      *                   an array of the node name(s) with each value.
++     * @throws {Error} If any of the following conditions are met:
++     *                 -If cat is not present in this._featureMetadataColumns
++     *                 -If method is not "tip" or "all"
+      */
+     Empress.prototype.getUniqueFeatureMetadataInfo = function (cat, method) {
+         // In order to access feature metadata for a given node, we need to
+@@ -2253,6 +2385,11 @@ define([
+         } else {
+             throw 'F. metadata coloring method "' + method + '" unrecognized.';
+         }
++
++        // Define how we're going to extract feature metadata for a given "row"
++        // (i.e. for each entry in the feature metadata).
++        var getValFromFM = this._getFMValRetrievalFunction(cat);
++
+         // Produce a mapping of unique values in this feature metadata
+         // column to an array of the node name(s) with each value.
+         var uniqueValueToFeatures = {};
+@@ -2261,7 +2398,7 @@ define([
+                 // need to convert to integer
+                 node = parseInt(node);
+                 // This is loosely based on how BIOMTable.getObsBy() works.
+-                var fmVal = fmRow[fmIdx];
++                var fmVal = getValFromFM(fmRow);
+                 if (_.has(uniqueValueToFeatures, fmVal)) {
+                     uniqueValueToFeatures[fmVal].push(node);
+                 } else {
+diff --git a/empress/support_files/templates/empress-template.html b/empress/support_files/templates/empress-template.html
+index 8a933ebd3..891217e1b 100644
+--- a/empress/support_files/templates/empress-template.html
++++ b/empress/support_files/templates/empress-template.html
+@@ -139,6 +139,8 @@ <h3 id="menu-sm-header">Sample Presence Information</h3>
+ 
+         var fmCols = {{ feature_metadata_columns | tojson }};
+ 
++        var splitTaxonomyCols = {{ split_taxonomy_columns | tojson }};
++
+         var canvas = document.getElementById('tree-surface');
+ 
+         // NOTE: the contents of this line are validated in the python
+@@ -162,6 +164,7 @@ <h3 id="menu-sm-header">Sample Presence Information</h3>
+             tree,
+             biom,
+             fmCols,
++            splitTaxonomyCols,
+             {{ compressed_tip_metadata | tojson }},
+             {{ compressed_int_metadata | tojson }},
+             canvas
+diff --git a/empress/taxonomy_utils.py b/empress/taxonomy_utils.py
+index 85feb5082..ff6df7bf8 100644
+--- a/empress/taxonomy_utils.py
++++ b/empress/taxonomy_utils.py
+@@ -44,6 +44,17 @@ def split_taxonomy(feature_metadata):
+         taxonomy columns, this DataFrame is identical to the input DataFrame.)
+         The new "Level" columns will be placed at the start of the returned
+         DataFrame's columns.
++    tax_columns : list
++        If taxonomy splitting is done, this will contain the resulting taxonomy
++        column names, in descending order (e.g. ["Level 1", "Level 2",
++        "Level 3"]). If no taxonomy splitting is done, this'll just return [].
++        The motivation for returning a list of the new column names, rather
++        than just a boolean "has / doesn't have taxonomy columns" flag, is to
++        make changes to the names used to represent taxonomy columns minimally
++        painful in the future -- "Level" isn't that uncommon of a word, and I
++        can imagine that we might want to change the names of taxonomy columns
++        in the future, so storing the taxonomy column names here should prevent
++        us from having to change both the Python and JS code. Hopefully :P
+ 
+     Raises
+     ------
+@@ -88,6 +99,7 @@ def split_taxonomy(feature_metadata):
+             # this.)
+             invalid_level_columns_present = True
+ 
++    new_tax_cols = []
+     if tax_col_index is not None:
+         if invalid_level_columns_present:
+             # Error condition 2 -- there is at least one "Level" column already
+@@ -129,12 +141,13 @@ def split_taxonomy(feature_metadata):
+         # Our use of expand=True means that tax_levels will be a DataFrame with
+         # the same index as feature_metadata but with one column for each
+         # taxonomic level (in order -- Kingdom, Phylum, etc.)
+-        tax_levels.columns = [
++        new_tax_cols = [
+             "Level {}".format(i) for i in range(1, len(tax_levels.columns) + 1)
+         ]
++        tax_levels.columns = new_tax_cols
+         fm_no_tax = feature_metadata.drop(columns=tax_col_name)
+         # Finally, join the f.m. with the tax. levels DF by the index.
+-        return pd.concat([tax_levels, fm_no_tax], axis="columns")
++        return pd.concat([tax_levels, fm_no_tax], axis="columns"), new_tax_cols
+     else:
+         # No taxonomy column found, so no need to modify the DataFrame
+-        return feature_metadata
++        return feature_metadata, new_tax_cols
+diff --git a/empress/tools.py b/empress/tools.py
+index d1e5c9854..9f89b02a2 100644
+--- a/empress/tools.py
++++ b/empress/tools.py
+@@ -40,15 +40,21 @@ def match_tree_and_feature_metadata(bp_tree, feature_metadata=None):
+ 
+     Returns
+     -------
+-    (tip_metadata, int_metadata): (pd.DataFrame or None, pd.DataFrame or None)
++    (tip_metadata, int_metadata, tax_columns):
++            (pd.DataFrame or None, pd.DataFrame or None, list)
+         If feature metadata was not passed, tip_metadata and int_metadata
+         will both be None. Otherwise, tip_metadata will contain the
+         entries of the feature metadata where the feature name was present
+         as a tip in the tree, and int_metadata will contain the entries
+         of the feature metadata where the feature name was present as
+-        internal node(s) in the tree. Also, this will call
++        internal node(s) in the tree.
++
++        Also, if feature metadata is passed, this will call
+         taxonomy_utils.split_taxonomy() on the feature metadata before
+-        splitting it up between tip and internal node feature mtadata.
++        splitting it up between tip and internal node feature metadata --
++        tax_columns will be set to whatever the tax_columns value returned by
++        split_taxonomy() is (see that function's documentation for details).
++        (If feature metadata is not passed, tax_columns will be [].)
+ 
+     Raises
+     ------
+@@ -58,9 +64,12 @@ def match_tree_and_feature_metadata(bp_tree, feature_metadata=None):
+     """
+     tip_metadata = None
+     int_metadata = None
++    tax_columns = []
+     if feature_metadata is not None:
+         # Split up taxonomy column, if present in the feature metadata
+-        ts_feature_metadata = taxonomy_utils.split_taxonomy(feature_metadata)
++        ts_feature_metadata, tax_columns = taxonomy_utils.split_taxonomy(
++            feature_metadata
++        )
+         fm_ids = ts_feature_metadata.index
+ 
+         # Subset tip metadata
+@@ -73,12 +82,12 @@ def match_tree_and_feature_metadata(bp_tree, feature_metadata=None):
+         int_metadata = ts_feature_metadata.loc[fm_and_int_features]
+ 
+         if len(tip_metadata.index) == 0 and len(int_metadata.index) == 0:
+-            # Error condition 5 in match_inputs_community_plot()
++            # Error condition 5 in match_inputs()
+             raise DataMatchingError(
+                 "No features in the feature metadata are present in the tree, "
+                 "either as tips or as internal nodes."
+             )
+-    return tip_metadata, int_metadata
++    return tip_metadata, int_metadata, tax_columns
+ 
+ 
+ def match_inputs(
+@@ -133,8 +142,8 @@ def match_inputs(
+ 
+     Returns
+     -------
+-    (table, sample_metadata, tip_metadata, int_metadata):
+-        (biom.Table, pd.DataFrame, pd.DataFrame / None, pd.DataFrame / None)
++    (table, sample_metadata, tip_metadata, int_metadata, tax_columns):
++        (biom.Table, pd.DataFrame, pd.DataFrame|None, pd.DataFrame|None, list)
+         Versions of the input table, sample metadata, and feature metadata
+         filtered such that:
+             -The table only contains features also present as tips in the tree.
+@@ -145,12 +154,15 @@ def match_inputs(
+              no metadata". (This will only be done if ignore_missing_samples is
+              True; otherwise, this situation will trigger an error. See below.)
+             -If feature metadata was not passed, tip_metadata and int_metadata
+-             will both be None. Otherwise, tip_metadata will contain the
+-             entries of the feature metadata where the feature name was present
+-             as a tip in the tree, and int_metadata will contain the entries
+-             of the feature metadata where the feature name was present as
+-             internal node(s) in the tree.
+-                -Also, for sanity's sake, this will call
++             will both be None (and tax_columns will be []). Otherwise,
++             tip_metadata will contain the entries of the feature metadata
++             where the feature name was present as a tip in the tree,
++             int_metadata will contain the entries of the feature metadata
++             where the feature name was present as internal node(s) in the
++             tree, and tax_columns will contain the names of any newly-created
++             columns representing levels in a taxonomy, sorted in descending
++             order.
++                -For sanity's sake, this will call
+                  taxonomy_utils.split_taxonomy() on the feature metadata before
+                  splitting it up into tip and internal node metadata.
+ 
+@@ -166,8 +178,10 @@ def match_inputs(
+                metadata, AND ignore_missing_samples is False.
+             5. The feature metadata was passed, but no features present in it
+                are also present as tips or internal nodes in the tree.
+-            6. The ordination AND feature table don't have exactly the same
+-               samples.
++            6. The ordination and feature table don't share any samples.
++            7. The feature table contains more samples than the ordination, AND
++               filter_extra_samples is False.
++            8. The ordination contains more samples than the feature table.
+ 
+     References
+     ----------
+@@ -186,6 +200,7 @@ def match_inputs(
+ 
+         # don't allow for disjoint datasets
+         if not (table_ids & ord_ids):
++            # Error condition 6
+             raise DataMatchingError(
+                 "No samples in the feature table are present in the "
+                 "ordination"
+@@ -195,6 +210,7 @@ def match_inputs(
+             extra = table_ids - ord_ids
+             if extra:
+                 if not filter_extra_samples:
++                    # Error condition 7
+                     raise DataMatchingError(
+                         "The feature table has more samples than the "
+                         "ordination. These are the problematic sample "
+@@ -206,6 +222,7 @@ def match_inputs(
+                 # We'll remove now-empty features from the table later in
+                 # the code
+         else:
++            # Error condition 8
+             raise DataMatchingError(
+                 "The ordination has more samples than the feature table."
+             )
+@@ -309,12 +326,14 @@ def match_inputs(
+     # presence of such "dropped samples" is a common occurrence in 16S studies,
+     # so we currently don't do that for the sake of avoiding alarm fatigue.
+ 
+-    tip_metadata, int_metadata = match_tree_and_feature_metadata(
++    tip_metadata, int_metadata, tax_columns = match_tree_and_feature_metadata(
+         bp_tree,
+         feature_metadata
+     )
+ 
+-    return ff_table, sf_sample_metadata, tip_metadata, int_metadata
++    return (
++        ff_table, sf_sample_metadata, tip_metadata, int_metadata, tax_columns
++    )
+ 
+ 
+ def shifting(bitlist, size=51):
+diff --git a/tests/python/test_core.py b/tests/python/test_core.py
+index d666c001e..69ad7cf61 100644
+--- a/tests/python/test_core.py
++++ b/tests/python/test_core.py
+@@ -754,6 +754,7 @@ def test_ordination_integration_callbacks(self):
+         ["1", "0", "4", "jkl"],
+     ],
+     "feature_metadata_columns": [],
++    "split_taxonomy_columns": [],
+     "compressed_tip_metadata": {},
+     "compressed_int_metadata": {},
+     "emperor_div": "",
+diff --git a/tests/python/test_taxonomy_utils.py b/tests/python/test_taxonomy_utils.py
+index 703a2d7c1..657b451ad 100644
+--- a/tests/python/test_taxonomy_utils.py
++++ b/tests/python/test_taxonomy_utils.py
+@@ -11,6 +11,21 @@
+ import empress.taxonomy_utils as tax_utils
+ 
+ 
++def assert_taxcols_ok(taxcols, exp_num_levels=7):
++    """Checks that a given taxcols list (returned by
++       taxonomy_utils.split_taxonomy()) looks how we expect it to.
++
++       exp_num_levels is the number of levels in the taxonomy -- it
++       defaults to 7, which is the case for the moving pictures dataset
++       (kingdom, phylum, class, order, family, genus, species).
++    """
++    expcols = ["Level {}".format(i) for i in range(1, exp_num_levels + 1)]
++    # I guess ideally we'd use self.assertEqual() from within a unittest class,
++    # but just using the vanilla assert here makes it easy to use this function
++    # from multiple unittest classes
++    assert taxcols == expcols
++
++
+ class TestTaxonomyUtils(unittest.TestCase):
+ 
+     def setUp(self):
+@@ -41,9 +56,10 @@ def setUp(self):
+             index=["f1", "f2", "f3", "f4"]
+         )
+ 
+-    def check_basic_case_worked(self, split_fm):
+-        """Checks that a given DataFrame matches the expected output from
+-           running split_taxonomy() on self.feature_metadata.
++    def _check_basic_case_worked(self, split_fm, taxcols):
++        """Checks that a given DataFrame (and list of split-up taxonomy columns)
++           matches the expected output from running split_taxonomy() on
++           self.feature_metadata.
+         """
+ 
+         # Let's verify that split_fm looks how we expect it to look.
+@@ -57,6 +73,9 @@ def check_basic_case_worked(self, split_fm):
+         # isn't even a thing that split_taxonomy() does, but let's be safe :P)
+         self.assertCountEqual(split_fm.index, ["f1", "f2", "f3", "f4"])
+ 
++        # While we're at it, let's check that taxcols looks good
++        assert_taxcols_ok(taxcols)
++
+         # Finally, let's check each row individually. This is kinda inelegant.
+         assert_series_equal(
+             split_fm.loc["f1"],
+@@ -114,8 +133,9 @@ def check_basic_case_worked(self, split_fm):
+     def test_split_taxonomy_no_tax_column(self):
+         fm2 = self.feature_metadata.copy()
+         fm2.columns = ["asdf", "ghjkl"]
+-        fm3 = tax_utils.split_taxonomy(fm2)
++        fm3, taxcols = tax_utils.split_taxonomy(fm2)
+         assert_frame_equal(fm2, fm3)
++        self.assertEqual(taxcols, [])
+ 
+     def test_split_taxonomy_multiple_tax_columns(self):
+         bad_fm = self.feature_metadata.copy()
+@@ -148,27 +168,28 @@ def test_split_taxonomy_invalid_level_column(self):
+     def test_split_taxonomy_level_column_but_no_taxonomy_column(self):
+         meh_fm = self.feature_metadata.copy()
+         meh_fm.columns = ["I'm ambivalent!", "Level 20"]
+-        meh_fm2 = tax_utils.split_taxonomy(meh_fm)
++        meh_fm2, taxcols = tax_utils.split_taxonomy(meh_fm)
+         assert_frame_equal(meh_fm, meh_fm2)
++        self.assertEqual(taxcols, [])
+ 
+     def test_split_taxonomy_basic_case(self):
+         initial_fm = self.feature_metadata.copy()
+-        split_fm = tax_utils.split_taxonomy(initial_fm)
++        split_fm, taxcols = tax_utils.split_taxonomy(initial_fm)
+ 
+         # First off, check that initial_fm was NOT modified: the input DF
+         # should remain untouched
+         assert_frame_equal(self.feature_metadata, initial_fm)
+ 
+-        # Do all the in-depth testing of split_fm in a utility func (we'll
+-        # reuse this code a bit later)
+-        self.check_basic_case_worked(split_fm)
++        # Do all the in-depth testing of split_fm and taxcols in a utility
++        # func (we'll reuse this code a bit later)
++        self._check_basic_case_worked(split_fm, taxcols)
+ 
+     def test_split_taxonomy_rows_with_no_semicolons(self):
+         funky_fm = self.feature_metadata.copy()
+         funky_fm.loc["f1", "Taxonomy"] = "birds aren't real"
+         funky_fm.loc["f2", "Taxonomy"] = "theyve been drones"
+         funky_fm.loc["f3", "Taxonomy"] = "all along :O"
+-        split_fm = tax_utils.split_taxonomy(funky_fm)
++        split_fm, taxcols = tax_utils.split_taxonomy(funky_fm)
+ 
+         # Notice that f4's taxonomy is still there -- so each feature will have
+         # 3 levels
+@@ -176,6 +197,8 @@ def test_split_taxonomy_rows_with_no_semicolons(self):
+             "Level 1", "Level 2", "Level 3", "Confidence"
+         ])
+ 
++        assert_taxcols_ok(taxcols, exp_num_levels=3)
++
+         # Check each row individually
+         assert_series_equal(
+             split_fm.loc["f1"],
+@@ -228,9 +251,10 @@ def test_split_taxonomy_all_rows_no_semicolons(self):
+                 'is formatted so that "levels" are separated by semicolons.'
+             )
+         ):
+-            split_fm = tax_utils.split_taxonomy(funky_fm)
++            split_fm, taxcols = tax_utils.split_taxonomy(funky_fm)
+ 
+         self.assertCountEqual(split_fm.columns, ["Level 1", "Confidence"])
++        assert_taxcols_ok(taxcols, exp_num_levels=1)
+         assert_series_equal(
+             split_fm.loc["f1"],
+             pd.Series({"Level 1": "Bacteria", "Confidence": 0.95}, name="f1")
+@@ -271,8 +295,8 @@ def test_split_taxonomy_leading_trailing_whitespace(self):
+         funky_fm.loc["f4", "Taxonomy"] = (
+             " \t " + funky_fm.loc["f4", "Taxonomy"] + "\t"
+         )
+-        split_fm = tax_utils.split_taxonomy(funky_fm)
+-        self.check_basic_case_worked(split_fm)
++        split_fm, taxcols = tax_utils.split_taxonomy(funky_fm)
++        self._check_basic_case_worked(split_fm, taxcols)
+ 
+     def test_split_taxonomy_SILVA_annotation(self):
+         """Tests that a particular taxonomy annotation that has caused
+@@ -288,7 +312,7 @@ def test_split_taxonomy_SILVA_annotation(self):
+                 )
+             ]
+         }, index=["f0"])
+-        split_fm = tax_utils.split_taxonomy(fm)
++        split_fm, taxcols = tax_utils.split_taxonomy(fm)
+         assert_series_equal(
+             split_fm.loc["f0"],
+             pd.Series({
+@@ -301,6 +325,7 @@ def test_split_taxonomy_SILVA_annotation(self):
+                 "Level 7": "D_6__uncultured bacterium",
+             }, name="f0")
+         )
++        assert_taxcols_ok(taxcols)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/python/test_tools.py b/tests/python/test_tools.py
+index 759923ea4..6f3b87b62 100644
+--- a/tests/python/test_tools.py
++++ b/tests/python/test_tools.py
+@@ -14,6 +14,7 @@
+ from empress import tools
+ from empress.taxonomy_utils import split_taxonomy
+ from bp import parse_newick, from_skbio_treenode
++from .test_taxonomy_utils import assert_taxcols_ok
+ 
+ 
+ class TestTools(unittest.TestCase):
+@@ -64,7 +65,7 @@ def setUp(self):
+             },
+             index=["e", "h", "a"]
+         )
+-        self.split_tax_fm = split_taxonomy(self.feature_metadata)
++        self.split_tax_fm, self.taxcols = split_taxonomy(self.feature_metadata)
+         self.tip_md = self.split_tax_fm.loc[["a", "e"]]
+         self.int_md = self.split_tax_fm.loc[["h"]]
+         # This is designed to match the shearing that's done in the core test
+@@ -97,19 +98,22 @@ def setUp(self):
+                 proportion_explained=proportion_explained)
+ 
+     def test_match_inputs_nothing_dropped(self):
+-        filtered_table, filtered_sample_md, t_md, i_md = tools.match_inputs(
+-            self.bp_tree, self.table, self.sample_metadata
+-        )
++        (
++            filtered_table, filtered_sample_md, t_md, i_md, taxcols
++        ) = tools.match_inputs(self.bp_tree, self.table, self.sample_metadata)
+         self.assertEqual(filtered_table, self.table)
+         assert_frame_equal(filtered_sample_md, self.sample_metadata)
+         # We didn't pass in any feature metadata, so we shouldn't get any out
+         self.assertIsNone(t_md)
+         self.assertIsNone(i_md)
++        self.assertEqual(taxcols, [])
+ 
+     def test_match_inputs_nothing_dropped_with_ordination(self):
+         # everything is the same since the ordination has a 1:1 match to the
+         # feature table
+-        filtered_table, filtered_sample_md, t_md, i_md = tools.match_inputs(
++        (
++            filtered_table, filtered_sample_md, t_md, i_md, taxcols
++        ) = tools.match_inputs(
+             self.bp_tree, self.table, self.sample_metadata,
+             ordination=self.ordination
+         )
+@@ -119,18 +123,20 @@ def test_match_inputs_nothing_dropped_with_ordination(self):
+         # We didn't pass in any feature metadata, so we shouldn't get any out
+         self.assertIsNone(t_md)
+         self.assertIsNone(i_md)
++        self.assertEqual(taxcols, [])
+ 
+     def test_match_inputs_only_1_feature_in_table(self):
+         # This is technically allowed (so long as this 1 feature is a tree tip)
+         tiny_table = self.table.filter({"a", }, axis='observation',
+                                        inplace=False)
+-        filtered_tiny_table, filtered_sample_md, tm, im = tools.match_inputs(
+-            self.bp_tree, tiny_table, self.sample_metadata
+-        )
++        (
++            filtered_tiny_table, filtered_sample_md, tm, im, taxcols
++        ) = tools.match_inputs(self.bp_tree, tiny_table, self.sample_metadata)
+         self.assertEqual(filtered_tiny_table, tiny_table)
+         assert_frame_equal(filtered_sample_md, self.sample_metadata)
+         self.assertIsNone(tm)
+         self.assertIsNone(im)
++        self.assertEqual(taxcols, [])
+ 
+     def test_match_inputs_no_tips_in_table(self):
+         bad_table = self.table.copy()
+@@ -203,7 +209,7 @@ def test_match_inputs_filter_missing_features_override(self):
+                 "visualization."
+             )
+         ):
+-            out_table, out_sm, tm, im = tools.match_inputs(
++            out_table, out_sm, tm, im, taxcols = tools.match_inputs(
+                 self.bp_tree, bad_table, self.sample_metadata,
+                 filter_missing_features=True
+             )
+@@ -217,6 +223,10 @@ def test_match_inputs_filter_missing_features_override(self):
+         assert_frame_equal(
+             out_sm, self.sample_metadata
+         )
++        # We didn't pass in any feature metadata, so we shouldn't get any out
++        self.assertIsNone(tm)
++        self.assertIsNone(im)
++        self.assertEqual(taxcols, [])
+ 
+     def test_match_inputs_ignore_missing_samples_error(self):
+         # Replace one of the sample IDs in the table with some junk
+@@ -246,7 +256,7 @@ def test_match_inputs_ignore_missing_samples_override(self):
+                 "metadata."
+             )
+         ):
+-            out_table, out_sm, tm, im = tools.match_inputs(
++            out_table, out_sm, tm, im, taxcols = tools.match_inputs(
+                 self.bp_tree, bad_table, self.sample_metadata,
+                 ignore_missing_samples=True
+             )
+@@ -278,13 +288,20 @@ def test_match_inputs_ignore_missing_samples_override(self):
+             check_dtype=False
+         )
+ 
++        # We didn't pass in any feature metadata, so we shouldn't get any back
++        self.assertIsNone(tm)
++        self.assertIsNone(im)
++        self.assertEqual(taxcols, [])
++
+     def test_match_inputs_feature_metadata_nothing_dropped(self):
+         """Tests that tip/internal node names allowed as entries in feat. md.
+ 
+            (self.feature_metadata describes three features, "e", "h", and "a".
+             h is an internal node in self.tree, and e and a are tips.)
+         """
+-        f_table, f_sample_metadata, tip_md, int_md = tools.match_inputs(
++        (
++            f_table, f_sample_metadata, tip_md, int_md, taxcols
++        ) = tools.match_inputs(
+             self.bp_tree, self.table,
+             self.sample_metadata, self.feature_metadata
+         )
+@@ -301,6 +318,8 @@ def test_match_inputs_feature_metadata_nothing_dropped(self):
+         # Check that the tip + internal node metadata have identical columns
+         self.assertListEqual(list(tip_md.columns), self.exp_split_fm_cols)
+         self.assertListEqual(list(int_md.columns), self.exp_split_fm_cols)
++        # Check that the split-up taxonomy columns look good
++        assert_taxcols_ok(taxcols)
+ 
+     def test_match_inputs_feature_metadata_no_features_in_tree(self):
+         """Tests that feature names not corresponding to internal nodes / tips
+@@ -328,7 +347,7 @@ def test_match_inputs_feature_metadata_some_features_dropped(self):
+         # (since it's actually in the tree, while "asdf" and "hjkl" aren't)
+         bad_fm = self.feature_metadata.copy()
+         bad_fm.index = ["e", "asdf", "hjkl"]
+-        f_table, f_sample_metadata, t_fm, i_fm = tools.match_inputs(
++        f_table, f_sample_metadata, t_fm, i_fm, taxcols = tools.match_inputs(
+             self.bp_tree, self.table, self.sample_metadata, bad_fm
+         )
+         self.assertEqual(f_table, self.table)
+@@ -344,6 +363,8 @@ def test_match_inputs_feature_metadata_some_features_dropped(self):
+         # the generated HTML... but may as well check.)
+         self.assertListEqual(list(t_fm.columns), self.exp_split_fm_cols)
+         self.assertListEqual(list(i_fm.columns), self.exp_split_fm_cols)
++        # Check that the split-up taxonomy columns look good
++        assert_taxcols_ok(taxcols)
+ 
+     def test_match_inputs_feature_metadata_root_metadata_allowed(self):
+         """Tests that feature metadata for the root node is preserved."""
+@@ -351,7 +372,7 @@ def test_match_inputs_feature_metadata_root_metadata_allowed(self):
+         t = parse_newick('(((a:1,e:2):1,b:2)g:1,(:1,d:3)h:2)i:1;')
+         fm = self.feature_metadata.copy()
+         fm.index = ["a", "g", "i"]
+-        f_table, f_sample_metadata, t_fm, i_fm = tools.match_inputs(
++        f_table, f_sample_metadata, t_fm, i_fm, taxcols1 = tools.match_inputs(
+             t, self.table, self.sample_metadata, fm
+         )
+         # (check that we didn't mess up the table / sample metadata matching by
+@@ -359,40 +380,44 @@ def test_match_inputs_feature_metadata_root_metadata_allowed(self):
+         self.assertEqual(f_table, self.table)
+         assert_frame_equal(f_sample_metadata, self.sample_metadata)
+ 
+-        split_fm = split_taxonomy(fm)
++        split_fm, taxcols2 = split_taxonomy(fm)
+         # Main point of this test: all of the feature metadata should have been
+         # kept, since a, g, and i are all included in the tree (i in particular
+         # is important to verify, since it's the root)
+         assert_frame_equal(t_fm, split_fm.loc[["a"]])
+         assert_frame_equal(i_fm, split_fm.loc[["g", "i"]], check_like=True)
++        assert_taxcols_ok(taxcols1)
++        self.assertEqual(taxcols1, taxcols2)
+ 
+     def test_match_inputs_feature_metadata_duplicate_name_internal_node(self):
+         """Tests that feature metadata for internal nodes with duplicate names
+            is preserved.
+ 
+-           In the JS interface, there are two options for coloring nodes by
+-           feature metadata: 1) just coloring tips (and propagating
+-           clades with uniform feature metadata upwards), or 2) coloring all
+-           nodes with feature metadata, which can include internal nodes. In
+-           2), internal nodes with the same name will have the same feature
+-           metadata color.
++           In the JS interface, there are two options for coloring nodes by a
++           given feature metadata column: 1) just coloring tips (and
++           propagating clades with the same value in this feature metadata
++           column upwards), or 2) coloring all nodes with feature metadata,
++           which can include internal nodes. In 2), internal nodes with the
++           same name will have the same feature metadata color.
+         """
+         # Slightly modified version of self.tree with duplicate internal node
+         # names (i and g)
+         t = parse_newick('(((a:1,e:2)i:1,b:2)g:1,(:1,d:3)g:2)i:1;')
+         fm = self.feature_metadata.copy()
+         fm.index = ["a", "g", "i"]
+-        f_table, f_sample_metadata, t_fm, i_fm = tools.match_inputs(
++        f_table, f_sample_metadata, t_fm, i_fm, taxcols1 = tools.match_inputs(
+             t, self.table, self.sample_metadata, fm
+         )
+         self.assertEqual(f_table, self.table)
+         assert_frame_equal(f_sample_metadata, self.sample_metadata)
+ 
+-        split_fm = split_taxonomy(fm)
++        split_fm, taxcols2 = split_taxonomy(fm)
+         # Main point of this test: all of the feature metadata should have been
+         # kept, even though g and i were both duplicate node names.
+         assert_frame_equal(t_fm, split_fm.loc[["a"]])
+         assert_frame_equal(i_fm, split_fm.loc[["g", "i"]], check_like=True)
++        assert_taxcols_ok(taxcols1)
++        self.assertEqual(taxcols1, taxcols2)
+ 
+     def test_match_inputs_feature_metadata_only_internal_node_metadata(self):
+         """Tests that feature metadata only for internal nodes is allowed."""
+@@ -400,13 +425,13 @@ def test_match_inputs_feature_metadata_only_internal_node_metadata(self):
+         t = parse_newick('(((a:1,e:2):1,b:2)g:1,(:1,d:3)h:2)i:1;')
+         fm = self.feature_metadata.copy()
+         fm.index = ["h", "g", "i"]
+-        f_table, f_sample_metadata, t_fm, i_fm = tools.match_inputs(
++        f_table, f_sample_metadata, t_fm, i_fm, taxcols1 = tools.match_inputs(
+             t, self.table, self.sample_metadata, fm
+         )
+         self.assertEqual(f_table, self.table)
+         assert_frame_equal(f_sample_metadata, self.sample_metadata)
+ 
+-        split_fm = split_taxonomy(fm)
++        split_fm, taxcols2 = split_taxonomy(fm)
+         # 1) Check that tip metadata is empty
+         self.assertEqual(len(t_fm.index), 0)
+         # 2) Check that internal node metadata was preserved
+@@ -414,6 +439,10 @@ def test_match_inputs_feature_metadata_only_internal_node_metadata(self):
+         # 3) Check that columns on both DFs are identical
+         self.assertListEqual(list(t_fm.columns), self.exp_split_fm_cols)
+         self.assertListEqual(list(i_fm.columns), self.exp_split_fm_cols)
++        # 4) Check that the taxonomy columns produced by splitting the
++        # taxonomic feature metadata were produced as expected
++        assert_taxcols_ok(taxcols1)
++        self.assertEqual(taxcols1, taxcols2)
+ 
+     def test_disjoint_table_and_ordination(self):
+         self.ordination.samples.index = pd.Index(['Zample1', 'Zample2',
+@@ -469,9 +498,12 @@ def test_table_is_superset_override_raises(self):
+                            ['Sample1', 'Sample2', 'Sample3', 'Sample4',
+                             'Sample5'])
+ 
+-        filtered_table, filtered_sample_md, t_md, i_md = tools.match_inputs(
++        (
++            filtered_table, filtered_sample_md, t_md, i_md, taxcols
++        ) = tools.match_inputs(
+             self.bp_tree, table, self.sample_metadata,
+-            ordination=self.ordination, filter_extra_samples=True)
++            ordination=self.ordination, filter_extra_samples=True
++        )
+ 
+         # NOTE: even though 'e' is now empty, it isn't removed now; it'll be
+         # removed later on, in remove_empty_samples_and_features().
+@@ -485,6 +517,7 @@ def test_table_is_superset_override_raises(self):
+         # We didn't pass in any feature metadata, so we shouldn't get any out
+         self.assertIsNone(t_md)
+         self.assertIsNone(i_md)
++        self.assertEqual(taxcols, [])
+ 
+     def test_shifting(self):
+         # helper test function to count number of bits in the number
+diff --git a/tests/test-animation-panel-handler.js b/tests/test-animation-panel-handler.js
+index 9cf95367a..b17687126 100644
+--- a/tests/test-animation-panel-handler.js
++++ b/tests/test-animation-panel-handler.js
+@@ -93,7 +93,7 @@ require([
+                 smCols,
+                 sm
+             );
+-            var empress = new Empress({ size: 0 }, biom, [], {}, {}, null);
++            var empress = new Empress({ size: 0 }, biom, [], [], {}, {}, null);
+             var animator = new Animator(
+                 empress,
+                 new Legend(
+diff --git a/tests/test-barplots.js b/tests/test-barplots.js
+index a9d0512d4..bcfbbc803 100644
+--- a/tests/test-barplots.js
++++ b/tests/test-barplots.js
+@@ -29,6 +29,7 @@ require([
+                     this.testData.tree,
+                     this.testData.biom,
+                     this.testData.fmCols,
++                    this.testData.splitTaxCols,
+                     this.testData.tm,
+                     this.testData.im,
+                     this.testData.canvas
+@@ -112,6 +113,7 @@ require([
+             this.testData.tree,
+             this.testData.biom,
+             [],
++            [],
+             {},
+             {},
+             this.testData.canvas
+@@ -123,6 +125,7 @@ require([
+             this.testData.tree,
+             null,
+             [],
++            [],
+             {},
+             {},
+             this.testData.canvas
+@@ -132,6 +135,7 @@ require([
+             this.testData.tree,
+             null,
+             this.testData.fmCols,
++            [],
+             this.testData.tm,
+             this.testData.im,
+             this.testData.canvas
+@@ -141,6 +145,7 @@ require([
+             this.testData.tree,
+             this.testData.biom,
+             [],
++            [],
+             {},
+             {},
+             this.testData.canvas
+@@ -168,6 +173,7 @@ require([
+             this.testData.tree,
+             null,
+             this.testData.fmCols,
++            [],
+             this.testData.tm,
+             this.testData.im,
+             this.testData.canvas
+@@ -184,6 +190,7 @@ require([
+             this.testData.tree,
+             this.testData.biom,
+             [],
++            [],
+             {},
+             {},
+             this.testData.canvas
+diff --git a/tests/test-circular-layout-computation.js b/tests/test-circular-layout-computation.js
+index f89d61d81..c050bfaf6 100644
+--- a/tests/test-circular-layout-computation.js
++++ b/tests/test-circular-layout-computation.js
+@@ -181,6 +181,7 @@ require(["jquery", "BPTree", "BiomTable", "Empress"], function (
+                     tree,
+                     biom,
+                     [], // feature metadata columns
++                    [], // split taxonomy columns
+                     {}, // tip metadata
+                     {}, // internal node metadata
+                     null // canvas
+diff --git a/tests/test-empress.js b/tests/test-empress.js
+index d9722ace7..41be6f5ce 100644
+--- a/tests/test-empress.js
++++ b/tests/test-empress.js
+@@ -542,6 +542,7 @@ require([
+                 testData.tree,
+                 null,
+                 testData.fmCols,
++                testData.splitTaxCols,
+                 testData.tm,
+                 testData.im,
+                 testData.canvas
+@@ -1093,6 +1094,7 @@ require([
+                 testData.tree,
+                 tinyBiom,
+                 testData.fmCols,
++                testData.splitTaxCols,
+                 testData.tm,
+                 testData.im,
+                 testData.canvas
+@@ -1153,6 +1155,90 @@ require([
+                 );
+             }, /F. metadata coloring method "i'm invalid!" unrecognized./);
+         });
++        test("Test getUniqueFeatureMetadataInfo with ancestor taxonomy propagation (lowest level, just tip metadata)", function () {
++            var stEmp = UtilitiesForTesting.getEmpressForAncestorTaxProp();
++            var info = stEmp.getUniqueFeatureMetadataInfo("f2", "tip");
++            var uniqVals = ["1; 2", "2; 2"];
++            deepEqual(info.sortedUniqueValues, uniqVals);
++            // Check that the uniqueValueToFeatures object looks good
++            deepEqual(
++                new Set(Object.keys(info.uniqueValueToFeatures)),
++                new Set(uniqVals)
++            );
++            // Two tips have the "1; 2" taxonomy, and two tips have the "2; 2"
++            // taxonomy. ... Of course, in practice, these will probably be
++            // fancy strings like "k__Bacteria" or something, so the taxonomy
++            // displayed will look nicer
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["1; 2"]),
++                new Set([2, 3])
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["2; 2"]),
++                new Set([1, 6])
++            );
++        });
++        test("Test getUniqueFeatureMetadataInfo with ancestor taxonomy propagation (highest level, just tip metadata)", function () {
++            var stEmp = UtilitiesForTesting.getEmpressForAncestorTaxProp();
++            var info = stEmp.getUniqueFeatureMetadataInfo("f1", "tip");
++            var uniqVals = ["1", "2"];
++            deepEqual(info.sortedUniqueValues, uniqVals);
++            // Check that the uniqueValueToFeatures object looks good
++            deepEqual(
++                new Set(Object.keys(info.uniqueValueToFeatures)),
++                new Set(uniqVals)
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["1"]),
++                new Set([2, 3])
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["2"]),
++                new Set([1, 6])
++            );
++        });
++        test("Test getUniqueFeatureMetadataInfo with ancestor taxonomy propagation (lowest level, all f. metadata)", function () {
++            var stEmp = UtilitiesForTesting.getEmpressForAncestorTaxProp();
++            var info = stEmp.getUniqueFeatureMetadataInfo("f2", "all");
++            var uniqVals = ["1; 1", "1; 2", "2; 2"];
++            deepEqual(info.sortedUniqueValues, uniqVals);
++            // Check that the uniqueValueToFeatures object looks good
++            deepEqual(
++                new Set(Object.keys(info.uniqueValueToFeatures)),
++                new Set(uniqVals)
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["1; 1"]),
++                new Set([4, 5])
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["1; 2"]),
++                new Set([2, 3])
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["2; 2"]),
++                new Set([1, 6])
++            );
++        });
++        test("Test getUniqueFeatureMetadataInfo with ancestor taxonomy propagation (highest level, all f. metadata)", function () {
++            var stEmp = UtilitiesForTesting.getEmpressForAncestorTaxProp();
++            var info = stEmp.getUniqueFeatureMetadataInfo("f1", "all");
++            var uniqVals = ["1", "2"];
++            deepEqual(info.sortedUniqueValues, uniqVals);
++            // Check that the uniqueValueToFeatures object looks good
++            deepEqual(
++                new Set(Object.keys(info.uniqueValueToFeatures)),
++                new Set(uniqVals)
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["1"]),
++                new Set([2, 3, 4, 5])
++            );
++            deepEqual(
++                new Set(info.uniqueValueToFeatures["2"]),
++                new Set([1, 6])
++            );
++        });
+         test("Test _getNodeAngleInfo", function () {
+             var scope = this;
+             this.empress.updateLayout("Circular");
+diff --git a/tests/utilities-for-testing.js b/tests/utilities-for-testing.js
+index 866f8b76c..315174132 100644
+--- a/tests/utilities-for-testing.js
++++ b/tests/utilities-for-testing.js
+@@ -115,6 +115,7 @@ define(["Empress", "BPTree", "BiomTable"], function (
+             ["b", "4", "t4"],
+         ];
+         var featureColumns = ["f1", "f2"];
++        var splitTaxColumns = [];
+         var tipMetadata = {
+             1: ["2", "2"],
+             2: ["1", "2"],
+@@ -137,6 +138,7 @@ define(["Empress", "BPTree", "BiomTable"], function (
+                 tree,
+                 biom,
+                 featureColumns,
++                splitTaxColumns,
+                 tipMetadata,
+                 intMetadata,
+                 canvas
+@@ -156,12 +158,41 @@ define(["Empress", "BPTree", "BiomTable"], function (
+             tdToInd: tdToInd,
+             biom: biom,
+             fmCols: featureColumns,
++            splitTaxCols: splitTaxColumns,
+             tm: tipMetadata,
+             im: intMetadata,
+             canvas: canvas,
+         };
+     }
+ 
++    /**
++     * Returns an Empress object created from the test data returned by
++     * getTestData(), with the key distinction that all feature metadata
++     * columns are "declared" as split taxonomy columns.
++     *
++     * Abstracting this is surprisingly useful for testing this functionality
++     * in many different ways -- it lets us avoid re-typing a lot of stuff.
++     *
++     * @return {Empress} testEmpress
++     */
++    function getEmpressForAncestorTaxProp() {
++        // Need to create a new Empress object, since the default test one has no
++        // split taxonomy columns "declared" on initialization
++        var testData = getTestData();
++        return new Empress(
++            testData.tree,
++            null,
++            testData.fmCols,
++            // Let's say that f1 and f2 are both split taxonomy columns -- our
++            // declaration of them in this order means that f1 is the highest
++            // level and f2 is the lowest level
++            testData.fmCols,
++            testData.tm,
++            testData.im,
++            testData.canvas
++        );
++    }
++
+     /**
+      * Returns an Object containing test data that can be used to construct an
+      * instance of Empress.
+@@ -183,7 +214,7 @@ define(["Empress", "BPTree", "BiomTable"], function (
+             null
+         );
+ 
+-        var empress = new Empress(tree, null, [], [], [], null);
++        var empress = new Empress(tree, null, [], [], [], [], null);
+ 
+         // see core.py for more details on  the format of treeData
+         var treeData = [
+@@ -392,6 +423,7 @@ define(["Empress", "BPTree", "BiomTable"], function (
+ 
+     return {
+         getTestData: getTestData,
++        getEmpressForAncestorTaxProp: getEmpressForAncestorTaxProp,
+         approxDeepEqual: approxDeepEqual,
+         approxDeepEqualMulti: approxDeepEqualMulti,
+         getReferenceSVGs: getReferenceSVGs,

@@ -1,0 +1,538 @@
+diff --git a/bin/format_kegg_database.py b/bin/format_kegg_database.py
+index a7b76ef9..81bea689 100755
+--- a/bin/format_kegg_database.py
++++ b/bin/format_kegg_database.py
+@@ -5,11 +5,14 @@
+ from glob import glob
+ import logging
+ import subprocess
+-from skbio import write as write_sequence, read as read_sequence
+-from collections import defaultdict
+ import gzip
+ import argparse
+ from pathlib import Path
++import re
++import sqlite3
++from itertools import islice
++from tempfile import TemporaryDirectory
++from contextlib import closing
+ 
+ 
+ LOGGER = logging.getLogger("database_processing.log")
+@@ -17,7 +20,7 @@
+ 
+ def prepare_databases(
+     kegg_loc,
+-    gene_ko_link_loc,
++    kegg_kff_loc,
+     output_dir="kegg",
+     kegg_download_date=None,
+     threads=10,
+@@ -35,7 +38,7 @@ def prepare_databases(
+     processed_locs = process_kegg(
+         kegg_loc=kegg_loc,
+         output_dir=output_dir,
+-        gene_ko_link_loc=gene_ko_link_loc,
++        kegg_kff_loc=kegg_kff_loc,
+         threads=threads,
+         download_date=kegg_download_date,
+     )
+@@ -55,23 +58,18 @@ def prepare_databases(
+ def process_kegg(
+     kegg_loc,
+     output_dir,
+-    gene_ko_link_loc=None,
++    kegg_kff_loc,
+     download_date=None,
+     threads=10,
+ ):
+     threads = threads or 10  # make sure cli option is >=1 and not None
+     if not download_date:
+         download_date = get_iso_date()
+-    if gene_ko_link_loc is not None and Path(gene_ko_link_loc).exists():
+-        # add KOs to end of header where KO is not already there
+-        kegg_mod_loc = path.join(output_dir, "kegg.mod.fa")
+-        write_sequence(
+-            generate_modified_kegg_fasta(kegg_loc, gene_ko_link_loc),
+-            format="fasta",
+-            into=kegg_mod_loc,
++    kegg_mod_loc = path.join(output_dir, "kegg.mod.fa")
++    with open(kegg_mod_loc, "w") as output:
++        output.writelines(
++            generate_modified_kegg_fasta(kegg_loc, kegg_kff_loc, output_dir)
+         )
+-    else:
+-        kegg_mod_loc = kegg_loc
+     # make mmseqsdb from modified kegg fasta
+     kegg_mmseqs_db = path.join(output_dir, "kegg.mmsdb")
+     create_mmseqs(
+@@ -109,33 +107,86 @@ def create_mmseqs(fasta_loc, output_loc, threads):
+         print(f"Removed temporary directory: {tmp_dir}")
+ 
+ 
+-def generate_modified_kegg_fasta(kegg_fasta, gene_ko_link_loc=None):
++def open_text(filename):
++    """Detect gzip by content, since Nextflow may rename staged input files."""
++    with open(filename, "rb") as source:
++        compressed = source.read(2) == b"\x1f\x8b"
++    return gzip.open(filename, "rt") if compressed else open(filename)
++
++
++def kff_annotations(kegg_kff):
++    """Read KEGG's 11-column tab-delimited KFF, preserving empty fields.
++
++    Column 1 is the gene ID, 10 is the KO assignment, and 11 is the
++    KO description (including EC annotations). KFF has no protein sequence.
+     """
+-    Takes kegg fasta file and gene ko link file, adds kos not already in headers to headers
+-    Whish I knew about this, oh well I may split this out.
++    with open_text(kegg_kff) as source:
++        for line_number, line in enumerate(source, 1):
++            if not line.strip():
++                continue
++            fields = line.rstrip("\r\n").split("\t")
++            if len(fields) != 11 or not fields[0].strip():
++                raise ValueError(
++                    f"{kegg_kff}:{line_number}: expected 11 tab-separated KFF fields and a gene ID"
++                )
++            kos = re.findall(r"\bK\d{5}\b", fields[9])
++            annotation = "; ".join(dict.fromkeys(kos + [fields[10].strip()])).strip(
++                "; "
++            )
++            if annotation:
++                yield fields[0].strip(), annotation
++
++
++def generate_modified_kegg_fasta(kegg_fasta, kegg_kff, temporary_dir=None):
++    """Stream FASTA with KFF metadata joined by full gene ID using a disk index.
++
++    Sequences and identifiers are preserved, including genes absent from KFF.
++    Repeated identical KFF annotations are ignored; distinct annotations for the
++    same gene are retained. Memory use does not grow with the number of genes.
+     """
+-    genes_ko_dict = defaultdict(list)
+-    if gene_ko_link_loc is not None:
+-        if gene_ko_link_loc.endswith(".gz"):
+-            gene_ko_link_fh = gzip.open(gene_ko_link_loc, "rt")
+-        else:
+-            gene_ko_link_fh = open(gene_ko_link_loc)
+-        for line in gene_ko_link_fh:
+-            gene, ko = line.strip().split()
+-            genes_ko_dict[gene].append(remove_prefix(ko, "ko:"))
+-    for seq in read_sequence(kegg_fasta, format="fasta"):
+-        new_description = seq.metadata["description"]
+-        for ko in genes_ko_dict[seq.metadata["id"]]:
+-            if ko not in new_description:
+-                new_description += "; %s" % ko
+-        seq.metadata["description"] = new_description
+-        yield seq
+-
+-
+-def remove_prefix(text, prefix):
+-    if text.startswith(prefix):
+-        return text[len(prefix) :]
+-    return text  # or whatever
++    with TemporaryDirectory(prefix="kegg_metadata_", dir=temporary_dir) as directory:
++        with closing(
++            sqlite3.connect(path.join(directory, "annotations.sqlite"))
++        ) as connection:
++            connection.execute(
++                "CREATE TABLE annotations (gene TEXT, annotation TEXT, "
++                "PRIMARY KEY (gene, annotation)) WITHOUT ROWID"
++            )
++            annotations = iter(kff_annotations(kegg_kff))
++            while batch := list(islice(annotations, 10000)):
++                connection.executemany(
++                    "INSERT OR IGNORE INTO annotations VALUES (?, ?)", batch
++                )
++                connection.commit()
++
++            missing = 0
++            with open_text(kegg_fasta) as source:
++                for line in source:
++                    if not line.startswith(">"):
++                        yield line
++                        continue
++                    header = line[1:].rstrip("\r\n")
++                    fields = header.split(maxsplit=1)
++                    if not fields:
++                        raise ValueError(f"{kegg_fasta}: empty FASTA identifier")
++                    gene = fields[0]
++                    description = fields[1] if len(fields) > 1 else ""
++                    rows = connection.execute(
++                        "SELECT annotation FROM annotations WHERE gene = ? ORDER BY annotation",
++                        (gene,),
++                    ).fetchall()
++                    if not rows:
++                        missing += 1
++                    for (annotation,) in rows:
++                        for part in annotation.split("; "):
++                            if part and part not in description:
++                                description += ("; " if description else "") + part
++                    yield ">" + gene + (" " + description if description else "") + "\n"
++            if missing:
++                LOGGER.warning(
++                    "%s FASTA records had no KFF annotation; original headers retained",
++                    missing,
++                )
+ 
+ 
+ def get_iso_date():
+@@ -144,14 +195,17 @@ def get_iso_date():
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="Prepare KEGG database")
+-    parser.add_argument("--kegg_loc", type=str, help="Path to the KEGG fasta file")
+     parser.add_argument(
+-        "--gene_ko_link_loc", type=str, help="Path to the gene KO link file"
++        "--kegg_loc",
++        required=True,
++        type=str,
++        help="Path to the KEGG peptide FASTA (.pep or .pep.gz)",
+     )
+     parser.add_argument(
+-        "--skip_gene_ko_link",
+-        action="store_true",
+-        help="Skip gene KO link processing. If not passed in, `--gene_ko_link_loc` is required",
++        "--kegg_kff_loc",
++        required=True,
++        type=str,
++        help="Path to matching KEGG annotations (.kff or .kff.gz)",
+     )
+     parser.add_argument(
+         "--output_dir", type=str, help="Path to the output directory", default="kegg"
+@@ -166,18 +220,9 @@ def main():
+     )
+     args = parser.parse_args()
+ 
+-    if not args.skip_gene_ko_link and not args.gene_ko_link_loc:
+-        parser.error(
+-            "If `--skip_gene_ko_link` is not passed in, `--gene_ko_link_loc` is required"
+-        )
+-    if args.skip_gene_ko_link and args.gene_ko_link_loc:
+-        parser.error(
+-            "If `--skip_gene_ko_link` is passed in, `--gene_ko_link_loc` is not allowed"
+-        )
+-
+     prepare_databases(
+         kegg_loc=args.kegg_loc,
+-        gene_ko_link_loc=args.gene_ko_link_loc,
++        kegg_kff_loc=args.kegg_kff_loc,
+         output_dir=args.output_dir,
+         kegg_download_date=args.download_date,
+         threads=args.threads,
+diff --git a/conf/modules.config b/conf/modules.config
+index 9fb710ad..a950a743 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -29,7 +29,7 @@ process {
+ 
+     withName: FORMAT_KEGG_DB {
+         publishDir = [
+-            path: "${params.kegg_db}",
++            path: "${params.outdir}",
+             mode: 'move',
+         ]
+     }
+diff --git a/modules/local/database/cat_kegg_pep.nf b/modules/local/database/cat_kegg_pep.nf
+index 9d1428d4..c512ea08 100644
+--- a/modules/local/database/cat_kegg_pep.nf
++++ b/modules/local/database/cat_kegg_pep.nf
+@@ -1,15 +1,17 @@
+ process CAT_KEGG_PEP {
+ 
+     input:
+-    path( ch_kegg_pep_root_dir )
++    path( ch_kegg_pep_root_dir, stageAs: "kegg_raw" )
+ 
+     output:
+     path( "kegg.pep" ), emit: kegg_pep
++    path( "kegg.kff" ), emit: kegg_kff
+ 
+     script:
+     """
+ 
+-    cat ${ch_kegg_pep_root_dir}/*/*pep > kegg.pep
++    cat "${ch_kegg_pep_root_dir}"/*/*.pep > kegg.pep
++    cat "${ch_kegg_pep_root_dir}"/*/*.kff > kegg.kff
+ 
+     """
+ }
+diff --git a/modules/local/database/format_kegg_db.nf b/modules/local/database/format_kegg_db.nf
+index 3fcaadae..702c200b 100644
+--- a/modules/local/database/format_kegg_db.nf
++++ b/modules/local/database/format_kegg_db.nf
+@@ -10,22 +10,15 @@ process FORMAT_KEGG_DB {
+ 
+     input:
+         path( ch_kegg_pep, stageAs: "kegg_pep_loc" )
+-        path(gene_ko_link_loc)
++        path(ch_kegg_kff, stageAs: "kegg_kff_loc")
+         val(kegg_download_date)
+-        val(skip_gene_ko_link)
+ 
+     output:
+         path( "kegg/*" )
+ 
+     script:
+     """
+-    if [ "${skip_gene_ko_link}" = "true" ]; then
+-        echo "No Gene KO Link file provided. Running KEGG DB formatting without"
+-        format_kegg_database.py --kegg_loc ${ch_kegg_pep} --download_date ${kegg_download_date} --threads ${params.threads} --output_dir kegg --skip_gene_ko_link
+-    else
+-        echo "Gene KO Link file provided. Running KEGG DB formatting with Gene KO Link file"
+-        format_kegg_database.py --kegg_loc ${ch_kegg_pep} --gene_ko_link_loc ${gene_ko_link_loc} --download_date ${kegg_download_date} --threads ${params.threads} --output_dir kegg
+-    fi
++    format_kegg_database.py --kegg_loc "${ch_kegg_pep}" --kegg_kff_loc "${ch_kegg_kff}" --download_date "${kegg_download_date}" --threads ${params.threads} --output_dir kegg
+ 
+     """
+ }
+diff --git a/nextflow.config b/nextflow.config
+index 93302d4f..859e12b6 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -179,9 +179,8 @@ params {
+     /* Format KEGG options */
+     kegg_pep_root_dir = null
+     kegg_pep_loc = null
+-    gene_ko_link_loc = null
++    kegg_kff_loc = null
+     kegg_download_date = null
+-    skip_gene_ko_link = false
+ 
+     /* GPU options */
+     gpu_container_options = null
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 38c152af..6eed7074 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -649,24 +649,19 @@
+                     "type": "string",
+                     "format": "file-path",
+                     "exists": true,
+-                    "description": "Only required if you need to concatenate all of KEGG's provided pep files. Root directory to downloaded KEGG peptide files. The pipeline will search for all pep files in this directory and concatenate them into a single file. In format <root_dir>/*/*.pep."
++                    "description": "Root directory containing matching KEGG peptide and KFF annotation files. Concatenates <root_dir>/*/*.pep and <root_dir>/*/*.kff. Alternatively, provide both kegg_pep_loc and kegg_kff_loc."
+                 },
+                 "kegg_pep_loc": {
+                     "type": "string",
+                     "format": "file-path",
+                     "exists": true,
+-                    "description": "Path to and of the gene fasta files that are provided by the KEGG FTP server or a concatenated version of them. Either this or kegg_pep_root_dir must be provided."
++                    "description": "Path to a KEGG peptide FASTA or concatenated peptide FASTA (.pep or .pep.gz). Requires kegg_kff_loc unless kegg_pep_root_dir is provided."
+                 },
+-                "gene_ko_link_loc": {
++                "kegg_kff_loc": {
+                     "type": "string",
+                     "format": "file-path",
+                     "exists": true,
+-                    "description": "Path to and of the KO file that is provided by the KEGG FTP server."
+-                },
+-                "skip_gene_ko_link": {
+-                    "type": "boolean",
+-                    "fa_icon": "fas fa-question-circle",
+-                    "description": "Skip the gene_ko_link file. If you are using an older version of KEGG that does not supply the gene_ko_link file you can use this option to skip the gene_ko_link file. Otherwise, the gene_ko_link file is required."
++                    "description": "Path to matching KEGG tab-separated KFF annotations or a concatenated KFF file (.kff or .kff.gz). Supplies KO assignments and descriptions including EC numbers. Required alongside kegg_pep_loc unless kegg_pep_root_dir is provided."
+                 },
+                 "kegg_download_date": {
+                     "type": "string",
+diff --git a/tests/kegg_formatting/test_format_kegg_database.py b/tests/kegg_formatting/test_format_kegg_database.py
+new file mode 100644
+index 00000000..afb611b5
+--- /dev/null
++++ b/tests/kegg_formatting/test_format_kegg_database.py
+@@ -0,0 +1,160 @@
++"""Run with python -m unittest discover -s tests/kegg_formatting -v."""
++
++import gzip
++import importlib.util
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++import os
++import shutil
++import subprocess
++
++
++ROOT = Path(__file__).resolve().parents[2]
++spec = importlib.util.spec_from_file_location(
++    "format_kegg", ROOT / "bin/format_kegg_database.py"
++)
++formatter = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(formatter)
++
++
++def kff_row(gene, ko="", description=""):
++    return (
++        "\t".join(
++            [gene, "CDS", "3", "12", "1..12", "", "", "", "original", ko, description]
++        )
++        + "\n"
++    )
++
++
++class KeggFormattingTests(unittest.TestCase):
++    def test_join_preserves_sequences_and_missing_genes(self):
++        with tempfile.TemporaryDirectory() as directory:
++            pep = Path(directory) / "input.pep"
++            kff = Path(directory) / "input.kff"
++            pep.write_text(
++                ">chyl:CE91St63_15060 bile-acid 7-alpha-dehydratase\nMA\nAA\n"
++                ">org:bare\nMBB\n>org:missing original\nMCC\n>org:empty original\nMDD\n"
++            )
++            annotation = kff_row(
++                "chyl:CE91St63_15060",
++                "K15872",
++                "baiE; bile-acid 7alpha-dehydratase [EC:4.2.1.106]",
++            )
++            kff.write_text(
++                annotation
++                + annotation
++                + kff_row("org:bare", "K00001 K00002", "enzyme [EC:1.2.3.- 1.2.3.4]")
++                + kff_row("org:empty")
++            )
++            result = "".join(
++                formatter.generate_modified_kegg_fasta(pep, kff, directory)
++            )
++            self.assertEqual(
++                result,
++                ">chyl:CE91St63_15060 bile-acid 7-alpha-dehydratase; K15872; baiE; bile-acid 7alpha-dehydratase [EC:4.2.1.106]\nMA\nAA\n"
++                ">org:bare K00001; K00002; enzyme [EC:1.2.3.- 1.2.3.4]\nMBB\n"
++                ">org:missing original\nMCC\n>org:empty original\nMDD\n",
++            )
++            self.assertEqual(list(Path(directory).glob("kegg_metadata_*")), [])
++
++    def test_gzip_and_existing_annotation(self):
++        with tempfile.TemporaryDirectory() as directory:
++            pep = Path(directory) / "input.pep.gz"
++            kff = Path(directory) / "input.kff.gz"
++            with gzip.open(pep, "wt") as output:
++                output.write(">org:gene enzyme [EC:1.2.3.4]; K00001\nMABC\n")
++            with gzip.open(kff, "wt") as output:
++                output.write(kff_row("org:gene", "ko:K00001", "enzyme [EC:1.2.3.4]"))
++            result = "".join(formatter.generate_modified_kegg_fasta(pep, kff))
++            self.assertEqual(result, ">org:gene enzyme [EC:1.2.3.4]; K00001\nMABC\n")
++
++    def test_malformed_kff_fails_with_location(self):
++        with tempfile.TemporaryDirectory() as directory:
++            kff = Path(directory) / "bad.kff"
++            kff.write_text("org:gene CDS 3\n")
++            with self.assertRaisesRegex(
++                ValueError, r"bad.kff:1: expected 11 tab-separated"
++            ):
++                list(formatter.kff_annotations(kff))
++
++    def test_build_uses_enriched_fasta(self):
++        with tempfile.TemporaryDirectory() as directory:
++            pep = Path(directory) / "input.pep"
++            kff = Path(directory) / "input.kff"
++            output = Path(directory) / "output"
++            pep.write_text(">org:gene original\nMAAA\n")
++            kff.write_text(kff_row("org:gene", "K15872", "enzyme [EC:4.2.1.106]"))
++            with patch.object(formatter, "create_mmseqs") as create:
++                formatter.prepare_databases(pep, kff, output, threads=2)
++            create.assert_called_once_with(
++                str(output / "kegg.mod.fa"), str(output / "kegg.mmsdb"), threads=2
++            )
++            self.assertIn("[EC:4.2.1.106]", (output / "kegg.mod.fa").read_text())
++
++    @unittest.skipUnless(shutil.which("nextflow"), "Nextflow is not installed")
++    def test_nextflow_modules_with_directory_and_explicit_files(self):
++        # Run real Nextflow modules and the real formatter; mock only expensive
++        # MMseqs database construction so this test needs no KEGG installation.
++        with tempfile.TemporaryDirectory() as directory:
++            project = Path(directory)
++            organism = project / "organisms with spaces" / "org"
++            organism.mkdir(parents=True)
++            pep = organism / "org.pep"
++            kff = organism / "org.kff"
++            pep.write_text(">org:gene original\nMAAA\n")
++            kff.write_text(kff_row("org:gene", "K15872", "enzyme [EC:4.2.1.106]"))
++            pep_gz = project / "input.pep.gz"
++            kff_gz = project / "input.kff.gz"
++            with gzip.open(pep_gz, "wt") as output:
++                output.write(pep.read_text())
++            with gzip.open(kff_gz, "wt") as output:
++                output.write(kff.read_text())
++            binaries = project / "bin"
++            binaries.mkdir()
++            shutil.copy2(ROOT / "bin/format_kegg_database.py", binaries)
++            mmseqs = binaries / "mmseqs"
++            mmseqs.write_text(
++                "#!/usr/bin/env python\nimport sys\nfrom pathlib import Path\n"
++                "if sys.argv[1] == 'createdb':\n"
++                "    Path(sys.argv[3]).write_text('mock database')\n"
++                "elif sys.argv[1] == 'createindex':\n"
++                "    Path(sys.argv[3]).mkdir()\n"
++            )
++            mmseqs.chmod(0o755)
++            (project / "main.nf").write_text(f"""
++include {{ CAT_KEGG_PEP }} from '{ROOT}/modules/local/database/cat_kegg_pep.nf'
++include {{ FORMAT_KEGG_DB }} from '{ROOT}/modules/local/database/format_kegg_db.nf'
++include {{ FORMAT_KEGG_DB as FORMAT_DIRECT }} from '{ROOT}/modules/local/database/format_kegg_db.nf'
++params.threads = 1
++workflow {{
++    CAT_KEGG_PEP(file('{organism.parent}'))
++    FORMAT_KEGG_DB(CAT_KEGG_PEP.out.kegg_pep, CAT_KEGG_PEP.out.kegg_kff, '')
++    FORMAT_DIRECT(file('{pep_gz}'), file('{kff_gz}'), '20260528')
++}}
++""")
++            environment = dict(
++                os.environ,
++                NXF_HOME=os.environ.get("NXF_HOME", str(Path.home() / ".nextflow")),
++            )
++            result = subprocess.run(
++                ["nextflow", "run", "main.nf", "-ansi-log", "false", "--threads", "1"],
++                cwd=project,
++                env=environment,
++                capture_output=True,
++                text=True,
++                timeout=120,
++            )
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++            fastas = list(project.glob("work/*/*/kegg/kegg.mod.fa"))
++            self.assertEqual(len(fastas), 2, result.stdout + result.stderr)
++            for fasta in fastas:
++                self.assertEqual(
++                    fasta.read_text(),
++                    ">org:gene original; K15872; enzyme [EC:4.2.1.106]\nMAAA\n",
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/workflows/dram.nf b/workflows/dram.nf
+index cbddf35f..e09429f4 100644
+--- a/workflows/dram.nf
++++ b/workflows/dram.nf
+@@ -258,21 +258,20 @@ workflow DRAM {
+ 
+     } else if (params.format_kegg){
+         if ( params.kegg_pep_root_dir ) {
+-            CAT_KEGG_PEP( file(params.kegg_pep_root_dir) )
++            CAT_KEGG_PEP( file(params.kegg_pep_root_dir, checkIfExists: true) )
+             kegg_pep_f = CAT_KEGG_PEP.out.kegg_pep
++            kegg_kff_f = CAT_KEGG_PEP.out.kegg_kff
+         }
+         else {
+-            kegg_pep_f = file(params.kegg_pep_loc)
+-        }
+-
+-        if ( !kegg_pep_f.exists() ) {
+-            error("Error: when using running format_kegg, the kegg_pep_loc file must exists or the user must provide the KEGG pep file root directories. KEGG pep file not found at ${params.kegg_pep_loc} nor kegg pep root directory at ${params.kegg_pep_root_dir}.")
++            if (!params.kegg_pep_loc || !params.kegg_kff_loc) {
++                error("--format_kegg requires --kegg_pep_root_dir containing organism .pep and .kff files, or both --kegg_pep_loc and --kegg_kff_loc.")
++            }
++            kegg_pep_f = file(params.kegg_pep_loc, checkIfExists: true)
++            kegg_kff_f = file(params.kegg_kff_loc, checkIfExists: true)
+         }
+ 
+-        gene_ko_link_f = params.gene_ko_link_loc && file(params.gene_ko_link_loc).exists() ? file(params.gene_ko_link_loc) : default_sheet
+-        kegg_download_date = params.kegg_download_date ? params.kegg_download_date : "''"
+-        skip_gene_ko_link = params.skip_gene_ko_link ? "true" : "false"
+-        FORMAT_KEGG_DB( kegg_pep_f, gene_ko_link_f, kegg_download_date, skip_gene_ko_link )
++        kegg_download_date = params.kegg_download_date ?: ""
++        FORMAT_KEGG_DB( kegg_pep_f, kegg_kff_f, kegg_download_date )
+ 
+     } else if (params.merge_annotations){
+         MERGE()

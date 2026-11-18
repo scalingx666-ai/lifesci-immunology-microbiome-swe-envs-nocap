@@ -1,0 +1,467 @@
+diff --git a/src/chimera.cc b/src/chimera.cc
+index 7deb0a41b..0061491e3 100644
+--- a/src/chimera.cc
++++ b/src/chimera.cc
+@@ -2411,6 +2411,13 @@ auto chimera(struct Parameters const & parameters) -> void
+ 
+       query_fasta_h = fasta_open(parameters.opt_uchime_ref);
+       progress_total = fasta_get_size(query_fasta_h);
++
++      /* The query file is parsed inside the worker threads
++         (chimera_thread_core). Defer parse errors so a malformed query
++         stops the pool cooperatively instead of calling fatal()/std::exit()
++         from a worker while siblings are writing output (CC3); reported
++         after the pool joins, below, from the main thread. */
++      query_fasta_h->defer_errors = true;
+     }
+   else
+     {
+@@ -2490,6 +2497,13 @@ auto chimera(struct Parameters const & parameters) -> void
+ 
+   progress_done();
+ 
++  /* all workers joined; report a deferred query parse error (CC3, uchime_ref
++     only) from the main thread so it does not race a worker's output */
++  if ((parameters.opt_uchime_ref != nullptr) and fastx_get_error(query_fasta_h))
++    {
++      fatal("%s", fastx_get_errmsg(query_fasta_h));
++    }
++
+   if (not parameters.opt_quiet)
+     {
+       if (total_count > 0)
+diff --git a/src/fasta.cc b/src/fasta.cc
+index 2a47c7ad2..2f5cfb845 100644
+--- a/src/fasta.cc
++++ b/src/fasta.cc
+@@ -135,28 +135,36 @@ namespace {
+   }
+ 
+ 
+-  // __attribute__((noreturn))
+-  auto report_illegal_symbol_and_exit(unsigned char symbol, uint64_t line_number) -> void {
++  auto report_illegal_symbol_and_exit(fastx_handle input_handle, unsigned char symbol, uint64_t line_number) -> void {
+     static constexpr std::size_t max_buffer_size = 200;
+-    static std::array<char, max_buffer_size> msg {{}};
++    std::array<char, max_buffer_size> msg {{}};
+     static_cast<void>(std::snprintf(
+         msg.data(), max_buffer_size,
+         "Illegal character '%c' in sequence on line %" PRIu64 " of FASTA file",
+         symbol,
+         line_number));
++    /* deferred-error mode (see fastx.h): record and return instead of
++       exiting, so a worker thread does not std::exit() with siblings live */
++    if (input_handle->defer_errors) {
++      fastx_set_deferred_error(input_handle, msg.data());
++      return;
++    }
+     fatal(msg.data());
+   }
+ 
+ 
+-  // __attribute__((noreturn))
+-  auto report_unprintable_symbol_and_exit(unsigned char symbol, uint64_t line_number) -> void {
++  auto report_unprintable_symbol_and_exit(fastx_handle input_handle, unsigned char symbol, uint64_t line_number) -> void {
+     static constexpr std::size_t max_buffer_size = 200;
+-    static std::array<char, max_buffer_size> msg {{}};
++    std::array<char, max_buffer_size> msg {{}};
+     static_cast<void>(std::snprintf(
+         msg.data(), max_buffer_size,
+         "Illegal unprintable ASCII character no %d in sequence on line %" PRIu64 " of FASTA file",
+         symbol,
+         line_number));
++    if (input_handle->defer_errors) {
++      fastx_set_deferred_error(input_handle, msg.data());
++      return;
++    }
+     fatal(msg.data());
+   }
+ 
+@@ -212,12 +220,14 @@ auto fasta_filter_sequence(fastx_handle input_handle,
+ 
+         case Action::reject:
+           /* fatal character */
+-          report_illegal_symbol_and_exit(current_char, input_handle->lineno);
++          report_illegal_symbol_and_exit(input_handle, current_char, input_handle->lineno);
++          if (input_handle->error) { return; }
+           break;
+ 
+         case Action::show:
+           /* fatal unprintable character */
+-          report_unprintable_symbol_and_exit(current_char, input_handle->lineno);
++          report_unprintable_symbol_and_exit(input_handle, current_char, input_handle->lineno);
++          if (input_handle->error) { return; }
+           break;
+ 
+         case Action::skip:
+@@ -262,6 +272,11 @@ auto fasta_next(fastx_handle input_handle,
+ 
+   if (input_handle->file_buffer.data[input_handle->file_buffer.position] != '>')
+     {
++      if (input_handle->defer_errors)
++        {
++          fastx_set_deferred_error(input_handle, "Invalid FASTA - header must start with > character");
++          return false;
++        }
+       fprintf(stderr, "Found character %02x\n", static_cast<unsigned char>(input_handle->file_buffer.data[input_handle->file_buffer.position]));
+       fatal("Invalid FASTA - header must start with > character");
+     }
+@@ -275,6 +290,11 @@ auto fasta_next(fastx_handle input_handle,
+       rest = fastx_file_fill_buffer(input_handle);
+       if (rest == 0)
+         {
++          if (input_handle->defer_errors)
++            {
++              fastx_set_deferred_error(input_handle, "Invalid FASTA - header must be terminated with newline");
++              return false;
++            }
+           fatal("Invalid FASTA - header must be terminated with newline");
+         }
+ 
+diff --git a/src/fastq.cc b/src/fastq.cc
+index 27650770a..3fae043ef 100644
+--- a/src/fastq.cc
++++ b/src/fastq.cc
+@@ -194,7 +194,7 @@ namespace {
+ }  // end of anonymous namespace
+ 
+ 
+-auto fastq_fatal(uint64_t const lineno, const char * msg) -> void
++auto fastq_fatal(fastx_handle input_handle, uint64_t const lineno, const char * msg) -> void
+ {
+   char * string = nullptr;
+   if (xsprintf(&string,
+@@ -202,16 +202,36 @@ auto fastq_fatal(uint64_t const lineno, const char * msg) -> void
+                lineno,
+                msg) == -1)
+     {
++      if (input_handle->defer_errors)
++        {
++          fastx_set_deferred_error(input_handle, "Out of memory");
++          return;
++        }
+       fatal("Out of memory");
+     }
+ 
+   if (string != nullptr)
+     {
++      /* deferred-error mode (see fastx.h): record the message and return
++         so the worker can stop cooperatively instead of std::exit()-ing
++         from a worker thread. The caller (fastq_next) returns false right
++         after this call. */
++      if (input_handle->defer_errors)
++        {
++          fastx_set_deferred_error(input_handle, string);
++          xfree(string);
++          return;
++        }
+       fatal(string);
+       xfree(string);
+     }
+   else
+     {
++      if (input_handle->defer_errors)
++        {
++          fastx_set_deferred_error(input_handle, "Out of memory");
++          return;
++        }
+       fatal("Out of memory");
+     }
+ }
+@@ -334,7 +354,8 @@ auto fastq_next(fastx_handle input_handle,
+ 
+   if (input_handle->file_buffer.data[input_handle->file_buffer.position] != '@')
+     {
+-      fastq_fatal(input_handle->lineno, "Header line must start with '@' character");
++      fastq_fatal(input_handle, input_handle->lineno, "Header line must start with '@' character");
++      return false;
+     }
+   input_handle->file_buffer.position++;
+   --rest;
+@@ -346,7 +367,8 @@ auto fastq_next(fastx_handle input_handle,
+       rest = fastx_file_fill_buffer(input_handle);
+       if (rest == 0)
+         {
+-          fastq_fatal(input_handle->lineno, "Unexpected end of file");
++          fastq_fatal(input_handle, input_handle->lineno, "Unexpected end of file");
++          return false;
+         }
+ 
+       /* find LF */
+@@ -379,7 +401,8 @@ auto fastq_next(fastx_handle input_handle,
+       /* cannot end here */
+       if (rest == 0)
+         {
+-          fastq_fatal(input_handle->lineno, "Unexpected end of file");
++          fastq_fatal(input_handle, input_handle->lineno, "Unexpected end of file");
++          return false;
+         }
+ 
+       /* end when new line starting with + is seen */
+@@ -426,7 +449,8 @@ auto fastq_next(fastx_handle input_handle,
+                        "Illegal sequence character (unprintable, no %d)",
+                        static_cast<unsigned char>(illegal_char));
+             }
+-          fastq_fatal(input_handle->lineno - ((line_end != nullptr) ? 1 : 0), message.data());
++          fastq_fatal(input_handle, input_handle->lineno - ((line_end != nullptr) ? 1 : 0), message.data());
++          return false;
+         }
+     }
+ 
+@@ -445,7 +469,8 @@ auto fastq_next(fastx_handle input_handle,
+       /* cannot end here */
+       if (rest == 0)
+         {
+-          fastq_fatal(input_handle->lineno, "Unexpected end of file");
++          fastq_fatal(input_handle, input_handle->lineno, "Unexpected end of file");
++          return false;
+         }
+ 
+       /* find LF */
+@@ -489,8 +514,9 @@ auto fastq_next(fastx_handle input_handle,
+     }
+   if (plusline_invalid)
+     {
+-      fastq_fatal(input_handle->lineno - ((line_end != nullptr) ? 1 : 0),
++      fastq_fatal(input_handle, input_handle->lineno - ((line_end != nullptr) ? 1 : 0),
+                   "'+' line must be empty or identical to header");
++      return false;
+     }
+ 
+   /* read quality line(s) */
+@@ -559,14 +585,16 @@ auto fastq_next(fastx_handle input_handle,
+                        "Illegal quality character (unprintable, no %d)",
+                        static_cast<unsigned char>(illegal_char));
+             }
+-          fastq_fatal(input_handle->lineno - ((line_end != nullptr) ? 1 : 0), message.data());
++          fastq_fatal(input_handle, input_handle->lineno - ((line_end != nullptr) ? 1 : 0), message.data());
++          return false;
+         }
+     }
+ 
+   if (input_handle->sequence_buffer.length != input_handle->quality_buffer.length)
+     {
+-      fastq_fatal(input_handle->lineno - ((line_end != nullptr) ? 1 : 0),
++      fastq_fatal(input_handle, input_handle->lineno - ((line_end != nullptr) ? 1 : 0),
+                   "Sequence and quality lines must be equally long");
++      return false;
+     }
+ 
+   fastx_filter_header(input_handle, truncateatspace);
+diff --git a/src/fastx.cc b/src/fastx.cc
+index d448ce9bd..db8827b38 100644
+--- a/src/fastx.cc
++++ b/src/fastx.cc
+@@ -195,6 +195,18 @@ auto fastx_filter_header(fastx_handle input_handle, bool truncateatspace) -> voi
+     auto const is_illegal = ((symbol == 127) or
+                              ((symbol > '\0') and (symbol < ' ') and not (symbol == '\t')));
+     if (is_illegal) {
++      if (input_handle->defer_errors) {
++        /* Record the error and stop scanning instead of exiting here:
++           this may run on a worker thread (see the deferred-error note in
++           fastx.h). The caller reports it from the main thread. */
++        std::array<char, 256> message {{}};
++        std::snprintf(message.data(), message.size(),
++                      "Illegal character encountered in FASTA/FASTQ header.\n"
++                      "Unprintable ASCII character no %d on line %" PRIu64 ".",
++                      symbol, input_handle->lineno_start);
++        fastx_set_deferred_error(input_handle, message.data());
++        return;
++      }
+       fatal("Illegal character encountered in FASTA/FASTQ header.\n"
+             "Unprintable ASCII character no %d on line %" PRIu64 ".",
+             symbol, input_handle->lineno_start);
+@@ -671,11 +683,47 @@ auto fastx_next(fastx_handle input_handle,
+                 bool truncateatspace,
+                 const unsigned char * char_mapping) -> bool
+ {
+-  if (input_handle->is_fastq)
++  /* deferred-error mode (see fastx.h): if a previous call already
++     recorded a parse error, report no further records so every worker
++     stops; and if the current record triggered a deferred error, treat
++     it as unusable (return false) rather than handing back a bogus record */
++  if (input_handle->error)
++    {
++      return false;
++    }
++  bool const got_record = input_handle->is_fastq
++    ? fastq_next(input_handle, truncateatspace, char_mapping)
++    : fasta_next(input_handle, truncateatspace, char_mapping);
++  if (input_handle->error)
++    {
++      return false;
++    }
++  return got_record;
++}
++
++
++auto fastx_get_error(struct fastx_s const * input_handle) -> bool
++{
++  return input_handle->error;
++}
++
++
++auto fastx_get_errmsg(struct fastx_s const * input_handle) -> char const *
++{
++  return input_handle->errmsg.data();
++}
++
++
++auto fastx_set_deferred_error(fastx_handle input_handle, char const * message) -> void
++{
++  /* record the first deferred parse error and flag the handle (see the
++     deferred-error note in fastx.h). First error wins; later ones are
++     ignored so the message reflects the earliest failure. */
++  if (not input_handle->error)
+     {
+-      return fastq_next(input_handle, truncateatspace, char_mapping);
++      std::snprintf(input_handle->errmsg.data(), input_handle->errmsg.size(), "%s", message);
++      input_handle->error = true;
+     }
+-  return fasta_next(input_handle, truncateatspace, char_mapping);
+ }
+ 
+ 
+diff --git a/src/fastx.h b/src/fastx.h
+index 05132be1f..1273b366f 100644
+--- a/src/fastx.h
++++ b/src/fastx.h
+@@ -118,6 +118,18 @@ struct fastx_s
+   std::array<uint64_t, byte_range> stripped {{}};
+ 
+   Format format = Format::undefined;
++
++  /* Deferred error reporting (prototype for CC3). When defer_errors is
++     set, a parse error records its message here and makes fastx_next()
++     return false, instead of calling fatal() (std::exit()) on the spot.
++     A command that reads this handle from worker threads enables this so
++     the worker can stop cooperatively; the error is then reported from
++     the main thread after the worker pool has joined, avoiding a
++     std::exit() that races sibling threads. Default false → behavior is
++     unchanged (immediate fatal) for every other caller. */
++  bool defer_errors = false;
++  bool error = false;
++  std::array<char, 512> errmsg {{}};
+ };
+ 
+ using fastx_handle = struct fastx_s *;
+@@ -129,6 +141,9 @@ auto fastx_is_fastq(struct fastx_s const * input_handle) -> bool;
+ auto fastx_is_empty(struct fastx_s const * input_handle) -> bool;
+ auto fastx_is_pipe(struct fastx_s const * input_handle) -> bool;
+ auto fastx_filter_header(fastx_handle input_handle, bool truncateatspace) -> void;
++auto fastx_get_error(struct fastx_s const * input_handle) -> bool;
++auto fastx_get_errmsg(struct fastx_s const * input_handle) -> char const *;
++auto fastx_set_deferred_error(fastx_handle input_handle, char const * message) -> void;
+ auto fastx_open(const char * filename) -> fastx_handle;
+ auto fastx_close(fastx_handle input_handle) -> void;
+ auto fastx_next(fastx_handle input_handle,
+diff --git a/src/search.cc b/src/search.cc
+index 35ca973fe..92816bc41 100644
+--- a/src/search.cc
++++ b/src/search.cc
+@@ -830,6 +830,12 @@ auto usearch_global(struct Parameters const & parameters, char const * cmdline,
+   queries_abundance = 0;
+   query_fastx_h = fastx_open(parameters.opt_usearch_global);
+ 
++  /* The query file is parsed inside the worker threads (search_thread_run).
++     Defer parse errors so a malformed query stops the pool cooperatively
++     instead of calling fatal()/std::exit() from a worker while siblings are
++     writing output (CC3); reported below from the main thread after join. */
++  query_fastx_h->defer_errors = true;
++
+   /* allocate memory for thread info */
+   si_plus = new searchinfo_s[opt_threads]{};
+   if (opt_strand > 1)
+@@ -845,6 +851,13 @@ auto usearch_global(struct Parameters const & parameters, char const * cmdline,
+   search_thread_worker_run();
+   progress_done();
+ 
++  /* all workers joined; report a deferred query parse error (CC3) from the
++     main thread so it does not race a worker's output */
++  if (fastx_get_error(query_fastx_h))
++    {
++      fatal("%s", fastx_get_errmsg(query_fastx_h));
++    }
++
+   delete [] si_plus;
+   if (si_minus != nullptr)
+     {
+diff --git a/src/search_exact.cc b/src/search_exact.cc
+index ab3716b43..fe287348a 100644
+--- a/src/search_exact.cc
++++ b/src/search_exact.cc
+@@ -811,6 +811,13 @@ auto search_exact(struct Parameters const & parameters, char const * cmdline, ch
+   queries_abundance = 0;
+   query_fastx_h = fastx_open(parameters.opt_search_exact);
+ 
++  /* The query file is parsed inside the worker threads
++     (search_exact_thread_run). Defer parse errors so a malformed query
++     stops the pool cooperatively instead of calling fatal()/std::exit()
++     from a worker while siblings are writing output (CC3); reported below
++     from the main thread after join. */
++  query_fastx_h->defer_errors = true;
++
+   /* allocate memory for thread info */
+   std::vector<struct searchinfo_s> si_plus_v(parameters.opt_threads);
+   si_plus = si_plus_v.data();
+@@ -825,6 +832,13 @@ auto search_exact(struct Parameters const & parameters, char const * cmdline, ch
+   search_exact_thread_worker_run();
+   progress_done();
+ 
++  /* all workers joined; report a deferred query parse error (CC3) from the
++     main thread so it does not race a worker's output */
++  if (fastx_get_error(query_fastx_h))
++    {
++      fatal("%s", fastx_get_errmsg(query_fastx_h));
++    }
++
+   // si_plus not used below that point
+   // si_minus not used below that point
+ 
+diff --git a/src/sintax.cc b/src/sintax.cc
+index be0cbe535..7a7acce33 100644
+--- a/src/sintax.cc
++++ b/src/sintax.cc
+@@ -542,7 +542,11 @@ auto sintax_thread_run(uint64_t const t) -> void
+         }
+       else
+         {
+-          /* input_lock released by RAII when leaving the loop body */
++          /* End of input, or a deferred parse error was recorded (CC3):
++             fastx_next() returns false in both cases, so the worker stops
++             here cooperatively. The error, if any, is reported by sintax()
++             from the main thread after the pool joins.
++             input_lock released by RAII when leaving the loop body. */
+           break;
+         }
+     }
+@@ -665,6 +669,14 @@ auto sintax(struct Parameters const & parameters) -> void
+ 
+   query_fastx_h = fastx_open(parameters.opt_sintax);
+ 
++  /* The query file is parsed inside the worker threads (see
++     sintax_thread_run). Enable deferred error reporting so a malformed
++     query records the error and stops the pool cooperatively, rather than
++     calling fatal()/std::exit() from a worker thread while siblings are
++     still writing output (CC3). The error is reported below, from the
++     main thread, after the pool has joined. */
++  query_fastx_h->defer_errors = true;
++
+   /* allocate memory for thread info */
+ 
+   si_plus = new searchinfo_s[opt_threads]{};
+@@ -683,6 +695,14 @@ auto sintax(struct Parameters const & parameters) -> void
+   sintax_thread_worker_run();
+   progress_done();
+ 
++  /* All workers have joined. If one hit a malformed query, report it now
++     from the main thread (single-threaded) so the message is emitted and
++     the process exits without racing any worker (CC3). */
++  if (fastx_get_error(query_fastx_h))
++    {
++      fatal("%s", fastx_get_errmsg(query_fastx_h));
++    }
++
+   if (! opt_quiet)
+     {
+       std::fprintf(stderr, "Classified %d of %d sequences", classified, queries);

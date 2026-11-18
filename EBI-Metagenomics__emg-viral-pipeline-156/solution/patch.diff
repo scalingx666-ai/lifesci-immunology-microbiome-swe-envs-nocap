@@ -1,0 +1,408 @@
+diff --git a/bin/parse_viral_pred.py b/bin/parse_viral_pred.py
+index 4daf8a65..133dbf29 100755
+--- a/bin/parse_viral_pred.py
++++ b/bin/parse_viral_pred.py
+@@ -39,7 +39,7 @@ def get_seq_record(self):
+         """Get the SeqRecord with the category and prange encoded in the header."""
+         seq_record = copy(self.seq_record)
+         if self.category == "prophage" and len(self.prange):
+-            seq_record.id += f"|prophage-{self.prange[0]}:{self.prange[1]}"
++            seq_record.id += f"|prophage-{int(self.prange[0])}:{int(self.prange[1])}"
+         if self.circular:
+             seq_record.id += "|phage-circular"
+         # clean
+diff --git a/bin/rename_fasta.py b/bin/rename_fasta.py
+index 8057b206..30774b71 100755
+--- a/bin/rename_fasta.py
++++ b/bin/rename_fasta.py
+@@ -42,15 +42,17 @@ def rename(args):
+     print("Renaming " + args.input)
+     with open(args.input, "r") as fasta_in:
+         with open(args.output, "w") as fasta_out, open(args.map, "w") as map_tsv:
+-            count = 1
++            count = 0
+             tsv_map = csv.writer(map_tsv, delimiter="\t")
+-            tsv_map.writerow(["original", "renamed"])
++            tsv_map.writerow(["original", "temporary", "short"])
+             for line in fasta_in:
+                 if line.startswith(">"):
++                    count += 1
+                     fasta_out.write(f">{args.prefix}{count}\n")
+                     name, _ = _parse_name(line)
+-                    tsv_map.writerow([name, f"{args.prefix}{count}"])
+-                    count += 1
++                    short_name = name.split(' ')[0]
++                    temporary_name = f"{args.prefix}{count}"
++                    tsv_map.writerow([name, temporary_name, short_name])
+                 else:
+                     fasta_out.write(line)
+     print(f"Wrote {count} sequences to {args.output}.")
+@@ -69,11 +71,11 @@ def restore(args):
+         print("File " + args.input + " doesn't exist. Skipping")
+         return
+ 
+-    print("Restoring " + args.input)
++    print(f"Restoring {args.input} from {args.from_restore} to {args.to_restore}")
+     mapping = {}
+     with open(args.map, "r") as map_tsv:
+         for m in csv.DictReader(map_tsv, delimiter="\t"):
+-            mapping[m["renamed"]] = m["original"]
++            mapping[m[args.from_restore]] = m[args.to_restore]
+ 
+     with open(args.input, "r") as fasta_in:
+         with open(args.output, "w") as fasta_out:
+@@ -126,6 +128,20 @@ def main():
+     rename_parser.set_defaults(func=rename)
+ 
+     restore_parser = subparser.add_parser("restore")
++    restore_parser.add_argument(
++        "--from-restore",
++        help="Name of column FROM what do renaming. "
++             "Example, temporary name: seq1, short name: ERZ.1, original name: ERZ1 NODE1_len10_cov3.8",
++        type=str,
++        choices=['temporary', 'original', 'short']
++    )
++    restore_parser.add_argument(
++        "--to-restore",
++        help="Name of column TO what do renaming. "
++             "Example, temporary name: seq1, short name: ERZ.1, original name: ERZ1 NODE1_len10_cov3.8",
++        type=str,
++        choices=['temporary', 'original', 'short']
++    )
+     restore_parser.set_defaults(func=restore)
+ 
+     args = parser.parse_args()
+diff --git a/configs/modules.config b/configs/modules.config
+index 9b7ab179..e967328c 100644
+--- a/configs/modules.config
++++ b/configs/modules.config
+@@ -579,6 +579,26 @@ process {
+         ]
+     }
+     
++    withName: RENAME {
++        publishDir = [
++            [
++                path: "${params.output}",
++                saveAs: {
++                    filename -> {
++                        if ( filename.equals('versions.yml') ) {
++                            return null;
++                        }
++                        def output_file = new File(filename);
++                        return "${meta.id}/${params.finaldir}/contigs/${output_file.name}";
++                    }
++                },
++                mode: params.publish_dir_mode,
++                failOnError: false,
++                pattern: "*_map.tsv"
++            ]
++        ]
++    }
++    
+     withName: RESTORE {
+         publishDir = [
+             [
+diff --git a/modules/local/restore/main.nf b/modules/local/restore/main.nf
+index 751d472d..028dd76f 100644
+--- a/modules/local/restore/main.nf
++++ b/modules/local/restore/main.nf
+@@ -9,6 +9,8 @@ process RESTORE {
+ 
+     input:
+     tuple val(meta), path(fasta), path(map) 
++    val from_restore
++    val to_restore
+     
+     output:
+     tuple val(meta), env(BN), path("*_original.fasta")
+@@ -16,7 +18,7 @@ process RESTORE {
+     script:
+     """    
+     BN=\$(basename ${fasta} .fna)
+-    rename_fasta.py -i ${fasta} -m ${map} -o \${BN}_original.fasta restore 2> /dev/null
++    rename_fasta.py -i ${fasta} -m ${map} -o \${BN}_original.fasta restore --from-restore "${from_restore}" --to-restore "${to_restore}" 
+     """
+ }
+ 
+diff --git a/subworkflows/local/detect.nf b/subworkflows/local/detect.nf
+index 8d7aed9b..0e9d1b94 100644
+--- a/subworkflows/local/detect.nf
++++ b/subworkflows/local/detect.nf
+@@ -13,38 +13,30 @@ include { CONCATENATE_FILES as CONCATENATE_FILES_FA                  } from '../
+ 
+ workflow DETECT {
+   take:
+-  assembly_renamed_length_filtered
++  renamed_assembly_and_contigs_count
+   virsorter_db
+   virfinder_db
+   pprmeta_git
+ 
+   main:
+ 
+-  renamed_ch = assembly_renamed_length_filtered.map { meta, renamed_fasta, map, _ignored, __ignored ->
+-    tuple(meta, renamed_fasta, map)
+-  }
+-
+-  length_filtered_ch = assembly_renamed_length_filtered.map { meta, _ignored, __ignored, filtered_fasta, contig_number ->
+-    tuple(meta, filtered_fasta, contig_number)
+-  }
+-
+   // virus detection --> VirSorter/VirSorter2, VirFinder and PPR-Meta
+ 
+   virsorter_output = Channel.empty()
+ 
+   if (params.use_virsorter_v1) {
+ 
+-    VIRSORTER(length_filtered_ch, virsorter_db)
++    VIRSORTER(renamed_assembly_and_contigs_count, virsorter_db)
+ 
+     virsorter_output = VIRSORTER.out
+   }
+   else {
+ 
+     // chunk fasta by 500Mb
+-    chunked_ch = length_filtered_ch.flatMap { meta, fasta, value ->
++    chunked_ch = renamed_assembly_and_contigs_count.flatMap { meta, fasta, contigs_count ->
+       def chunks = fasta.splitFasta(file: true, size: 500.MB)
+       chunks.collect { chunk ->
+-        return tuple(meta, chunk, value)
++        return tuple(meta, chunk, contigs_count)
+       }
+     }
+     VIRSORTER2(chunked_ch, virsorter_db)
+@@ -75,13 +67,13 @@ workflow DETECT {
+       }
+   }
+ 
+-  VIRFINDER(length_filtered_ch, virfinder_db)
++  VIRFINDER(renamed_assembly_and_contigs_count, virfinder_db)
+ 
+-  PPRMETA(length_filtered_ch, pprmeta_git)
++  PPRMETA(renamed_assembly_and_contigs_count, pprmeta_git)
+ 
+   // parsing predictions
+-  PARSE(length_filtered_ch.join(VIRFINDER.out).join(virsorter_output).join(PPRMETA.out))
++  PARSE(renamed_assembly_and_contigs_count.join(VIRFINDER.out).join(virsorter_output).join(PPRMETA.out))
+ 
+   emit:
+-  detect_output = PARSE.out.join(renamed_ch).transpose().map { meta, fasta, _vs_meta, _log, _renamed_fasta, map -> tuple(meta, fasta, map) }
++  detect_output = PARSE.out.map { meta, fasta, _vs_meta, _log -> tuple(meta, fasta) }
+ }
+diff --git a/subworkflows/local/postprocess.nf b/subworkflows/local/postprocess.nf
+deleted file mode 100644
+index 91b80406..00000000
+--- a/subworkflows/local/postprocess.nf
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/* Comment section:
+-Restore original contig names. 
+-*/
+-
+-include { RESTORE } from '../../modules/local/restore'
+-
+-workflow POSTPROCESS {
+-    take:   fasta
+-    main:
+-        // restore contig names
+-        RESTORE(fasta)
+-    emit:
+-        restored_fasta = RESTORE.out
+-}
+\ No newline at end of file
+diff --git a/tests/rename_fixtures/virsorter_map.tsv b/tests/rename_fixtures/virsorter_map.tsv
+index ce21c872..ae315381 100644
+--- a/tests/rename_fixtures/virsorter_map.tsv
++++ b/tests/rename_fixtures/virsorter_map.tsv
+@@ -1,6 +1,6 @@
+-original	renamed
+-NODE_1_length_79063_cov_13.902377	test.1
+-NODE_2_length_876543_cov_16.902388	test.2
+-NODE_3_length_637829_cov_11.42453	test.3
+-NODE_3_length_637829_cov_11.99	test.4
+-NODE_3_length_637829_cov_11.100	test.5
++original	temporary	short
++ERZ1.1 NODE_1_length_79063_cov_13.902377	test.1	ERZ1.1
++ERZ1.2 NODE_2_length_876543_cov_16.902388	test.2	ERZ1.2
++ERZ1.3 NODE_3_length_637829_cov_11.42453	test.3	ERZ1.3
++ERZ1.4 NODE_3_length_637829_cov_11.99	test.4	ERZ1.4
++ERZ1.5 NODE_3_length_637829_cov_11.100	test.5	ERZ1.5
+diff --git a/tests/test_rename.py b/tests/test_rename.py
+index 5cd94919..3540fd43 100644
+--- a/tests/test_rename.py
++++ b/tests/test_rename.py
+@@ -17,9 +17,10 @@ def test_rename(self):
+         renamed = self._build_path("/rename_fixtures/renamed.fasta")
+         mapfile = self._build_path("/rename_fixtures/map.tsv")
+ 
+-        input_args = namedtuple("input_args", "prefix input output map")
++        input_args_rename = namedtuple("input_args", "prefix input output map")
++        input_args_restore = namedtuple("input_args", "prefix input output map from_restore to_restore")
+ 
+-        rename(input_args(prefix="test.", input=fasta, output=renamed, map=mapfile))
++        rename(input_args_rename(prefix="test.", input=fasta, output=renamed, map=mapfile))
+ 
+         obtained = []
+         with open(renamed, "r") as output_file:
+@@ -37,8 +38,13 @@ def test_rename(self):
+         output_restored = self._build_path("/rename_fixtures/restored.fasta")
+ 
+         restore(
+-            input_args(
+-                prefix="not-used", input=renamed, output=output_restored, map=mapfile
++            input_args_restore(
++                prefix="not-used", 
++                input=renamed, 
++                output=output_restored, 
++                map=mapfile, 
++                from_restore="temporary", 
++                to_restore="original"
+             )
+         )
+ 
+@@ -73,11 +79,16 @@ def test_rename_with_virsorter_metadata(self):
+ 
+         output_restored = self._build_path("/rename_fixtures/restored.fasta")
+ 
+-        input_args = namedtuple("input_args", "prefix input output map")
++        input_args = namedtuple("input_args", "prefix input output map from_restore to_restore")
+ 
+         restore(
+             input_args(
+-                prefix="not-used", input=renamed, output=output_restored, map=mapfile
++                prefix="not-used", 
++                input=renamed, 
++                output=output_restored, 
++                map=mapfile, 
++                from_restore="temporary", 
++                to_restore="short"
+             )
+         )
+ 
+@@ -91,12 +102,12 @@ def test_rename_with_virsorter_metadata(self):
+             self.assertEqual(24, lines)
+ 
+         expected = [
+-            "NODE_1_length_79063_cov_13.902377",
+-            "NODE_2_length_876543_cov_16.902388|phage-circular",
+-            "NODE_3_length_637829_cov_11.42453|prophage-21696:135184",
+-            "NODE_3_length_637829_cov_11.42453|prophage-100:500",
+-            "NODE_3_length_637829_cov_11.99|prophage-100:500|prophage-500:700",
+-            "NODE_3_length_637829_cov_11.100|phage-circular|prophage-100:500|prophage-500:700",
++            "ERZ1.1",
++            "ERZ1.2|phage-circular",
++            "ERZ1.3|prophage-21696:135184",
++            "ERZ1.3|prophage-100:500",
++            "ERZ1.4|prophage-100:500|prophage-500:700",
++            "ERZ1.5|phage-circular|prophage-100:500|prophage-500:700",
+         ]
+ 
+         self.assertListEqual(sorted(obtained), sorted(expected))
+diff --git a/workflows/virify.nf b/workflows/virify.nf
+index 7305e54f..ebbfb182 100755
+--- a/workflows/virify.nf
++++ b/workflows/virify.nf
+@@ -5,8 +5,9 @@ include { samplesheetToList            } from 'plugin/nf-schema'
+ /************************** 
+ * MODULES
+ **************************/
+-
+-include { MULTIQC                      } from '../modules/nf-core/multiqc'
++include { RESTORE as RESTORE_CATEGORY_FASTA    } from '../modules/local/restore'
++include { RESTORE as RESTORE_FILTERED_FASTA    } from '../modules/local/restore'
++include { MULTIQC                              } from '../modules/nf-core/multiqc'
+ 
+ /************************** 
+ * SUB WORKFLOWS
+@@ -17,7 +18,6 @@ include { ANNOTATE                     } from '../subworkflows/local/annotate'
+ include { DETECT                       } from '../subworkflows/local/detect'
+ include { DOWNLOAD_DATABASES           } from '../subworkflows/local/download_databases'
+ include { PLOT                         } from '../subworkflows/local/plot'
+-include { POSTPROCESS                  } from '../subworkflows/local/postprocess'
+ include { PREPROCESS                   } from '../subworkflows/local/preprocess'
+ include { SPLIT_PROTEINS_BY_CATEGORIES } from '../subworkflows/local/split_proteins_by_categories'
+ 
+@@ -119,29 +119,32 @@ workflow VIRIFY {
+   // ----------- rename fasta + length filtering
+   // out: (meta, renamed_fasta, map, filtered_fasta, env)
+   PREPROCESS(assembly_ch)
+-
++  mapfile = PREPROCESS.out.preprocessed_data.map { meta, _renamed_fasta, map, _filtered_fasta, _contig_number -> tuple(meta, map) }
++  filtered_assembly = PREPROCESS.out.preprocessed_data.map { meta, _renamed_fasta, _map, filtered_fasta, contig_number -> tuple(meta, filtered_fasta, contig_number) }
++ 
++  // Rename contigs to names before space for original assembly
++  RESTORE_FILTERED_FASTA(filtered_assembly.map{meta, fasta, _contig_number -> [meta, fasta]}.join(mapfile), "temporary", "short")
++  assembly_with_short_contignames = RESTORE_FILTERED_FASTA.out.map{meta, name, fasta -> [meta, fasta]}
++  
+   // ----------- if --onlyannotate - skip DETECT step
+-  postprocess_input_ch = Channel.empty()
+-
+   if (params.onlyannotate) {
+-    postprocess_input_ch = PREPROCESS.out.preprocessed_data.map { name, _renamed_fasta, map, filtered_fasta, _contig_number -> tuple(name, filtered_fasta, map) }
++    // use filtered fasta with short names
++    category_fasta = RESTORE_FILTERED_FASTA.out  // (meta, name, fasta)
+   }
+   else {
+     DETECT(
+-      PREPROCESS.out.preprocessed_data,
++      filtered_assembly,
+       DOWNLOAD_DATABASES.out.virsorter_db,
+       DOWNLOAD_DATABASES.out.virfinder_db,
+       DOWNLOAD_DATABASES.out.pprmeta_git,
+-    )
+-    // (meta, fasta, map)
+-    postprocess_input_ch = DETECT.out.detect_output
++    )   // output: (meta, fasta)
++    
++    // ----------- restore fasta files for each category fasta
++    files_to_restore = DETECT.out.detect_output.join(mapfile).transpose(by:1)
++    RESTORE_CATEGORY_FASTA(files_to_restore, "temporary", "short")
++    category_fasta = RESTORE_CATEGORY_FASTA.out  // (meta, type(HC/LC/PP), fasta)
+   }
+ 
+-  // ----------- POSTPROCESS: restore fasta file
+-  POSTPROCESS(postprocess_input_ch)
+-  category_fasta = POSTPROCESS.out.restored_fasta
+-  // (meta, type(HC/LC/PP), fasta)
+-
+   // ----------- split proteins into HC/LC/PP - if provided
+   if (params.use_proteins) {
+ 
+@@ -154,28 +157,28 @@ workflow VIRIFY {
+ 
+   // ----------- ANNOTATE
+   if (params.use_proteins) {
+-    // (meta, [type](HC/LC/PP), [fasta], [faa], assembly) -> [(meta, type, fasta, faa, assembly)]
++    // (meta, [type](HC/LC/PP), [fasta], [faa], original_assembly) -> [(meta, type, fasta, faa, original_assembly)]
+     annotate_input = proteins_ch
+       .groupTuple()
+-      .join(assembly_ch)
+-      .flatMap { meta, types, fasta_paths, faa_paths, common_path ->
++      .join(assembly_with_short_contignames)
++      .flatMap { meta, types, fasta_paths, faa_paths, original_contigs ->
+         types
+           .indexed()
+           .collect { i, type ->
+-            tuple(meta, type, fasta_paths[i], faa_paths[i], common_path)
++            tuple(meta, type, fasta_paths[i], faa_paths[i], original_contigs)
+           }
+       }
+   }
+   else {
+-    // (meta, [type](HC/LC/PP), [fasta], assembly) -> [(meta, type, fasta, assembly)]
++    // (meta, [type](HC/LC/PP), [fasta], original_assembly) -> [(meta, type, fasta, original_assembly)]
+     annotate_input = category_fasta
+       .groupTuple()
+-      .join(assembly_ch)
+-      .flatMap { meta, types, fasta_paths, common_path ->
++      .join(assembly_with_short_contignames)
++      .flatMap { meta, types, fasta_paths, original_contigs ->
+         types
+           .indexed()
+           .collect { i, type ->
+-            tuple(meta, type, fasta_paths[i], common_path)
++            tuple(meta, type, fasta_paths[i], original_contigs)
+           }
+       }
+   }

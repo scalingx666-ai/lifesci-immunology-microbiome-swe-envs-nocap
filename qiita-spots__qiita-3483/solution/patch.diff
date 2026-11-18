@@ -1,0 +1,603 @@
+diff --git a/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+index 4b17a6fa5..0feb2a5da 100644
+--- a/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
++++ b/qiita_pet/handlers/cloud_handlers/file_transfer_handlers.py
+@@ -1,11 +1,77 @@
+ import os
++from pathlib import Path
++import zipfile
++from io import BytesIO
+ 
+ from tornado.gen import coroutine
+ from tornado.web import HTTPError, RequestHandler
+ 
+ from qiita_core.qiita_settings import qiita_config
+-from qiita_core.util import execute_as_transaction
++from qiita_core.util import execute_as_transaction, is_test_environment
+ from qiita_db.handlers.oauth2 import authenticate_oauth
++from qiita_pet.handlers.download import BaseHandlerDownload
++import qiita_db as qdb
++
++
++def is_directory(filepath):
++    """Tests if given filepath is listed as directory in Qiita DB.
++
++    Note: this is independent of the actual filesystem, only checks DB entries.
++
++    Parameters
++    ----------
++    filepath : str
++        The filepath to the directory that shall be tested for beeing listed
++        as directory in Qiita's DB
++
++    Returns
++    -------
++    Bool: True if the last part of the filepath is contained as filepath in
++          qiita.filepath AND part after base_data_dir is a mountpoint in
++          qiita.data_directory AND the filepath_type is 'directory or
++          'html_summary_dir'.
++    False otherwise.
++    """
++    working_filepath = filepath
++    # chop off trailing / to ensure we point to a directory name properly
++    if working_filepath.endswith(os.sep):
++        working_filepath = os.path.dirname(working_filepath)
++
++    dirname = os.path.basename(working_filepath)
++    # file-objects foo are stored in <base_data_dir>/<mountpoint>/foo. To
++    # determine mountpoint from a given filepath, we need to chop of
++    # base_data_dir and then take the top directory level.
++    # Checking if user provided filepath contains a valid mountpoint adds
++    # to preventing users to download arbitrary file contents
++    try:
++        mount_dirname = Path(working_filepath).relative_to(
++            Path(qiita_config.base_data_dir)).parts[0]
++    except ValueError:
++        # base_data_dir is no proper prefix of given filepath
++        return False
++    except IndexError:
++        # only base_data_dir given
++        return False
++    if dirname == '' or mount_dirname == '':
++        # later should never be true due to above IndexError, but better save
++        # than sorry
++        return False
++
++    with qdb.sql_connection.TRN:
++        # find entries that
++        #   a) are of filepath_type "directory" or "html_summary_dir"
++        #   b) whose filepath ends with directory name
++        #   c) whose mountpoint matches the provided parent_directory
++        sql = """SELECT filepath_id
++                FROM qiita.filepath
++                    JOIN qiita.filepath_type USING (filepath_type_id)
++                    JOIN qiita.data_directory USING (data_directory_id)
++                WHERE filepath_type IN ('directory', 'html_summary_dir') AND
++                    filepath=%s AND
++                    position(%s in mountpoint)>0;"""
++        qdb.sql_connection.TRN.add(sql, [dirname, mount_dirname])
++        hits = qdb.sql_connection.TRN.execute_fetchflatten()
++        return len(hits) > 0
+ 
+ 
+ class FetchFileFromCentralHandler(RequestHandler):
+@@ -29,34 +95,103 @@ def get(self, requested_filepath):
+             # attempt to access files outside of the BASE_DATA_DIR
+             # intentionally NOT reporting the actual location to avoid exposing
+             # instance internal information
+-            raise HTTPError(
+-                403,
+-                reason=(
+-                    "You cannot access files outside of the BASE_DATA_DIR of Qiita!"
+-                ),
+-            )
++            raise HTTPError(403, reason=(
++                "You cannot access files outside of "
++                "the BASE_DATA_DIR of Qiita!"))
+ 
+         if not os.path.exists(filepath):
+-            raise HTTPError(
+-                403,
+-                reason=("The requested file is not present in Qiita's BASE_DATA_DIR!"),
+-            )
+-
+-        # delivery of the file via nginx requires replacing the basedatadir
+-        # with the prefix defined in the nginx configuration for the
+-        # base_data_dir, '/protected/' by default
+-        protected_filepath = filepath.replace(basedatadir, "/protected")
+-
+-        self.set_header("Content-Type", "application/octet-stream")
+-        self.set_header("Content-Transfer-Encoding", "binary")
+-        self.set_header("X-Accel-Redirect", protected_filepath)
+-        self.set_header("Content-Description", "File Transfer")
+-        self.set_header("Expires", "0")
+-        self.set_header("Cache-Control", "no-cache")
+-        self.set_header(
+-            "Content-Disposition",
+-            "attachment; filename=%s" % os.path.basename(protected_filepath),
+-        )
++            raise HTTPError(403, reason=(
++                "The requested file is not present in Qiita's BASE_DATA_DIR!"))
++
++        filename_directory = "qiita-main-data.zip"
++        if os.path.isdir(filepath):
++            # Test if this directory is managed by Qiita's DB as directory
++            # Thus we can prevent that a lazy client simply downloads the whole
++            # basa_data_directory
++            if not is_directory(filepath):
++                raise HTTPError(403, reason=(
++                    "You cannot access this directory!"))
++            else:
++                # flag the response for qiita_client
++                self.set_header('Is-Qiita-Directory', 'yes')
++
++        self.set_header('Content-Type', 'application/octet-stream')
++        self.set_header('Content-Transfer-Encoding', 'binary')
++        self.set_header('Content-Description', 'File Transfer')
++        self.set_header('Expires',  '0')
++        self.set_header('Cache-Control',  'no-cache')
++
++        # We here need to differentiate a request that comes directly to the
++        # qiita instance (happens in testing) or was redirected through nginx
++        # (should be the default). If nginx, we can use nginx' fast file
++        # delivery mechanisms, otherwise, we need to send via slower tornado.
++        # We indirectly infer this by looking for the "X-Forwarded-For" header,
++        # which should only exists when redirectred through nginx.
++        if self.request.headers.get('X-Forwarded-For') is None:
++            # delivery via tornado
++            if not is_directory(filepath):
++                # a single file
++                self.set_header(
++                    'Content-Disposition',
++                    'attachment; filename=%s' % os.path.basename(filepath))
++                with open(filepath, "rb") as f:
++                    self.write(f.read())
++            else:
++                # a whole directory
++                memfile = BytesIO()
++                with zipfile.ZipFile(memfile, 'w', zipfile.ZIP_DEFLATED) as zf:
++                    for root, dirs, files in os.walk(filepath):
++                        for file in files:
++                            full_path = os.path.join(root, file)
++                            # make path in zip file relative
++                            rel_path = os.path.relpath(full_path, filepath)
++                            zf.write(full_path, rel_path)
++                memfile.seek(0)
++                self.set_header('Content-Type', 'application/zip')
++                self.set_header('Content-Disposition',
++                                'attachment; filename=%s' % filename_directory)
++                self.write(memfile.read())
++        else:
++            # delivery via nginx
++            if not is_directory(filepath):
++                # a single file:
++                # delivery of the file via nginx requires replacing the
++                # basedatadir with the prefix defined in the nginx
++                # configuration for the base_data_dir, '/protected/' by default
++                protected_filepath = filepath.replace(basedatadir,
++                                                      '/protected')
++                self.set_header('X-Accel-Redirect', protected_filepath)
++                self.set_header(
++                    'Content-Disposition',
++                    'attachment; filename=%s' % os.path.basename(
++                        protected_filepath))
++            else:
++                # a whole directory
++                to_download = BaseHandlerDownload._list_dir_files_nginx(
++                    self, filepath)
++
++                # fp_subdir is the part of the filepath the user requested,
++                # without QIITA_BASE_DIR
++                fp_subdir = os.path.relpath(filepath, basedatadir)
++
++                # above function adds filepath to located files, which is
++                # different from the non-nginx version, e.g.
++                # fp = /protected/job/2_test_folder/testdir/fileA.txt
++                # fp_name = job/2_test_folder/testdir/fileA.txt
++                # where "job/2_test_folder" is what user requested and
++                #       "testdir/fileA.txt" is a file within this directory.
++                # When extracting by qiita_client, the "job/2_test_folder"
++                # part would be added twice (one by user request, second by
++                # unzipping). Therefore, we need to correct these names here:
++                to_download = [
++                    (fp, os.path.relpath(fp_name, fp_subdir), fp_checksum,
++                     fp_size)
++                    for fp, fp_name, fp_checksum, fp_size
++                    in to_download]
++                BaseHandlerDownload._write_nginx_file_list(self, to_download)
++                BaseHandlerDownload._set_nginx_headers(
++                    self, filename_directory)
++
+         self.finish()
+ 
+ 
+@@ -66,40 +201,59 @@ class PushFileToCentralHandler(RequestHandler):
+     @execute_as_transaction
+     def post(self):
+         if not self.request.files:
+-            raise HTTPError(400, reason="No files to upload defined!")
++            raise HTTPError(400, reason='No files to upload defined!')
+ 
+         # canonic version of base_data_dir
+         basedatadir = os.path.abspath(qiita_config.base_data_dir)
+         stored_files = []
++        stored_directories = []
+ 
+         for filespath, filelist in self.request.files.items():
+             if filespath.startswith(basedatadir):
+-                filespath = filespath[len(basedatadir) :]
++                filespath = filespath[len(basedatadir):]
+ 
+             for file in filelist:
+-                filepath = os.path.join(filespath, file["filename"])
++                # differentiate between regular files and whole directories,
++                # which must be zipped AND the client must provide the
++                # is_directory='true' body argument.
++                sent_directory = self.get_body_argument(
++                    'is_directory', "false") == "true"
++
++                filepath = os.path.join(filespath, file['filename'])
+                 # remove leading /
+                 if filepath.startswith(os.sep):
+-                    filepath = filepath[len(os.sep) :]
++                    filepath = filepath[len(os.sep):]
+                 filepath = os.path.abspath(os.path.join(basedatadir, filepath))
+ 
+-                if os.path.exists(filepath):
+-                    raise HTTPError(
+-                        403,
+-                        reason=(
+-                            "The requested file is already "
+-                            "present in Qiita's BASE_DATA_DIR!"
+-                        ),
+-                    )
++                if sent_directory:
++                    # if a whole directory was send, we want to store it at
++                    # the given dirname of the filepath
++                    filepath = os.path.dirname(filepath)
++
++                # prevent overwriting existing files, except in test mode
++                if os.path.exists(filepath) and (not is_test_environment()):
++                    raise HTTPError(403, reason=(
++                        "The requested %s is already "
++                        "present in Qiita's BASE_DATA_DIR!" %
++                        ('directory' if sent_directory else 'file')))
+ 
+                 os.makedirs(os.path.dirname(filepath), exist_ok=True)
+-                with open(filepath, "wb") as f:
+-                    f.write(file["body"])
+-                    stored_files.append(filepath)
++                if sent_directory:
++                    with zipfile.ZipFile(BytesIO(file['body'])) as zf:
++                        zf.extractall(filepath)
++                        stored_directories.append(filepath)
++                else:
++                    with open(filepath, "wb") as f:
++                        f.write(file['body'])
++                        stored_files.append(filepath)
+ 
+-        self.write(
+-            "Stored %i files into BASE_DATA_DIR of Qiita:\n%s\n"
+-            % (len(stored_files), "\n".join(map(lambda x: " - %s" % x, stored_files)))
+-        )
++        for (_type, objs) in [('files', stored_files),
++                              ('directories', stored_directories)]:
++            if len(objs) > 0:
++                self.write(
++                    "Stored %i %s into BASE_DATA_DIR of Qiita:\n%s\n" % (
++                        len(objs),
++                        _type,
++                        '\n'.join(map(lambda x: ' - %s' % x, objs))))
+ 
+-        self.finish()
++        self.finish()
+\ No newline at end of file
+diff --git a/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+index 11dfd3ca0..c301c9954 100644
+--- a/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
++++ b/qiita_pet/handlers/cloud_handlers/tests/test_file_transfer_handlers.py
+@@ -1,89 +1,266 @@
+ import filecmp
+-from os import remove
+-from os.path import basename, exists
++from os import remove, makedirs
++from os.path import exists, basename, join, isdir, splitext
+ from unittest import main
++from shutil import rmtree, make_archive
+ 
+ import qiita_db as qdb
+ from qiita_db.handlers.tests.oauthbase import OauthTestingBase
++from qiita_db.sql_connection import TRN
++from qiita_pet.handlers.cloud_handlers.file_transfer_handlers import \
++    is_directory
+ 
+ 
+ class FetchFileFromCentralHandlerTests(OauthTestingBase):
+     def setUp(self):
+         super(FetchFileFromCentralHandlerTests, self).setUp()
++        self.endpoint = '/cloud/fetch_file_from_central/'
++        self.base_data_dir = qdb.util.get_db_files_base_dir()
++        self._clean_up_files = []
+ 
+-    def test_get(self):
+-        endpoint = "/cloud/fetch_file_from_central/"
+-        base_data_dir = qdb.util.get_db_files_base_dir()
++    def tearDown(self):
++        for fp in self._clean_up_files:
++            if exists(fp):
++                if isdir(fp):
++                    rmtree(fp)
++                else:
++                    remove(fp)
+ 
+-        obs = self.get_authed(endpoint + "nonexistingfile")
++    def test_get(self):
++        obs = self.get_authed(self.endpoint + 'nonexistingfile')
+         self.assertEqual(obs.status_code, 403)
+-        self.assertIn("outside of the BASE_DATA_DIR", obs.reason)
++        self.assertIn('outside of the BASE_DATA_DIR', obs.reason)
+ 
+-        obs = self.get_authed(endpoint + base_data_dir[1:] + "/nonexistingfile")
++        obs = self.get_authed(
++            self.endpoint + self.base_data_dir[1:] + '/nonexistingfile')
+         self.assertEqual(obs.status_code, 403)
+-        self.assertIn("The requested file is not present", obs.reason)
++        self.assertIn('The requested file is not present', obs.reason)
+ 
+         obs = self.get_authed(
+-            endpoint + base_data_dir[1:] + "/raw_data/FASTA_QUAL_preprocessing.fna"
+-        )
++            self.endpoint + self.base_data_dir[1:] +
++            '/raw_data/FASTA_QUAL_preprocessing.fna')
+         self.assertEqual(obs.status_code, 200)
+-        self.assertIn("FLP3FBN01ELBSX length=250 xy=1766_01", str(obs.content))
++        self.assertIn('FLP3FBN01ELBSX length=250 xy=1766_01', str(obs.content))
++
++        self.assertNotIn('Is-Qiita-Directory', obs.headers.keys())
++
++    def test_get_directory(self):
++        # a directory that exists BUT is not managed as a directory by Qiita
++        obs = self.get_authed(
++            self.endpoint + self.base_data_dir[1:] + '/BIOM/7')
++        self.assertEqual(obs.status_code, 403)
++        self.assertIn('You cannot access this directory', obs.reason)
++
++        # create directory and file for a negative test as mountpoint is not
++        # correct. 2_test_folder is registered in DB through
++        # populate_test_db.sql
++        fp_testfolder = join(self.base_data_dir, 'wrongmount', '2_test_folder')
++        makedirs(fp_testfolder, exist_ok=True)
++        PushFileToCentralHandlerTests._create_test_dir(self, fp_testfolder)
++        self._clean_up_files.append(fp_testfolder)
++        obs = self.get_authed(self.endpoint + fp_testfolder[1:])
++        self.assertEqual(obs.status_code, 403)
++        self.assertIn('You cannot access this directory', obs.reason)
++
++        # create directory and file for a positive test. 2_test_folder is
++        # registered in DB through populate_test_db.sql
++        fp_testfolder = join(self.base_data_dir, 'job', '2_test_folder')
++        makedirs(fp_testfolder, exist_ok=True)
++        PushFileToCentralHandlerTests._create_test_dir(self, fp_testfolder)
++        self._clean_up_files.append(fp_testfolder)
++        obs = self.get_authed(self.endpoint + fp_testfolder[1:])
++        self.assertEqual(obs.status_code, 200)
++        self.assertIn('call me c', str(obs.content))
++        self.assertIn('Is-Qiita-Directory', obs.headers.keys())
+ 
+ 
+ class PushFileToCentralHandlerTests(OauthTestingBase):
+     def setUp(self):
+         super(PushFileToCentralHandlerTests, self).setUp()
++        self.endpoint = '/cloud/push_file_to_central/'
++        self.base_data_dir = qdb.util.get_db_files_base_dir()
++        self._clean_up_files = []
+ 
+-    def test_post(self):
+-        endpoint = "/cloud/push_file_to_central/"
+-        base_data_dir = qdb.util.get_db_files_base_dir()
++    def tearDown(self):
++        for fp in self._clean_up_files:
++            if exists(fp):
++                if isdir(fp):
++                    rmtree(fp)
++                else:
++                    remove(fp)
+ 
++    def test_post(self):
+         # create a test file "locally", i.e. in current working directory
+-        fp_source = "foo.bar"
+-        with open(fp_source, "w") as f:
++        fp_source = 'foo.bar'
++        with open(fp_source, 'w') as f:
+             f.write("this is a test\n")
+         self._files_to_remove.append(fp_source)
+ 
+         # if successful, expected location of the file in BASE_DATA_DIR
+-        fp_target = base_data_dir + "/bar/" + basename(fp_source)
++        fp_target = self.base_data_dir + '/bar/' + basename(fp_source)
+         self._files_to_remove.append(fp_target)
+ 
+         # create a second test file
+-        fp_source2 = "foo_two.bar"
+-        with open(fp_source2, "w") as f:
++        fp_source2 = 'foo_two.bar'
++        with open(fp_source2, 'w') as f:
+             f.write("this is another test\n")
+         self._files_to_remove.append(fp_source2)
+-        fp_target2 = base_data_dir + "/barr/" + basename(fp_source2)
++        fp_target2 = self.base_data_dir + '/barr/' + basename(fp_source2)
+         self._files_to_remove.append(fp_target2)
+ 
+         # test raise error if no file is given
+-        obs = self.post_authed(endpoint)
++        obs = self.post_authed(self.endpoint)
+         self.assertEqual(obs.reason, "No files to upload defined!")
+ 
+         # test correct mechanism
+-        with open(fp_source, "rb") as fh:
+-            obs = self.post_authed(endpoint, files={"bar/": fh})
+-            self.assertIn(
+-                "Stored 1 files into BASE_DATA_DIR of Qiita", str(obs.content)
+-            )
++        with open(fp_source, 'rb') as fh:
++            obs = self.post_authed(self.endpoint, files={'bar/': fh})
++            self.assertIn('Stored 1 files into BASE_DATA_DIR of Qiita',
++                          str(obs.content))
+             self.assertTrue(filecmp.cmp(fp_source, fp_target, shallow=False))
+ 
+         # check if error is raised, if file already exists
+-        with open(fp_source, "rb") as fh:
+-            obs = self.post_authed(endpoint, files={"bar/": fh})
+-            self.assertIn("already present in Qiita's BASE_DATA_DIR!", obs.reason)
++        with open(fp_source, 'rb') as fh:
++            # we need to let qiita thinks for this test, to NOT be in test mode
++            with TRN:
++                TRN.add("UPDATE settings SET test = False")
++                TRN.execute()
++            obs = self.post_authed(self.endpoint, files={'bar/': fh})
++            # reset test mode to true
++            with TRN:
++                TRN.add("UPDATE settings SET test = True")
++                TRN.execute()
++            self.assertIn("already present in Qiita's BASE_DATA_DIR!",
++                          obs.reason)
+ 
+         # test transfer of multiple files
+         if exists(fp_target):
+             remove(fp_target)
+-        with open(fp_source, "rb") as fh1:
+-            with open(fp_source2, "rb") as fh2:
+-                obs = self.post_authed(endpoint, files={"bar/": fh1, "barr/": fh2})
+-                self.assertIn(
+-                    "Stored 2 files into BASE_DATA_DIR of Qiita", str(obs.content)
+-                )
+-                self.assertTrue(filecmp.cmp(fp_source, fp_target, shallow=False))
+-                self.assertTrue(filecmp.cmp(fp_source2, fp_target2, shallow=False))
++        with open(fp_source, 'rb') as fh1:
++            with open(fp_source2, 'rb') as fh2:
++                obs = self.post_authed(
++                    self.endpoint, files={'bar/': fh1, 'barr/': fh2})
++                self.assertIn('Stored 2 files into BASE_DATA_DIR of Qiita',
++                              str(obs.content))
++                self.assertTrue(filecmp.cmp(fp_source, fp_target,
++                                            shallow=False))
++                self.assertTrue(filecmp.cmp(fp_source2, fp_target2,
++                                            shallow=False))
++
++    def _create_test_dir(self, prefix=None):
++        """Creates a test directory with files and subdirs."""
++        # prefix
++        # |- testdir/
++        # |---- fileA.txt
++        # |---- subdirA_l1/
++        # |-------- fileB.fna
++        # |-------- subdirC_l2/
++        # |------------ fileC.log
++        # |------------ fileD.seq
++        # |---- subdirB_l1/
++        # |-------- fileE.sff
++        if (prefix is not None) and (prefix != ""):
++            prefix = join(prefix, 'testdir')
++        else:
++            prefix = 'testdir'
++
++        for dir in [join(prefix, 'subdirA_l1', 'subdirC_l2'),
++                    join(prefix, 'subdirB_l1')]:
++            if not exists(dir):
++                makedirs(dir)
++        for file, cont in [(join(prefix, 'fileA.txt'), 'contentA'),
++                           (join(prefix, 'subdirA_l1',
++                                 'fileB.fna'), 'this is B'),
++                           (join(prefix, 'subdirA_l1', 'subdirC_l2',
++                                 'fileC.log'), 'call me c'),
++                           (join(prefix, 'subdirA_l1', 'subdirC_l2',
++                                 'fileD.seq'), 'I d'),
++                           (join(prefix, 'subdirB_l1', 'fileE.sff'), 'oh e')]:
++            with open(file, "w") as f:
++                f.write(cont + "\n")
++        self._clean_up_files.append(prefix)
++
++        return prefix
++
++    def _send_dir(self, fp_zipped='tmp_senddir.zip'):
++        dir = self._create_test_dir(prefix='/tmp/try1')
++
++        make_archive(splitext(fp_zipped)[0], 'zip', dir)
++        self._clean_up_files.append(fp_zipped)
++
++        with open(fp_zipped, 'rb') as fh:
++            obs = self.post_authed(
++                self.endpoint,
++                data={'is_directory': 'true'},
++                files={dir: fh})
++
++        return obs
++
++    def test_post_directory(self):
++        obs = self._send_dir()
++        self.assertTrue(obs.status_code == 200)
++        qmain_dir = obs.content.decode().split('\n')[1].split(' - ')[-1]
++
++        self.assertTrue(
++            len(filecmp.cmpfiles(
++                '/tmp/try1/testdir/', qmain_dir,
++                ['fileA.txt',
++                 'subdirA_l1/fileB.fna',
++                 'subdirA_l1/subdirC_l2/fileC.log',
++                 'subdirA_l1/subdirC_l2/fileD.seq',
++                 'subdirB_l1/fileE.sff'])[0]) == 5)
++
++    def test_post_directory_testexisting(self):
++        # check if error is raised, if directory already exists
++        # send first time, should be OK
++        obs = self._send_dir()
++        self.assertTrue(obs.status_code == 200)
++
++        # we need to let qiita thinks for this test, to NOT be in test mode
++        with TRN:
++            TRN.add("UPDATE settings SET test = False")
++            TRN.execute()
++        # send again, should fal
++        obs = self._send_dir()
++        # reset test mode to true
++        with TRN:
++            TRN.add("UPDATE settings SET test = True")
++            TRN.execute()
++
++        self.assertIn("already present in Qiita's BASE_DATA_DIR!",
++                      obs.reason)
++
++
++class UtilsTests(OauthTestingBase):
++    def setUp(self):
++        self.base_data_dir = qdb.util.get_db_files_base_dir()
++        self._files_to_remove = []
++
++    def test_is_directory(self):
++        obs = is_directory(join('/wrong_root', 'karl', 'heinz'))
++        self.assertFalse(obs)
++
++        # no path given
++        obs = is_directory('')
++        self.assertFalse(obs)
++
++        # just pointing to BASE_DATA_DIR, i.e. no mountpoint given
++        obs = is_directory(self.base_data_dir)
++        self.assertFalse(obs)
++
++        # existing dir, but not accessible as not managed by Qiita DB as dir
++        obs = is_directory(join(self.base_data_dir, 'BIOM'))
++        self.assertFalse(obs)
++
++        # managed directory, but wrong mountpoint
++        fp_testfolder = join(self.base_data_dir, 'wrongmount', '2_test_folder')
++        obs = is_directory(fp_testfolder)
++        self.assertFalse(obs)
++
++        # positive test
++        fp_testfolder = join(self.base_data_dir, 'job', '2_test_folder')
++        obs = is_directory(fp_testfolder)
++        self.assertTrue(obs)
+ 
+ 
+ if __name__ == "__main__":

@@ -1,0 +1,126 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 075239de..603ae3de 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -53,6 +53,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🐛 Bug Fixes
+ 
++* {func}`ep.tl.rank_features_groups <ehrapy.tools.rank_features_groups>` stores results only for the compared groups like scanpy, instead of also for the `reference` and for groups outside `groups`, which drew empty panels in {func}`ep.pl.rank_features_groups <ehrapy.plot.rank_features_groups>`, and no longer crashes on categorical features with a `groups` subset ([#1145](https://github.com/theislab/ehrapy/pull/1145)) @Zethson
+ * {func}`ep.pl.violin <ehrapy.plot.violin>`, {func}`ep.pl.scatter <ehrapy.plot.scatter>`, {func}`ep.pl.ols <ehrapy.plot.ols>` and the causal estimators and diagnostics such as {func}`ep.tl.iptw <ehrapy.tools.iptw>` work on 3D data when they only use `obs` columns, and {func}`ep.pl.dendrogram <ehrapy.plot.dendrogram>` when the dendrogram is precomputed ([#1143](https://github.com/theislab/ehrapy/pull/1143)) @Zethson
+ * {func}`ep.pp.neighbors <ehrapy.preprocessing.neighbors>` uses the 3D `.X` by default with the time series metrics and rejects it with a clear error for other metrics instead of failing inside scikit-learn, and {func}`ep.tl.rank_features_groups <ehrapy.tools.rank_features_groups>` rejects 3D data with the same error as other 2D-only functions ([#1143](https://github.com/theislab/ehrapy/pull/1143)) @Zethson
+ * {func}`ep.pp.simple_impute <ehrapy.preprocessing.simple_impute>`, {func}`ep.pp.miss_forest_impute <ehrapy.preprocessing.miss_forest_impute>` and {func}`ep.pp.locf_impute <ehrapy.preprocessing.locf_impute>` raise a `KeyError` for unknown `var_names` instead of imputing the last variable, and {func}`ep.pp.explicit_impute <ehrapy.preprocessing.explicit_impute>` raises one for unknown `replacement` keys instead of ignoring them ([#1140](https://github.com/theislab/ehrapy/pull/1140)) @Zethson
+diff --git a/ehrapy/tools/feature_ranking/_rank_features_groups.py b/ehrapy/tools/feature_ranking/_rank_features_groups.py
+index 1560998f..ffd59039 100644
+--- a/ehrapy/tools/feature_ranking/_rank_features_groups.py
++++ b/ehrapy/tools/feature_ranking/_rank_features_groups.py
+@@ -230,8 +230,8 @@ def _evaluate_categorical_features(
+         pvals = []
+         scores = []
+ 
+-        for group in group_names:
+-            if group not in groups_order:
++        for group in groups_order:
++            if group == reference:
+                 continue
+ 
+             if reference == "rest":
+@@ -248,14 +248,14 @@ def _evaluate_categorical_features(
+             scores.append(score)
+             pvals.append(p_value)
+ 
+-        categorical_names.append([feature] * len(group_names))
++        categorical_names.append([feature] * len(scores))
+         categorical_scores.append(scores)
+         categorical_pvals.append(pvals)
+         # It is not clear, how to interpret logFC or percentages for categorical data
+         # For now, leave some values so that plotting and sorting methods work
+-        categorical_logfoldchanges.append(np.ones(len(group_names)))
++        categorical_logfoldchanges.append(np.ones(len(scores)))
+         if pts:
+-            categorical_pts.append(np.ones(len(group_names)))
++            categorical_pts.append(np.ones(len(scores)))
+ 
+     return (
+         np.array(categorical_names),
+@@ -561,6 +561,7 @@ def rank_features_groups(
+     }
+ 
+     group_names = pd.Categorical(edata.obs[groupby].astype(str)).categories.tolist()
++    groups_order = _get_groups_order(groups_subset=groups, group_names=group_names, reference=reference)
+ 
+     if list(edata.var_names[edata.var[FEATURE_TYPE_KEY] == NUMERIC_TAG]):
+         # Rank numerical features
+@@ -594,7 +595,9 @@ def rank_features_groups(
+             pvals=numerical_edata.uns[key_added].get("pvals"),
+             pvals_adj=numerical_edata.uns[key_added].get("pvals_adj"),
+             logfoldchanges=numerical_edata.uns[key_added].get("logfoldchanges"),
+-            groups_order=group_names,
++            groups_order=[
++                group for group in groups_order if group in numerical_edata.uns[key_added]["names"].dtype.names
++            ],
+         )
+ 
+     if list(edata.var_names[edata.var[FEATURE_TYPE_KEY] == CATEGORICAL_TAG]):
+@@ -626,7 +629,7 @@ def rank_features_groups(
+             pvals=categorical_pvals,
+             pvals_adj=categorical_pvals.copy(),
+             logfoldchanges=categorical_logfoldchanges,
+-            groups_order=group_names,
++            groups_order=[group for group in groups_order if group != reference],
+         )
+ 
+     if pts and "names" in edata.uns[key_added]:
+@@ -635,7 +638,7 @@ def rank_features_groups(
+                 edata,
+                 _ranked_features(edata.uns[key_added]),
+                 groupby=groupby,
+-                groups_order=_get_groups_order(groups_subset=groups, group_names=group_names, reference=reference),
++                groups_order=groups_order,
+                 reference=reference,
+             )
+         )
+diff --git a/tests/tools/feature_ranking/test_rank_features_groups.py b/tests/tools/feature_ranking/test_rank_features_groups.py
+index bb9ca1cd..9c7ef353 100644
+--- a/tests/tools/feature_ranking/test_rank_features_groups.py
++++ b/tests/tools/feature_ranking/test_rank_features_groups.py
+@@ -4,6 +4,7 @@
+ import numpy as np
+ import pandas as pd
+ import pytest
++import scanpy as sc
+ import scipy.sparse as sp
+ from ehrdata.core.constants import CATEGORICAL_TAG, DEFAULT_TEM_LAYER_NAME, FEATURE_TYPE_KEY, NUMERIC_TAG
+ from ehrdata.io import read_csv
+@@ -544,6 +545,31 @@ def test_rank_features_groups_logreg_with_categorical_raises(rng):
+         ep.tl.rank_features_groups(_ranking_edata(_ranking_data(rng)), "group", num_cols_method="logreg")
+ 
+ 
++@pytest.mark.parametrize(
++    ("kwargs", "compared_groups"),
++    [
++        ({"reference": "b"}, ("a", "c", "d")),
++        ({"groups": ["a"], "reference": "b"}, ("a",)),
++        ({"groups": ["c", "a"], "reference": "b"}, ("c", "a")),
++        ({"groups": ["c", "a"], "reference": "rest"}, ("c", "a")),
++    ],
++)
++def test_rank_features_groups_compared_groups(kwargs, compared_groups, rng):
++    edata = _ranking_edata(_ranking_data(rng))
++    numeric = edata[:, edata.var[FEATURE_TYPE_KEY] == NUMERIC_TAG].copy()
++
++    ep.tl.rank_features_groups(edata, "group", **kwargs)
++    sc.tl.rank_genes_groups(numeric, "group", **kwargs)
++
++    result, expected = edata.uns["rank_features_groups"], numeric.uns["rank_genes_groups"]
++    for key in ("names", "scores", "pvals", "pvals_adj", "logfoldchanges"):
++        assert result[key].dtype.names == compared_groups
++    for group in compared_groups:
++        assert set(result["names"][group]) == set(edata.var_names)
++        scores = pd.Series(result["scores"][group], index=result["names"][group])
++        np.testing.assert_allclose(scores[expected["names"][group]], expected["scores"][group])
++
++
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu)
+ def test_filter_rank_features_groups_array_types(array_type, rng):
+     X = _ranking_data(rng)

@@ -1,0 +1,484 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 73e7ae80f..94cea494f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ | --classifier      | --qiime_classifier            |         |
+ 
+ - [#1028](https://github.com/nf-core/ampliseq/pull/1028) - Multi-region sample sheet via `--multiregion` had its header changed from `FW_primer` and `RV_primer` to `primer_fwd` and `primer_rev`, respectively. (by @d4straub)
++- [#1032](https://github.com/nf-core/ampliseq/pull/1032) - Refactor the pipeline's parameter handling and initialization (by @erikrikarddaniel).
+ 
+ ### `Fixed`
+ 
+diff --git a/conf/test.config b/conf/test.config
+index 6f531d282..6f967b9a2 100644
+--- a/conf/test.config
++++ b/conf/test.config
+@@ -27,6 +27,8 @@ params {
+     primer_rev = "GGACTACNVGGGTWTCTAAT"
+     input = params.pipelines_testdata_base_path + "ampliseq/samplesheets/Samplesheet_v3.tsv"
+     metadata = params.pipelines_testdata_base_path + "ampliseq/samplesheets/Metadata.tsv"
++    // reuse Metadata.tsv (already fetched above) as a stand-in report_abstract fixture, just to exercise the parameter
++    report_abstract = params.pipelines_testdata_base_path + "ampliseq/samplesheets/Metadata.tsv"
+     dada_ref_taxonomy = "gtdb=R07-RS207"
+     cut_dada_ref_taxonomy = true
+     qiime_ref_taxonomy = "greengenes85"
+diff --git a/conf/test_sintax.config b/conf/test_sintax.config
+index 3313ab023..bb9b35646 100644
+--- a/conf/test_sintax.config
++++ b/conf/test_sintax.config
+@@ -42,6 +42,9 @@ params {
+     //produce average barplots
+     metadata_category_barplot = "var2,var3"
+ 
++    //restrict diversity/ancom metadata category selection (exercises the --metadata_category param)
++    metadata_category = "var2"
++
+     //restrict ANCOM analysis to higher taxonomic levels
+     tax_agglom_max = 4
+     ancom = true
+diff --git a/main.nf b/main.nf
+index ca9be493f..161384636 100644
+--- a/main.nf
++++ b/main.nf
+@@ -30,6 +30,18 @@ include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_ampl
+ //
+ workflow NFCORE_AMPLISEQ {
+ 
++    take:
++    ch_metadata            // channel: [ path(metadata) ] or empty
++    ch_report_template     // channel: [ path(report_template) ]
++    ch_report_css          // channel: [ path(report_css) ]
++    ch_report_logo         // channel: [ path(report_logo) ]
++    ch_report_abstract     // channel: [ path(report_abstract) ] or []
++    ch_pplace_sheet        // channel: parsed pplace_sheet rows, or empty
++    ch_expected_sequences  // channel: [ path(expected_sequences) ] or empty
++    ch_expected_abundances // channel: [ path(expected_abundances) ] or empty
++    ch_expected_profile    // channel: [ path(expected_profile) ] or empty
++    ch_metadata_category   // channel: tokenized metadata_category, or empty
++
+     main:
+ 
+     //
+@@ -41,6 +53,16 @@ workflow NFCORE_AMPLISEQ {
+         params.multiqc_logo,
+         params.multiqc_methods_description,
+         params.outdir,
++        ch_metadata,
++        ch_report_template,
++        ch_report_css,
++        ch_report_logo,
++        ch_report_abstract,
++        ch_pplace_sheet,
++        ch_expected_sequences,
++        ch_expected_abundances,
++        ch_expected_profile,
++        ch_metadata_category,
+     )
+     emit:
+     multiqc_report = AMPLISEQ.out.multiqc_report // channel: /path/to/multiqc_report.html
+@@ -252,7 +274,18 @@ workflow {
+     //
+     // WORKFLOW: Run main workflow
+     //
+-    NFCORE_AMPLISEQ ()
++    NFCORE_AMPLISEQ (
++        PIPELINE_INITIALISATION.out.metadata,
++        PIPELINE_INITIALISATION.out.report_template,
++        PIPELINE_INITIALISATION.out.report_css,
++        PIPELINE_INITIALISATION.out.report_logo,
++        PIPELINE_INITIALISATION.out.report_abstract,
++        PIPELINE_INITIALISATION.out.pplace_sheet,
++        PIPELINE_INITIALISATION.out.expected_sequences,
++        PIPELINE_INITIALISATION.out.expected_abundances,
++        PIPELINE_INITIALISATION.out.expected_profile,
++        PIPELINE_INITIALISATION.out.metadata_category,
++    )
+ 
+     //
+     // SUBWORKFLOW: Run completion tasks
+diff --git a/modules/local/summary_report.nf b/modules/local/summary_report.nf
+index b40dfb72c..c5ef5694f 100644
+--- a/modules/local/summary_report.nf
++++ b/modules/local/summary_report.nf
+@@ -88,7 +88,7 @@ process SUMMARY_REPORT  {
+         "workflow_manifest_version='${workflow.manifest.version}'",
+         "workflow_scriptid='${workflow.scriptId.substring(0,10)}'",
+         params.report_title ? "report_title='$params.report_title'" : "",
+-        report_abstract ? "report_abstract='$params.report_abstract'" : "",
++        report_abstract ? "report_abstract='$report_abstract'" : "",
+         meta.single_end ? "flag_single_end=TRUE" : "",
+         metadata ? "metadata='$metadata'" : "",
+         input_samplesheet ? "input_samplesheet='$input_samplesheet'" : "",
+diff --git a/modules/nf-core/cutadapt/cutadapt.diff b/modules/nf-core/cutadapt/cutadapt.diff
+index 6f34e4753..7cf165fa3 100644
+--- a/modules/nf-core/cutadapt/cutadapt.diff
++++ b/modules/nf-core/cutadapt/cutadapt.diff
+@@ -22,9 +22,26 @@ Changes in 'cutadapt/main.nf':
+      """
+      cutadapt \\
+          --cores $task.cpus \\
++@@ -33,12 +34,13 @@
++ 
++     stub:
++     def prefix = task.ext.prefix ?: "${meta.id}"
+++    outformat = task.ext.outformat ?: "fastq"
++     if (meta.single_end) {
++-        output_command = "echo '' | gzip > ${prefix}.trim.fastq.gz ;"
+++        output_command = "echo '' | gzip > ${prefix}.trim.${outformat}.gz ;"
++     }
++     else {
++-        output_command  = "echo '' | gzip > ${prefix}_1.trim.fastq.gz ;"
++-        output_command += "echo '' | gzip > ${prefix}_2.trim.fastq.gz ;"
+++        output_command  = "echo '' | gzip > ${prefix}_1.trim.${outformat}.gz ;"
+++        output_command += "echo '' | gzip > ${prefix}_2.trim.${outformat}.gz ;"
++     }
++     """
++     ${output_command}
+ 
+ 'modules/nf-core/cutadapt/environment.yml' is unchanged
+-'modules/nf-core/cutadapt/tests/main.nf.test' is unchanged
+-'modules/nf-core/cutadapt/tests/main.nf.test.snap' is unchanged
+ 'modules/nf-core/cutadapt/tests/nextflow.config' is unchanged
++'modules/nf-core/cutadapt/tests/main.nf.test.snap' is unchanged
++'modules/nf-core/cutadapt/tests/main.nf.test' is unchanged
+ ************************************************************
+diff --git a/modules/nf-core/cutadapt/main.nf b/modules/nf-core/cutadapt/main.nf
+index 5699a675f..f0abd60cb 100644
+--- a/modules/nf-core/cutadapt/main.nf
++++ b/modules/nf-core/cutadapt/main.nf
+@@ -34,12 +34,13 @@ process CUTADAPT {
+ 
+     stub:
+     def prefix = task.ext.prefix ?: "${meta.id}"
++    outformat = task.ext.outformat ?: "fastq"
+     if (meta.single_end) {
+-        output_command = "echo '' | gzip > ${prefix}.trim.fastq.gz ;"
++        output_command = "echo '' | gzip > ${prefix}.trim.${outformat}.gz ;"
+     }
+     else {
+-        output_command  = "echo '' | gzip > ${prefix}_1.trim.fastq.gz ;"
+-        output_command += "echo '' | gzip > ${prefix}_2.trim.fastq.gz ;"
++        output_command  = "echo '' | gzip > ${prefix}_1.trim.${outformat}.gz ;"
++        output_command += "echo '' | gzip > ${prefix}_2.trim.${outformat}.gz ;"
+     }
+     """
+     ${output_command}
+diff --git a/subworkflows/local/utils_nfcore_ampliseq_pipeline/main.nf b/subworkflows/local/utils_nfcore_ampliseq_pipeline/main.nf
+index 76c9d29d6..a6740b7cc 100644
+--- a/subworkflows/local/utils_nfcore_ampliseq_pipeline/main.nf
++++ b/subworkflows/local/utils_nfcore_ampliseq_pipeline/main.nf
+@@ -40,6 +40,53 @@ workflow PIPELINE_INITIALISATION {
+ 
+     ch_versions = channel.empty()
+ 
++    //
++    // Build channels from self-contained parameters
++    // (params only used to construct these channels; no other logic depends on how they're built)
++    //
++    if (params.metadata) {
++        ch_metadata = channel.fromPath( params.metadata )
++    } else { ch_metadata = channel.empty() }
++
++    // report sources
++    ch_report_template = channel.fromPath("${params.report_template}", checkIfExists: true)
++    ch_report_css = channel.fromPath("${params.report_css}", checkIfExists: true)
++    ch_report_logo = channel.fromPath("${params.report_logo}", checkIfExists: true)
++    ch_report_abstract = params.report_abstract ? channel.fromPath(params.report_abstract) : []
++
++    // Parse the --pplace_sheet file if present (may be overwritten later in AMPLISEQ based on --dada_ref_taxonomy)
++    ch_pplace_sheet = channel.empty()
++    if ( params.pplace_sheet ) {
++        ch_pplace_sheet = channel.fromPath(params.pplace_sheet)
++            .splitCsv(header: true)
++            .map { it ->
++                [
++                    meta: [
++                        id: it.target,
++                        min_bitscore: it.min_bitscore
++                    ],
++                    data: [
++                        alignmethod:    it.alignmethod  ?: 'clustalo',
++                        hmm:            file(it.hmm,  checkIfExists: true),
++                        extract_hmm:    it.extract_hmm,
++                        refseqfile:     it.refseqfile   ? file(it.refseqfile,   checkIfExists: true) : [],
++                        refphylogeny:   it.refphylogeny ? file(it.refphylogeny, checkIfExists: true) : [],
++                        model:          it.model,
++                        taxonomy:       it.taxonomy     ? file(it.taxonomy,     checkIfExists: true) : []
++                    ]
++                ]
++            }
++    }
++
++    ch_expected_sequences = params.expected_sequences ? channel.fromPath( params.expected_sequences ) : channel.empty()
++    ch_expected_abundances = params.expected_abundances ? channel.fromPath( params.expected_abundances ) : channel.empty()
++    ch_expected_profile = params.expected_profile ? channel.fromPath( params.expected_profile ) : channel.empty()
++
++    // Select metadata categories for diversity analysis & ancom, if explicitly specified
++    if (params.metadata_category) {
++        ch_metadata_category = channel.fromList(params.metadata_category.tokenize(','))
++    } else { ch_metadata_category = channel.empty() }
++
+     //
+     // Print version and exit if required and dump pipeline parameters to JSON file
+     //
+@@ -124,7 +171,17 @@ workflow PIPELINE_INITIALISATION {
+     }
+ 
+     emit:
+-    versions    = ch_versions
++    versions             = ch_versions
++    metadata             = ch_metadata             // channel: [ path(metadata) ] or empty
++    report_template      = ch_report_template       // channel: [ path(report_template) ]
++    report_css           = ch_report_css            // channel: [ path(report_css) ]
++    report_logo          = ch_report_logo           // channel: [ path(report_logo) ]
++    report_abstract      = ch_report_abstract       // channel: [ path(report_abstract) ] or []
++    pplace_sheet         = ch_pplace_sheet          // channel: parsed pplace_sheet rows, or empty
++    expected_sequences   = ch_expected_sequences    // channel: [ path(expected_sequences) ] or empty
++    expected_abundances  = ch_expected_abundances   // channel: [ path(expected_abundances) ] or empty
++    expected_profile     = ch_expected_profile      // channel: [ path(expected_profile) ] or empty
++    metadata_category    = ch_metadata_category     // channel: tokenized metadata_category, or empty
+ }
+ 
+ /*
+diff --git a/tests/sintax.nf.test.snap b/tests/sintax.nf.test.snap
+index f5d0e6dfe..2e5b61317 100644
+--- a/tests/sintax.nf.test.snap
++++ b/tests/sintax.nf.test.snap
+@@ -81,9 +81,6 @@
+                 "MERGE_STATS_FILTERTAXA": {
+                     "R": "4.5.2"
+                 },
+-                "METADATA_ALL": {
+-                    "R": "4.5.2"
+-                },
+                 "METADATA_PAIRWISE": {
+                     "R": "4.5.2"
+                 },
+@@ -514,134 +511,6 @@
+                 "qiime2/ancom/Category-var2-level-4/q2templateassets/js/child.js",
+                 "qiime2/ancom/Category-var2-level-4/q2templateassets/js/jquery-3.2.0.min.js",
+                 "qiime2/ancom/Category-var2-level-4/q2templateassets/js/parent.js",
+-                "qiime2/ancom/Category-var3-ASV",
+-                "qiime2/ancom/Category-var3-ASV/ancom.tsv",
+-                "qiime2/ancom/Category-var3-ASV/css",
+-                "qiime2/ancom/Category-var3-ASV/css/spinkit.css",
+-                "qiime2/ancom/Category-var3-ASV/data.tsv",
+-                "qiime2/ancom/Category-var3-ASV/index.html",
+-                "qiime2/ancom/Category-var3-ASV/js",
+-                "qiime2/ancom/Category-var3-ASV/js/vega-embed.min.js",
+-                "qiime2/ancom/Category-var3-ASV/js/vega.min.js",
+-                "qiime2/ancom/Category-var3-ASV/licenses",
+-                "qiime2/ancom/Category-var3-ASV/licenses/vega-embed.txt",
+-                "qiime2/ancom/Category-var3-ASV/licenses/vega.txt",
+-                "qiime2/ancom/Category-var3-ASV/percent-abundances.tsv",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/css",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/css/base-template.css",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/css/bootstrap.min.css",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/css/normalize.css",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/css/tab-parent.css",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts/glyphicons-halflings-regular.eot",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts/glyphicons-halflings-regular.svg",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts/glyphicons-halflings-regular.ttf",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts/glyphicons-halflings-regular.woff",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/fonts/glyphicons-halflings-regular.woff2",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/img",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/img/qiime2-rect-200.png",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/js",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/js/bootstrap.min.js",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/js/child.js",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/js/jquery-3.2.0.min.js",
+-                "qiime2/ancom/Category-var3-ASV/q2templateassets/js/parent.js",
+-                "qiime2/ancom/Category-var3-level-2",
+-                "qiime2/ancom/Category-var3-level-2/ancom.tsv",
+-                "qiime2/ancom/Category-var3-level-2/css",
+-                "qiime2/ancom/Category-var3-level-2/css/spinkit.css",
+-                "qiime2/ancom/Category-var3-level-2/data.tsv",
+-                "qiime2/ancom/Category-var3-level-2/index.html",
+-                "qiime2/ancom/Category-var3-level-2/js",
+-                "qiime2/ancom/Category-var3-level-2/js/vega-embed.min.js",
+-                "qiime2/ancom/Category-var3-level-2/js/vega.min.js",
+-                "qiime2/ancom/Category-var3-level-2/licenses",
+-                "qiime2/ancom/Category-var3-level-2/licenses/vega-embed.txt",
+-                "qiime2/ancom/Category-var3-level-2/licenses/vega.txt",
+-                "qiime2/ancom/Category-var3-level-2/percent-abundances.tsv",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/css",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/css/base-template.css",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/css/bootstrap.min.css",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/css/normalize.css",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/css/tab-parent.css",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts/glyphicons-halflings-regular.eot",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts/glyphicons-halflings-regular.svg",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts/glyphicons-halflings-regular.ttf",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts/glyphicons-halflings-regular.woff",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/fonts/glyphicons-halflings-regular.woff2",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/img",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/img/qiime2-rect-200.png",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/js",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/js/bootstrap.min.js",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/js/child.js",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/js/jquery-3.2.0.min.js",
+-                "qiime2/ancom/Category-var3-level-2/q2templateassets/js/parent.js",
+-                "qiime2/ancom/Category-var3-level-3",
+-                "qiime2/ancom/Category-var3-level-3/ancom.tsv",
+-                "qiime2/ancom/Category-var3-level-3/css",
+-                "qiime2/ancom/Category-var3-level-3/css/spinkit.css",
+-                "qiime2/ancom/Category-var3-level-3/data.tsv",
+-                "qiime2/ancom/Category-var3-level-3/index.html",
+-                "qiime2/ancom/Category-var3-level-3/js",
+-                "qiime2/ancom/Category-var3-level-3/js/vega-embed.min.js",
+-                "qiime2/ancom/Category-var3-level-3/js/vega.min.js",
+-                "qiime2/ancom/Category-var3-level-3/licenses",
+-                "qiime2/ancom/Category-var3-level-3/licenses/vega-embed.txt",
+-                "qiime2/ancom/Category-var3-level-3/licenses/vega.txt",
+-                "qiime2/ancom/Category-var3-level-3/percent-abundances.tsv",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/css",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/css/base-template.css",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/css/bootstrap.min.css",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/css/normalize.css",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/css/tab-parent.css",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts/glyphicons-halflings-regular.eot",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts/glyphicons-halflings-regular.svg",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts/glyphicons-halflings-regular.ttf",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts/glyphicons-halflings-regular.woff",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/fonts/glyphicons-halflings-regular.woff2",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/img",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/img/qiime2-rect-200.png",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/js",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/js/bootstrap.min.js",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/js/child.js",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/js/jquery-3.2.0.min.js",
+-                "qiime2/ancom/Category-var3-level-3/q2templateassets/js/parent.js",
+-                "qiime2/ancom/Category-var3-level-4",
+-                "qiime2/ancom/Category-var3-level-4/ancom.tsv",
+-                "qiime2/ancom/Category-var3-level-4/css",
+-                "qiime2/ancom/Category-var3-level-4/css/spinkit.css",
+-                "qiime2/ancom/Category-var3-level-4/data.tsv",
+-                "qiime2/ancom/Category-var3-level-4/index.html",
+-                "qiime2/ancom/Category-var3-level-4/js",
+-                "qiime2/ancom/Category-var3-level-4/js/vega-embed.min.js",
+-                "qiime2/ancom/Category-var3-level-4/js/vega.min.js",
+-                "qiime2/ancom/Category-var3-level-4/licenses",
+-                "qiime2/ancom/Category-var3-level-4/licenses/vega-embed.txt",
+-                "qiime2/ancom/Category-var3-level-4/licenses/vega.txt",
+-                "qiime2/ancom/Category-var3-level-4/percent-abundances.tsv",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/css",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/css/base-template.css",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/css/bootstrap.min.css",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/css/normalize.css",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/css/tab-parent.css",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts/glyphicons-halflings-regular.eot",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts/glyphicons-halflings-regular.svg",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts/glyphicons-halflings-regular.ttf",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts/glyphicons-halflings-regular.woff",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/fonts/glyphicons-halflings-regular.woff2",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/img",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/img/qiime2-rect-200.png",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/js",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/js/bootstrap.min.js",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/js/child.js",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/js/jquery-3.2.0.min.js",
+-                "qiime2/ancom/Category-var3-level-4/q2templateassets/js/parent.js",
+                 "qiime2/barplot",
+                 "qiime2/barplot/dist",
+                 "qiime2/barplot/dist/bundle.js",
+diff --git a/workflows/ampliseq.nf b/workflows/ampliseq.nf
+index 893429c77..252cafbd5 100644
+--- a/workflows/ampliseq.nf
++++ b/workflows/ampliseq.nf
+@@ -124,6 +124,16 @@ workflow AMPLISEQ {
+     multiqc_logo
+     multiqc_methods_description
+     outdir
++    ch_metadata            // channel: [ path(metadata) ] or empty
++    ch_report_template     // channel: [ path(report_template) ]
++    ch_report_css          // channel: [ path(report_css) ]
++    ch_report_logo         // channel: [ path(report_logo) ]
++    ch_report_abstract     // channel: [ path(report_abstract) ] or []
++    ch_pplace_sheet        // channel: initial value built in PIPELINE_INITIALISATION from --pplace_sheet, or empty; may be overwritten below based on --dada_ref_taxonomy database config (the "pplace" key)
++    ch_expected_sequences  // channel: [ path(expected_sequences) ] or empty
++    ch_expected_abundances // channel: [ path(expected_abundances) ] or empty
++    ch_expected_profile    // channel: [ path(expected_profile) ] or empty
++    ch_metadata_category   // channel: tokenized metadata_category, or empty
+ 
+     main:
+     // set empty channels
+@@ -134,15 +144,6 @@ workflow AMPLISEQ {
+     //
+     // INPUT AND VARIABLES
+     //
+-    if (params.metadata) {
+-        ch_metadata = channel.fromPath( params.metadata )
+-    } else { ch_metadata = channel.empty() }
+-
+-    // report sources
+-    ch_report_template = channel.fromPath("${params.report_template}", checkIfExists: true)
+-    ch_report_css = channel.fromPath("${params.report_css}", checkIfExists: true)
+-    ch_report_logo = channel.fromPath("${params.report_logo}", checkIfExists: true)
+-    ch_report_abstract = params.report_abstract ? channel.fromPath(params.report_abstract) : []
+ 
+     // Set non-params Variables
+ 
+@@ -203,30 +204,6 @@ workflow AMPLISEQ {
+         error("One of `--input`, `--input_fasta`, `--input_folder` must be provided!")
+     }
+ 
+-    // Parse the --pplace_sheet file if present
+-    ch_pplace_sheet = channel.empty()
+-    if ( params.pplace_sheet ) {
+-        ch_pplace_sheet = channel.fromPath(params.pplace_sheet)
+-            .splitCsv(header: true)
+-            .map { it ->
+-                [
+-                    meta: [
+-                        id: it.target,
+-                        min_bitscore: it.min_bitscore
+-                    ],
+-                    data: [
+-                        alignmethod:    it.alignmethod  ?: 'clustalo',
+-                        hmm:            file(it.hmm,  checkIfExists: true),
+-                        extract_hmm:    it.extract_hmm,
+-                        refseqfile:     it.refseqfile   ? file(it.refseqfile,   checkIfExists: true) : [],
+-                        refphylogeny:   it.refphylogeny ? file(it.refphylogeny, checkIfExists: true) : [],
+-                        model:          it.model,
+-                        taxonomy:       it.taxonomy     ? file(it.taxonomy,     checkIfExists: true) : []
+-                    ]
+-                ]
+-            }
+-    }
+-
+     //
+     // Add primer info to sequencing files
+     //
+@@ -1113,7 +1090,7 @@ workflow AMPLISEQ {
+ 
+         //Select metadata categories for diversity analysis & ancom
+         if (params.metadata_category) {
+-            ch_metacolumn_all = channel.fromList(params.metadata_category.tokenize(','))
++            ch_metacolumn_all = ch_metadata_category
+             ch_metacolumn_pairwise = METADATA_PAIRWISE ( ch_metadata ).category.splitCsv().flatten()
+             ch_metacolumn_pairwise = ch_metacolumn_all.join(ch_metacolumn_pairwise)
+         } else if (params.ancom || params.ancombc || params.ancombc2 || !params.skip_diversity_indices) {
+@@ -1221,10 +1198,10 @@ workflow AMPLISEQ {
+             params.expected_sequences_region,
+             run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.abs_fasta : ch_asv_fasta,  // observed sequences (fasta)
+             run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.rel_tsv : ch_asv_table,      // observed sequences (abundance table)
+-            run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.rel_tax : channel.empty(),   // observed taxonomic profile
+-            params.expected_sequences ? channel.fromPath( params.expected_sequences ) : channel.empty(),  // expected sequences (fasta)
+-            params.expected_abundances ? channel.fromPath( params.expected_abundances ) : channel.empty(),// expected sequences (abundance table)
+-            params.expected_profile ? channel.fromPath( params.expected_profile ) : channel.empty() // expected taxonomic profile
++            run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.rel_tax : channel.empty(), // observed taxonomic profile
++            ch_expected_sequences,  // expected sequences (fasta)
++            ch_expected_abundances, // expected sequences (abundance table)
++            ch_expected_profile     // expected taxonomic profile
+         )
+     }
+ 

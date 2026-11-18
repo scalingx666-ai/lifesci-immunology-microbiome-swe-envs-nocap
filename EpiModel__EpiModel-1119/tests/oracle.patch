@@ -1,0 +1,480 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 866af439..ba7aa669 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -35,6 +35,7 @@ Depends:
+ Imports:
+     future (>= 1.40.0),
+     future.apply,
++    globals,
+     graphics,
+     grDevices,
+     stats,
+diff --git a/NEWS.md b/NEWS.md
+index 63025139..3a02f4a8 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -9,6 +9,7 @@
+ 
+ ### OTHER
+ 
++-   `netsim()` and `netdx()` with `ncores > 1` now warn when modules or network model formulas refer to global objects or functions from attached packages, which multisession workers do not have, and `?netsim` has a new Parallel Simulation section on making such code self-contained (#1104).
+ -   `netsim()` now stops with an error naming the module when a module returns `dat` with an R attribute set on it, which is what happens when magrittr is attached after EpiModel and masks `set_attr()` (#1120).
+ 
+ ## EpiModel 2.7.0
+diff --git a/R/net.fn.utils.R b/R/net.fn.utils.R
+index 78d16a21..2a1fe364 100644
+--- a/R/net.fn.utils.R
++++ b/R/net.fn.utils.R
+@@ -14,6 +14,150 @@ cap_ncores <- function(ncores, detected = parallel::detectCores()) {
+   return(min(detected, ncores))
+ }
+ 
++# Warn when the user code passed to netsim() or netdx() in `...` (modules,
++# updaters, trackers, network model formulas) refers to global objects, or to
++# functions from packages attached in this session, that the workers do not
++# have (#1104). Code defined in a script looks these up in the global
++# environment and on the search path, and workers in separate R sessions
++# (multisession, cluster) start with neither. Sequential and forked
++# (multicore) workers share this session's, so they are not checked. Nothing
++# is exported: the user decides how the workers get what the code needs.
++warn_worker_globals <- function(fn, ...) {
++  if (inherits(future::plan(), c("sequential", "multicore"))) {
++    return(invisible(NULL))
++  }
++  found <- worker_globals(list(...))
++  if (length(found) == 0) {
++    return(invisible(NULL))
++  }
++  uses <- paste0("  ", names(found), ": ", vapply(found, paste, character(1), collapse = ", "))
++  warning(
++    fn, "() runs the simulations in separate R sessions, which do not have the global objects ",
++    "or attached packages of this one. Code passed to ", fn, "() uses:\n",
++    paste(uses, collapse = "\n"),
++    "\nSee the Parallel Simulation section of ?netsim.",
++    call. = FALSE
++  )
++}
++
++# The global objects, and the functions from packages that the workers do not
++# attach, that the user code in `objs` refers to, grouped by where the code
++# was found (such as "control$my.FUN")
++worker_globals <- function(objs) {
++  on_workers <- worker_packages()
++  queue <- find_user_code(objs)
++  queue <- queue[order(lengths(lapply(queue, `[[`, "path")))]
++  done <- list()
++  found <- character(0)
++  while (length(queue) > 0) {
++    obj <- queue[[1]]$obj
++    path <- queue[[1]]$path
++    queue <- queue[-1]
++    if (any(vapply(done, identical, logical(1), obj))) next
++    done <- c(done, list(obj))
++
++    g <- tryCatch({
++      expr <- if (is.function(obj)) obj else as.call(c(as.name("{"), formula_term_args(obj)))
++      globals::globalsOf(expr, envir = environment(obj), substitute = FALSE,
++                         mustExist = FALSE, recursive = TRUE)
++    }, error = function(e) NULL)
++    where <- attr(g, "where")
++    inner <- list()
++    for (i in seq_along(g)) {
++      env <- where[[i]]
++      if (!is.environment(env) || identical(env, baseenv()) || isNamespace(env)) next
++      if (identical(env, globalenv())) {
++        name <- paste0(names(g)[i], if (is.function(g[[i]])) "()")
++      } else if (startsWith(environmentName(env), "package:")) {
++        pkg <- sub("^package:", "", environmentName(env))
++        if (pkg %in% on_workers) next
++        name <- paste0(names(g)[i], "() from ", pkg)
++      } else {
++        # an environment that travels with the code, such as the trimmed
++        # environment of a fitted model's formula, which holds the formation
++        # formula from the script; scanned next, under the same path
++        inner <- c(inner, find_user_code(g[[i]], path))
++        next
++      }
++      if (!name %in% names(found)) {
++        found[name] <- paste(utils::head(path, 2), collapse = "")
++      }
++    }
++    queue <- c(inner, queue)
++  }
++  if (length(found) == 0) {
++    return(list())
++  }
++  split(names(found), factor(found, levels = unique(found)))
++}
++
++# Functions and formulas in `x`, walked recursively through lists, that come
++# from a script rather than from package code: their environment leads to the
++# global environment, or to the base environment for formulas trimmed with
++# trim_env(), which may hold user formulas in turn. Each comes with its path
++# in `x`, such as c("control", "$my.FUN").
++find_user_code <- function(x, path = character(0)) {
++  if (is.function(x) || inherits(x, "formula")) {
++    env <- environment(x)
++    top <- if (is.environment(env)) topenv(env)
++    if (identical(top, globalenv()) || identical(top, baseenv())) {
++      return(list(list(obj = x, path = path)))
++    }
++    return(list())
++  }
++  if (is.list(x) && !is.data.frame(x) && !inherits(x, "network")) {
++    x <- unclass(x)
++    nms <- if (is.null(names(x))) character(length(x)) else names(x)
++    out <- lapply(seq_along(x), function(i) {
++      step <- if (!nzchar(nms[i])) {
++        paste0("[[", i, "]]")
++      } else if (length(path) == 0) {
++        nms[i]
++      } else {
++        paste0("$", nms[i])
++      }
++      find_user_code(x[[i]], c(path, step))
++    })
++    return(unlist(out, recursive = FALSE))
++  }
++  list()
++}
++
++# The expressions that a network model formula evaluates: the arguments of its
++# terms, and the terms of formulas passed to operator terms such as
++# Passthrough(), but not the term names (edges, concurrent), which are not R
++# objects
++formula_term_args <- function(expr) {
++  if (!is.call(expr)) {
++    return(list())
++  }
++  if (identical(expr[[1]], as.name("~"))) {
++    return(formula_term_args(expr[[length(expr)]]))
++  }
++  args <- unname(as.list(expr)[-1])
++  if (is.name(expr[[1]]) && as.character(expr[[1]]) %in% c("+", "-", "(", "offset")) {
++    return(unlist(lapply(args, formula_term_args), recursive = FALSE))
++  }
++  is_formula <- vapply(args, function(a) is.call(a) && identical(a[[1]], as.name("~")), logical(1))
++  c(args[!is_formula], unlist(lapply(args[is_formula], formula_term_args), recursive = FALSE))
++}
++
++# Packages attached on a worker that runs EpiModel code: the default packages,
++# future, and EpiModel with the packages it depends on
++worker_packages <- function() {
++  pkgs <- "EpiModel"
++  i <- 0
++  while (i < length(pkgs)) {
++    i <- i + 1
++    deps <- utils::packageDescription(pkgs[i], fields = "Depends")
++    if (!is.na(deps)) {
++      deps <- sub("^\\s*([[:alnum:].]+).*$", "\\1", strsplit(deps, ",")[[1]])
++      pkgs <- union(pkgs, setdiff(deps, "R"))
++    }
++  }
++  c("base", getOption("defaultPackages"), "future", pkgs)
++}
++
+ #' @title Check Degree Distribution for Balance in Target Statistics
+ #'
+ #' @description Checks for consistency in the implied network statistics
+diff --git a/R/net.inputs.R b/R/net.inputs.R
+index 86626046..08b41cbb 100644
+--- a/R/net.inputs.R
++++ b/R/net.inputs.R
+@@ -456,7 +456,8 @@ init.net <- function(i.num, r.num, i.num.g2, r.num.g2,
+ #' @param nsims The total number of disease simulations.
+ #' @param ncores Number of processor cores to run multiple simulations on, using
+ #'        the `future` framework with `multisession`. See `future.use.plan` for
+-#'        other `future` backends.
++#'        other `future` backends. Each worker is a separate R session; see the
++#'        Parallel Simulation section of [`netsim`].
+ #' @param start For models with network resimulation, time point to start up the simulation. For
+ #'        restarted simulations, this must be one greater than the final time step in the prior
+ #'        simulation and must be less than the value in `nsteps`. Every simulation restarts from
+diff --git a/R/netclique.R b/R/netclique.R
+index 98071511..c915a04a 100644
+--- a/R/netclique.R
++++ b/R/netclique.R
+@@ -101,7 +101,10 @@
+ #' every `netsim` object simulated from it. Define the function at the top
+ #' level of a script or in a package, not inside another function whose local
+ #' objects (fitted networks, population data) would then be saved with each
+-#' simulation.
++#' simulation. The global objects and helper functions it calls are not saved
++#' with it, so define them again before restarting a saved simulation in a new
++#' session. They are not available on multisession workers either (see the
++#' Parallel Simulation section of [`netsim`]).
+ #'
+ #' The rule decides the group attribute of every arriving node. A value given
+ #' by `attr.rules` in [control.net()] or by a custom arrivals module is
+diff --git a/R/netdx.R b/R/netdx.R
+index 8eb1cde5..71264ce1 100644
+--- a/R/netdx.R
++++ b/R/netdx.R
+@@ -52,7 +52,8 @@
+ #'        objects, with one entry per simulation. Accessible at `$network`.
+ #' @param verbose If `TRUE`, print progress to the console.
+ #' @param ncores Number of processor cores to run multiple simulations
+-#'        on, using the `future` framework.
++#'        on, using the `future` framework. Each worker is a separate R
++#'        session; see the Parallel Simulation section of [`netsim`].
+ #' @param skip.dissolution If `TRUE`, skip over the calculations of
+ #'        duration and dissolution stats in `netdx`.
+ #' @param future.use.plan If `FALSE`, `netdx` uses `multisession` with `workers = ncores` for its
+@@ -369,6 +370,9 @@ netdx <- function(x, nsims = 1, dynamic = TRUE, nsteps = NULL,
+       ncores_eff <- min(nsims, ncores)
+       with(future::plan("multisession", workers = ncores_eff), local = TRUE)
+     } # else if (isTRUE(future.use.plan)) - use plan defined by user
++    warn_worker_globals("netdx", x = x, nwstats.formula = nwstats.formula,
++                        set.control.ergm = set.control.ergm,
++                        set.control.tergm = set.control.tergm)
+     diag.sim <- future.apply::future_replicate(
+       nsims, dosim(), simplify = FALSE, future.seed = TRUE
+     )
+diff --git a/R/netsim.R b/R/netsim.R
+index 15e5a541..79109bd9 100644
+--- a/R/netsim.R
++++ b/R/netsim.R
+@@ -87,6 +87,29 @@
+ #' time. Without it, the network structure evolves independently of the
+ #' epidemic and demographic dynamics.
+ #'
++#' @section Parallel Simulation:
++#' With `ncores > 1`, `netsim` runs the simulations on a `multisession` plan
++#' from the `future` package (see `future.use.plan` in [`control.net`] for
++#' other plans). Each worker is a separate R session with EpiModel attached and
++#' an empty global environment. Modules, updaters, trackers, and network model
++#' formulas are copied to the workers, but the global objects they refer to and
++#' the packages attached with `library()` are not. Code that runs with
++#' `ncores = 1` can then fail with "object not found", or call a different
++#' function: after `library(dplyr)`, `lag()` is `stats::lag()` on the workers.
++#' `netsim` and [`netdx`] warn when user code refers to such objects or
++#' functions.
++#'
++#' To make the code self-contained, pass values through [`param.net`] and read
++#' them with [`get_param`], call package functions as `pkg::fun()`, keep helper
++#' functions in a package, and store the objects a formula needs in its
++#' environment with [statnet.common::trim_env()], as in
++#' `trim_env(~nodefactor("grp", levels = lv), keep = "lv")`. For larger
++#' projects, run the simulations in parallel outside `netsim`, so that each
++#' worker loads and creates what it needs, and call `netsim` with
++#' `ncores = 1`. A `multicore` plan, set with `future::plan("multicore")` and
++#' `future.use.plan = TRUE`, forks this session and shares its global objects
++#' and packages, but is not available on Windows or in RStudio.
++#'
+ #' @section Partnership Histories (Cumulative Edgelist):
+ #' For contact tracing, partnership-duration analysis, or reachability
+ #' analysis, enable cumulative-edgelist tracking via
+@@ -288,6 +311,7 @@ netsim <- function(x, param, init, control) {
+     } else if (control$ncores > 1 && isFALSE(control$future.use.plan)) {
+       with(future::plan("multisession", workers = control$ncores), local = TRUE)
+     } # else if (isTRUE(control$future.use.plan)) - use plan defined by user
++    warn_worker_globals("netsim", x = x, param = param, init = init, control = control)
+     dat_list <- future.apply::future_lapply(
+       seq_len(control$nsims),
+       function(s) {
+diff --git a/man/control.net.Rd b/man/control.net.Rd
+index 6a40a946..5532456c 100644
+--- a/man/control.net.Rd
++++ b/man/control.net.Rd
+@@ -70,7 +70,8 @@ section of \code{\link{netsim}}).}
+ 
+ \item{ncores}{Number of processor cores to run multiple simulations on, using
+ the \code{future} framework with \code{multisession}. See \code{future.use.plan} for
+-other \code{future} backends.}
++other \code{future} backends. Each worker is a separate R session; see the
++Parallel Simulation section of \code{\link{netsim}}.}
+ 
+ \item{resimulate.network}{If \code{TRUE}, resimulate the network at each time step. This is required
+ when the epidemic or demographic processes impact the network structure (e.g., vital
+diff --git a/man/netclique.Rd b/man/netclique.Rd
+index 28bacac2..7605ac05 100644
+--- a/man/netclique.Rd
++++ b/man/netclique.Rd
+@@ -136,7 +136,10 @@ The layer keeps \code{arrivals.FUN} with its enclosing environment, and so does
+ every \code{netsim} object simulated from it. Define the function at the top
+ level of a script or in a package, not inside another function whose local
+ objects (fitted networks, population data) would then be saved with each
+-simulation.
++simulation. The global objects and helper functions it calls are not saved
++with it, so define them again before restarting a saved simulation in a new
++session. They are not available on multisession workers either (see the
++Parallel Simulation section of \code{\link{netsim}}).
+ 
+ The rule decides the group attribute of every arriving node. A value given
+ by \code{attr.rules} in \code{\link[=control.net]{control.net()}} or by a custom arrivals module is
+diff --git a/man/netdx.Rd b/man/netdx.Rd
+index 00f09c57..33cbbf88 100644
+--- a/man/netdx.Rd
++++ b/man/netdx.Rd
+@@ -78,7 +78,8 @@ objects, with one entry per simulation. Accessible at \verb{$network}.}
+ \item{verbose}{If \code{TRUE}, print progress to the console.}
+ 
+ \item{ncores}{Number of processor cores to run multiple simulations
+-on, using the \code{future} framework.}
++on, using the \code{future} framework. Each worker is a separate R
++session; see the Parallel Simulation section of \code{\link{netsim}}.}
+ 
+ \item{skip.dissolution}{If \code{TRUE}, skip over the calculations of
+ duration and dissolution stats in \code{netdx}.}
+diff --git a/man/netsim.Rd b/man/netsim.Rd
+index 6cb9135d..eecc57a4 100644
+--- a/man/netsim.Rd
++++ b/man/netsim.Rd
+@@ -131,6 +131,31 @@ time. Without it, the network structure evolves independently of the
+ epidemic and demographic dynamics.
+ }
+ 
++\section{Parallel Simulation}{
++
++With \code{ncores > 1}, \code{netsim} runs the simulations on a \code{multisession} plan
++from the \code{future} package (see \code{future.use.plan} in \code{\link{control.net}} for
++other plans). Each worker is a separate R session with EpiModel attached and
++an empty global environment. Modules, updaters, trackers, and network model
++formulas are copied to the workers, but the global objects they refer to and
++the packages attached with \code{library()} are not. Code that runs with
++\code{ncores = 1} can then fail with "object not found", or call a different
++function: after \code{library(dplyr)}, \code{lag()} is \code{stats::lag()} on the workers.
++\code{netsim} and \code{\link{netdx}} warn when user code refers to such objects or
++functions.
++
++To make the code self-contained, pass values through \code{\link{param.net}} and read
++them with \code{\link{get_param}}, call package functions as \code{pkg::fun()}, keep helper
++functions in a package, and store the objects a formula needs in its
++environment with \code{\link[statnet.common:trim_env]{statnet.common::trim_env()}}, as in
++\code{trim_env(~nodefactor("grp", levels = lv), keep = "lv")}. For larger
++projects, run the simulations in parallel outside \code{netsim}, so that each
++worker loads and creates what it needs, and call \code{netsim} with
++\code{ncores = 1}. A \code{multicore} plan, set with \code{future::plan("multicore")} and
++\code{future.use.plan = TRUE}, forks this session and shares its global objects
++and packages, but is not available on Windows or in RStudio.
++}
++
+ \section{Partnership Histories (Cumulative Edgelist)}{
+ 
+ For contact tracing, partnership-duration analysis, or reachability
+diff --git a/tests/testthat/test-netsim-parallel.R b/tests/testthat/test-netsim-parallel.R
+index 41102726..dbc8b633 100644
+--- a/tests/testthat/test-netsim-parallel.R
++++ b/tests/testthat/test-netsim-parallel.R
+@@ -91,3 +91,120 @@ test_that("netsim par, 2 sims, 1 cores", {
+   expect_true(mod$control$ncores == 1)
+ 
+ })
++
++test_that("worker_globals() finds what user code needs from this session", {
++  # Functions and formulas from a script look up their objects in the global
++  # environment and on the search path, which multisession workers do not
++  # share (#1104)
++  genv <- globalenv()
++  skip_if(exists("edges", envir = genv, inherits = FALSE))
++  assign("epimodel_test_lv", 2, envir = genv)
++  assign("epimodel_test_rate", function() 0.5, envir = genv)
++  assign("edges", 100, envir = genv)
++  on.exit(rm(list = c("epimodel_test_lv", "epimodel_test_rate", "edges"),
++             envir = genv))
++
++  # EpiModel and stats are attached on the workers, testthat is not, and
++  # qualified calls and locals are fine
++  my_mod <- function(dat, at) {
++    expect_true(TRUE)
++    testthat::expect_false(FALSE)
++    lv <- rbinom(1, 1, 0.5)
++    set_epi(dat, "rate", epimodel_test_rate() + lv)
++  }
++  environment(my_mod) <- genv
++
++  # a closure carries its own objects
++  carry_env <- new.env(parent = genv)
++  carry_env$epimodel_test_lv <- 3
++  carried_mod <- function(dat, at) epimodel_test_lv
++  environment(carried_mod) <- carry_env
++
++  # term names are not R objects, term arguments are; trim_env() carries them
++  formation <- ~edges + nodefactor("grp", levels = epimodel_test_lv) +
++    offset(edges)
++  environment(formation) <- genv
++  carried <- trim_env(formation, keep = "epimodel_test_lv")
++  nwstats <- ~edges + offset(nodematch("grp"))
++  environment(nwstats) <- genv
++
++  found <- worker_globals(list(
++    x = list(formation = formation, carried = carried),
++    nwstats.formula = nwstats,
++    control = list(my.FUN = my_mod, carried.FUN = carried_mod)
++  ))
++  expect_named(found, c("x$formation", "control$my.FUN"))
++  expect_identical(found[["x$formation"]], "epimodel_test_lv")
++  expect_setequal(found[["control$my.FUN"]],
++                  c("epimodel_test_rate()", "expect_true() from testthat"))
++
++  # through the trimmed formula environment of a fitted model
++  nw <- network_initialize(n = 50)
++  nw <- set_vertex_attribute(nw, "grp", rep(1:2, 25))
++  formation <- ~edges + nodefactor("grp", levels = epimodel_test_lv)
++  environment(formation) <- genv
++  coef.diss <- dissolution_coefs(~offset(edges), 10, 0)
++  for (nested in c(TRUE, FALSE)) {
++    est <- netest(nw, formation, target.stats = c(24, 12), coef.diss,
++                  nested.edapprox = nested, verbose = FALSE)
++    expect_identical(worker_globals(list(x = est)),
++                     list("x$formation" = "epimodel_test_lv"))
++  }
++})
++
++test_that("netsim() and netdx() warn about what multisession workers lack", {
++  skip_on_cran()
++
++  genv <- globalenv()
++  assign("epimodel_test_lv", 2, envir = genv)
++  assign("epimodel_test_rate", function() 0.5, envir = genv)
++  on.exit(rm(list = c("epimodel_test_lv", "epimodel_test_rate"), envir = genv))
++
++  # a global helper in a branch that never runs, so the simulation completes
++  my_mod <- function(dat, at) {
++    if (at < 0) dat <- set_epi(dat, "rate", epimodel_test_rate())
++    dat
++  }
++  environment(my_mod) <- genv
++
++  nw <- network_initialize(n = 50)
++  nw <- set_vertex_attribute(nw, "grp", rep(1:2, 25))
++  coef.diss <- dissolution_coefs(~offset(edges), 10, 0)
++  est <- netest(nw, ~edges, target.stats = 24, coef.diss, verbose = FALSE)
++  param <- param.net(inf.prob = 0.3, act.rate = 0.5)
++  init <- init.net(i.num = 10)
++
++  control <- control.net(type = NULL, nsims = 2, nsteps = 3, ncores = 2,
++                         infection.FUN = infection.net, my.FUN = my_mod,
++                         verbose = FALSE)
++  expect_warning(mod <- netsim(est, param, init, control),
++                 "control\\$my.FUN: epimodel_test_rate\\(\\)")
++  expect_s3_class(mod, "netsim")
++
++  control <- control.net(type = NULL, nsims = 2, nsteps = 3, ncores = 1,
++                         infection.FUN = infection.net, my.FUN = my_mod,
++                         verbose = FALSE)
++  expect_no_warning(netsim(est, param, init, control),
++                    message = "separate R sessions")
++
++  # nothing is exported, so a formula that needs a global object fails on the
++  # workers, and one that carries it with trim_env() runs
++  formation <- ~edges + nodefactor("grp", levels = epimodel_test_lv)
++  environment(formation) <- genv
++  est <- netest(nw, formation, target.stats = c(24, 12), coef.diss,
++                verbose = FALSE)
++  expect_error(
++    expect_warning(netdx(est, nsims = 2, nsteps = 3, ncores = 2, verbose = FALSE),
++                   "x\\$formation: epimodel_test_lv"),
++    "epimodel_test_lv"
++  )
++
++  formation <- trim_env(formation, keep = "epimodel_test_lv")
++  est <- netest(nw, formation, target.stats = c(24, 12), coef.diss,
++                verbose = FALSE)
++  expect_no_warning(
++    dx <- netdx(est, nsims = 2, nsteps = 3, ncores = 2, verbose = FALSE),
++    message = "separate R sessions"
++  )
++  expect_s3_class(dx, "netdx")
++})

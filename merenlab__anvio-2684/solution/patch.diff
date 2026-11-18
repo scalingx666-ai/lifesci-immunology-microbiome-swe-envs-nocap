@@ -1,0 +1,113 @@
+diff --git a/anvio/__init__.py b/anvio/__init__.py
+index 143e45922c..7e5f27ede5 100644
+--- a/anvio/__init__.py
++++ b/anvio/__init__.py
+@@ -3526,6 +3526,22 @@ def TABULATE(table, header, numalign="right", max_width=0):
+                      "you to choose how many gaps there can be in the chain on either side of the metabolite in "
+                      "the network. Very conservatively set to 0, as in no gaps allowed."}
+                 ),
++    'max-reactions-for-pathway-map-walk': (
++            ['--max-reactions-for-pathway-map-walk'],
++            {'default': None,
++             'type': int,
++             'metavar': 'INT',
++             'required': False,
++             'help': "Truncate pathway map walks at this number of reactions. By default there is no limit, "
++                     "but with certain inputs some pathway maps yield very long walks (sometimes even to "
++                     "the point of causing memory issues). Note that setting this parameter bounds the walk length "
++                     "for all pathway maps, so it may be a good idea to first identify problematic maps using the "
++                     "`--debug` flag, run the program once while excluding those problematic maps with `--exclude-pathway-maps`, "
++                     "and THEN run the program again using this flag to bound the pathway map walk only for those maps "
++                     "with `--include-pathway-maps`. It's likely that if you need this flag, something is wrong (like an infinite "
++                     "cycle in the walk), so check the Pathway Map walk evidence carefully to make sure results are biologically "
++                     "meaningful."}
++                ),
+     'add-reactions-to-output': (
+             ['--add-reactions-to-output'],
+             {'default': False,
+diff --git a/anvio/cli/predict_metabolic_exchanges.py b/anvio/cli/predict_metabolic_exchanges.py
+index 607760c5f4..6752e042d1 100755
+--- a/anvio/cli/predict_metabolic_exchanges.py
++++ b/anvio/cli/predict_metabolic_exchanges.py
+@@ -88,6 +88,7 @@ def get_args():
+                                                             "number of genome pairs to process in parallel (but each comparison will get just 1 thread)."}))
+     groupE.add_argument(*anvio.A('no-pathway-walk'), **anvio.K('no-pathway-walk'))
+     groupE.add_argument(*anvio.A('pathway-walk-only'), **anvio.K('pathway-walk-only'))
++    groupE.add_argument(*anvio.A('max-reactions-for-pathway-map-walk'), **anvio.K('max-reactions-for-pathway-map-walk'))
+ 
+     return parser.get_args(parser)
+ 
+diff --git a/anvio/docs/programs/anvi-predict-metabolic-exchanges.md b/anvio/docs/programs/anvi-predict-metabolic-exchanges.md
+index 6e5aa6bece..5e156a23c0 100644
+--- a/anvio/docs/programs/anvi-predict-metabolic-exchanges.md
++++ b/anvio/docs/programs/anvi-predict-metabolic-exchanges.md
+@@ -222,6 +222,21 @@ Resource requirement: Your computer (or the job you submitted to a high-performa
+ {:.notice}
+ Why >12 threads? Well, 4 * 3 = 12, plus there is one additional thread on which the main program is running while waiting for its child processes for a total usage of n=13 threads (confused? read the yellow box under the first example). If you are paying _really_ close attention, you might realize that each child process needs to run on its own thread while spawning its own set of (grand)child processes. Good catch! We account for this by allowing each child process to create `t-1` threads (where `t` is the `--num-threads` value) so that the total per-process footprint is equal to `--num-threads`. So in this example, technically only 3 Pathway Map walks are done at once for each genome pair comparison even though we set `--num-threads` to 4. At large scales, we cannot necessarily afford to ignore an extra thread per child process like we do for the parent process.
+ 
++### The program is running out of memory?
++
++If this program starts consuming tons of memory and taking ages to run at the Pathway Map walk step, it's likely stuck in an infinite cycle of reactions for one of the Pathway Maps. We have sanity checks to prevent this sort of thing, but we cannot guarantee that we've identified all problematic cases. The good thing is that these sort of issues are input-dependent, so you can avoid them by excluding problematic maps with the `--exclude-pathway-maps` flag (if you cannot figure out which maps are problematic from the regular program output, try re-running the program with `--debug`).
++
++If you don't want to exclude specific Maps entirely from your analysis, one workaround is to use the `--max-reactions-for-pathway-map-walk` parameter to truncate problematic walks early. Note that this upper bound on reaction chain length applies globally, so it's probably best to use it only on problematic Pathway Maps:
++
++{{ codestart }}
++anvi-predict-metabolic-exchanges -e %(external-genomes)s \
++                                 -O ANY_PREFIX \
++                                 --max-reactions 25 \
++                                 --include-pathway-maps 00061
++{{ codestop }}
++
++Just keep in mind when you interpret the results that all reaction chain lengths in the evidence output will be artificially capped at the value you set, and that long chains could be technical artifacts from cycles rather than biologically relevant.
++
+ ## Technical Details
+ 
+ This section describes how the predictions of metabolic exchanges are done, for a given pair of genomes.
+diff --git a/anvio/metabolicexchanges.py b/anvio/metabolicexchanges.py
+index 76cc01a850..4ad2fa56bc 100644
+--- a/anvio/metabolicexchanges.py
++++ b/anvio/metabolicexchanges.py
+@@ -54,6 +54,7 @@ def __init__(self, args, format_args_for_single_estimator=False, run=run_quiet):
+         self.report_compounds_with_no_prediction = A('report_compounds_with_no_prediction')
+         self.no_pathway_walk = A('no_pathway_walk')
+         self.pathway_walk_only = A('pathway_walk_only')
++        self.max_reactions_for_pathway_map_walk = A('max_reactions_for_pathway_map_walk')
+ 
+         # this class can either receive the in/exclude_pathway_maps attributes as a string (from the client program)
+         # or as a set (when initializing it directly in Python, as is done in the MultiPredictor class)
+@@ -292,6 +293,7 @@ def predict_exchanges(self, output_files_dictionary=None, return_data_dicts=Fals
+             # Hence, we strictly control the number of threads in use by having two functions for doing essentially the same thing.
+             # (BONUS: the single-threaded version has more precise terminal output since it knows exactly what is currently being processed)
+             self.run.warning("", header="PATHWAY MAP WALK OUTPUT", lc='cyan')
++            self.run.info("Max number of reactions in any given walk", self.max_reactions_for_pathway_map_walk)
+             if self.num_threads == 1:
+                 failed_maps = self.walk_all_pathway_maps_singlethread()
+             else:
+@@ -478,6 +480,7 @@ def get_args_for_pathway_walker(self, net, pathway_map, fate, gaps):
+         walker_args.kegg_pathway_number = pathway_map
+         walker_args.compound_fate = fate
+         walker_args.max_gaps = gaps
++        walker_args.max_reactions = self.max_reactions_for_pathway_map_walk
+         walker_args.keep_intermediate_chains = True
+         walker_args.verbose = False
+         return walker_args
+@@ -518,6 +521,9 @@ def walk_all_pathway_maps_singlethread(self):
+             self.progress.update(f"{processed_count} / {num_pms_to_process} Pathway Maps (current Map: {pm})")
+             try:
+                 for g in self.genomes_to_compare:
++                    if anvio.DEBUG:
++                        self.progress.reset()
++                        self.run.info_single(f"Started walking over map {pm} for genome {g}")
+                     wargs = self.get_args_for_pathway_walker(self.genomes_to_compare[g]['network'], pm, fate='produce', gaps=self.maximum_gaps)
+                     walker = nw.KGMLNetworkWalker(wargs)
+                     production_chains = walker.get_chains()
+@@ -546,6 +552,9 @@ def walk_all_pathway_maps_singlethread(self):
+                         else:
+                             self.compound_to_pathway_walk_chains[modelseed_id][pm][g] = {'produce': production_chains[compound] if compound in production_chains else None,
+                                                                                 'consume': consumption_chains[compound] if compound in consumption_chains else None}
++                    if anvio.DEBUG:
++                        self.progress.reset()
++                        self.run.info_single(f"Successfully finished map {pm} for genome {g}")
+             except ConfigError as e:
+                 self.progress.reset()
+                 self.run.warning(f"Just FYI, attempting to do a pathway walk for Pathway Map {pm} resulted in an "

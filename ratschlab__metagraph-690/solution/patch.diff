@@ -1,0 +1,183 @@
+diff --git a/metagraph/src/graph/alignment/annotation_buffer.cpp b/metagraph/src/graph/alignment/annotation_buffer.cpp
+index 893150717c..7e882115f0 100644
+--- a/metagraph/src/graph/alignment/annotation_buffer.cpp
++++ b/metagraph/src/graph/alignment/annotation_buffer.cpp
+@@ -107,13 +107,17 @@ void AnnotationBuffer::fetch_queued_annotations() {
+                     queued_nodes.push_back(base_path[i]);
+                 }
+             } else if (find_a == node_to_cols_.end() && find_b != node_to_cols_.end()) {
+-                node_to_cols_.try_emplace(path[i], find_b->second);
+-                if (find_b->second == nannot) {
++                // copy the value first: inserting may reallocate the map and
++                // invalidate find_b
++                size_t label_i = find_b->second;
++                node_to_cols_.try_emplace(path[i], label_i);
++                if (label_i == nannot) {
+                     queued_rows.push_back(row);
+                     queued_nodes.push_back(path[i]);
+                 }
+             } else if (find_a != node_to_cols_.end() && find_b == node_to_cols_.end()) {
+-                node_to_cols_.try_emplace(base_path[i], find_a->second);
++                size_t label_i = find_a->second;
++                node_to_cols_.try_emplace(base_path[i], label_i);
+             } else {
+                 size_t label_i = std::min(find_a->second, find_b->second);
+                 if (label_i != nannot) {
+@@ -195,7 +199,7 @@ auto AnnotationBuffer::get_labels_and_coords(node_index node) const
+     if (it == node_to_cols_.end() || it->second == nannot)
+         return ret_val;
+ 
+-    ret_val.first = &column_sets_.data()[it->second];
++    ret_val.first = &get_cached_column_set(it->second);
+ 
+     if (has_coordinates()) {
+         assert(static_cast<size_t>(it - node_to_cols_.begin()) < label_coords_.size());
+diff --git a/metagraph/src/graph/alignment/annotation_buffer.hpp b/metagraph/src/graph/alignment/annotation_buffer.hpp
+index ef302d769a..d34ab8cb15 100644
+--- a/metagraph/src/graph/alignment/annotation_buffer.hpp
++++ b/metagraph/src/graph/alignment/annotation_buffer.hpp
+@@ -1,6 +1,8 @@
+ #ifndef __ANNOTATION_BUFFER_HPP__
+ #define __ANNOTATION_BUFFER_HPP__
+ 
++#include <deque>
++
+ #include "alignment.hpp"
+ #include "graph/annotated_dbg.hpp"
+ #include "annotation/int_matrix/base/int_matrix.hpp"
+@@ -36,7 +38,8 @@ class AnnotationBuffer {
+     bool has_coordinates() const { return multi_int_; }
+ 
+     // Get the annotations and coordinates of a node if they have been fetched.
+-    // The returned pointers are valid until next fetch_queued_annotations().
++    // The returned label pointer stays valid for the lifetime of the buffer.
++    // The coordinate pointer is valid until next fetch_queued_annotations().
+     std::pair<const Columns*, const CoordinateSet*>
+     get_labels_and_coords(node_index node) const;
+ 
+@@ -59,10 +62,11 @@ class AnnotationBuffer {
+         return it - column_sets_.begin();
+     }
+ 
+-    // Fetch a label set given its index returned by `cache_column_set()`
++    // Fetch a label set given its index returned by `cache_column_set()`.
++    // The reference stays valid when more column sets are cached later.
+     inline const Columns& get_cached_column_set(size_t i) const {
+         assert(i < column_sets_.size());
+-        return column_sets_.data()[i];
++        return column_sets_.values_container()[i];
+     }
+ 
+   private:
+@@ -73,7 +77,10 @@ class AnnotationBuffer {
+ 
+     // keep a unique set of annotation rows
+     // the first element is the empty label set
+-    VectorSet<Columns, utils::VectorHash> column_sets_;
++    // Stored in a deque, so that inserting new column sets never moves the
++    // existing ones: callers hold references to them while caching new sets.
++    VectorSet<Columns, utils::VectorHash, uint64_t, std::equal_to<Columns>,
++              std::allocator<Columns>, std::deque<Columns>> column_sets_;
+      // map node to index in |column_sets_|
+     VectorMap<node_index, size_t> node_to_cols_;
+     // coordinate sets for all nodes in |node_to_cols_| in the same order
+diff --git a/metagraph/tests/annotation/test_aligner_labeled.cpp b/metagraph/tests/annotation/test_aligner_labeled.cpp
+index 2e9653ec9f..e55c599aa7 100644
+--- a/metagraph/tests/annotation/test_aligner_labeled.cpp
++++ b/metagraph/tests/annotation/test_aligner_labeled.cpp
+@@ -1,5 +1,6 @@
+ #include <gtest/gtest.h>
+ 
++#include <random>
+ #include <unordered_set>
+ 
+ #include "../graph/all/test_dbg_helpers.hpp"
+@@ -11,6 +12,7 @@
+ #include "annotation/annotation_converters.hpp"
+ #include "common/seq_tools/reverse_complement.hpp"
+ #include "graph/alignment/aligner_labeled.hpp"
++#include "graph/alignment/annotation_buffer.hpp"
+ #include "graph/representation/canonical_dbg.hpp"
+ #include "kmer/alphabets.hpp"
+ #include "seq_io/sequence_io.hpp"
+@@ -61,6 +63,80 @@ typedef ::testing::Types<std::pair<DBGHashFast, annot::ColumnCompressed<>>,
+ 
+ TYPED_TEST_SUITE(LabeledAlignerTest, FewGraphAnnotationPairTypes);
+ 
++TYPED_TEST(LabeledAlignerTest, CachedColumnSetsKeepTheirAddress) {
++    // The labeled extender holds references to cached column sets while it
++    // caches new ones, so caching must never move the existing sets.
++    size_t k = 4;
++    const std::vector<std::string> sequences { "GCAAT", "AATGCTT" };
++    const std::vector<std::string> labels { "A", "B" };
++
++    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
++                                       typename TypeParam::second_type>(k, sequences, labels);
++    const auto &graph = anno_graph->get_graph();
++    AnnotationBuffer buffer(graph, anno_graph->get_annotator());
++
++    auto path = map_to_nodes_sequentially(graph, sequences[1]);
++    ASSERT_EQ(sequences[1].size() - k + 1, path.size());
++    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(path));
++    buffer.fetch_queued_annotations();
++
++    const auto *node_labels = buffer.get_labels(path.front());
++    ASSERT_TRUE(node_labels);
++    const auto node_labels_copy = *node_labels;
++
++    size_t first = buffer.cache_column_set(AnnotationBuffer::Columns{ 0, 1 });
++    const auto &first_set = buffer.get_cached_column_set(first);
++
++    // enough new sets to reallocate any contiguous storage several times
++    for (AnnotationBuffer::Columns::value_type i = 2; i < 10'000; ++i) {
++        buffer.cache_column_set(AnnotationBuffer::Columns{ i });
++    }
++
++    EXPECT_EQ(&first_set, &buffer.get_cached_column_set(first));
++    EXPECT_EQ((AnnotationBuffer::Columns{ 0, 1 }), first_set);
++    EXPECT_EQ(node_labels, buffer.get_labels(path.front()));
++    EXPECT_EQ(node_labels_copy, *node_labels);
++}
++
++#if ! _PROTEIN_GRAPH
++TYPED_TEST(LabeledAlignerTest, FetchBothStrandsInOneBatch) {
++    // Queue the forward path of a sequence and then its reverse complement in
++    // the same batch. On CANONICAL graphs, the reverse-complement nodes map to
++    // the forward nodes queued just before, and the buffer grows (and may
++    // reallocate) while it registers them. Every node must get its labels.
++    size_t k = 21;
++    std::mt19937 rng(42);
++    std::string sequence(5000, 'A');
++    for (char &c : sequence) {
++        c = "ACGT"[rng() % 4];
++    }
++    std::string rc_sequence = sequence;
++    reverse_complement(rc_sequence.begin(), rc_sequence.end());
++
++    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
++                                       typename TypeParam::second_type>(
++        k, { sequence }, { "A" }, DeBruijnGraph::CANONICAL
++    );
++    const auto &graph = anno_graph->get_graph();
++    AnnotationBuffer buffer(graph, anno_graph->get_annotator());
++
++    auto path = map_to_nodes_sequentially(graph, sequence);
++    auto rc_path = map_to_nodes_sequentially(graph, rc_sequence);
++    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(path));
++    buffer.queue_path(std::vector<DeBruijnGraph::node_index>(rc_path));
++    buffer.fetch_queued_annotations();
++
++    for (const auto *nodes : { &path, &rc_path }) {
++        for (auto node : *nodes) {
++            ASSERT_NE(DeBruijnGraph::npos, node);
++            const auto *labels = buffer.get_labels(node);
++            ASSERT_TRUE(labels) << node;
++            EXPECT_EQ(1u, labels->size()) << node;
++        }
++    }
++}
++#endif  // ! _PROTEIN_GRAPH
++
+ TYPED_TEST(LabeledAlignerTest, SimpleLinearGraph) {
+     size_t k = 4;
+     /*

@@ -1,0 +1,948 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f5900c84..69f2a8ee 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,81 @@
+ Notable changes to vdjtools v2. Releases before 3.0.0 are recorded in the git tags
+ (`v2.5.0` … `v2.9.0`) and their commit history.
+ 
++## 3.3.0 — 2026-08-12
++
++### Added — `vdjtools.model.viterbi`: the argmax side of the Pgen DP
++
++`pgen_nt` **sums** over every recombination that could produce a nucleotide CDR3.
++**`best_scenario(model, cdr3_nt, v=, j=)`** takes the **maximum** over the same loops and returns
++the single most likely one — which *is* the V/D/J boundary markup:
++
++```python
++from vdjtools.model import best_scenario
++sc = best_scenario(model, cdr3_nt, v=v_call, j=j_call)
++sc.v_end, sc.d_call, sc.d_start, sc.d_end, sc.j_start   # 0-based, half-open, CDR3-nt space
++```
++
++It re-derives nothing: every probability comes from `prepare()`'s tables, and the D placement is a
++max-product mirror of `pgen._d_middle` over the same `P(D|J)·P(delD|D)·Pins(VD)·Pins(DJ)` terms.
++
++⛔ **The D therefore obeys `P(D|J)`.** TRBD2 lies 3′ of the whole TRBJ1 cluster, so deletional
++joining can never produce a TRBD2–TRBJ1 pair and the model encodes that as a zero. An earlier draft
++here chose D by longest exact substring and ignored `j` entirely — it would have called the
++impossible pair. There is a regression test.
++
++Validated on 200–500 generated draws per locus: the V span **is** the V germline, the J span the J
++germline, the D span the D germline, `scenario_p ≤ pgen_nt` (a maximum cannot exceed the sum it is
++taken over), and `scenario_p` recomputes exactly from the reported path's own table entries.
++
++`infer_nt_bruteforce` is an exact but exponential **oracle for tests**.
++
++### Not added — `infer_nt` (amino-acid → nucleotide) raises
++
++⛔ Inferring a nucleotide CDR3 from an amino-acid one needs a max-product DP with traceback over the
++aa-constrained space; it is **not written**, and the entry point raises rather than dispatching to
++the oracle, because a silent fallback would look like a working feature.
++
++Two measurements say why the easy routes do not work:
++
++* **Enumeration cannot scale.** On VDJdb's 79,997 records the codon search space is a median
++  **5.3 × 10⁶ (TRA)** and **1.9 × 10⁷ (TRB)**; only 8.9 % / 1.6 % are ≤ 10⁵ candidates, and each
++  candidate costs a full `pgen_nt`.
++* ⛔ **Pinning the germline-templated flanks to shrink it is UNSOUND.** It excludes every sequence
++  whose germline was *trimmed*, and the true maximum can be one of them — caught against the
++  brute-force oracle (`CAVSDMRF` → `…GTGAGTGAC…`, pinned version returned `…GTGAGCGAT…`). Do not
++  reintroduce it as an optimisation.
++
++⚠ Both functions assume an **in-frame** CDR3 (`len(nt) == 3 × len(aa)`). Real productive receptors
++satisfy this; an out-of-frame draw does not (measured: 8 aa against 25 nt).
++
++### Changed
++
++- `arda-mapper` pinned to **>= 2.19.0** (was >= 2.5.5).
++
++### Fixed — `generate(model, n, seed=)` was not reproducible across processes
++
++Same seed, same wheel, a **new interpreter → a different draw**. Within one process it looked
++perfect, which is why no existing test caught it.
++
++Root cause: **`collapse_alleles`** — which `load_bundled(..., collapse=True)` runs by default —
++built its tables with unordered polars `group_by().agg()`. `group_by` is a multithreaded hash
++aggregation, so the collapsed table's **row order varied per process**; `_cum` then assigned the
++same cumulative interval to a different allele, and the same `rng.random()` drew a different one.
++`_pick` and `default_rng` were correct throughout — the ordering beneath them was not.
++
++⚠ **Not hash randomisation.** `PYTHONHASHSEED=0` did not help, which is what ruled it out and
++pointed at the aggregation. Same class as the nondeterminism recorded against arda's `correct`
++stage.
++
++Fixed by `maintain_order=True` on all 12 `group_by` calls in `collapse.py` and all 7 in
++`generate.py`. Verified identical across 5 separate processes on TRA, TRB and IGH.
++
++⛔ **This changes generated output** for a given seed — it has to, since the old order was
++arbitrary. Any recorded expectation from `generate()` predating 3.3.0 must be re-derived.
++
++New tests run the sampler in a **subprocess**, because an in-process test agrees even with the bug
++present; they fail 4 of 5 without the fix.
++
+ ## 3.2.0 — 2026-08-09
+ 
+ ### Fixed
+diff --git a/README.md b/README.md
+index 20457494..218a843d 100644
+--- a/README.md
++++ b/README.md
+@@ -104,9 +104,27 @@ native.pgen_nt(model, "TGTGCCAGCAGC...")        # nucleotide generation probabil
+ native.pgen_aa(model, "CASSLAPGATNEKLFF")       # amino-acid Pgen (codon-marginalised)
+ native.pgen_aa(model, "CASSLAPGATNEKLFF", mismatches=1)   # + the whole Hamming-1 ball
+ native.pgen_aa_batch(model, seqs, mismatches=1, threads=0)  # Pgen over many CDR3s, thread-parallel (~11×)
+-generate(model, 1000)                           # sample a repertoire -> polars DataFrame
++generate(model, 1000, seed=1)                    # sample a repertoire -> polars DataFrame
++                                                # seed= is process-stable from 3.3.0
+ ```
+ 
++Where Pgen *sums* over recombination scenarios, `model.viterbi` takes the **argmax** — the single
++most likely one, which is the V/D/J boundary markup:
++
++```python
++from vdjtools.model import best_scenario
++
++sc = best_scenario(model, "TGTGCCAGCAGCTTAGGGACAGGGGGCTACGAGCAGTACTTC",
++                   v="TRBV19*01", j="TRBJ2-7*01")     # ALLELE names, as the model's tables are
++
++sc.v_end, sc.d_call, sc.d_start, sc.d_end, sc.j_start   # 0-based, half-open, in CDR3-nt space
++# -> 8, 'TRBD1*01', 15, 24, 26
++```
++
++It reuses the same tables and the same loops as `pgen_nt`, so the chosen D obeys `P(D|J)` — a
++TRBD2–TRBJ1 pair is genomically impossible and cannot be called. ⛔ Inferring a *nucleotide* CDR3
++from an amino-acid one (`infer_nt`) is **not implemented yet** and raises rather than guessing.
++
+ Matches OLGA's Pgen to machine precision across all 7 loci, and adds tandem-D (D-D) support that
+ OLGA/IGoR lack. Learn a model from your own **non-functional** reads (out-of-frame *or* stop-codon — both escaped
+ selection, which is all a generative model needs) with `model.infer.infer_native`.
+diff --git a/docs/api.rst b/docs/api.rst
+index 451e5160..ad63b62f 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -69,6 +69,11 @@ Import, germline reference and stitching
+    :undoc-members:
+    :show-inheritance:
+ 
++.. automodule:: vdjtools.model.viterbi
++   :members:
++   :undoc-members:
++   :show-inheritance:
++
+ .. automodule:: vdjtools.model.data
+    :members:
+    :undoc-members:
+diff --git a/pyproject.toml b/pyproject.toml
+index 4f84b6cf..c67e4268 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "vdjtools"  # if the PyPI name is taken, fall back to a distinct dist name (cf. arda -> arda-mapper)
+-version = "3.2.0"
++version = "3.3.0"
+ description = "TCR/BCR repertoire analysis — Pgen/generation/inference, diversity, overlap, biomarkers (Python + C++)"
+ readme = "README.md"
+ requires-python = ">=3.10"
+@@ -36,7 +36,9 @@ dependencies = [
+     # its only runtime deps are polars + typer (already ours) + requests. It is imported
+     # lazily inside the functions that need it, so `import vdjtools` stays light. mmseqs2 is
+     # needed only for arda's alignment/annotate path, never for germline lookup or Pgen.
+-    "arda-mapper>=2.5.5",
++    # >=2.19.0: the germline anchors `model.reference` reads, plus arda 2.17.0+
++    # `junction_completed_nt` / 2.19.0 `--flag-chimeras` in the annotation path.
++    "arda-mapper>=2.19.0",
+     # seqtree = the fuzzy-search / e-value engine, vdjmatch = overlap + TCRnet on top of it.
+     # Phase 4/5 landed, so they are base deps too: without them a plain install cannot do
+     # error correction (preprocess.correct), fuzzy/similarity overlap, TCRnet, or
+diff --git a/python/vdjtools/__init__.py b/python/vdjtools/__init__.py
+index 862805ae..ab371684 100644
+--- a/python/vdjtools/__init__.py
++++ b/python/vdjtools/__init__.py
+@@ -15,5 +15,5 @@
+ feature that needs them is used.
+ """
+ 
+-__version__ = "3.2.0"
++__version__ = "3.3.0"
+ __all__ = ["__version__"]
+diff --git a/python/vdjtools/model/__init__.py b/python/vdjtools/model/__init__.py
+index 8dabe445..c031c494 100644
+--- a/python/vdjtools/model/__init__.py
++++ b/python/vdjtools/model/__init__.py
+@@ -15,6 +15,7 @@
+ from .rescale import rescale_usage
+ from .schema import Manifest
+ from .stitch import stitch_contig, stitch_frame
++from .viterbi import Scenario, best_scenario
+ 
+ __all__ = [
+     "analyze",
+@@ -37,4 +38,6 @@
+     "translate",
+     "stitch_contig",
+     "stitch_frame",
++    "Scenario",
++    "best_scenario",
+ ]
+diff --git a/python/vdjtools/model/collapse.py b/python/vdjtools/model/collapse.py
+index 6262b359..7d4c1c17 100644
+--- a/python/vdjtools/model/collapse.py
++++ b/python/vdjtools/model/collapse.py
+@@ -49,7 +49,7 @@ def _allele_weights(choice: pl.DataFrame, allele_col: str) -> pl.DataFrame:
+ def _collapse_choice(choice: pl.DataFrame, allele_col: str) -> pl.DataFrame:
+     """Marginal choice at gene resolution, relabelled ``gene*01``."""
+     return (choice.with_columns(_gene(allele_col).alias("_g"))
+-            .group_by("_g").agg(pl.col("p").sum())
++            .group_by("_g", maintain_order=True).agg(pl.col("p").sum())
+             .with_columns(pl.col("_g").map_elements(_rep, return_dtype=pl.Utf8).alias(allele_col))
+             .drop("_g").select(allele_col, "p"))
+ 
+@@ -60,7 +60,7 @@ def _collapse_conditional(tbl: pl.DataFrame, allele_col: str, weights: pl.DataFr
+     w = weights.rename({"_a": allele_col})
+     out = (tbl.join(w, on=allele_col, how="inner")
+            .with_columns(pw=pl.col("p") * pl.col("w"))
+-           .group_by(["_g", *bin_cols]).agg(pl.col("pw").sum().alias("p"))
++           .group_by(["_g", *bin_cols], maintain_order=True).agg(pl.col("pw").sum().alias("p"))
+            .with_columns(pl.col("_g").map_elements(_rep, return_dtype=pl.Utf8).alias(allele_col))
+            .drop("_g"))
+     return out.select(allele_col, *bin_cols, "p")
+@@ -105,17 +105,17 @@ def collapse_alleles(model: Model) -> Model:
+         # VJ: j_choice is P(J|V) keyed (v_allele, j_allele). Collapse J within each V allele
+         # (sum over J sub-alleles), then collapse V (weighted average over V sub-alleles).
+         jc = (t["j_choice"].with_columns(_gene("v_allele").alias("_gv"), _gene("j_allele").alias("_gj"))
+-              .group_by(["v_allele", "_gv", "_gj"]).agg(pl.col("p").sum()))   # sum J alleles
++              .group_by(["v_allele", "_gv", "_gj"], maintain_order=True).agg(pl.col("p").sum()))   # sum J alleles
+         jc = (jc.join(wv.rename({"_a": "v_allele", "_g": "_gv"}), on=["v_allele", "_gv"])
+               .with_columns(pw=pl.col("p") * pl.col("w"))
+-              .group_by(["_gv", "_gj"]).agg(pl.col("pw").sum().alias("p"))    # weighted avg over V alleles
++              .group_by(["_gv", "_gj"], maintain_order=True).agg(pl.col("pw").sum().alias("p"))    # weighted avg over V alleles
+               .with_columns(pl.col("_gv").map_elements(_rep, return_dtype=pl.Utf8).alias("v_allele"),
+                             pl.col("_gj").map_elements(_rep, return_dtype=pl.Utf8).alias("j_allele")))
+         new["j_choice"] = jc.select("v_allele", "j_allele", "p")
+         # j_5_del keyed by j_allele: weight by the J marginal P(J) = Σ_V P(J|V)P(V).
+         pv = _marginal(t["v_choice"], "v_allele").rename({"_a": "v_allele"})
+         jmarg = (t["j_choice"].join(pv, on="v_allele").with_columns(pj=pl.col("p") * pl.col("p_right"))
+-                 .group_by("j_allele").agg(pl.col("pj").sum().alias("p")))
++                 .group_by("j_allele", maintain_order=True).agg(pl.col("pj").sum().alias("p")))
+         wjm = _allele_weights(jmarg, "j_allele")
+         new["j_5_del"] = _collapse_conditional(t["j_5_del"], "j_allele", wjm, ["ndel"])
+ 
+@@ -125,17 +125,17 @@ def collapse_alleles(model: Model) -> Model:
+         # (weighted average over J sub-alleles, by j_choice usage).
+         wj_full = _allele_weights(t["j_choice"], "j_allele")
+         dg = (t["d_gene"].with_columns(_gene("j_allele").alias("_gj"), _gene("d_allele").alias("_gd"))
+-              .group_by(["j_allele", "_gj", "_gd"]).agg(pl.col("p").sum()))     # sum D alleles
++              .group_by(["j_allele", "_gj", "_gd"], maintain_order=True).agg(pl.col("p").sum()))     # sum D alleles
+         dg = (dg.join(wj_full.rename({"_a": "j_allele", "_g": "_gj"}), on=["j_allele", "_gj"])
+               .with_columns(pw=pl.col("p") * pl.col("w"))
+-              .group_by(["_gj", "_gd"]).agg(pl.col("pw").sum().alias("p"))       # weighted avg over J alleles
++              .group_by(["_gj", "_gd"], maintain_order=True).agg(pl.col("pw").sum().alias("p"))       # weighted avg over J alleles
+               .with_columns(pl.col("_gj").map_elements(_rep, return_dtype=pl.Utf8).alias("j_allele"),
+                             pl.col("_gd").map_elements(_rep, return_dtype=pl.Utf8).alias("d_allele")))
+         new["d_gene"] = dg.select("j_allele", "d_allele", "p")
+         # d_del keyed by d_allele: weight by the D marginal P(D) = Σ_J P(D|J)P(J).
+         pj = _marginal(t["j_choice"], "j_allele").rename({"_a": "j_allele"})
+         dmarg = (t["d_gene"].join(pj, on="j_allele").with_columns(pd=pl.col("p") * pl.col("p_right"))
+-                 .group_by("d_allele").agg(pl.col("pd").sum().alias("p")))
++                 .group_by("d_allele", maintain_order=True).agg(pl.col("pd").sum().alias("p")))
+         wdm = _allele_weights(dmarg, "d_allele")
+         bins = [c for c in t["d_del"].columns if c not in ("d_allele", "p")]
+         new["d_del"] = _collapse_conditional(t["d_del"], "d_allele", wdm, bins)
+@@ -144,10 +144,10 @@ def collapse_alleles(model: Model) -> Model:
+         if "d2_gene" in t:
+             wd1 = _allele_weights(dmarg, "d_allele")                     # weights over the parent D1
+             d2 = (t["d2_gene"].with_columns(_gene("d_allele").alias("_gd1"), _gene("d2_allele").alias("_gd2"))
+-                  .group_by(["d_allele", "_gd1", "_gd2"]).agg(pl.col("p").sum()))          # sum D2 sub-alleles
++                  .group_by(["d_allele", "_gd1", "_gd2"], maintain_order=True).agg(pl.col("p").sum()))          # sum D2 sub-alleles
+             d2 = (d2.join(wd1.rename({"_a": "d_allele", "_g": "_gd1"}), on=["d_allele", "_gd1"])
+                   .with_columns(pw=pl.col("p") * pl.col("w"))
+-                  .group_by(["_gd1", "_gd2"]).agg(pl.col("pw").sum().alias("p"))            # weighted avg over D1
++                  .group_by(["_gd1", "_gd2"], maintain_order=True).agg(pl.col("pw").sum().alias("p"))            # weighted avg over D1
+                   .with_columns(pl.col("_gd1").map_elements(_rep, return_dtype=pl.Utf8).alias("d_allele"),
+                                 pl.col("_gd2").map_elements(_rep, return_dtype=pl.Utf8).alias("d2_allele")))
+             new["d2_gene"] = d2.select("d_allele", "d2_allele", "p")
+@@ -156,7 +156,7 @@ def collapse_alleles(model: Model) -> Model:
+             pd1 = dmarg.select(pl.col("d_allele").alias("_a"), "p")
+             d2marg = (t["d2_gene"].join(pd1.rename({"_a": "d_allele"}), on="d_allele")
+                       .with_columns(pd2=pl.col("p") * pl.col("p_right"))
+-                      .group_by("d2_allele").agg(pl.col("pd2").sum().alias("p")))
++                      .group_by("d2_allele", maintain_order=True).agg(pl.col("pd2").sum().alias("p")))
+             wd2 = _allele_weights(d2marg, "d2_allele")
+             b2 = [c for c in t["d2_del"].columns if c not in ("d2_allele", "p")]
+             new["d2_del"] = _collapse_conditional(t["d2_del"], "d2_allele", wd2, b2)
+diff --git a/python/vdjtools/model/generate.py b/python/vdjtools/model/generate.py
+index 447113ca..f2447ae2 100644
+--- a/python/vdjtools/model/generate.py
++++ b/python/vdjtools/model/generate.py
+@@ -67,7 +67,7 @@ def usable(seg):
+         fun = set(g.filter(g["functional"])[f"{seg}_allele"].to_list())
+         col = f"{seg}_allele"
+         dtab = t[{"v": "v_3_del", "j": "j_5_del", "d": "d_del"}[seg]]
+-        recomb = set(dtab.group_by(col).agg(pl.col("p").sum().alias("s")).filter(pl.col("s") > 0)[col].to_list())
++        recomb = set(dtab.group_by(col, maintain_order=True).agg(pl.col("p").sum().alias("s")).filter(pl.col("s") > 0)[col].to_list())
+         return fun & recomb
+ 
+     uv, uj = usable("v"), usable("j")
+@@ -82,20 +82,20 @@ def _choice(df, allele_col, keep):
+     j_marg, j_given_v, d_given_j = None, {}, {}
+     if vdj:
+         j_marg = _choice(t["j_choice"], "j_allele", uj)
+-        for j, sub in t["d_gene"].filter(t["d_gene"]["d_allele"].is_in(list(ud))).group_by("j_allele"):
++        for j, sub in t["d_gene"].filter(t["d_gene"]["d_allele"].is_in(list(ud))).group_by("j_allele", maintain_order=True):
+             key = j[0] if isinstance(j, tuple) else j
+             if key in uj:
+                 d_given_j[key] = _cum(sub["d_allele"].to_numpy(), sub["p"].to_numpy())
+     else:
+         jgv = t["j_choice"].filter(t["j_choice"]["j_allele"].is_in(list(uj)))
+-        for vv, sub in jgv.group_by("v_allele"):
++        for vv, sub in jgv.group_by("v_allele", maintain_order=True):
+             key = vv[0] if isinstance(vv, tuple) else vv
+             if key in uv:
+                 j_given_v[key] = _cum(sub["j_allele"].to_numpy(), sub["p"].to_numpy())
+ 
+     def del_map(tab, allele_col):
+         out = {}
+-        for a, sub in tab.group_by(allele_col):
++        for a, sub in tab.group_by(allele_col, maintain_order=True):
+             key = a[0] if isinstance(a, tuple) else a
+             out[key] = _cum(sub["ndel"].to_numpy(), sub["p"].to_numpy())
+         return out
+@@ -104,7 +104,7 @@ def del_map(tab, allele_col):
+     delj = del_map(t["j_5_del"], "j_allele")
+     deld, deld_pairs = {}, {}
+     if vdj:
+-        for d, sub in t["d_del"].group_by("d_allele"):
++        for d, sub in t["d_del"].group_by("d_allele", maintain_order=True):
+             key = d[0] if isinstance(d, tuple) else d
+             pairs = np.stack([sub["ndel5"].to_numpy(), sub["ndel3"].to_numpy()], axis=1)
+             idx, cum = _cum(np.arange(len(pairs)), sub["p"].to_numpy())
+@@ -127,11 +127,11 @@ def del_map(tab, allele_col):
+         ndf = t["n_d"].sort("n_d")
+         p_nd = _cum(ndf["n_d"].to_numpy(), ndf["p"].to_numpy())
+         d2t = t["d2_gene"].filter(t["d2_gene"]["d2_allele"].is_in(list(ud)))
+-        for d1, sub in d2t.group_by("d_allele"):
++        for d1, sub in d2t.group_by("d_allele", maintain_order=True):
+             key = d1[0] if isinstance(d1, tuple) else d1
+             if key in ud:
+                 d2_given_d1[key] = _cum(sub["d2_allele"].to_numpy(), sub["p"].to_numpy())
+-        for d, sub in t["d2_del"].group_by("d2_allele"):
++        for d, sub in t["d2_del"].group_by("d2_allele", maintain_order=True):
+             key = d[0] if isinstance(d, tuple) else d
+             pairs = np.stack([sub["ndel5"].to_numpy(), sub["ndel3"].to_numpy()], axis=1)
+             idx, cum = _cum(np.arange(len(pairs)), sub["p"].to_numpy())
+diff --git a/python/vdjtools/model/viterbi.py b/python/vdjtools/model/viterbi.py
+new file mode 100644
+index 00000000..fa4b5ed5
+--- /dev/null
++++ b/python/vdjtools/model/viterbi.py
+@@ -0,0 +1,296 @@
++"""Most-likely nucleotide CDR3 for an amino-acid CDR3, and the recombination scenario behind it.
++
++VDJdb-style records carry ``(V, J, CDR3aa)`` and no nucleotides. :func:`infer_nt` returns the
++nucleotide CDR3 that maximises the model's generation probability, together with the argmax
++scenario — which *is* the V/D/J boundary markup (``v_end``, ``d_start``, ``d_end``, ``j_start``).
++
++**This is the argmax counterpart of a sum that already exists.** :func:`pgen.pgen_aa` marginalises
++over every nucleotide sequence encoding a given amino-acid CDR3; the most likely such sequence is
++the maximum of the same set, and :func:`pgen.pgen_nt`'s own loops — ``(V, len_v)``, ``(J, len_j)``,
++then the D/insertion middle — already enumerate the scenarios. Nothing here re-derives the
++recombination model: every probability comes from :func:`pgen.prepare`'s tables.
++
++Two objectives are deliberately separated, because they are not the same number:
++
++* :func:`infer_nt` maximises the **marginal** ``P(nt) = pgen_nt(nt)``, which sums over every
++  scenario that could produce that sequence. That is the right target for "the most likely
++  nucleotide sequence".
++* :func:`best_scenario` then maximises over scenarios **for that fixed sequence**, which is what the
++  boundary markup has to come from. The two maxima are over different things and taking the second
++  as an answer to the first would be wrong.
++
++⛔ **STATUS — read before using.**
++
++* :func:`best_scenario` is **complete and validated**. It needs no enumeration: it is a max-product
++  walk of the ``(V, len_v) x (J, len_j) x middle`` loops :func:`pgen.pgen_nt` already sums over.
++  Checked on 500 generated draws per locus: the reported V span is the V germline 500/500, the J
++  span the J germline 500/500, the D span the D germline 500/500 (TRB), and
++  ``scenario_p <= pgen_nt`` 500/500 — a max cannot exceed the sum it is taken over.
++* :func:`infer_nt_bruteforce` is **exact but exponential**, and exists as the TEST ORACLE.
++* ⛔ **There is no production ``infer_nt`` yet.** It needs a max-product DP over the
++  aa-constrained space (the argmax counterpart of :func:`pgen.pgen_aa`), which is not written.
++
++**Why brute force cannot be the answer, measured on the real VDJdb (79,997 records).** The codon
++search space — the product of synonymous-codon counts over the CDR3 — has a median of **5.3e6 for
++TRA** and **1.9e7 for TRB**; only **8.9 %** / **1.6 %** of records are at or under 1e5 candidates.
++Each candidate costs a full :func:`pgen.pgen_nt`, so enumeration is out by orders of magnitude.
++
++⛔ **And it cannot be rescued by pinning the germline-templated flanks**, which was tried and is
++**unsound**: pinning a codon to the V/J germline excludes every sequence in which that germline was
++*trimmed*, and the true maximum can be one of them. Caught against the brute-force oracle —
++``CAVSDMRF`` under ``TRAV21*01`` gives ``…GTGAGTGAC…`` where the pinned version returns
++``…GTGAGCGAT…``. The pin is gone; do not reintroduce it as an optimisation.
++
++⚠ Both functions assume an **in-frame** CDR3, i.e. ``len(nt) == 3 * len(aa)``. That is the VDJdb
++population (real, productive receptors) but NOT every draw from :func:`generate` — an out-of-frame
++rearrangement has e.g. 8 aa and 25 nt, and no in-frame nt can explain it. Test with
++``productive_only=True`` or the comparison is meaningless.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from itertools import product
++
++from .model import Model
++from .pgen import (_CODON_AA, _NUM2NT, _j_candidates, _p_insert, _v_candidates,
++                   _Prepared, pgen_nt, prepare)
++
++__all__ = ["Scenario", "best_scenario", "infer_nt_bruteforce", "codon_options"]
++
++
++def _prep(m) -> _Prepared:
++    """Accept a :class:`Model` or an already-:func:`pgen.prepare` -d one.
++
++    `prepare` is not cheap and callers annotating a whole table should hoist it out of the loop, so
++    both are accepted rather than forcing a re-prepare per record.
++    """
++    return m if isinstance(m, _Prepared) else prepare(m)
++
++#: aa -> the codons encoding it as STRINGS, sorted so every result is reproducible.
++#:
++#: ⚠ `pgen._CODON_AA` is keyed by a TUPLE OF NUCLEOTIDE INDICES (`_NT2NUM`: A0 C1 G2 T3), not by a
++#: string — `(3, 2, 1)` is "TGC". Everything here works in strings, so the conversion happens once.
++_AA2CODONS: dict[str, list[str]] = {}
++for _c, _a in _CODON_AA.items():
++    _AA2CODONS.setdefault(_a, []).append("".join(_NUM2NT[i] for i in _c))
++for _a in _AA2CODONS:
++    _AA2CODONS[_a].sort()
++
++
++@dataclass(frozen=True)
++class Scenario:
++    """A nucleotide CDR3 and the recombination that most likely produced it.
++
++    Coordinates are **0-based, half-open, in CDR3 nucleotide space** (the conserved Cys through the
++    conserved Phe/Trp, both included) — the same space as ``cdr3_nt`` itself. ``d_start``/``d_end``
++    are ``None`` when the model has no D (a VJ chain) or no D was placed.
++    """
++
++    cdr3_nt: str
++    v_call: str
++    j_call: str
++    v_end: int                      # nt contributed by the V germline: cdr3_nt[:v_end]
++    j_start: int                    # nt contributed by the J germline: cdr3_nt[j_start:]
++    d_call: str | None = None
++    d_start: int | None = None
++    d_end: int | None = None
++    pgen: float = 0.0               # marginal P(cdr3_nt) — the quantity infer_nt maximises
++    scenario_p: float = 0.0         # P of this single scenario; always <= pgen
++    n_candidates: int = 0           # nt sequences actually scored
++    truncated: bool = False         # the candidate set hit max_candidates
++    runner_up_pgen: float = 0.0     # 2nd-best marginal, for the margin
++
++    @property
++    def margin(self) -> float:
++        """``pgen / runner_up_pgen``. 1.0 means a tie; large means the argmax is unambiguous.
++
++        ⚠ Report this. With a long non-templated core many sequences are near-equally likely and a
++        bare "most likely" claim is then close to meaningless — the margin is what says so.
++        """
++        return self.pgen / self.runner_up_pgen if self.runner_up_pgen > 0 else float("inf")
++
++
++def codon_options(aa: str) -> list[list[str]]:
++    """Per residue, the codons encoding it. Unknown residues get no options (an empty list)."""
++    return [_AA2CODONS.get(a, []) for a in aa.upper()]
++
++
++def best_scenario(model_or_prep, cdr3_nt: str, v: str | None = None,
++                  j: str | None = None) -> Scenario | None:
++    """The single most likely recombination for a KNOWN nucleotide CDR3.
++
++    A max-product walk of exactly the loops :func:`pgen.pgen_nt` sums over — ``(V, P(V), len_v)`` ×
++    ``(J, P(J), len_j)`` × the middle — so the scenario space, the pruning and every probability are
++    the shipped ones. Returns ``None`` when no (V, J) pair can explain the sequence.
++
++    ⚠ The D placement is taken from the middle by the same gapless scan the model uses; ``d_call``
++    is ``None`` for a VJ chain.
++    """
++    prep = _prep(model_or_prep)
++    s = cdr3_nt.upper()
++    vdj = prep.chain_type == "VDJ"
++    v_cands = _v_candidates(prep, s, [v] if v else prep.functional_v)
++    j_cands = _j_candidates(prep, s, [j] if j else prep.functional_j)
++
++    best = None
++    for V, pv, v_opts in v_cands:
++        for J, j_opts in j_cands:
++            pj = prep.p_j.get(J if vdj else (V, J), 0.0)
++            if pj == 0.0:
++                continue
++            for len_v, _nv, p_dv in v_opts:
++                for len_j, _nj, p_dj in j_opts:
++                    if len_v + len_j > len(s):
++                        continue
++                    middle = s[len_v:len(s) - len_j]
++                    # ⛔ MAX throughout, including over the D placement. Ranking (V, J, trims) by the
++                    # SUM over middles and only then picking a D would answer a different question:
++                    # the most likely (V, J, trims) MARGINALLY, whose best D need not lie on the
++                    # single most likely path. This function's contract is one path.
++                    if vdj:
++                        inner, D, off, dlen = _best_vdj_middle(prep, J, middle)
++                    else:
++                        inner, D, off, dlen = _vj_middle(prep, middle), None, None, 0
++                    if inner == 0.0:
++                        continue
++                    p = pv * pj * p_dv * p_dj * inner
++                    if best is None or p > best[0]:
++                        best = (p, V, J, len_v, len_j, D, off, dlen)
++    if best is None:
++        return None
++    p, V, J, len_v, len_j, D, off, dlen = best
++    d_call = D
++    d_start = d_end = None
++    if D is not None and off is not None:
++        d_start, d_end = len_v + off, len_v + off + dlen
++    return Scenario(cdr3_nt=s, v_call=V, j_call=J, v_end=len_v, j_start=len(s) - len_j,
++                    d_call=d_call, d_start=d_start, d_end=d_end, scenario_p=p)
++
++
++def _vj_middle(prep, middle: str) -> float:
++    """P(the whole middle as VJ insertions). A VJ chain has one term, so max and sum coincide."""
++    return _p_insert(middle, prep.p_ins["vj"], prep.R["vj"], prep.bias["vj"], from_right=False)
++
++
++def _best_vdj_middle(prep, j: str, middle: str):
++    """``(p, D, offset, length)`` — the single most likely D placement inside ``middle``.
++
++    A max-product mirror of :func:`pgen._d_middle`, which sums
++    ``P(D|J)·P(delD|D)·Pins(VD)·Pins(DJ)`` over every D, both trims and every position. Same terms,
++    same tables, ``max`` instead of ``+`` — so the winner is the argmax of exactly the distribution
++    the model defines, not a heuristic standing next to it.
++
++    ⛔ ``P(D|J) == 0`` prunes the pair, which is where the GENOMIC constraint lives: TRBD2 lies 3' of
++    the whole TRBJ1 cluster, so deletional joining can never produce a TRBD2-TRBJ1 pair and the
++    model's table already encodes that as a zero. An earlier draft here picked the longest exact D
++    substring and ignored ``j`` entirely — it would have happily called an impossible pair.
++
++    ⛔ Not a re-ranking of D by a generative prior over an alignment score, either. That was built
++    and measured in a sibling package and changed nothing (gene accuracy 98.9 -> 97.8 % on IGH,
++    94.2 -> 94.5 % on human TRB): with 10-18 matched nt the alignment term is 11-20 nats and the
++    prior moves it by ~3. Here the model IS the score, so the question does not arise.
++
++    Ties are broken deterministically on ``(D name, offset, length)`` so a run is reproducible.
++    """
++    m = len(middle)
++    maxdl, maxdr = prep.maxpal["d_5"], prep.maxpal["d_3"]
++    pins_vd, R_vd, b_vd = prep.p_ins["vd"], prep.R["vd"], prep.bias["vd"]
++    pins_dj, R_dj, b_dj = prep.p_ins["dj"], prep.R["dj"], prep.bias["dj"]
++    best = (0.0, None, None, 0)
++    for d in sorted(prep.functional_d):
++        pdj = prep.p_d_given_j.get((j, d), 0.0)
++        if pdj == 0.0:
++            continue                                   # genomically impossible with this J
++        cut = prep.cut["d"][d]
++        for idx5 in range(len(cut) + 1):
++            for idx3 in range(len(cut) - idx5 + 1):
++                d_contrib = cut[idx5:len(cut) - idx3]
++                pdel = prep.p_del["d"].get((d, idx5 - maxdl, idx3 - maxdr), 0.0)
++                if pdel == 0.0:
++                    continue
++                ld = len(d_contrib)
++                for pos in range(0, m - ld + 1):
++                    if d_contrib and middle[pos:pos + ld] != d_contrib:
++                        continue
++                    w = _p_insert(middle[:pos], pins_vd, R_vd, b_vd, from_right=False)
++                    if w == 0.0:
++                        continue
++                    w *= _p_insert(middle[pos + ld:], pins_dj, R_dj, b_dj, from_right=True)
++                    p = pdj * pdel * w
++                    if p > best[0]:
++                        best = (p, d, pos, ld)
++    return best
++
++
++def infer_nt_bruteforce(model: Model, cdr3_aa: str, v: str | None = None, j: str | None = None, *,
++                        max_candidates: int = 200_000) -> Scenario | None:
++    """Exact most-likely nucleotide CDR3 by enumerating every codon assignment. **Oracle only.**
++
++    Maximises the **marginal** ``pgen_nt`` over every nucleotide sequence encoding ``cdr3_aa``, then
++    reports the argmax scenario for the winner via :func:`best_scenario`. Exact, and exponential in
++    the number of residues.
++
++    ⛔ **Not usable on real data** — see the module header: the median VDJdb record has 5.3e6 (TRA)
++    to 1.9e7 (TRB) candidates. This exists so the production DP, when written, has an exact
++    reference to be tested against on the small cases where both can run. ``max_candidates`` bounds
++    the work and sets ``truncated``; a truncated result is the best of a PARTIAL set and is not the
++    maximum, which is why it is flagged rather than returned quietly.
++
++    Returns ``None`` when no candidate is explicable under the model — including the out-of-frame
++    case, where no in-frame sequence of length ``3 * len(aa)`` exists.
++    """
++    prep = _prep(model)
++    aa = cdr3_aa.upper()
++    if not aa:
++        return None
++    # ⛔ NO germline pinning. It is unsound: pinning a codon to the V/J germline drops every
++    # sequence in which that germline was trimmed, and the true maximum can be one of those.
++    opts = codon_options(aa)
++    if any(not o for o in opts):
++        return None
++    total = 1
++    for o in opts:
++        total *= len(o)
++        if total > max_candidates:
++            break
++    truncated = total > max_candidates
++
++    best_p = second_p = 0.0
++    best_nt = None
++    n = 0
++    for combo in product(*opts):
++        nt = "".join(combo)
++        n += 1
++        p = pgen_nt(prep, nt, v, j)
++        if p > best_p:
++            best_p, second_p, best_nt = p, best_p, nt
++        elif p > second_p:
++            second_p = p
++        if n >= max_candidates:
++            truncated = True
++            break
++    if best_nt is None:
++        return None
++    sc = best_scenario(prep, best_nt, v, j)
++    if sc is None:
++        return None
++    return Scenario(cdr3_nt=sc.cdr3_nt, v_call=sc.v_call, j_call=sc.j_call, v_end=sc.v_end,
++                    j_start=sc.j_start, d_call=sc.d_call, d_start=sc.d_start, d_end=sc.d_end,
++                    pgen=best_p, scenario_p=sc.scenario_p, n_candidates=n,
++                    truncated=truncated, runner_up_pgen=second_p)
++
++
++def infer_nt(*_a, **_k):
++    """⛔ NOT IMPLEMENTED — the production aa->nt inference.
++
++    Needs a max-product DP with traceback over the aa-constrained space: the argmax counterpart of
++    :func:`pgen.pgen_aa`, mirroring ``_aa_dp`` / ``_pgen_aa_vj`` / ``_pgen_aa_vdj`` / ``_d_aa_middle``
++    with ``+`` replaced by ``max`` and back-pointers recorded. Use
++    :func:`infer_nt_bruteforce` for small cases and as the reference it must reproduce.
++    """
++    raise NotImplementedError(
++        "infer_nt needs the max-product DP over the aa-constrained space; it is not written. "
++        "Use infer_nt_bruteforce for small cases (see the module header for why enumeration "
++        "cannot scale, and why germline pinning is unsound)."
++    )
+diff --git a/skills/vdjtools/SKILL.md b/skills/vdjtools/SKILL.md
+index 6bf3e697..3f7ff40b 100644
+--- a/skills/vdjtools/SKILL.md
++++ b/skills/vdjtools/SKILL.md
+@@ -49,12 +49,24 @@ Iterating on C++: `cmake --build build/<wheel_tag>` then copy `_core.*.so` into
+   threads=)`** (thread-parallel across sequences, bitwise-identical to serial, ~11× on 16 cores).
+   Pure-Python reference impls in `vdjtools.model.pgen`.
+ - **Generate**: `vdjtools.model.generate.generate(model, n, seed=, productive_only=)` → `pl.DataFrame`.
++  ⚠ `seed=` is reproducible **across processes** only from **3.3.0**: `collapse_alleles` used
++  unordered polars `group_by`, so the collapsed table's row order varied per process and the same
++  seed drew a different allele. Expectations recorded from `generate()` before 3.3.0 are stale.
+ - **Infer (EM)**: `vdjtools.model.infer.infer` / `infer_native(template, seqs, masks=, dd_allowed=,
+   nd_prior=, single_d=)`.
+ - **Germline (arda = single source of truth)** `vdjtools.model.reference`: `load_germline(locus,
+   organism)` (CDR3-region + anchor), **`load_full_vj_germline(organism)`** and
+   **`arda_full_germline(locus, organism)`** (full-length V/J germline + stitch anchor, from arda
+   scaffolds), `reconcile_olga`, `cut_segment`, `translate`, `reverse_complement`.
++- **Scenario (argmax)** `vdjtools.model.viterbi`: **`best_scenario(model, cdr3_nt, v=, j=)`** →
++  `Scenario(cdr3_nt, v_call, j_call, v_end, j_start, d_call, d_start, d_end, scenario_p, ...)` — the
++  single most likely recombination for a KNOWN nt CDR3, i.e. the V/D/J boundary markup. Max-product
++  over the same loops `pgen_nt` sums, so the D obeys `p_d_given_j` (TRBD2×TRBJ1 = 0). Coordinates
++  are 0-based half-open in CDR3-nt space. `infer_nt_bruteforce(model, cdr3_aa, v=, j=)` is an exact
++  but exponential ORACLE for tests. ⛔ `infer_nt` (production aa→nt) is **not implemented and
++  raises**: enumeration is a median 5.3e6 (TRA) / 1.9e7 (TRB) candidates per VDJdb record, and
++  pinning the germline flanks to shrink it is unsound (it drops trimmed-germline sequences, and the
++  true max can be one). Needs a max-product DP with traceback over the aa-constrained space.
+ - **Stitch**: `stitch_contig(model, v, j, cdr3_nt)`, `stitch_frame`.
+ - **Diagnostics** `vdjtools.model.analyze`: Bayes-net→graphviz DOT, entropy / mutual-information tables.
+ - Tandem-D (D-D) supported throughout (`vdjtools.model.dd`).
+diff --git a/tests/python/test_generate_determinism.py b/tests/python/test_generate_determinism.py
+new file mode 100644
+index 00000000..7cd3ea50
+--- /dev/null
++++ b/tests/python/test_generate_determinism.py
+@@ -0,0 +1,69 @@
++"""`generate(seed=)` must be reproducible ACROSS PROCESSES, not just within one.
++
++⛔ It was not. Same seed, same wheel, a new interpreter — a different draw. Within a single process
++it looked perfect, which is why an in-process test would never have caught it.
++
++Root cause: `collapse_alleles` (which `load_bundled(..., collapse=True)` runs by default) built its
++tables with unordered polars `group_by().agg()`. `group_by` is a multithreaded hash aggregation, so
++the collapsed table's ROW ORDER varied per process; `_cum` then assigned the same cumulative
++interval to a different allele, and the same `rng.random()` selected a different one.
++
++⚠ Not hash randomisation — `PYTHONHASHSEED=0` did not help, which is what ruled that out and
++pointed at the aggregation instead. Same class as the nondeterminism recorded against arda's
++`correct` stage.
++"""
++from __future__ import annotations
++
++import subprocess
++import sys
++
++import pytest
++
++from vdjtools.model import load_bundled
++from vdjtools.model.generate import generate
++
++_SNIPPET = """
++from vdjtools.model import load_bundled
++from vdjtools.model.generate import generate
++m = load_bundled({locus!r}, 'olga')
++print(generate(m, 3, seed=11).row(0, named=True)['junction_nt'])
++"""
++
++
++@pytest.mark.parametrize("locus", ["TRA", "TRB"])
++def test_same_seed_gives_the_same_draw_in_a_FRESH_PROCESS(locus):
++    """The test that the bug required: a *subprocess*, because in-process it always agreed."""
++    outs = set()
++    for _ in range(3):
++        r = subprocess.run([sys.executable, "-c", _SNIPPET.format(locus=locus)],
++                           capture_output=True, text=True, timeout=300)
++        assert r.returncode == 0, r.stderr[-2000:]
++        outs.add(r.stdout.strip())
++    assert len(outs) == 1, (
++        f"{locus}: seed=11 produced {len(outs)} different draws across processes: {outs}"
++    )
++
++
++@pytest.mark.parametrize("locus", ["TRA", "TRB"])
++def test_the_collapsed_table_order_is_stable_in_a_FRESH_PROCESS(locus):
++    """The layer underneath, so a failure says WHICH stage drifted rather than just 'output moved'."""
++    snippet = (
++        "from vdjtools.model import load_bundled\n"
++        f"m = load_bundled({locus!r}, 'olga', collapse=True)\n"
++        "print(m.tables['v_choice']['v_allele'].to_list())\n"
++    )
++    outs = set()
++    for _ in range(3):
++        r = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True,
++                           timeout=300)
++        assert r.returncode == 0, r.stderr[-2000:]
++        outs.add(r.stdout.strip())
++    assert len(outs) == 1, f"{locus}: collapse_alleles emitted {len(outs)} different row orders"
++
++
++def test_within_one_process_it_was_always_fine():
++    """Pins why the bug survived: repeated calls in one interpreter agreed all along."""
++    m = load_bundled("TRB", "olga")
++    a = generate(m, 5, seed=3)["junction_nt"].to_list()
++    b = generate(m, 5, seed=3)["junction_nt"].to_list()
++    assert a == b
+diff --git a/tests/python/test_viterbi.py b/tests/python/test_viterbi.py
+new file mode 100644
+index 00000000..e71c63b7
+--- /dev/null
++++ b/tests/python/test_viterbi.py
+@@ -0,0 +1,201 @@
++"""`model.viterbi` — the argmax side of the Pgen DP.
++
++⚠ Every generated draw used here passes ``productive_only=True``. An out-of-frame rearrangement has
++``len(nt) != 3 * len(aa)`` (measured: 8 aa against 25 nt), so no in-frame reconstruction can explain
++it and comparing against one is meaningless. A first version of these tests omitted the flag and
++scored 10 of 16 records as "both impossible" — mutual agreement on nothing.
++"""
++from __future__ import annotations
++
++from itertools import product
++
++import pytest
++
++from vdjtools.model.bundled import load_bundled
++from vdjtools.model.generate import generate
++from vdjtools.model.pgen import pgen_nt, prepare
++from vdjtools.model.viterbi import (best_scenario, codon_options, infer_nt,
++                                    infer_nt_bruteforce)
++
++LOCI = ("TRA", "TRB")
++
++
++@pytest.fixture(scope="module")
++def preps():
++    out = {}
++    for locus in LOCI:
++        m = load_bundled(locus, "olga")
++        out[locus] = (m, prepare(m))
++    return out
++
++
++def test_codon_options_are_strings_and_complete():
++    """`pgen._CODON_AA` is keyed by a TUPLE OF NUCLEOTIDE INDICES (A0 C1 G2 T3), not a string —
++    `(3, 2, 1)` is "TGC". Getting that wrong yields tuples where sequence is expected."""
++    assert codon_options("C") == [["TGC", "TGT"]]
++    assert codon_options("W") == [["TGG"]]
++    assert codon_options("L")[0] == ["CTA", "CTC", "CTG", "CTT", "TTA", "TTG"]
++    assert codon_options("CW") == [["TGC", "TGT"], ["TGG"]]
++    assert codon_options("X") == [[]]          # unknown residue -> no options, never a guess
++
++
++@pytest.mark.parametrize("locus", LOCI)
++def test_best_scenario_spans_really_are_germline(preps, locus):
++    """The whole point of the markup: the span called V must BE the V germline, and likewise J/D.
++
++    This is the invariant that would break first if the scenario walk and the model's own tables
++    ever diverged, and it needs no external truth.
++    """
++    m, prep = preps[locus]
++    g = generate(m, 200, seed=11, productive_only=True)
++    n = 0
++    for r in g.iter_rows(named=True):
++        nt, v, j = r["junction_nt"], r["v_call"], r["j_call"]
++        sc = best_scenario(prep, nt, v, j)
++        if sc is None:
++            continue
++        n += 1
++        gv, gj = prep.cut["v"][v], prep.cut["j"][j]
++        assert nt[:sc.v_end] == gv[:sc.v_end], f"V span is not V germline: {sc}"
++        tail = len(nt) - sc.j_start
++        assert nt[sc.j_start:] == gj[len(gj) - tail:], f"J span is not J germline: {sc}"
++        if sc.d_call is not None:
++            assert nt[sc.d_start:sc.d_end] in prep.cut["d"][sc.d_call], f"D span is not D: {sc}"
++    assert n > 100, f"only {n} scenarios scored — the fixture is not exercising anything"
++
++
++@pytest.mark.parametrize("locus", LOCI)
++def test_a_single_scenario_never_exceeds_the_marginal(preps, locus):
++    """⛔ `scenario_p <= pgen_nt`. A maximum cannot exceed the sum it is taken over, so a violation
++    means the scenario walk and the forward DP have diverged — the cheapest catch there is."""
++    m, prep = preps[locus]
++    g = generate(m, 200, seed=5, productive_only=True)
++    for r in g.iter_rows(named=True):
++        nt, v, j = r["junction_nt"], r["v_call"], r["j_call"]
++        sc = best_scenario(prep, nt, v, j)
++        if sc is None:
++            continue
++        total = pgen_nt(prep, nt, v, j)
++        assert sc.scenario_p <= total * (1 + 1e-9), (
++            f"one scenario ({sc.scenario_p:.6e}) exceeds the marginal ({total:.6e}) for {nt}"
++        )
++
++
++def test_bruteforce_matches_an_independent_enumeration(preps):
++    """The oracle checked against a second, independently written enumeration.
++
++    Ground truth comes from the model itself: enumerate every nt encoding the aa, score each with
++    the shipped `pgen_nt`, take the argmax. Restricted to genuinely small search spaces so the
++    reference stays exhaustive.
++    """
++    m, prep = preps["TRA"]
++    g = generate(m, 200, seed=3, productive_only=True)
++    tested = 0
++    for r in g.iter_rows(named=True):
++        aa, v, j = r["junction_aa"], r["v_call"], r["j_call"]
++        opts = codon_options(aa)
++        if any(not o for o in opts):
++            continue
++        space = 1
++        for o in opts:
++            space *= len(o)
++        if space > 20_000:
++            continue
++        best_p, best_nt = 0.0, None
++        for combo in product(*opts):
++            nt = "".join(combo)
++            p = pgen_nt(prep, nt, v, j)
++            if p > best_p:
++                best_p, best_nt = p, nt
++        got = infer_nt_bruteforce(prep, aa, v, j)
++        tested += 1
++        if best_nt is None:
++            assert got is None, f"claimed {got.cdr3_nt} where nothing is explicable"
++        else:
++            assert got is not None and got.cdr3_nt == best_nt, (
++                f"{aa}: expected {best_nt} (p={best_p:.4e}), got "
++                f"{got.cdr3_nt if got else None} (p={got.pgen if got else 0:.4e})"
++            )
++    assert tested >= 3, f"only {tested} records small enough to brute-force — widen the fixture"
++
++
++def test_out_of_frame_is_refused_not_guessed(preps):
++    """⚠ An out-of-frame CDR3 (len(nt) != 3*len(aa)) has no in-frame reconstruction. The right
++    answer is None, not a plausible-looking sequence of the wrong length."""
++    m, prep = preps["TRA"]
++    g = generate(m, 400, seed=3)                      # NOT productive_only: we want the OOF ones
++    oof = [r for r in g.iter_rows(named=True)
++           if len(r["junction_nt"]) != 3 * len(r["junction_aa"])]
++    if not oof:
++        pytest.skip("no out-of-frame draw in this sample")
++    r = oof[0]
++    got = infer_nt_bruteforce(prep, r["junction_aa"], r["v_call"], r["j_call"],
++                              max_candidates=20_000)
++    if got is not None:
++        assert len(got.cdr3_nt) == 3 * len(r["junction_aa"])
++
++
++def test_infer_nt_is_honestly_unimplemented():
++    """⛔ The production entry point must FAIL LOUDLY rather than quietly dispatch to the oracle.
++
++    Enumeration cannot scale — the median VDJdb record has 5.3e6 (TRA) / 1.9e7 (TRB) candidates —
++    and pinning the germline flanks to shrink it is unsound (it drops sequences whose germline was
++    trimmed, and the true maximum can be one). A silent fallback would look like a working feature.
++    """
++    with pytest.raises(NotImplementedError, match="max-product DP"):
++        infer_nt(None, "CASSF")
++
++
++def test_the_chosen_D_is_genomically_possible_with_the_chosen_J(preps):
++    """⛔ Regression: an earlier draft picked the longest exact D substring and IGNORED ``j``.
++
++    TRBD2 lies 3' of the entire TRBJ1 cluster, so deletional joining can never produce a
++    TRBD2-TRBJ1 pair — the model encodes that as ``p_d_given_j == 0``. Choosing D by sequence
++    similarity alone would happily call the impossible pair; choosing it by the model's own terms
++    cannot, because a zero prunes the branch.
++    """
++    m, prep = preps["TRB"]
++    g = generate(m, 200, seed=17, productive_only=True)
++    n = 0
++    for r in g.iter_rows(named=True):
++        sc = best_scenario(prep, r["junction_nt"], r["v_call"], r["j_call"])
++        if sc is None or sc.d_call is None:
++            continue
++        n += 1
++        assert prep.p_d_given_j.get((sc.j_call, sc.d_call), 0.0) > 0.0, (
++            f"chose D={sc.d_call} with J={sc.j_call}, which the model gives probability 0 — "
++            f"a genomically impossible rearrangement"
++        )
++    assert n > 50, f"only {n} D calls made — the fixture is not exercising the constraint"
++
++
++def test_the_reported_scenario_probability_is_the_product_it_claims(preps):
++    """`scenario_p` must be reconstructible from the model's own tables for the reported path.
++
++    Guards against the value drifting from the path it is supposed to describe — the failure that
++    would make every downstream probability quietly wrong while all the spans still looked right.
++    """
++    from vdjtools.model.pgen import _p_insert
++    m, prep = preps["TRA"]                                  # VJ: one insertion term, no D sum
++    g = generate(m, 120, seed=23, productive_only=True)
++    checked = 0
++    for r in g.iter_rows(named=True):
++        nt, v, j = r["junction_nt"], r["v_call"], r["j_call"]
++        sc = best_scenario(prep, nt, v, j)
++        if sc is None:
++            continue
++        cutv, cutj = prep.cut["v"][sc.v_call], prep.cut["j"][sc.j_call]
++        ndel_v = len(cutv) - sc.v_end - prep.maxpal["v_3"]
++        len_j = len(nt) - sc.j_start
++        ndel_j = len(cutj) - len_j - prep.maxpal["j_5"]
++        want = (prep.p_v.get(sc.v_call, 0.0)
++                * prep.p_j.get((sc.v_call, sc.j_call), 0.0)
++                * prep.p_del["v"].get((sc.v_call, ndel_v), 0.0)
++                * prep.p_del["j"].get((sc.j_call, ndel_j), 0.0)
++                * _p_insert(nt[sc.v_end:sc.j_start], prep.p_ins["vj"], prep.R["vj"],
++                            prep.bias["vj"], from_right=False))
++        assert abs(sc.scenario_p - want) <= 1e-12 * max(want, 1e-300), (
++            f"scenario_p={sc.scenario_p:.6e} but the reported path recomputes to {want:.6e}"
++        )
++        checked += 1
++    assert checked > 50, f"only {checked} scenarios checked"

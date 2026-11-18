@@ -1,0 +1,214 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 13fa13bb0..c7bbf7564 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - [#718](https://github.com/nf-core/mag/pull/718) - Added metaMDBG and (meta)Flye as long read assemblers (added by @muabnezor)
+ - [#718](https://github.com/nf-core/mag/pull/718) - Added host removal for long reads using minimap2 as aligner (added by @muabnezor)
+ - [#827](https://github.com/nf-core/mag/pull/827) - Added nf-test CI testing for all test profiles (added by @jfy133)
++- [#829](https://github.com/nf-core/mag/pull/829) - Add `--skip_shortread_qc` and `--skip_longread_qc` params for skipping certain default preprocessing steps (added by @erikrikarddaniel)
+ 
+ ### `Changed`
+ 
+diff --git a/nextflow.config b/nextflow.config
+index b13bc54ca..c0c031a00 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -28,6 +28,7 @@ params {
+     adapterremoval_adapter2              = 'AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT'
+     adapterremoval_trim_quality_stretch  = false
+     keep_phix                            = false
++    skip_shortread_qc                    = false
+     // long read preprocessing options
+     longread_adaptertrimming_tool        = "porechop_abi"
+     longread_filtering_tool              = "filtlong"
+@@ -108,6 +109,7 @@ params {
+     // long read preprocessing options
+     skip_adapter_trimming                = false
+     skip_longread_filtering              = false
++    skip_longread_qc                     = false
+     keep_lambda                          = false
+     longreads_min_quality                = null
+     longreads_min_length                 = 1000
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 31ba559b8..94b0aa0c6 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -376,6 +376,11 @@
+                     "type": "boolean",
+                     "description": "Skip read preprocessing using fastp or adapterremoval."
+                 },
++                "skip_shortread_qc": {
++                    "type": "boolean",
++                    "description": "Skip all default QC steps for short reads (adapter trimming, phiX removal).",
++                    "help": "Skips clipping and removal of phiX sequences. Does not affect host sequence removal as this is opt in."
++                },
+                 "save_phixremoved_reads": {
+                     "type": "boolean",
+                     "description": "Specify to save input FASTQ files with phiX reads removed to --outdir."
+@@ -414,6 +419,11 @@
+                     "type": "boolean",
+                     "description": "Skip filtering long reads."
+                 },
++                "skip_longread_qc": {
++                    "type": "boolean",
++                    "description": "Skip all default QC steps for long reads (adapter trimming, filtering, removal of lambda sequences).",
++                    "help": "Skips adapter trimming and filtering, but not host sequence removal."
++                },
+                 "longreads_min_length": {
+                     "type": "integer",
+                     "default": 1000,
+diff --git a/subworkflows/local/longread_preprocessing.nf b/subworkflows/local/longread_preprocessing.nf
+index 22786547a..9938c0ecf 100644
+--- a/subworkflows/local/longread_preprocessing.nf
++++ b/subworkflows/local/longread_preprocessing.nf
+@@ -21,6 +21,7 @@ workflow LONGREAD_PREPROCESSING {
+     ch_short_reads            // [ [meta] , fastq1, fastq2] (mandatory)
+     ch_lambda_db              // [fasta]
+     ch_host_fasta             // [fasta]
++    skip_qc                   // [boolean]
+ 
+     main:
+     ch_versions = Channel.empty()
+@@ -32,7 +33,7 @@ workflow LONGREAD_PREPROCESSING {
+     ch_versions = ch_versions.mix(NANOPLOT_RAW.out.versions.first())
+ 
+     if ( !params.assembly_input ) {
+-        if (!params.skip_adapter_trimming) {
++        if (!params.skip_adapter_trimming && !skip_qc) {
+             if (params.longread_adaptertrimming_tool &&
+                 params.longread_adaptertrimming_tool == 'porechop_abi') {
+                 PORECHOP_ABI (
+@@ -53,7 +54,7 @@ workflow LONGREAD_PREPROCESSING {
+             ch_long_reads = ch_raw_long_reads
+         }
+ 
+-        if (!params.keep_lambda && params.longread_filtering_tool != 'chopper') {
++        if (!params.keep_lambda && params.longread_filtering_tool != 'chopper' && !skip_qc) {
+             NANOLYSE (
+                 ch_long_reads,
+                 ch_lambda_db
+@@ -61,7 +62,7 @@ workflow LONGREAD_PREPROCESSING {
+             ch_long_reads = NANOLYSE.out.fastq
+             ch_versions = ch_versions.mix(NANOLYSE.out.versions.first())
+         }
+-        if (!params.skip_longread_filtering) {
++        if (!params.skip_longread_filtering && !skip_qc) {
+             if (params.longread_filtering_tool == 'filtlong') {
+                 // join long and short reads by sample name
+                 ch_short_reads_tmp = ch_short_reads
+@@ -108,16 +109,23 @@ workflow LONGREAD_PREPROCESSING {
+             ch_multiqc_files = ch_multiqc_files.mix( LONGREAD_HOSTREMOVAL.out.multiqc_files )
+         }
+ 
+-        if (!(
+-            params.skip_adapter_trimming &&
+-            params.skip_longread_filtering &&
+-            !params.host_fasta &&
+-            params.keep_lambda
+-        )) {
+-            NANOPLOT_FILTERED (
+-                ch_long_reads
+-            )
+-            ch_versions = ch_versions.mix(NANOPLOT_FILTERED.out.versions.first())
++        /**
++         * Conditions for *not* running NANOPLOT_FILTERED:
++         * - No host removal and skip_qc (params.skip_longread_qc)
++         * - No host removal and *all* --keep_lambda, --skip_adapter_trimming, --skip_longread_filtering
++         */
++        if ( !( ( skip_qc && !( params.host_fasta || params.host_genome ) ) ) ) {
++            if (
++                !(
++                    params.skip_adapter_trimming && params.skip_longread_filtering && params.keep_lambda &&
++                    !(params.host_fasta || params.host_genome )
++                )
++            ) {
++                NANOPLOT_FILTERED (
++                    ch_long_reads
++                )
++                ch_versions = ch_versions.mix(NANOPLOT_FILTERED.out.versions.first())
++            }
+         }
+ 
+         // Run merging
+diff --git a/subworkflows/local/shortread_preprocessing.nf b/subworkflows/local/shortread_preprocessing.nf
+index 208045ca0..b495203e7 100644
+--- a/subworkflows/local/shortread_preprocessing.nf
++++ b/subworkflows/local/shortread_preprocessing.nf
+@@ -22,6 +22,7 @@ workflow SHORTREAD_PREPROCESSING {
+     ch_host_fasta        // [fasta] (optional)
+     ch_host_genome_index // fasta (optional)
+     ch_phix_db_file      // [fasta] (optional)
++    skip_qc              // [boolean]
+ 
+     main:
+     ch_versions = Channel.empty()
+@@ -33,7 +34,7 @@ workflow SHORTREAD_PREPROCESSING {
+     ch_versions = ch_versions.mix(FASTQC_RAW.out.versions.first())
+     ch_multiqc_files = ch_multiqc_files.mix(FASTQC_RAW.out.zip)
+ 
+-    if (!params.skip_clipping) {
++    if (!params.skip_clipping && !skip_qc) {
+         if (params.clip_tool == 'fastp') {
+             FASTP(
+                 ch_raw_short_reads,
+@@ -111,7 +112,7 @@ workflow SHORTREAD_PREPROCESSING {
+         ch_short_reads_hostremoved = ch_short_reads_prepped
+     }
+ 
+-    if (!params.keep_phix) {
++    if (!params.keep_phix && !skip_qc) {
+         ch_phix_fasta_for_build = ch_phix_db_file.combine(ch_short_reads_prepped)
+                 .map { host_fasta, meta, reads ->
+                     host_fasta
+@@ -131,12 +132,24 @@ workflow SHORTREAD_PREPROCESSING {
+         ch_short_reads_phixremoved = ch_short_reads_hostremoved
+     }
+ 
+-    if (!(params.keep_phix && params.skip_clipping && !(params.host_genome || params.host_fasta))) {
+-        FASTQC_TRIMMED(
+-            ch_short_reads_phixremoved
+-        )
+-        ch_versions = ch_versions.mix(FASTQC_TRIMMED.out.versions)
+-        ch_multiqc_files = ch_multiqc_files.mix(FASTQC_TRIMMED.out.zip)
++    /**
++     * Conditions for *not* running FASTQC_TRIMMED:
++     * - No host removal and skip_qc (params.skip_shortread_qc)
++     * - No host removal and *both* --keep_phix --skip_clipping
++     */
++    if ( !( ( skip_qc && !( params.host_fasta || params.host_genome ) ) ) ) {
++        if (
++            !(
++                params.keep_phix && params.skip_clipping &&
++                !( params.host_genome || params.host_fasta )
++            )
++        ) {
++            FASTQC_TRIMMED(
++                ch_short_reads_phixremoved
++            )
++            ch_versions = ch_versions.mix(FASTQC_TRIMMED.out.versions)
++            ch_multiqc_files = ch_multiqc_files.mix(FASTQC_TRIMMED.out.zip)
++        }
+     }
+ 
+     // Run/Lane merging
+diff --git a/workflows/mag.nf b/workflows/mag.nf
+index d2f87f7be..7dc15cffe 100644
+--- a/workflows/mag.nf
++++ b/workflows/mag.nf
+@@ -136,6 +136,7 @@ workflow MAG {
+             ch_host_fasta,
+             ch_host_bowtie2index,
+             ch_phix_db_file,
++            params.skip_shortread_qc,
+         )
+ 
+         ch_versions = ch_versions.mix(SHORTREAD_PREPROCESSING.out.versions)
+@@ -161,6 +162,7 @@ workflow MAG {
+         ch_short_reads,
+         ch_lambda_db,
+         ch_host_fasta,
++        params.skip_longread_qc,
+     )
+ 
+     ch_versions = ch_versions.mix(LONGREAD_PREPROCESSING.out.versions)

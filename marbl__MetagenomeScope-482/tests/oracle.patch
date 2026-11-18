@@ -1,0 +1,1141 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4ff92a84..7642dbd4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,10 @@ this format is adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1
+ 
+ ### Added
+ 
++- Add the `-f`/`--fasta` command-line option, along with basic functionality
++  for searching by sequence and drawing dot plots of sequences
++  ([#44](https://github.com/marbl/MetagenomeScope/issues/44)).
++
+ - Add new options to the the drawing options dialog (all selected by default):
+ 
+   - `Decouple strand-tangled components`
+@@ -213,6 +217,8 @@ this format is adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1
+ 
+ - Various improvements to the documentation, tests, and code.
+ 
++- Add pyfastx and wotplot as dependencies.
++
+ ### Fixed
+ 
+ - Use consistent conversions between Graphviz points and inches; fixes
+diff --git a/metagenomescope/_cli.py b/metagenomescope/_cli.py
+index c39dc7ed..ed5a7f24 100644
+--- a/metagenomescope/_cli.py
++++ b/metagenomescope/_cli.py
+@@ -23,13 +23,13 @@
+     required=True,
+     help=descs.GRAPH,
+ )
+-# @click.option(
+-#     "-f",
+-#     "--fasta",
+-#     type=click.Path(exists=True, dir_okay=False, readable=True),
+-#     required=False,
+-#     help=FASTA,
+-# )
++@click.option(
++    "-f",
++    "--fasta",
++    type=click.Path(exists=True, dir_okay=False, readable=True),
++    required=False,
++    help=descs.FASTA,
++)
+ @click.option(
+     "-a",
+     "--agp",
+@@ -114,6 +114,7 @@
+ @click.version_option(__version__, "-v", "--version")
+ def run_script(
+     graph: str,
++    fasta: str,
+     agp: str,
+     vtsv: str,
+     info: str,
+@@ -144,6 +145,7 @@ def run_script(
+         [
+             "Settings:",
+             f"Graph file: {graph}",
++            f"FASTA file: {fasta}",
+             f"AGP file: {agp}",
+             f"Verkko paths TSV file: {vtsv}",
+             f"Flye info file: {info}",
+@@ -163,6 +165,7 @@ def run_script(
+ 
+     run(
+         graph=graph,
++        fasta=fasta,
+         agp=agp,
+         vtsv=vtsv,
+         flye_info=info,
+diff --git a/metagenomescope/aln_config.py b/metagenomescope/aln_config.py
+new file mode 100644
+index 00000000..0e3824da
+--- /dev/null
++++ b/metagenomescope/aln_config.py
+@@ -0,0 +1 @@
++MINIMAP2 = "minimap2"
+diff --git a/metagenomescope/assets/viewer.css b/metagenomescope/assets/viewer.css
+index 3802a946..694472fb 100644
+--- a/metagenomescope/assets/viewer.css
++++ b/metagenomescope/assets/viewer.css
+@@ -267,7 +267,9 @@ h6 {
+ /* same deal for some other icons */
+ .bi-search,
+ .bi-snow,
++.bi-shuffle,
+ .bi-arrow-right,
++.bi-arrow-down,
+ .bi-record-circle {
+     -webkit-text-stroke: 1px;
+ }
+@@ -749,3 +751,17 @@ input {
+ .layout-alg-desc p:last-of-type {
+     margin-bottom: 0;
+ }
++
++#seqSearchResults {
++    margin-top: 1em;
++    max-height: 25em;
++    padding: 0em 0.75em;
++    overflow-y: auto;
++    border: 1px dashed var(--bs-success);
++    border-radius: 4px;
++}
++
++#seqSearchResults p {
++    margin-top: 0.75em;
++    margin-bottom: 0.75em;
++}
+diff --git a/metagenomescope/descs.py b/metagenomescope/descs.py
+index 6f9fdc2d..ef59f0c0 100644
+--- a/metagenomescope/descs.py
++++ b/metagenomescope/descs.py
+@@ -2,10 +2,7 @@
+ 
+ GRAPH = "In GFA, FASTG, DOT, GML, or LastGraph format."
+ 
+-FASTA = (
+-    "FASTA file describing the sequences of the nodes (GFA, FASTG, GML, "
+-    "LastGraph) or edges (DOT)."
+-)
++FASTA = "FASTA file describing node sequences."
+ 
+ AGP = "AGP file describing paths."
+ 
+diff --git a/metagenomescope/errors.py b/metagenomescope/errors.py
+index 53a51b90..ba499617 100644
+--- a/metagenomescope/errors.py
++++ b/metagenomescope/errors.py
+@@ -6,6 +6,10 @@ class PathParsingError(Exception):
+     pass
+ 
+ 
++class SeqParsingError(Exception):
++    pass
++
++
+ class GraphError(Exception):
+     pass
+ 
+diff --git a/metagenomescope/graph/assembly_graph.py b/metagenomescope/graph/assembly_graph.py
+index 5817e7ec..efef414b 100644
+--- a/metagenomescope/graph/assembly_graph.py
++++ b/metagenomescope/graph/assembly_graph.py
+@@ -1,10 +1,15 @@
+ import math
+ import random
++import base64
+ import logging
+ import pandas as pd
++import matplotlib
++from matplotlib import pyplot
++from io import BytesIO
+ from copy import deepcopy
+ from collections import defaultdict
+ import networkx as nx
++import wotplot as wp
+ from .. import (
+     parsers,
+     config,
+@@ -20,8 +25,9 @@
+     log_utils,
+ )
+ from ..gap import Gap
+-from ..errors import WeirdError, GraphParsingError
++from ..errors import WeirdError, GraphParsingError, UIError
+ from . import validators, graph_utils
++from .seq_holder import SeqHolder
+ from .draw_results import DrawResults
+ from .subgraph import Subgraph
+ from .component import Component
+@@ -29,6 +35,9 @@
+ from .node import Node
+ from .edge import Edge
+ 
++# turn off matplotlib warning: https://stackoverflow.com/a/74471578
++matplotlib.use("agg")
++
+ 
+ class AssemblyGraph(object):
+     """Representation of an assembly graph.
+@@ -69,6 +78,7 @@ class AssemblyGraph(object):
+     def __init__(
+         self,
+         graph_fp,
++        fasta_fp=None,
+         agp_fp=None,
+         verkko_tsv_fp=None,
+         flye_info_fp=None,
+@@ -83,6 +93,10 @@ def __init__(
+         graph_fp: str
+             Path to the assembly graph to be visualized.
+ 
++        fasta_fp: str or None
++            If specified, this should be a path to a FASTA file describing the
++            sequences of nodes in the graph.
++
+         agp_fp: str or None
+             If specified, this should be a path to an AGP file describing paths
+             in the graph.
+@@ -135,6 +149,9 @@ def __init__(
+ 
+         self.filename = graph_fp
+         self.basename = misc_utils.get_basename_if_fp(graph_fp)
++        self.fasta_filename = fasta_fp
++        self.fasta_basename = misc_utils.get_basename_if_fp(fasta_fp)
++        self.seq_holder = None
+         self.agp_filename = agp_fp
+         self.agp_basename = misc_utils.get_basename_if_fp(agp_fp)
+         self.verkko_tsv_filename = verkko_tsv_fp
+@@ -435,6 +452,20 @@ def __init__(
+                     f"{ui_utils.pluralize(len(self.st_cc_nums), 'strand-tangled component')}."
+                 )
+ 
++        # Process sequences, if given.
++        if self.fasta_filename is not None:
++            logger.info(
++                "  Loading and (if needed) indexing input FASTA file "
++                f'"{self.fasta_basename}"...'
++            )
++            self.seq_holder = SeqHolder(
++                self.fasta_filename, self.nodename2objs
++            )
++            logger.info(
++                "  ...Done. It contained "
++                f"{ui_utils.pluralize(len(self.seq_holder), 'sequence')}."
++            )
++
+         # Process paths, if given.
+         #
+         # Maps path names -> list of node or edge names in path
+@@ -504,7 +535,7 @@ def __init__(
+         # If there were any paths at all, record info about them (and filter
+         # out paths containing stuff not in the graph)
+         if len(input_paths) > 0:
+-            logger.debug("  Matching up paths to the graph...")
++            logger.info("  Matching up paths to the graph...")
+             # TODO can update path lookup stuff to use nodename2objs - faster
+             id2obj = self.nodeid2obj if self.node_centric else self.edgeid2obj
+             self.objname2pathnames, self.pathname2ccnums = (
+@@ -520,7 +551,7 @@ def __init__(
+                     n for n in input_paths[p] if type(n) is not Gap
+                 ]
+                 ccs_with_a_path |= ccnums
+-            logger.debug(
++            logger.info(
+                 "  ...Done. Found "
+                 f"{ui_utils.pluralize(len(self.pathname2objnames), 'path')} "
+                 "across "
+@@ -2874,3 +2905,67 @@ def to_cc_scatter(self):
+             xlatex,
+             ylatex,
+         )
++
++    def run_seq_search(self, in_fasta):
++        if self.seq_holder is not None:
++            return self.seq_holder.run_search(in_fasta)
++        else:
++            # if no seqs given, the UI elements for this should be hidden
++            raise WeirdError("No sequences given")
++
++    def _get_seq(self, seq_type, graph_seq, other_seq, seq_num):
++        if seq_type == ui_config.GRAPH_SEQ:
++            if graph_seq is None:
++                raise UIError(f"Sequence {seq_num}: No node name specified.")
++            return self.seq_holder.get_seq(graph_seq)
++
++        else:
++            if other_seq is None:
++                raise UIError(f"Sequence {seq_num}: No sequence given.")
++            # lazy hack to remove whitespace:
++            # https://stackoverflow.com/a/8270146
++            return "".join(other_seq.split())
++
++    def create_dot_plot(
++        self,
++        type1,
++        type2,
++        graphseq1,
++        otherseq1,
++        graphseq2,
++        otherseq2,
++        k,
++        markersize,
++    ):
++        logging.debug("  Getting sequences...")
++
++        s1 = self._get_seq(type1, graphseq1, otherseq1, 1)
++        s2 = self._get_seq(type2, graphseq2, otherseq2, 2)
++        logging.debug("  ...Done. Creating matrix...")
++
++        try:
++            m = wp.DotPlotMatrix(s1, s2, k)
++        except ValueError as ei:
++            raise UIError(str(ei))
++        logging.debug("  ...Done. Drawing the matrix...")
++
++        title = f"Dot plot ($k$ = {k:,})"
++        fig, ax = pyplot.subplots()
++        if len(s1) + len(s2) < 1000:
++            wp.viz_imshow(m, ax=ax, title=title)
++        else:
++            wp.viz_spy(m, ax=ax, title=title, markersize=markersize)
++
++        # Convert matplotlib output to a base 64 string so that it can be used
++        # as the source of an img tag: https://plotly.com/blog/dash-matplotlib/
++        buf = BytesIO()
++        fig.savefig(buf, format="png", bbox_inches="tight")
++        fig_b64 = base64.b64encode(buf.getbuffer()).decode("ascii")
++        fig_b64_s = f"data:image/png;base64,{fig_b64}"
++        # Prevent matplotlib from keeping old stuff in memory (if we don't do
++        # this, you'll see a warning after creating 20 images -- or at least
++        # that is what happens in october 2026 ._.)
++        pyplot.close("all")
++        logging.debug("  ...Done.")
++
++        return fig_b64_s
+diff --git a/metagenomescope/graph/seq_holder.py b/metagenomescope/graph/seq_holder.py
+new file mode 100644
+index 00000000..21986664
+--- /dev/null
++++ b/metagenomescope/graph/seq_holder.py
+@@ -0,0 +1,118 @@
++import os
++import logging
++import tempfile
++import subprocess
++import pyfastx as pf
++from collections import defaultdict
++from .. import name_utils, ui_utils, aln_config
++from ..errors import SeqParsingError, UIError
++
++
++class SeqHolder(object):
++    """Holds sequence data.
++
++    Currently this is super strict, for the sake of avoiding scope creep and
++    getting this stuff done ASAP. Each sequence in the FASTA file must
++    represent a forward node in the graph.
++
++    Eventually we can do fancier stuff (supporting edge sequences for DOT
++    graphs; indexing FASTG files directly rather than making the user specify
++    a FASTA file for those; automatically extracting sequences from GFA /
++    LastGraph files; ...) but for now this is enough. Maybe.
++    """
++
++    def __init__(self, fasta_fp, nodename2objs):
++        self.f = pf.Fasta(fasta_fp)
++        self.fasta_fp = fasta_fp
++        self.node_names_with_seqs = set()
++        self._record_seqs(nodename2objs)
++
++    def _record_seqs(self, nodename2objs):
++        """Populates self.node_names_with_seqs based on the FASTA file."""
++        for seq_name in self.f.keys():
++            if name_utils.is_rev(seq_name):
++                raise SeqParsingError(f"FASTA contains - seq: {seq_name}")
++            if name_utils.has_split_suffix(seq_name):
++                raise SeqParsingError(f"FASTA contains split seq: {seq_name}")
++            if seq_name not in nodename2objs:
++                raise SeqParsingError(
++                    f"Sequence {seq_name} is not a node in the graph"
++                )
++            if seq_name in self.node_names_with_seqs:
++                raise SeqParsingError(
++                    f"Sequence {seq_name} listed twice in the FASTA?"
++                )
++            self.node_names_with_seqs.add(seq_name)
++
++    def __len__(self):
++        """Returns the number of nodes with sequences given."""
++        return len(self.node_names_with_seqs)
++
++    def get_seq(self, seq_name):
++        if seq_name in self.node_names_with_seqs:
++            return self.f[seq_name]
++        elif name_utils.is_rev(seq_name):
++            fwd_name = name_utils.negate(seq_name)
++            if fwd_name in self.node_names_with_seqs:
++                return self.f[fwd_name].antisense
++        raise UIError(f'No sequence named "{seq_name}" in input FASTA.')
++
++    def run_search(self, in_fasta, aligner=aln_config.MINIMAP2):
++        if in_fasta is None:
++            # can happen if the textarea is empty
++            raise UIError("No sequence(s) given.")
++
++        # Use a temporary directory instead of just a single temporary file,
++        # since indexing will create a bunch of files that I don't want to
++        # leave around (so that doing a bunch of searches won't clog up the
++        # user's /tmp/ directory)
++        with tempfile.TemporaryDirectory() as td:
++
++            tfp = os.path.join(td, "in.fa")
++            logging.debug(f"  Writing out input FASTA to {tfp}...")
++            with open(tfp, "w") as fh:
++                fh.write(in_fasta)
++            logging.debug(f"  ...Done. Running {aligner}...")
++
++            afp = os.path.join(td, "aln.paf")
++            try:
++                subprocess.run(
++                    [
++                        "minimap2",
++                        "-x",
++                        "sr",
++                        tfp,
++                        self.fasta_fp,
++                        "-o",
++                        afp,
++                    ],
++                    check=True,
++                )
++            except FileNotFoundError:
++                raise UIError(
++                    "Received a FileNotFoundError when trying to run "
++                    "{aligner}. Please make sure that it is installed."
++                )
++            except subprocess.CalledProcessError as cpe:
++                raise UIError(
++                    f"Running {aligner} failed. Return code: {cpe.returncode}."
++                )
++            logging.debug("  ...Done. Parsing alignment...")
++
++            # NOTE: since we haven't specified -a, -c, or --cs,
++            # minimap2 will only output approximate mapping locations.
++            # This should be okay if we are just checking for hits and don't
++            # care abt exact locations within the sequences -- see
++            # https://github.com/lh3/minimap2/blob/master/FAQ.md
++            inseq2graphseqs = defaultdict(set)
++            num_alns = 0
++            with open(afp, "r") as fh:
++                for line in fh:
++                    parts = line.split("\t")
++                    inseq2graphseqs[parts[5]].add(parts[0])
++                    num_alns += 1
++            logging.debug(
++                "  ...Done. "
++                f"Found {ui_utils.pluralize(num_alns, 'alignment')}."
++            )
++        return inseq2graphseqs
+diff --git a/metagenomescope/log_utils.py b/metagenomescope/log_utils.py
+index e1500fe2..f0919309 100644
+--- a/metagenomescope/log_utils.py
++++ b/metagenomescope/log_utils.py
+@@ -26,6 +26,9 @@ def start_log(verbose, quiet):
+     # in any case, stop logging every time a request or something happens:
+     # https://community.plotly.com/t/logging-debug-messages-suppressed-in-callbacks/17854/4
+     logging.getLogger("werkzeug").setLevel(logging.WARNING)
++    # creating a dot plot results in so much debug stuff being logged lol
++    logging.getLogger("matplotlib").setLevel(logging.WARNING)
++    logging.getLogger("PIL").setLevel(logging.WARNING)
+     if verbose:
+         if quiet:
+             # verbose and quiet (these are mutually exclusive options, so ...)
+diff --git a/metagenomescope/main.py b/metagenomescope/main.py
+index c40ac9cb..9bc20415 100644
+--- a/metagenomescope/main.py
++++ b/metagenomescope/main.py
+@@ -36,6 +36,7 @@
+ 
+ def run(
+     graph: str = None,
++    fasta: str = None,
+     agp: str = None,
+     vtsv: str = None,
+     flye_info: str = None,
+@@ -53,6 +54,11 @@ def run(
+     graph: str
+         Path to the assembly graph to be visualized.
+ 
++    fasta: str
++        Path to a FASTA file describing node sequences. Eventually this
++        will support edge sequences in DOT files, etc., probably.
++        (Optional.)
++
+     agp: str or None
+         Path to an AGP file describing paths of nodes/edges in the graph.
+         (Optional.)
+@@ -101,6 +107,7 @@ def run(
+     # edges, etc.
+     ag = AssemblyGraph(
+         graph,
++        fasta_fp=fasta,
+         agp_fp=agp,
+         verkko_tsv_fp=vtsv,
+         flye_info_fp=flye_info,
+@@ -209,6 +216,40 @@ def run(
+         ]
+     )
+ 
++    # If the user specified, show an interface for that
++    seqs_given = ag.seq_holder is not None
++    seq_html = []
++    if seqs_given:
++        seq_html = [
++            ctrl_sep,
++            html.H4("Sequences"),
++            html.Button(
++                [
++                    html.I(className="bi bi-filter-left"),
++                    html.Span(
++                        "Search by sequence",
++                        className="iconlbl",
++                    ),
++                ],
++                id="seqSearchButton",
++                className="btn btn-light",
++                type="button",
++            ),
++            ctrl_sep_invis,
++            html.Button(
++                [
++                    html.I(className="bi bi-graph-up"),
++                    html.Span(
++                        "Dot plots",
++                        className="iconlbl",
++                    ),
++                ],
++                id="dotPlotButton",
++                className="btn btn-light",
++                type="button",
++            ),
++        ]
++
+     # If the user specified paths somehow (e.g. an AGP file), we'll show an
+     # interface for these
+     paths_given = len(ag.pathname2objnames) > 0
+@@ -726,6 +767,7 @@ def run(
+                             + ui_utils.get_selected_patt_html(),
+                             className="noPadding",
+                         ),
++                        *seq_html,
+                         *path_html,
+                         ctrl_sep,
+                         html.H4(
+@@ -1788,9 +1830,53 @@ def run(
+                         ),
+                     ),
+                 ],
+-                id="modal",
++                id="drawingOptionsModal",
+                 is_open=False,
+             ),
++            dbc.Modal(
++                [
++                    dbc.ModalHeader(
++                        [
++                            html.H1(
++                                [
++                                    html.I(className="bi bi-filter-left"),
++                                    html.Span(
++                                        "Search by sequence",
++                                        className="iconlbl",
++                                    ),
++                                ],
++                                className="modal-title fs-5",
++                            ),
++                        ]
++                    ),
++                    dbc.ModalBody(ui_utils.get_seq_search_modal_body()),
++                ],
++                id="seqSearchModal",
++                is_open=False,
++                size="xl",
++            ),
++            dbc.Modal(
++                [
++                    dbc.ModalHeader(
++                        [
++                            html.H1(
++                                [
++                                    html.I(className="bi bi-graph-up"),
++                                    html.Span(
++                                        "Dot plots of sequences",
++                                        className="iconlbl",
++                                    ),
++                                ],
++                                className="modal-title fs-5",
++                            ),
++                        ]
++                    ),
++                    dbc.ModalBody(ui_utils.get_dot_plot_modal_body()),
++                ],
++                id="dotPlotModal",
++                is_open=False,
++                size="xl",
++            ),
+             # toast messages will go here. you can change top-0 to bottom-0 to
+             # position these in the bottom right of the window; see
+             # https://getbootstrap.com/docs/5.3/components/toasts/#live-example
+@@ -2398,9 +2484,10 @@ def toggle_controls(controls_classes, cy_div_style, n_clicks):
+             )
+ 
+     @callback(
+-        Output("modal", "is_open"),
++        Output("drawingOptionsModal", "is_open"),
+         Input("drawingOptionsButton", "n_clicks"),
+-        State("modal", "is_open"),
++        State("drawingOptionsModal", "is_open"),
++        prevent_initial_call=True,
+     )
+     def toggle_drawing_options_modal(nc, is_open):
+         # from https://www.dash-bootstrap-components.com/docs/components/modal/
+@@ -3427,6 +3514,181 @@ def drawn(ni):
+             {"requestGood": True, "nodesToSelect": drawn_nodes},
+         )
+ 
++    if seqs_given:
++
++        @callback(
++            Output("seqSearchModal", "is_open"),
++            Input("seqSearchButton", "n_clicks"),
++            State("seqSearchModal", "is_open"),
++            prevent_initial_call=True,
++        )
++        def toggle_seq_search_modal(nc, is_open):
++            # https://www.dash-bootstrap-components.com/docs/components/modal/
++            if nc:
++                return not is_open
++            return is_open
++
++        @callback(
++            Output("toastHolder", "children", allow_duplicate=True),
++            Output("seqSearchResults", "children"),
++            State("toastHolder", "children"),
++            Input("seqSearchRunButton", "n_clicks"),
++            State("seqSearchInput", "value"),
++            prevent_initial_call=True,
++            running=[
++                (Output("seqSearchStatus", "children"), "Running...", "Done."),
++                (Output("seqSearchRunButton", "disabled"), True, False),
++            ],
++        )
++        def run_seq_search(curr_toasts, nc, in_fasta):
++            try:
++                logging.debug("Running sequence search...")
++                inseq2graphseqs = ag.run_seq_search(in_fasta)
++            except UIError as err:
++                logging.debug("...Ran into an error.")
++                return (
++                    ui_utils.add_error_toast(
++                        curr_toasts, "Mapping error", str(err)
++                    ),
++                    no_update,
++                )
++            seq_search_results = ui_utils.get_seq_search_results_html(
++                inseq2graphseqs
++            )
++            logging.debug("...Done.")
++            return no_update, seq_search_results
++
++        @callback(
++            Output("dotPlotModal", "is_open"),
++            Input("dotPlotButton", "n_clicks"),
++            State("dotPlotModal", "is_open"),
++            prevent_initial_call=True,
++        )
++        def toggle_dot_plot_modal(nc, is_open):
++            if nc:
++                return not is_open
++            return is_open
++
++        @callback(
++            Output("dp1GraphSeqUI", "className"),
++            Output("dp1OtherSeqUI", "className"),
++            Input("dp1SeqType", "value"),
++            prevent_initial_call=True,
++        )
++        def toggle_dot_plot_seq1_type(seq_type):
++            if seq_type == ui_config.GRAPH_SEQ:
++                return "", "removedEntirely"
++            else:
++                return "removedEntirely", ""
++
++        @callback(
++            Output("dp2GraphSeqUI", "className"),
++            Output("dp2OtherSeqUI", "className"),
++            Input("dp2SeqType", "value"),
++            prevent_initial_call=True,
++        )
++        def toggle_dot_plot_seq2_type(seq_type):
++            if seq_type == ui_config.GRAPH_SEQ:
++                return "", "removedEntirely"
++            else:
++                return "removedEntirely", ""
++
++        @callback(
++            Output("toastHolder", "children", allow_duplicate=True),
++            Output("dotPlotImg", "src"),
++            State("toastHolder", "children"),
++            State("dotPlotK", "value"),
++            State("dotPlotMarkerSize", "value"),
++            State("dp1SeqType", "value"),
++            State("dp2SeqType", "value"),
++            State("dp1GraphSeq", "value"),
++            State("dp1OtherSeq", "value"),
++            State("dp2GraphSeq", "value"),
++            State("dp2OtherSeq", "value"),
++            Input("dotPlotRunButton", "n_clicks"),
++            prevent_initial_call=True,
++            running=[
++                (Output("dotPlotStatus", "children"), "Running...", "Done."),
++                (Output("dotPlotRunButton", "disabled"), True, False),
++            ],
++        )
++        def create_dot_plot(
++            curr_toasts, k, ms, t1, t2, gs1, os1, gs2, os2, nc
++        ):
++            k = ui_utils.get_num(
++                k, "k-mer size", integer=True, min_val=1, min_incl=True
++            )
++            ms = ui_utils.get_num(
++                ms,
++                "marker size",
++                integer=False,
++                min_val=0,
++                min_incl=False,
++            )
++            try:
++                logging.debug("Creating a dot plot...")
++                img_b64 = ag.create_dot_plot(
++                    t1, t2, gs1, os1, gs2, os2, k=k, markersize=ms
++                )
++            except UIError as err:
++                logging.debug("...Ran into an error.")
++                return (
++                    ui_utils.add_error_toast(
++                        curr_toasts, "Dot plot error", str(err)
++                    ),
++                    no_update,
++                )
++            logging.debug("...Done.")
++            return no_update, img_b64
++
++        @callback(
++            Output("toastHolder", "children", allow_duplicate=True),
++            Output("dp1SeqType", "value"),
++            Output("dp2SeqType", "value"),
++            Output("dp1GraphSeq", "value"),
++            Output("dp2GraphSeq", "value"),
++            State("toastHolder", "children"),
++            State("selectedNodeAndPatternJSONFromJS", "data"),
++            Input("dotPlotGetTwoButton", "n_clicks"),
++            prevent_initial_call=True,
++        )
++        def autofill_dotplot_nodes(curr_toasts, selected_nodes, nc):
++            nids = []
++            if selected_nodes is not None:
++                for n in selected_nodes:
++                    if n["ntype"] == cy_config.NODE_DATA_TYPE:
++                        nids.append(int(n["id"]))
++            if len(nids) == 2:
++                n0 = ag.nodeid2obj[nids[0]]
++                n1 = ag.nodeid2obj[nids[1]]
++                if "length" in n0.data and "length" in n1.data:
++                    # try to put longest node on x-axis
++                    if n0.data["length"] >= n1.data["length"]:
++                        nx = n0
++                        ny = n1
++                    else:
++                        nx = n1
++                        ny = n0
++                else:
++                    # silly bypass. this really shouldn't happen for now;
++                    # eventually these should be referring to edges, which will
++                    # also have lengths, so whatever
++                    nx = n0
++                    ny = n1
++                return (
++                    no_update,
++                    ui_config.GRAPH_SEQ,
++                    ui_config.GRAPH_SEQ,
++                    nx.basename,
++                    ny.basename,
++                )
++            out_toasts = ui_utils.add_error_toast(
++                curr_toasts,
++                "Dot plot error",
++                f"{ui_utils.pluralize(len(nids), 'node')} selected.",
++            )
++            return out_toasts, no_update, no_update, no_update, no_update
++
+     clientside_callback(
+         ClientsideFunction(
+             namespace="selection", function_name="showSelectedNodes"
+diff --git a/metagenomescope/tests/input/sample1.fa b/metagenomescope/tests/input/sample1.fa
+new file mode 100644
+index 00000000..bb19c1ba
+--- /dev/null
++++ b/metagenomescope/tests/input/sample1.fa
+@@ -0,0 +1,12 @@
++>1
++CGATGCAA
++>2
++TGCAAAGTAC
++>3
++TGCAACGTATAGACTTGTCAC
++>4
++TATATGC
++>5
++CGATGATA
++>6
++ATGA
+diff --git a/metagenomescope/tests/input/sample1.fa.fxi b/metagenomescope/tests/input/sample1.fa.fxi
+new file mode 100644
+index 00000000..57036e7a
+Binary files /dev/null and b/metagenomescope/tests/input/sample1.fa.fxi differ
+diff --git a/metagenomescope/ui_config.py b/metagenomescope/ui_config.py
+index c1006e8f..4daeecb0 100644
+--- a/metagenomescope/ui_config.py
++++ b/metagenomescope/ui_config.py
+@@ -232,6 +232,15 @@
+ TREEMAP_SINGLE = "single"
+ TREEMAP_DOUBLE = "double"
+ 
++###############################################################################
++# Dot plot UI
++###############################################################################
++
++# Is the user specifying a sequence name in the FASTA file, or giving an
++# arbitrary sequence?
++GRAPH_SEQ = "graph"
++OTHER_SEQ = "other"
++
+ ###############################################################################
+ # Component size rank selection
+ ###############################################################################
+diff --git a/metagenomescope/ui_utils.py b/metagenomescope/ui_utils.py
+index 0c486ff3..742660a9 100644
+--- a/metagenomescope/ui_utils.py
++++ b/metagenomescope/ui_utils.py
+@@ -6,7 +6,7 @@
+ import dash_ag_grid as dag
+ from collections import defaultdict
+ from dash import html, dcc, no_update
+-from . import css_config, ui_config, config, name_utils, misc_utils
++from . import css_config, ui_config, aln_config, config, name_utils, misc_utils
+ from .errors import UIError, WeirdError
+ from .gap import Gap
+ 
+@@ -1943,6 +1943,273 @@ def get_style_options_tab(node_centric):
+     )
+ 
+ 
++def get_seq_search_modal_body(aligner=aln_config.MINIMAP2):
++    return html.Div(
++        [
++            html.H5("Input sequence(s)"),
++            html.P(
++                "Here, you can specify the sequence(s) to search for in the "
++                "graph. Your input should be in FASTA format."
++            ),
++            html.P(
++                "Note that this functionality requires that you have "
++                f"{aligner} installed and available in your PATH!"
++            ),
++            dbc.Textarea(
++                size="md",
++                placeholder="FASTA of sequence(s) to search for in the graph",
++                style={"min-height": "15em"},
++                className="font-monospace",
++                spellcheck=False,
++                id="seqSearchInput",
++            ),
++            html.Div(
++                [
++                    html.Span(
++                        "(No results yet.)",
++                        className="font-monospace",
++                        id="seqSearchStatus",
++                        style={
++                            "margin-right": "1em",
++                            "vertical-align": "middle",
++                        },
++                    ),
++                    html.Button(
++                        [
++                            html.I(className="bi bi-shuffle"),
++                            html.Span(
++                                "Map graph sequences to these sequences",
++                                className="iconlbl",
++                            ),
++                        ],
++                        id="seqSearchRunButton",
++                        className="btn btn-success",
++                        type="button",
++                    ),
++                ],
++                style={
++                    "text-align": "right",
++                    "margin-top": "1em",
++                    "margin-bottom": "1em",
++                },
++            ),
++            html.H5(
++                "Results: input sequences, and the graph sequences that mapped to them"
++            ),
++            html.Div(
++                html.P(
++                    "super secret placeholder text :)", style={"color": "#fff"}
++                ),
++                id="seqSearchResults",
++                className="font-monospace",
++            ),
++        ]
++    )
++
++
++def get_seq_search_results_html(inseq2graphseqs):
++    paras = []
++    if len(inseq2graphseqs) > 0:
++        # TODO would be nice to match the ordering in the input FASTA
++        for s in sorted(inseq2graphseqs):
++            paras.append(
++                html.P(
++                    [
++                        html.Span(f"{s}:", style={"font-weight": "bold"}),
++                        " ",
++                        ", ".join(inseq2graphseqs[s]),
++                    ]
++                )
++            )
++    else:
++        paras.append(
++            html.P(
++                "No sequences in the graph mapped to any of the input "
++                "sequence(s).",
++                style={"font-weight": "bold"},
++            )
++        )
++    return paras
++
++
++def get_dot_plot_seq_ui(seq_num):
++    idprefix = f"dp{seq_num}"
++    axis = "x" if seq_num == 1 else "y"
++    title = f"Sequence {seq_num} ({axis}-axis)"
++    return html.Div(
++        [
++            dbc.Row(
++                [
++                    dbc.Col(
++                        # H5 elements mess up the styling a bit due to
++                        # margins and junk so just kinda imitate this.
++                        # not ideallll but sufficient
++                        html.Span(title, style={"font-size": "1.25rem"}),
++                        width=6,
++                    ),
++                    dbc.Col(
++                        html.Div(
++                            dbc.RadioItems(
++                                options=[
++                                    {
++                                        "label": "Node",
++                                        "value": ui_config.GRAPH_SEQ,
++                                    },
++                                    {
++                                        "label": "Provide a sequence below",
++                                        "value": ui_config.OTHER_SEQ,
++                                    },
++                                ],
++                                value=ui_config.GRAPH_SEQ,
++                                className="btn-group",
++                                inputClassName="btn-check",
++                                labelClassName="btn btn-sm btn-outline-dark",
++                                labelCheckedClassName="active",
++                                id=f"{idprefix}SeqType",
++                            ),
++                            className="btn-opt-group",
++                            style={"text-align": "right"},
++                        ),
++                        width=6,
++                    ),
++                ],
++                style={"margin-bottom": "0.5em"},
++            ),
++            html.Div(
++                dbc.InputGroup(
++                    [
++                        dbc.InputGroupText("Node name"),
++                        dbc.Input(
++                            type="text",
++                            id=f"{idprefix}GraphSeq",
++                        ),
++                    ],
++                    size="sm",
++                ),
++                id=f"{idprefix}GraphSeqUI",
++            ),
++            html.Div(
++                dbc.Textarea(
++                    size="sm",
++                    placeholder="Single sequence (just A/C/G/Ts)",
++                    style={"min-height": "10em"},
++                    className="font-monospace",
++                    spellcheck=False,
++                    id=f"{idprefix}OtherSeq",
++                ),
++                id=f"{idprefix}OtherSeqUI",
++                className="removedEntirely",
++            ),
++        ],
++        style={
++            "margin-bottom": "1em",
++        },
++    )
++
++
++def get_dot_plot_modal_body():
++    return html.Div(
++        [
++            # https://www.dash-bootstrap-components.com/docs/components/layout/
++            # basically the two dbc.Cols should add up to a total width of 12.
++            # setting 6 and 6 means they take up half of the total row width.
++            dbc.Row(
++                [
++                    dbc.Col(
++                        [
++                            html.Div(
++                                dbc.Button(
++                                    [
++                                        html.I(className="bi bi-arrow-down"),
++                                        html.Span(
++                                            "Use two currently-selected nodes",
++                                            className="iconlbl",
++                                        ),
++                                    ],
++                                    id="dotPlotGetTwoButton",
++                                    color="primary",
++                                    style={"margin-bottom": "1em"},
++                                ),
++                                style={"text-align": "center"},
++                            ),
++                            get_dot_plot_seq_ui(1),
++                            get_dot_plot_seq_ui(2),
++                            html.H5("Parameters"),
++                            dbc.InputGroup(
++                                [
++                                    dbc.InputGroupText(
++                                        [
++                                            html.Span(
++                                                "k",
++                                                style={"font-style": "italic"},
++                                            ),
++                                            "-mer size",
++                                        ],
++                                    ),
++                                    dbc.Input(
++                                        type="text",
++                                        id="dotPlotK",
++                                        value=21,
++                                        className="short-num-input",
++                                    ),
++                                ],
++                                size="sm",
++                            ),
++                            ui_config.OPTIONS_SEP,
++                            dbc.InputGroup(
++                                [
++                                    dbc.InputGroupText(
++                                        "Marker size (big plots only)",
++                                    ),
++                                    dbc.Input(
++                                        type="text",
++                                        id="dotPlotMarkerSize",
++                                        value=0.1,
++                                        className="short-num-input",
++                                    ),
++                                ],
++                                size="sm",
++                            ),
++                        ],
++                        width=6,
++                    ),
++                    dbc.Col(
++                        html.Img(id="dotPlotImg"),
++                        style={"text-align": "center"},
++                        width=6,
++                    ),
++                ]
++            ),
++            html.Div(
++                [
++                    html.Span(
++                        "(No plot has been drawn yet.)",
++                        className="font-monospace",
++                        id="dotPlotStatus",
++                        style={
++                            "margin-right": "1em",
++                            "vertical-align": "middle",
++                        },
++                    ),
++                    html.Button(
++                        [
++                            html.I(className="bi bi-pencil-fill"),
++                            html.Span(
++                                "Draw dot plot",
++                                className="iconlbl",
++                            ),
++                        ],
++                        id="dotPlotRunButton",
++                        className="btn btn-success",
++                        type="button",
++                    ),
++                ],
++                style={"text-align": "right"},
++            ),
++        ]
++    )
++
++
+ def fail_flush(curr_toasts, error_name, err):
+     """Returns output info for flush() indicating that an error happened.
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 1d306176..dd91e08e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -67,6 +67,7 @@ dependencies = [
+     "click",
+     "networkx",
+     "pygraphviz",
++    "pyfastx",
+     # pyfastg 0.2.0 added support for MEGAHIT FASTG files!
+     "pyfastg >= 0.2.0",
+     "pandas",
+@@ -84,7 +85,9 @@ dependencies = [
+     # Also, using dash < 3 seems to cause strange issues with newer python
+     # versions (at least on WSL), so let's make sure that we use dash >= 3.
+     "dash >= 3",
+-    "plotly"
++    "plotly",
++    "wotplot >= 0.4.0",
++    "matplotlib",
+ ]
+ # Matches Dash's min python version, as of March 2026:
+ # https://github.com/plotly/dash/blob/dev/setup.py

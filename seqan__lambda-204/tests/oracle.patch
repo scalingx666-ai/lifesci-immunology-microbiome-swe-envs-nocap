@@ -1,0 +1,405 @@
+diff --git a/src/search.cpp b/src/search.cpp
+index fef87d46d..7d088ad71 100644
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -76,7 +76,7 @@ int searchMain(int const argc, char const ** argv)
+     parseCommandLine(options, argc, argv);
+ 
+ #ifdef _OPENMP
+-    omp_set_num_threads(options.threads - 1);
++    omp_set_num_threads(options.threads - options.lazyQryFile); // reserve one thread for I/O when lazy-loading
+ #else
+     options.threads = 1;
+ #endif
+@@ -337,7 +337,10 @@ void realMain(LambdaOptions const & options)
+ 
+     loadDbIndexFromDisk(globalHolder, options);
+ 
+-    countQuery(globalHolder, options);
++    if (options.lazyQryFile)
++        countQuery(globalHolder, options);
++    else
++        loadQuery(globalHolder, options);
+ 
+     myWriteHeader(globalHolder, options);
+ 
+@@ -346,35 +349,55 @@ void realMain(LambdaOptions const & options)
+             "Searching and extending hits on-line...progress:\n"
+             "0%  10%  20%  30%  40%  50%  60%  70%  80%  90%  100%\n|");
+ 
+-    double start = sysTime();
+-
++    double   start       = sysTime();
+     uint64_t lastPercent = 0;
+ 
+-    bio::io::seq::record r{.id   = std::string{},
+-                           .seq  = std::vector<typename TGlobalHolder::TOrigQryAlph>{},
+-                           .qual = std::ignore};
+-    bio::io::seq::reader reader{options.queryFile, bio::io::seq::reader_options{.record = r}};
+-
+-    auto file_view = reader | views::async_input_buffer(globalHolder.records_per_batch * options.threads);
++    /* Setup lazy-loader for query (if set in options) */
++    decltype(createQryView(globalHolder, options)) file_view;
++    if (options.lazyQryFile)
++        file_view = createQryView(globalHolder, options);
+ 
+     SEQAN_OMP_PRAGMA(parallel)
+     {
+         TLocalHolder localHolder(options, globalHolder);
+ 
++        /* Define region of query this thread gets (eager-loading only) */
++        size_t const chunk_begin = globalHolder.qrySeqs.size() * omp_get_thread_num() / omp_get_num_threads();
++        size_t const chunk_end   = globalHolder.qrySeqs.size() * (omp_get_thread_num() + 1) / omp_get_num_threads();
++        /* Track (per-thread) batch count (eager-loading only) */
++        size_t       batch_i     = 0;
++
+         while (true)
+         {
+             if (localHolder.iterativeSearch != IterativeSearchMode::PHASE2)
+             {
+                 localHolder.reset();
+ 
+-                // load records until batch is full or file at end
+-                for (auto & [id, seq, qual] : file_view)
++                if (options.lazyQryFile) // load records until batch is full or file at end
+                 {
+-                    localHolder.qryIds.push_back(std::move(id));
+-                    localHolder.qrySeqs.push_back(std::move(seq));
++                    for (auto & [id, seq, qual] : file_view)
++                    {
++                        localHolder.qryIdsTmp.push_back(std::move(id));
++                        localHolder.qrySeqsTmp.push_back(std::move(seq));
++
++                        if (++localHolder.queryCount == globalHolder.records_per_batch) // no more records in file
++                            break;
++                    }
++
++                    localHolder.qryIds  = localHolder.qryIdsTmp;
++                    localHolder.qrySeqs = localHolder.qrySeqsTmp;
++                }
++                else // select subset from stored query sequences
++                {
++                    size_t const slice_begin =
++                      std::min(chunk_end, chunk_begin + batch_i * globalHolder.records_per_batch);
++                    size_t const slice_end = std::min(chunk_end, slice_begin + globalHolder.records_per_batch);
++
++                    localHolder.qryIds  = globalHolder.qryIds | bio::views::slice(slice_begin, slice_end);
++                    localHolder.qrySeqs = globalHolder.qrySeqs | bio::views::slice(slice_begin, slice_end);
+ 
+-                    if (++localHolder.queryCount == globalHolder.records_per_batch)
+-                        break;
++                    ++batch_i;
++                    localHolder.queryCount = localHolder.qrySeqs.size();
+                 }
+ 
+                 if (localHolder.queryCount == 0) // no more records in file
+diff --git a/src/search_algo.hpp b/src/search_algo.hpp
+index 150087191..333930ecb 100644
+--- a/src/search_algo.hpp
++++ b/src/search_algo.hpp
+@@ -38,6 +38,9 @@
+ #include <bio/io/seq/reader.hpp>
+ #include <bio/ranges/views/complement.hpp>
+ #include <bio/ranges/views/translate_join.hpp>
++#if __cpp_lib_ranges <= 202106L
++#    include <bio/ranges/views/persist.hpp>
++#endif
+ 
+ #include <fmindex-collection/DenseCSA.h>
+ #include <fmindex-collection/locate.h>
+@@ -260,6 +263,42 @@ void loadDbIndexFromDisk(
+ // Function loadQuery()
+ // --------------------------------------------------------------------------
+ 
++template <DbIndexType  c_indexType,
++          AlphabetEnum c_origSbjAlph,
++          AlphabetEnum c_transAlph,
++          AlphabetEnum c_redAlph,
++          AlphabetEnum c_origQryAlph>
++void loadQuery(GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redAlph, c_origQryAlph> & globalHolder,
++               LambdaOptions const &                                                                 options)
++{
++    using TGH = GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redAlph, c_origQryAlph>;
++
++    double start = sysTime();
++
++    std::string strIdent = "Loading Query Sequences...";
++    myPrint(options, 1, strIdent);
++
++    bio::io::seq::record r{.id = std::string{}, .seq = std::vector<typename TGH::TOrigQryAlph>{}, .qual = std::ignore};
++    bio::io::seq::reader reader{options.queryFile, bio::io::seq::reader_options{.record = r}};
++    for (auto & rec : reader)
++    {
++        globalHolder.qryIds.push_back(std::move(rec.id));
++        globalHolder.qrySeqs.push_back(std::move(rec.seq));
++    }
++
++    // parse the file completely and get count in one line:
++    globalHolder.queryTotal = globalHolder.qrySeqs.size();
++
++    // batch-size as set in options (unless too few sequences)
++    globalHolder.records_per_batch = std::max<size_t>(
++      std::min<size_t>(globalHolder.queryTotal / (options.threads * 10), options.maximumQueryBlockSize),
++      1);
++    double finish = sysTime() - start;
++    myPrint(options, 1, " done.\n");
++
++    myPrint(options, 2, "Runtime: ", finish, "s \n\n");
++}
++
+ template <DbIndexType  c_indexType,
+           AlphabetEnum c_origSbjAlph,
+           AlphabetEnum c_transAlph,
+@@ -270,7 +309,7 @@ void countQuery(GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redA
+ {
+     double start = sysTime();
+ 
+-    std::string strIdent = "Counting Query Sequences ...";
++    std::string strIdent = "Counting Query Sequences...";
+     myPrint(options, 1, strIdent);
+ 
+     // TODO potentially optimise this for fasta/fastq with simple 'grep -c'
+@@ -295,6 +334,26 @@ void countQuery(GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redA
+     myPrint(options, 2, "Runtime: ", finish, "s \n\n");
+ }
+ 
++template <DbIndexType  c_indexType,
++          AlphabetEnum c_origSbjAlph,
++          AlphabetEnum c_transAlph,
++          AlphabetEnum c_redAlph,
++          AlphabetEnum c_origQryAlph>
++auto createQryView(GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redAlph, c_origQryAlph> & globalHolder,
++                   LambdaOptions const &                                                                 options)
++{
++    using TGH = GlobalDataHolder<c_indexType, c_origSbjAlph, c_transAlph, c_redAlph, c_origQryAlph>;
++    bio::io::seq::record r{.id = std::string{}, .seq = std::vector<typename TGH::TOrigQryAlph>{}, .qual = std::ignore};
++    bio::io::seq::reader reader{options.queryFile, bio::io::seq::reader_options{.record = r}};
++
++#if __cpp_lib_ranges <= 202106L
++    return std::move(reader) | bio::views::persist |
++           views::async_input_buffer(globalHolder.records_per_batch * options.threads);
++#else
++    return std::move(reader) | views::async_input_buffer(globalHolder.records_per_batch * options.threads);
++#endif
++}
++
+ /// THREAD LOCAL STUFF
+ 
+ // --------------------------------------------------------------------------
+@@ -1284,8 +1343,8 @@ void iterativeSearchPost(auto & lH)
+                     assert(subr2.size() == successfulCount);
+                 }
+ 
+-                lH.qryIds.resize(lH.qryIds.size() - successfulCount);
+-                lH.qrySeqs.resize(lH.qrySeqs.size() - successfulCount);
++                lH.qryIds  = lH.qryIds | std::views::take(lH.qryIds.size() - successfulCount);
++                lH.qrySeqs = lH.qrySeqs | std::views::take(lH.qrySeqs.size() - successfulCount);
+ 
+                 /* only switch to PHASE2 if there are any left */
+                 if (!lH.qryIds.empty())
+diff --git a/src/search_datastructures.hpp b/src/search_datastructures.hpp
+index 821583077..654a4e7df 100644
+--- a/src/search_datastructures.hpp
++++ b/src/search_datastructures.hpp
+@@ -395,6 +395,12 @@ class GlobalDataHolder
+     TTransSbjSeqs transSbjSeqs = indexFile.seqs | sbjTransView<c_origSbjAlph, c_transAlph, c_redAlph>;
+     TRedSbjSeqs   redSbjSeqs   = transSbjSeqs | redView<c_transAlph, c_redAlph>;
+ 
++    /* the following are not used when the query is loaded on-demand / lazily */
++    TQryIds       qryIds;
++    TQrySeqs      qrySeqs;
++    TTransQrySeqs transQrySeqs = qrySeqs | qryTransView<c_origQryAlph, c_transAlph, c_redAlph>;
++    TRedQrySeqs   redQrySeqs   = transQrySeqs | redView<c_transAlph, c_redAlph>;
++
+     TBlastTabFile outfileBlastTab;
+     TBlastRepFile outfileBlastRep;
+     TBamFile      outfileBam;
+@@ -406,7 +412,7 @@ class GlobalDataHolder
+ 
+     size_t              queryTotal        = 0;
+     std::atomic<size_t> queryCount        = 0;
+-    size_t              records_per_batch = 100;
++    size_t              records_per_batch = 100; // TODO this currently has no effect
+ 
+     GlobalDataHolder()                                     = default;
+     GlobalDataHolder(GlobalDataHolder const &)             = delete;
+@@ -436,10 +442,13 @@ class LocalDataHolder
+     TGlobalHolder /*const*/ &            gH;
+     static constexpr seqan::BlastProgram blastProgram = TGlobalHolder::blastProgram;
+ 
+-    // query data
+-    typename TGlobalHolder::TQryIds       qryIds;
+-    typename TGlobalHolder::TQrySeqs      qrySeqs;
+-    typename TGlobalHolder::TTransQrySeqs transQrySeqs =
++    // temporary storage used by lazy-loading
++    typename TGlobalHolder::TQryIds                qryIdsTmp;
++    typename TGlobalHolder::TQrySeqs               qrySeqsTmp;
++    // refers to temporary storage (lazy-loading) or subset of qry in globalHolder (eager-loading)
++    decltype(qryIdsTmp | bio::views::slice(0, 0))  qryIds;
++    decltype(qrySeqsTmp | bio::views::slice(0, 0)) qrySeqs;
++    typename TGlobalHolder::TTransQrySeqs          transQrySeqs =
+       qrySeqs | qryTransView<TGlobalHolder::c_origQryAlph, TGlobalHolder::c_transAlph, TGlobalHolder::c_redAlph>;
+     typename TGlobalHolder::TRedQrySeqs redQrySeqs =
+       transQrySeqs | redView<TGlobalHolder::c_transAlph, TGlobalHolder::c_redAlph>;
+@@ -512,8 +521,8 @@ class LocalDataHolder
+         // clear storage
+         queryCount = 0;
+         matches.clear();
+-        qryIds.clear();
+-        qrySeqs.clear();
++        qryIdsTmp.clear();
++        qrySeqsTmp.clear();
+         blastMatches.clear();
+ 
+         // stats explicitly not cleared, because accumulated
+diff --git a/src/search_options.hpp b/src/search_options.hpp
+index 5d9b814aa..f1ec123fe 100644
+--- a/src/search_options.hpp
++++ b/src/search_options.hpp
+@@ -68,7 +68,9 @@ struct LambdaOptions : public SharedOptions
+     unsigned                                    samBamSeq;
+     bool                                        samBamHardClip;
+     bool                                        versionInformationToOutputFile = true;
+-    size_t                                      maximumQueryBlockSize          = 10;
++    size_t                                      maximumQueryBlockSize          = 10; // WTF; TODO CHANGE THIS
++
++    bool lazyQryFile = false;
+ 
+     bool seedHalfExact   = true;
+     bool adaptiveSeeding = true;
+@@ -181,6 +183,12 @@ void parseCommandLine(LambdaOptions & options, int argc, char const ** argv)
+         options.qryOrigAlphabet = AlphabetEnum::DNA5;
+     }
+ 
++    parser.add_option(options.lazyQryFile,
++                      sharg::config{.long_id     = "lazy-query",
++                                    .description = "Load query sequences on-demand (instead of at start); "
++                                                   "reduces memory usage but \"wastes\" one thread on I/O.",
++                                    .advanced    = true});
++
+     parser.add_option(options.indexFilePath,
+                       sharg::config{.short_id    = 'i',
+                                     .long_id     = "index",
+@@ -346,7 +354,7 @@ void parseCommandLine(LambdaOptions & options, int argc, char const ** argv)
+                         .long_id     = "threads",
+                         .description = "Number of threads to run concurrently.",
+                         .advanced    = true,
+-                        .validator   = sharg::arithmetic_range_validator{2, 1000}
++                        .validator   = sharg::arithmetic_range_validator{1, 1000}
+     });
+ #else
+     parser.add_option(options.threads,
+@@ -355,7 +363,7 @@ void parseCommandLine(LambdaOptions & options, int argc, char const ** argv)
+                         .long_id     = "threads",
+                         .description = "LAMBDA BUILT WITHOUT OPENMP; setting this option has no effect.",
+                         .advanced    = true,
+-                        .validator   = sharg::arithmetic_range_validator{2, 2}
++                        .validator   = sharg::arithmetic_range_validator{1, 1}
+     });
+ #endif
+ 
+@@ -738,6 +746,9 @@ void parseCommandLine(LambdaOptions & options, int argc, char const ** argv)
+ 
+     // set samBamHardClip
+     options.samBamHardClip = (samBamClip == "hard");
++
++    if (options.threads == 1ull && options.lazyQryFile)
++        throw sharg::parser_error{"Lazy query loading requires at least two total threads."};
+ }
+ 
+ // --------------------------------------------------------------------------
+diff --git a/src/shared_definitions.hpp b/src/shared_definitions.hpp
+index 2e15a2146..8517180b4 100644
+--- a/src/shared_definitions.hpp
++++ b/src/shared_definitions.hpp
+@@ -254,13 +254,13 @@ template <AlphabetEnum c_origQryAlph, AlphabetEnum c_transAlph, AlphabetEnum c_r
+ constexpr auto qryTransView = []()
+ {
+     if constexpr (c_redAlph == AlphabetEnum::DNA3BS)
+-        return bio::views::add_reverse_complement | views::duplicate;
++        return bio::views::type_reduce | bio::views::add_reverse_complement | views::duplicate;
+     else if constexpr (bio::alphabet::nucleotide_alphabet<_alphabetEnumToType<c_redAlph>>)
+-        return bio::views::add_reverse_complement;
++        return bio::views::type_reduce | bio::views::add_reverse_complement;
+     else if constexpr (c_origQryAlph == c_transAlph)
+         return bio::views::type_reduce;
+     else
+-        return bio::views::translate_join;
++        return bio::views::type_reduce | bio::views::translate_join;
+ }();
+ 
+ template <AlphabetEnum c_transAlph, AlphabetEnum c_redAlph>
+@@ -269,11 +269,11 @@ constexpr auto redView = []()
+     if constexpr (c_transAlph == c_redAlph)
+         return bio::views::type_reduce;
+     else if constexpr (c_transAlph == AlphabetEnum::AMINO_ACID)
+-        return bio::views::deep{bio::views::convert<_alphabetEnumToType<c_redAlph>>};
++        return bio::views::type_reduce | bio::views::deep{bio::views::convert<_alphabetEnumToType<c_redAlph>>};
+     else if constexpr (c_redAlph == AlphabetEnum::DNA3BS)
+-        return views::dna_n_to_random | views::reduce_to_bisulfite;
++        return bio::views::type_reduce | views::dna_n_to_random | views::reduce_to_bisulfite;
+     else
+-        return views::dna_n_to_random;
++        return bio::views::type_reduce | views::dna_n_to_random;
+ }();
+ 
+ // ==========================================================================
+diff --git a/test/cli/search_test.cpp b/test/cli/search_test.cpp
+index 5441629be..cd842f78a 100644
+--- a/test/cli/search_test.cpp
++++ b/test/cli/search_test.cpp
+@@ -27,17 +27,25 @@ struct search_test : public cli_test
+                          std::string const & profile,
+                          std::string const & output_file,
+                          std::string const & output_type,
+-                         std::string const & control_file)
++                         std::string const & control_file,
++                         auto ... more_args)
+     {
+         std::string _r;
+         std::string _red;
+-
+         if (index_command == "mkindexp")
+         {
+             _r = "-r";
+             _red = reduction;
+         }
+ 
++        std::string _t = "-t";
++        std::string _threads = "1";
++        if (sizeof...(more_args) > 0 && ((more_args == "-t") || ...))
++        {
++            _t = "";
++            _threads = "";
++        }
++
+         cli_test_result result_index = execute_app("lambda3", index_command,
+                                                    "-d", data(db_file),
+                                                    "-i", index_file,
+@@ -47,10 +55,11 @@ struct search_test : public cli_test
+         cli_test_result result_search = execute_app("lambda3", search_command,
+                                                     "-i", index_file,
+                                                     "-q", data(query_file),
+-                                                    "-t", "2",
++                                                    _t, _threads,
+                                                     "--version-to-outputfile", "0",
+                                                     "-p", profile,
+-                                                    "-o", output_file);
++                                                    "-o", output_file,
++                                                    more_args...);
+ 
+         ASSERT_EQ(result_search.exit_code, 0);
+ 
+@@ -647,3 +656,12 @@ TEST_F(search_test, tblastx_fm_sensitive_sam)
+     run_search_test("mkindexp", "db_nucl.fasta.gz", "db_trans_fm.fasta.gz.lba", "fm", "li10", "searchp",
+                     "queries_nucl.fasta.gz", "sensitive", "output_tblastx_fm_sensitive_test.sam", "sam", "output_tblastx_fm_sensitive.sam");
+ }
++
++// special options
++
++TEST_F(search_test, lazy_loading)
++{
++    run_search_test("mkindexp", "db_prot.fasta.gz", "db_prot_fm.fasta.gz.lba", "fm", "li10", "searchp",
++                    "queries_nucl.fasta.gz", "none", "output_blastx_fm_lazy_test.m8", "m8", "output_blastx_fm.m8",
++                    "--lazy-query", "1", "-t", "2");
++}

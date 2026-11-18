@@ -1,0 +1,247 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 14b4720d..958ef773 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -6,6 +6,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🚀 Features
+ 
++* Models of time series in `ep.ml` measure the time since the last observation with the times of the timepoints in `edata.tem[time_key]`, a new argument of {func}`ep.ml.fit <ehrapy.ml.fit>`, instead of counting timepoints, so that irregular timepoints are spaced correctly ([#1151](https://github.com/theislab/ehrapy/pull/1151)) @Zethson
+ * {class}`ep.ml.Task <ehrapy.ml.Task>` with `rolling=True` predicts a longitudinal variable, such as the hourly sepsis label of PhysioNet 2019, at every timepoint from the timepoints before it, and every function of `ep.ml` fits, stores, evaluates, calibrates and explains these predictions per timepoint while keeping patients together ([#1152](https://github.com/theislab/ehrapy/pull/1152)) @Zethson
+ 
+   On the held-out patients of PhysioNet 2019, a GRU predicts the hourly sepsis label from the hours before with an AUROC of 0.75 and AUPRC of 0.05, and gradient boosting on summaries of those hours with 0.67 and 0.02, for 1.2% positive hours.
+diff --git a/ehrapy/ml/_deep.py b/ehrapy/ml/_deep.py
+index 9f13b1ad..af9a219b 100644
+--- a/ehrapy/ml/_deep.py
++++ b/ehrapy/ml/_deep.py
+@@ -65,6 +65,7 @@ def _fit(
+         n_outputs: int,
+         n_static: int,
+         tuning: tuple[np.ndarray, np.ndarray],
++        times: np.ndarray,
+         random_state: int,
+     ) -> _FittedModel:
+         torch = _torch()
+@@ -77,7 +78,7 @@ def _fit(
+             )
+         torch.manual_seed(random_state)
+         fitted = _FittedModel(self, task, n_static, X, y)
+-        inputs, targets = fitted._inputs(X), fitted._targets(y)
++        inputs, targets = fitted._inputs(X, times), fitted._targets(y)
+         network = self._network(inputs[0].shape[2], inputs[0].shape[1], n_static, every_step)
+         with torch.no_grad():
+             embedding, attention = embed(network, *(tensor[:1] for tensor in inputs))
+@@ -88,7 +89,7 @@ def _fit(
+             fitted,
+             inputs,
+             targets,
+-            fitted._inputs(tuning[0]),
++            fitted._inputs(tuning[0], times),
+             fitted._targets(tuning[1]),
+             _loss(task.kind, y[~np.isnan(y)] if every_step else y, n_outputs, self.trainer, labeled=every_step),
+             random_state,
+@@ -313,11 +314,11 @@ def __init__(self, model: DeepModel, task: Task, n_static: int, X: np.ndarray, y
+         else:
+             self.target_mean, self.target_std = 0.0, 1.0
+ 
+-    def outputs(self, X: np.ndarray) -> np.ndarray:
++    def outputs(self, X: np.ndarray, times: np.ndarray) -> np.ndarray:
+         """Predictions, embedding and attention of every observation, side by side."""
+         torch = _torch()
+ 
+-        outputs, embedding, attention = _forward(self, self._inputs(X))
++        outputs, embedding, attention = _forward(self, self._inputs(X, times))
+         match self.kind:
+             case "binary" | "multilabel":
+                 outputs = torch.sigmoid(outputs)
+@@ -331,8 +332,8 @@ def outputs(self, X: np.ndarray) -> np.ndarray:
+             return predictions
+         return torch.cat([outputs, embedding, *([] if attention is None else [attention])], dim=1).double().numpy()
+ 
+-    def _inputs(self, X: np.ndarray) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+-        """Values, whether they were observed and the time since their last observation of shape `(observations, timepoints, variables)`, and static covariates."""
++    def _inputs(self, X: np.ndarray, times: np.ndarray) -> tuple[Tensor, Tensor, Tensor, Tensor]:
++        """Values, whether they were observed and the time since their last observation as a fraction of the window, of shape `(observations, timepoints, variables)`, and static covariates."""
+         torch = _torch()
+ 
+         if not self.model.sequential:
+@@ -345,7 +346,9 @@ def _inputs(self, X: np.ndarray) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+             steps = np.arange(X.shape[2])
+             last = np.maximum.accumulate(np.where(observed, steps, -1), axis=2)
+             filled = np.take_along_axis(np.nan_to_num(values), np.maximum(last, 0), axis=2) * (last >= 0)
+-            since = np.where(last >= 0, steps - last, steps + 1) / X.shape[2]
++            step = np.median(np.diff(times)) if len(times) > 1 else 1.0
++            since = np.where(last >= 0, times - times[np.maximum(last, 0)], times - times[0] + step)
++            since /= times[-1] - times[0] + step
+             static = np.nan_to_num((X[:, n_variables:, 0] - self.static_mean) / self.static_std)
+             arrays = [*(np.moveaxis(array, 1, 2) for array in (filled, observed, since)), static]
+         return tuple(torch.as_tensor(array, dtype=torch.float32) for array in arrays)
+diff --git a/ehrapy/ml/_features.py b/ehrapy/ml/_features.py
+index bc35e223..a7e4bd64 100644
+--- a/ehrapy/ml/_features.py
++++ b/ehrapy/ml/_features.py
+@@ -99,6 +99,20 @@ def _with_covariates(values: Array, covariates: pd.DataFrame) -> Array:
+     return xp.concat([xp.astype(values, xp.float64), static], axis=1)
+ 
+ 
++def _times(edata: EHRData, task: Task, layer: str | None, time_key: str) -> np.ndarray:
++    """Time of every timepoint of the observation window from `edata.tem[time_key]`, or its position if `tem` has no such column."""
++    X = edata.X if layer is None else edata.layers[layer]
++    window = task._window(X.shape[2])
++    if time_key not in edata.tem:
++        return np.arange(X.shape[2], dtype=np.float64)[window]
++    times = edata.tem[time_key].iloc[window]
++    if pd.api.types.is_numeric_dtype(times):
++        return times.to_numpy(np.float64)
++    if pd.api.types.is_datetime64_any_dtype(times):
++        times = times - times.iloc[0]
++    return pd.to_timedelta(times).dt.total_seconds().to_numpy()
++
++
+ def _covariates(edata: EHRData, obs_keys: Sequence[str], columns: Sequence[str] | None) -> pd.DataFrame:
+     """`obs` columns with categorical columns one-hot encoded, aligned with `columns` if given."""
+     covariates = pd.get_dummies(edata.obs[list(obs_keys)]) if obs_keys else edata.obs[[]]
+diff --git a/ehrapy/ml/_predictor.py b/ehrapy/ml/_predictor.py
+index 958f72e1..3004715f 100644
+--- a/ehrapy/ml/_predictor.py
++++ b/ehrapy/ml/_predictor.py
+@@ -23,7 +23,7 @@
+ from ehrapy._compat import _map_observation_blocks, _materialize
+ from ehrapy._settings import settings
+ from ehrapy.ml._deep import DeepModel, _deep_model, _FittedModel
+-from ehrapy.ml._features import _features, _sequences
++from ehrapy.ml._features import _features, _sequences, _times
+ from ehrapy.ml._task import Kind, Task, _targets
+ 
+ if TYPE_CHECKING:
+@@ -61,6 +61,8 @@ class Predictor:
+     calibrator: Callable[[np.ndarray], np.ndarray] | None = None
+     #: Quantile of the nonconformity scores from :func:`~ehrapy.ml.conformalize`, or `None`.
+     conformal: float | None = None
++    #: Column of `tem` with the time of every timepoint.
++    time_key: str = "interval_start_offset"
+ 
+ 
+ def fit(
+@@ -90,6 +92,7 @@ def fit(
+     layer: str | None = None,
+     statistics: Iterable[Statistic] = ("min", "max", "mean"),
+     split_key: str = "split",
++    time_key: str = "interval_start_offset",
+     max_train_obs: int | None = 10_000,
+     random_state: int = 0,
+ ) -> Predictor:
+@@ -129,6 +132,8 @@ def fit(
+         statistics: Statistics that summarize every longitudinal variable over the observation window, see :func:`~ehrapy.preprocessing.summarize_measurements`.
+         split_key: Column of `obs` with the sets from :func:`~ehrapy.ml.split`.
+             The model is fit on the observations in `"train"` with all targets.
++        time_key: Column of `tem` with the time of every timepoint, as numbers, time differences or dates, from which models of time series compute the time since the last observation.
++            If `tem` has no such column, the timepoints are evenly spaced.
+         max_train_obs: Maximum number of randomly chosen training and tuning observations the model is fit on.
+             If `None`, all are used.
+         random_state: Seed for choosing the training observations and for the built-in models.
+@@ -196,9 +201,12 @@ def fit(
+             n_outputs=n_outputs,
+             n_static=len(feature_names) - len(var_names) if sequential else train_features.shape[1],
+             tuning=(tuning_features, tuning_targets),
++            times=_times(edata, task, layer, time_key) if sequential else np.empty(0),
+             random_state=random_state,
+         )
+-    return Predictor(task, preprocessing, fitted, var_names, obs_keys, layer, statistics, feature_names, classes)
++    return Predictor(
++        task, preprocessing, fitted, var_names, obs_keys, layer, statistics, feature_names, classes, time_key=time_key
++    )
+ 
+ 
+ def predict(
+@@ -303,9 +311,11 @@ def _outputs_of(edata: EHRData, predictor: Predictor, features: Any = None) -> l
+         widths[0] = features.shape[2]
+     elif isinstance(predictor.model, _FittedModel):
+         widths[1:] = predictor.model.n_embedding, predictor.model.n_attention
+-    outputs = _materialize(_outputs(features, predictor.preprocessing, predictor.model, kind, n_outputs, sum(widths)))[
+-        0
+-    ]
++    times = np.empty(0)
++    if predictor.preprocessing is None:
++        times = _times(edata, predictor.task, predictor.layer, predictor.time_key)
++    outputs = _outputs(features, predictor.preprocessing, predictor.model, kind, n_outputs, sum(widths), times)
++    outputs = _materialize(outputs)[0]
+     if predictor.task.rolling:
+         outputs[:, : predictor.task.gap + 1] = np.nan
+     return np.split(outputs, np.cumsum(widths)[:-1], axis=1)
+@@ -387,15 +397,21 @@ def _estimator(model: str | BaseEstimator, kind: Kind, random_state: int) -> Bas
+ 
+ @singledispatch
+ def _outputs(
+-    features: np.ndarray, preprocessing: Pipeline | None, model: Any, kind: Kind, n_outputs: int, n_columns: int
++    features: np.ndarray,
++    preprocessing: Pipeline | None,
++    model: Any,
++    kind: Kind,
++    n_outputs: int,
++    n_columns: int,
++    times: np.ndarray,
+ ) -> np.ndarray:
+     if preprocessing is not None and features.ndim == 3:
+         samples = np.moveaxis(features, 2, 1).reshape(-1, features.shape[1])
+-        return _outputs(samples, preprocessing, model, kind, n_outputs, 1)[:, 0].reshape(len(features), -1)
++        return _outputs(samples, preprocessing, model, kind, n_outputs, 1, times)[:, 0].reshape(len(features), -1)
+     if preprocessing is not None:
+         features = preprocessing.transform(features)
+     if isinstance(model, _FittedModel):
+-        return model.outputs(features)
++        return model.outputs(features, times)
+     match kind:
+         case "binary":
+             return model.predict_proba(features)[:, 1:]
+@@ -413,7 +429,13 @@ def _outputs(
+ 
+ @_outputs.register(DaskArray)
+ def _(
+-    features: DaskArray, preprocessing: Pipeline | None, model: Any, kind: Kind, n_outputs: int, n_columns: int
++    features: DaskArray,
++    preprocessing: Pipeline | None,
++    model: Any,
++    kind: Kind,
++    n_outputs: int,
++    n_columns: int,
++    times: np.ndarray,
+ ) -> DaskArray:
+     return _map_observation_blocks(
+         features,
+@@ -423,6 +445,7 @@ def _(
+         kind,
+         n_outputs,
+         n_columns,
++        times,
+         chunks=(features.chunks[0], (n_columns,)),
+         drop_axis=2 if features.ndim == 3 else [],
+         meta=np.empty((0, 0), dtype=np.float64),
+diff --git a/tests/ml/test_deep.py b/tests/ml/test_deep.py
+index 2958854a..aed50d22 100644
+--- a/tests/ml/test_deep.py
++++ b/tests/ml/test_deep.py
+@@ -144,3 +144,23 @@ def test_missing_torch_raises(monkeypatch):
+ 
+     with pytest.raises(ImportError, match=r"ehrapy\[ml\]"):
+         ep.ml.fit(_split(60), TASKS["binary"], model="gru")
++
++
++def test_time_since_observation_follows_tem():
++    edata = _split(60)
++    task = ep.ml.Task("label")
++    hours = np.array([0, 1, 2, 3, 10, 11, 12, 20, 21, 22])
++    predictors, predictions = {}, {}
++    for grid, times in {"positions": None, "regular": np.arange(10), "irregular": hours}.items():
++        data = edata.copy()
++        if times is not None:
++            data.tem["interval_start_offset"] = pd.to_timedelta(times, unit="h").astype(str)
++        predictors[grid] = ep.ml.fit(data, task, model=ep.ml.GRU(trainer=QUICK))
++        predictions[grid] = ep.ml.predict(data, predictors[grid], copy=True).obs["prediction"]
++
++    pd.testing.assert_series_equal(predictions["positions"], predictions["regular"])
++    assert not predictions["positions"].equals(predictions["irregular"])
++    X = np.full((1, 3, 10), np.nan)
++    X[0, :, [0, 4]] = 0
++    since = predictors["irregular"].model._inputs(X, hours.astype(float))[2][0, :, 0].numpy()
++    np.testing.assert_allclose(since, np.array([0, 1, 2, 3, 0, 1, 2, 10, 11, 12]) / 23, rtol=1e-6)

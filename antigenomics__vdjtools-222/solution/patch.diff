@@ -1,0 +1,354 @@
+diff --git a/python/vdjtools/model/check.py b/python/vdjtools/model/check.py
+index 8867edac..e43a972a 100644
+--- a/python/vdjtools/model/check.py
++++ b/python/vdjtools/model/check.py
+@@ -235,6 +235,30 @@ def _check_tables(model: Model, tol: float) -> list[dict]:
+                                f"...and {bad.height - 20} further mis-normalized group(s)",
+                                event=name, value=float(bad.height - 20)))
+         zeros = sums.filter(pl.col("s").abs() <= tol).height
++        if event.kind is EventKind.DELETION and keys in (["v_allele"], ["j_allele"]):
++            allele_col = keys[0]
++            choice = allele_col[0] + "_choice"
++            mass = _choice_mass(model, choice, allele_col)
++            genomic = model.genomic.get("genes_" + allele_col[0])
++            functional = (set(genomic.filter(pl.col("functional"))[allele_col])
++                          if genomic is not None and "functional" in genomic.columns else set(mass))
++            # J|V can be nonzero only under unused V parents; those J alleles are unreachable.
++            if choice == "j_choice" and "v_allele" in model.tables.get(choice, pl.DataFrame()).columns:
++                used_v = [a for a, p in _choice_mass(model, "v_choice", "v_allele").items() if p > 0]
++                genes_v = model.genomic.get("genes_v")
++                if genes_v is not None and "functional" in genes_v.columns:
++                    functional_v = set(genes_v.filter(pl.col("functional"))["v_allele"])
++                    used_v = [a for a in used_v if a in functional_v]
++                reachable = model.tables[choice].filter(pl.col("v_allele").is_in(used_v))
++                mass = dict(reachable.group_by(allele_col).agg(pl.col("p").sum()).iter_rows())
++            conditional = dict(sums.select(allele_col, "s").iter_rows())
++            for allele, parent_mass in mass.items():
++                if allele in functional and parent_mass > 0 and abs(conditional.get(allele, 0.0)) <= tol:
++                    rows.append(_issue("error", "required_conditional",
++                        "positive reachable gene-choice mass has a missing or zero deletion conditional",
++                        event=name, allele=allele, value=float(parent_mass)))
++                    if allele in conditional:
++                        zeros -= 1
+         if zeros:
+             # Legal: an undefined conditional for a gene that is never used. Worth surfacing --
+             # it is also what an absorbing EM state looks like.
+diff --git a/python/vdjtools/model/collapse.py b/python/vdjtools/model/collapse.py
+index 5225ade4..46451baa 100644
+--- a/python/vdjtools/model/collapse.py
++++ b/python/vdjtools/model/collapse.py
+@@ -263,7 +263,11 @@ def collapse_alleles(model: Model) -> Model:
+                   .group_by(["_gd1", "_gd2"], maintain_order=True).agg(pl.col("pw").sum().alias("p"))            # weighted avg over D1
+                   .with_columns(_rep_expr("_gd1").alias("d_allele"),
+                                 _rep_expr("_gd2").alias("d2_allele")))
+-            new["d2_gene"] = d2.select("d_allele", "d2_allele", "p")
++            # Undefined all-zero allele conditionals contribute no tandem support.
++            # Condition the gene-level distribution on the remaining defined mass.
++            total = pl.col("p").sum().over("d_allele")
++            new["d2_gene"] = d2.select("d_allele", "d2_allele", "p").with_columns(
++                p=pl.when(total > 0).then(pl.col("p") / total).otherwise(0.0))
+         if "d2_del" in t:
+             # weight by the D2 marginal P(D2) = Σ_D1 P(D2|D1)P(D1)
+             pd1 = dmarg.select(pl.col("d_allele").alias("_a"), "p")
+diff --git a/python/vdjtools/model/infer.py b/python/vdjtools/model/infer.py
+index 2e901c70..51f4a81f 100644
+--- a/python/vdjtools/model/infer.py
++++ b/python/vdjtools/model/infer.py
+@@ -915,8 +915,34 @@ def augment_from_oracle(learned: Model, oracle: Model) -> Model:
+                 p=pl.when(pl.col(acol).is_in(list(proxy))).then(floor).otherwise(pl.col("p")))
+         tot = pl.col("p").sum().over(nk) if nk else pl.col("p").sum()
+         tables[choice_ev] = tables[choice_ev].with_columns(p=pl.when(tot > 0).then(pl.col("p") / tot).otherwise(0.0))
+-    return Model(manifest=learned.manifest, tables=tables, genomic=learned.genomic,
+-                 training=learned.training)
++    # Copying V's P(J|V) can make a J reachable before the J pass, which then sees
++    # positive choice mass and skips it. Restore only undefined child groups;
++    # fitted choice probabilities and supported conditionals remain untouched.
++    for seg in ("v", "j"):
++        acol = f"{seg}_allele"
++        choice = tables[f"{seg}_choice"]
++        if seg == "j" and "v_allele" in choice.columns:
++            used_v = set(tables["v_choice"].filter(pl.col("p") > 0)["v_allele"])
++            used_v &= _functional_support(learned, "v")
++            choice = choice.filter(pl.col("v_allele").is_in(list(used_v)))
++        used = set(choice.filter(pl.col("p") > 0)[acol]) & _functional_support(learned, seg)
++        for name, event in learned.manifest.events.items():
++            if normalization_keys(event) != [acol]:
++                continue
++            child = tables[name]
++            supported = set(child.group_by(acol).agg(pl.col("p").sum())
++                            .filter(pl.col("p") > 0)[acol])
++            missing = used - supported
++            if not missing:
++                continue
++            donor = oracle.tables.get(name, child.clear()).filter(pl.col(acol).is_in(list(missing)))
++            available = set(donor.group_by(acol).agg(pl.col("p").sum())
++                            .filter(pl.col("p") > 0)[acol])
++            if available != missing:
++                raise ValueError(f"completion template lacks {name} support for {sorted(missing - available)}")
++            tables[name] = pl.concat([child.filter(~pl.col(acol).is_in(list(missing))), donor])
++    return enforce_dj_order(Model(manifest=learned.manifest, tables=tables, genomic=learned.genomic,
++                                  training=learned.training))
+ 
+ 
+ def enforce_dj_order(model: Model) -> Model:
+diff --git a/python/vdjtools/model/io.py b/python/vdjtools/model/io.py
+index 433d3eb5..7a95824e 100644
+--- a/python/vdjtools/model/io.py
++++ b/python/vdjtools/model/io.py
+@@ -615,7 +615,10 @@ def from_germline(germline: pl.DataFrame, *, locus: str, organism: str = "custom
+     manifest = Manifest(locus=locus, organism=organism, chain_type=chain_type, events=events,
+                         palindrome_max={k: int(v) for k, v in pal.items()},
+                         source=source or f"germline:{locus}")
+-    return Model(manifest=manifest, tables=tables, genomic=genomic).validate()
++    from .collapse import _project_onto_germline
++    from .infer import enforce_dj_order
++    tables = _project_onto_germline(tables, genomic, manifest)
++    return enforce_dj_order(Model(manifest=manifest, tables=tables, genomic=genomic)).validate()
+ 
+ 
+ def from_arda(locus: str, organism: str = "human", *,
+diff --git a/src/pgen.cpp b/src/pgen.cpp
+index 7decf710..1bc1885d 100644
+--- a/src/pgen.cpp
++++ b/src/pgen.cpp
+@@ -2230,6 +2230,9 @@ struct Cat {
+ 
+     bool empty() const { return value.empty(); }
+     int pick(Rng& r) const {
++        if (empty())
++            throw std::invalid_argument("generate_batch: cannot sample an empty categorical distribution; "
++                                        "model has no positive probability for a required event");
+         double u = r.uniform();
+         size_t i = static_cast<size_t>(
+             std::lower_bound(cum.begin(), cum.end(), u) - cum.begin());
+diff --git a/tests/python/test_collapse.py b/tests/python/test_collapse.py
+index 219ab4da..19923013 100644
+--- a/tests/python/test_collapse.py
++++ b/tests/python/test_collapse.py
+@@ -19,6 +19,32 @@
+ LOCI = ["TRA", "TRB", "TRG", "TRD", "IGH", "IGK", "IGL"]
+ 
+ 
++def test_tandem_collapse_normalizes_over_defined_parent_alleles(toy_model_vdj):
++    from dataclasses import replace
++    from vdjtools.model import Model
++    from vdjtools.model.events import Event, EventKind
++    model = toy_model_vdj
++    tables = dict(model.tables)
++    for name in ('d_gene', 'd_del'):
++        original = tables[name]
++        duplicate = original.with_columns(pl.lit('TOYD1*02').alias('d_allele'))
++        tables[name] = pl.concat([original, duplicate])
++        if name == 'd_gene':
++            tables[name] = tables[name].with_columns(p=pl.col('p') / 2)
++    tables['d2_gene'] = pl.DataFrame({'d_allele': ['TOYD1*01', 'TOYD1*01', 'TOYD1*02', 'TOYD1*02'],
++        'd2_allele': ['TOYD1*01', 'TOYD1*02'] * 2, 'p': [.25, .75, 0., 0.]})
++    genomic = dict(model.genomic)
++    genomic['genes_d'] = pl.concat([genomic['genes_d'], genomic['genes_d'].with_columns(
++        pl.lit('TOYD1*02').alias('d_allele'))])
++    manifest = replace(model.manifest, events={**model.manifest.events,
++        'd2_gene': Event(name='d2_gene', kind=EventKind.GENE_CHOICE, given=('d_gene',))})
++    raw = Model(manifest=manifest, tables=tables, genomic=genomic)
++    before = raw.tables['d2_gene'].clone()
++    collapsed = collapse_alleles(raw)
++    assert raw.tables['d2_gene'].equals(before)
++    assert collapsed.tables['d2_gene']['p'].to_list() == pytest.approx([1.])
++
++
+ def _shipped() -> list[tuple[str, str, str]]:
+     """Every ``(source, organism, locus)`` actually shipped — ``arda`` alone carries mouse."""
+     from vdjtools.model.bundled import list_bundled
+diff --git a/tests/python/test_generate_native.py b/tests/python/test_generate_native.py
+index e5aaf8cf..6308a4c1 100644
+--- a/tests/python/test_generate_native.py
++++ b/tests/python/test_generate_native.py
+@@ -84,6 +84,17 @@ def test_productive_only_returns_exactly_n_productive_draws(trb):
+     assert all(len(nt) % 3 == 0 for nt in nat["junction_nt"])
+ 
+ 
++@pytest.mark.parametrize('threads', [1, min(2, available_cores())])
++def test_empty_required_categorical_raises_instead_of_crashing(threads):
++    from vdjtools._core import generate_batch
++    from vdjtools.model.native import pack
++
++    packed, _, _ = pack(load_bundled('TRG', 'olga'))
++    packed.del_j = [0.] * len(packed.del_j)
++    with pytest.raises(ValueError, match='empty categorical distribution'):
++        generate_batch(packed, 64, 20261028, True, threads)
++
++
+ def test_an_unknown_engine_raises_rather_than_picking_one(trb):
+     """A silently-ignored engine name would be the worst of both: a knob that does nothing."""
+     with pytest.raises(ValueError, match="engine"):
+diff --git a/tests/python/test_model_check.py b/tests/python/test_model_check.py
+index 9287da01..8fa264b1 100644
+--- a/tests/python/test_model_check.py
++++ b/tests/python/test_model_check.py
+@@ -34,6 +34,33 @@ def test_toy_vdj_model_is_clean(toy_model_vdj):
+     assert issues.filter(pl.col("severity") == "error").is_empty()
+ 
+ 
++@pytest.mark.parametrize('missing', [False, True])
++@pytest.mark.parametrize('segment', ['v', 'j'])
++def test_required_deletion_conditional_distinguishes_used_and_unused(toy_model, missing, segment):
++    col, event = segment + '_allele', {'v': 'v_3_del', 'j': 'j_5_del'}[segment]
++    allele = toy_model.tables[event][col][0]
++    deletion = toy_model.tables[event]
++    deletion = (deletion.filter(pl.col(col) != allele) if missing else deletion.with_columns(
++        p=pl.when(pl.col(col) == allele).then(0.).otherwise(pl.col('p'))))
++    broken = _rebuild(toy_model, **{event: deletion})
++    issues = check_model(broken, germline='none')
++    required = issues.filter((pl.col('check') == 'required_conditional') & (pl.col('event') == event))
++    assert required['allele'].to_list() == [allele]
++    assert required['severity'].to_list() == ['error']
++    choice = segment + '_choice'
++    unused = _rebuild(broken, **{choice: broken.tables[choice].with_columns(
++        p=pl.when(pl.col(col) == allele).then(0.).otherwise(pl.col('p')))})
++    assert 'required_conditional' not in _checks(check_model(unused, germline='none'), 'error')
++
++
++def test_human_arda_tra_reports_selectable_traj14_without_deletion_mass():
++    issues = check_model(load_bundled('TRA', 'arda', collapse=False), germline='none')
++    required = issues.filter((pl.col('check') == 'required_conditional') &
++        (pl.col('event') == 'j_5_del') & (pl.col('allele') == 'TRAJ14*01'))
++    assert required['severity'].to_list() == ['error']
++    assert required['value'][0] > 0
++
++
+ def test_bundled_trb_has_no_errors():
+     """TRB is the workhorse locus; a shipped model must not carry error-level issues."""
+     for source in ("olga", "learned"):
+@@ -97,9 +124,8 @@ def test_deletion_unreachable_scales_with_the_lost_mass(toy_model):
+     """Reported as the FRACTION of an allele's mass that no trim can reach, not per row."""
+     t = toy_model.tables["v_3_del"]
+     # TOYV1*01's cut_segment is 13 nt with palindrome_max 4, so ndel > 8 is unreachable.
+-    heavy = t.with_columns(
+-        p=pl.when((pl.col("v_allele") == "TOYV1*01") & (pl.col("ndel") > 8))
+-        .then(1.0).otherwise(pl.col("p")))
++    heavy = pl.concat([t, t.filter(pl.col("v_allele") == "TOYV1*01").head(1).with_columns(
++        ndel=pl.lit(9).cast(t.schema["ndel"]), p=pl.lit(2.0))])
+     heavy = heavy.with_columns(p=pl.col("p") / pl.col("p").sum().over("v_allele"))
+     issues = check_model(_rebuild(toy_model, v_3_del=heavy), germline="none")
+     row = issues.filter(pl.col("check") == "deletion_unreachable").filter(
+diff --git a/tests/python/test_model_io_extend.py b/tests/python/test_model_io_extend.py
+index a30eca04..37a12496 100644
+--- a/tests/python/test_model_io_extend.py
++++ b/tests/python/test_model_io_extend.py
+@@ -21,6 +21,77 @@ def _gene_usage(model, seg):
+     return out
+ 
+ 
++def test_germline_initializer_projects_short_allele_deletions(toy_germline):
++    from vdjtools.model.io import from_germline
++    germline = toy_germline.with_columns(sequence=pl.when(pl.col('allele') == 'TOYV2*01')
++        .then(pl.lit('TGT')).otherwise(pl.col('sequence')))
++    model = from_germline(germline, locus='TOY')
++    assert check_model(model, germline='none').filter(pl.col('severity') == 'error').is_empty()
++
++
++@pytest.mark.parametrize('missing', [False, True])
++def test_completion_restores_j_deletion_newly_reachable_through_v(toy_model, missing):
++    from vdjtools.model import Model
++    from vdjtools.model.infer import augment_from_oracle
++    tables = dict(toy_model.tables)
++    tables['v_choice'] = tables['v_choice'].with_columns(p=pl.when(
++        pl.col('v_allele') == 'TOYV2*01').then(0.).otherwise(pl.col('p')))
++    tables['v_choice'] = tables['v_choice'].with_columns(p=pl.col('p') / pl.col('p').sum())
++    tables['j_choice'] = tables['j_choice'].with_columns(p=pl.when(
++        (pl.col('v_allele') == 'TOYV2*01') | (pl.col('j_allele') == 'TOYJ1*01'))
++        .then(0.).otherwise(pl.col('p')))
++    totals = pl.col('p').sum().over('v_allele')
++    tables['j_choice'] = tables['j_choice'].with_columns(p=pl.when(totals > 0)
++        .then(pl.col('p') / totals).otherwise(0.))
++    deletion = tables['j_5_del'].with_columns(p=pl.when(pl.col('j_allele') == 'TOYJ2*01')
++        .then((pl.col('ndel') == 0).cast(pl.Float64)).otherwise(pl.col('p')))
++    tables['j_5_del'] = (deletion.filter(pl.col('j_allele') != 'TOYJ1*01') if missing else
++        deletion.with_columns(p=pl.when(pl.col('j_allele') == 'TOYJ1*01').then(0.).otherwise(pl.col('p'))))
++    learned = Model(manifest=toy_model.manifest, tables=tables, genomic=toy_model.genomic)
++    done = augment_from_oracle(learned, toy_model)
++    assert done.tables['j_choice'].filter(pl.col('j_allele') == 'TOYJ1*01')['p'].sum() > 0
++    assert done.tables['j_5_del'].sort(['j_allele', 'ndel']).equals(deletion.sort(['j_allele', 'ndel']))
++    assert 'required_conditional' not in check_model(done, germline='none')['check'].to_list()
++    incomplete = Model(manifest=toy_model.manifest, tables={**toy_model.tables,
++        'j_5_del': tables['j_5_del']}, genomic=toy_model.genomic)
++    with pytest.raises(ValueError, match='completion template lacks j_5_del support'):
++        augment_from_oracle(learned, incomplete)
++
++
++def test_completion_reapplies_trb_dj_order():
++    from vdjtools.model.infer import augment_from_oracle
++    model = load_bundled('TRB', 'arda', collapse=False)
++    done = augment_from_oracle(model, model)
++    illegal = ((pl.col('d_allele').str.starts_with('TRBD2')) &
++               pl.col('j_allele').str.starts_with('TRBJ1'))
++    assert model.tables['d_gene'].filter(illegal)['p'].sum() > 0
++    assert done.tables['d_gene'].filter(illegal)['p'].sum() == 0
++    sums = done.tables['d_gene'].group_by('j_allele').agg(pl.col('p').sum())
++    used = done.tables['j_choice'].filter(pl.col('p') > 0)['j_allele']
++    sums = sums.filter(pl.col('j_allele').is_in(used.implode()))
++    assert sums['p'].to_list() == pytest.approx([1.] * sums.height)
++
++
++@pytest.mark.parametrize('parent_mass', [0., .5])
++def test_completion_ignores_j_support_under_unused_v_parents(toy_model, parent_mass):
++    from vdjtools.model import Model
++    from vdjtools.model.infer import augment_from_oracle
++    tables = dict(toy_model.tables)
++    tables['v_choice'] = tables['v_choice'].with_columns(p=pl.when(
++        pl.col('v_allele') == 'TOYV2*01').then(parent_mass).otherwise(pl.col('p')))
++    tables['v_choice'] = tables['v_choice'].with_columns(p=pl.col('p') / pl.col('p').sum())
++    tables['j_choice'] = tables['j_choice'].with_columns(p=pl.when(
++        pl.col('v_allele') == 'TOYV2*01').then((pl.col('j_allele') == 'TOYJ1*01').cast(pl.Float64))
++        .otherwise((pl.col('j_allele') == 'TOYJ2*01').cast(pl.Float64)))
++    tables['j_5_del'] = tables['j_5_del'].with_columns(p=pl.when(
++        pl.col('j_allele') == 'TOYJ1*01').then(0.).otherwise(pl.col('p')))
++    genomic = {**toy_model.genomic, 'genes_v': toy_model.genomic['genes_v'].with_columns(
++        functional=pl.when(pl.col('v_allele') == 'TOYV2*01').then(False).otherwise(pl.col('functional')))}
++    unused = Model(manifest=toy_model.manifest, tables=tables, genomic=genomic)
++    completed = augment_from_oracle(unused, unused)
++    assert all(completed.tables[name].equals(table) for name, table in unused.tables.items())
++
++
+ # --- flat marginal export / import -------------------------------------------------------------
+ 
+ def test_marginals_frame_covers_every_event(toy_model):
+diff --git a/tests/python/test_model_score.py b/tests/python/test_model_score.py
+index 48a9f949..69367c68 100644
+--- a/tests/python/test_model_score.py
++++ b/tests/python/test_model_score.py
+@@ -28,11 +28,11 @@
+ # Worked out by hand from the toy VJ scaffold (see conftest), per normalization group:
+ #   v_choice   3 alleles, one group                     ->  3 - 1 =  2
+ #   j_choice   P(J|V): 3 V groups x 2 J alleles         -> 3 * (2 - 1) =  3
+-#   v_3_del    3 alleles x ndel -4..13 (18 bins)        -> 3 * (18 - 1) = 51
+-#   j_5_del    2 alleles x ndel -4..22 (27 bins)        -> 2 * (27 - 1) = 52
++#   v_3_del    3 alleles x reachable -4..8 (13 bins)    -> 3 * (13 - 1) = 36
++#   j_5_del    reachable -4..17 / -4..11 (22/16 bins)  -> (22 - 1) + (16 - 1) = 36
+ #   vj_ins     lengths 0..3, one group                  ->  4 - 1 =  3
+ #   vj_dinucl  column-stochastic 4x4, 4 groups          -> 4 * (4 - 1) = 12
+-TOY_FREE_PARAMS = 2 + 3 + 51 + 52 + 3 + 12
++TOY_FREE_PARAMS = 2 + 3 + 36 + 36 + 3 + 12
+ 
+ 
+ def test_free_params_matches_the_hand_count(toy_model):
+@@ -51,7 +51,7 @@ def test_structural_zeros_are_not_parameters(toy_model):
+     tables = dict(toy_model.tables)
+     # Knock out three deletion bins for one allele and renormalize that allele's group.
+     t = tables["v_3_del"].with_columns(
+-        p=pl.when((pl.col("v_allele") == "TOYV1*01") & (pl.col("ndel") > 10))
++        p=pl.when((pl.col("v_allele") == "TOYV1*01") & (pl.col("ndel") > 5))
+         .then(0.0).otherwise(pl.col("p")))
+     t = t.with_columns(p=pl.col("p") / pl.col("p").sum().over("v_allele"))
+     tables["v_3_del"] = t
+@@ -66,9 +66,9 @@ def test_unreachable_conditionals_are_excluded(toy_model):
+         p=pl.when(pl.col("v_allele") == "TOYV2*01").then(0.0).otherwise(pl.col("p")))
+     tables["v_choice"] = tables["v_choice"].with_columns(p=pl.col("p") / pl.col("p").sum())
+     dead = type(toy_model)(manifest=toy_model.manifest, tables=tables, genomic=toy_model.genomic)
+-    # TOYV2*01 loses its own v_choice cell (-1), its 18-bin deletion group (-17), and the
++    # TOYV2*01 loses its own v_choice cell (-1), its 13-bin deletion group (-12), and the
+     # P(J|V=TOYV2*01) group (-1).
+-    assert free_params(dead, reachable_only=True) == TOY_FREE_PARAMS - 1 - 17 - 1
++    assert free_params(dead, reachable_only=True) == TOY_FREE_PARAMS - 1 - 12 - 1
+     assert free_params(dead, reachable_only=False) == TOY_FREE_PARAMS - 1
+ 
+ 

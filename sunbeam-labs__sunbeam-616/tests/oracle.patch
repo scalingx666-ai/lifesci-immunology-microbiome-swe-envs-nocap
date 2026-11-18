@@ -1,0 +1,296 @@
+diff --git a/sunbeam/configs/default_config.yml b/sunbeam/configs/default_config.yml
+index 136d7cff..b69e8ed8 100644
+--- a/sunbeam/configs/default_config.yml
++++ b/sunbeam/configs/default_config.yml
+@@ -15,9 +15,7 @@ qc:
+   trailing: 3
+   slidingwindow: [4,15]
+   minlen: 36
+-  adapter_template: ""
+-  fwd_adapters: ['GTTTCCCAGTCACGATC', 'GTTTCCCAGTCACGATCNNNNNNNNNGTTTCCCAGTCACGATC']
+-  rev_adapters: ['GTTTCCCAGTCACGATC', 'GTTTCCCAGTCACGATCNNNNNNNNNGTTTCCCAGTCACGATC']
++  adapter_fp: ""
+   kmer_size: 4
+   kz_threshold: 0.55
+   pct_id: 0.5
+diff --git a/sunbeam/workflow/rules/qc.smk b/sunbeam/workflow/rules/qc.smk
+index 5fe58df4..74395ecb 100755
+--- a/sunbeam/workflow/rules/qc.smk
++++ b/sunbeam/workflow/rules/qc.smk
+@@ -1,15 +1,13 @@
+ # -*- mode: Snakemake -*-
+-#
+-# Illumina quality control rules
++
++
+ localrules:
+     all_qc,
+     sample_intake,
+-    qc_final,
+     clean_qc,
+ 
+ 
+ rule all_qc:
+-    """Runs trimmomatic and fastqc on all input files."""
+     input:
+         TARGET_QC,
+ 
+@@ -25,15 +23,26 @@ rule sample_intake:
+         "../scripts/sample_intake.py"
+ 
+ 
++def fastp_in(wildcards, input):
++    if len(input.reads) > 1:
++        return f"--in1 {input.reads[0]} --in2 {input.reads[1]}"
++    else:
++        return f"--in1 {input.reads[0]}"
++
++
++def fastp_out(wildcards, output):
++    if len(output.reads) > 1:
++        return f"--out1 {output.reads[0]} --out2 {output.reads[1]}"
++    else:
++        return f"--out1 {output.reads[0]}"
++
++
+ rule adapter_removal:
+     input:
+         reads=expand(QC_FP / "00_samples" / "{{sample}}_{rp}.fastq.gz", rp=Pairs),
+     output:
+         reads=expand(QC_FP / "01_adapters" / "{{sample}}_{rp}.fastq.gz", rp=Pairs),
+-        fail=QC_FP / "01_adapters" / "{sample}_adapter_removal_failed.fastq.gz",
+         json=QC_FP / "reports" / "01_{sample}_adapter_removal.json",
+-        # Don't really want the HTML but it's better than having it float around somewhere else
+-        # and there doesn't seem to be a way to suppress it
+         html=QC_FP / "reports" / "01_{sample}_adapter_removal.html",
+     log:
+         LOG_FP / "adapter_removal_{sample}.log",
+@@ -47,10 +56,19 @@ rule adapter_removal:
+     resources:
+         runtime=lambda wc, input: max(MIN_RUNTIME, input.size_mb / 5),
+     params:
+-        adapter=Cfg["qc"]["adapter_template"],
+-        compression=Cfg["qc"].get("compression", 5),
+-    script:
+-        "../scripts/adapter_removal.py"
++        inargs=fastp_in,
++        outargs=fastp_out,
++        adapter=Cfg["qc"]["adapter_fp"],
++    shell:
++        """
++        fastp {params.inargs} {params.outargs} \
++          --adapter_fasta {params.adapter} \
++          --disable_quality_filtering \
++          --disable_length_filtering \
++          --json {output.json} \
++          --html {output.html} \
++          --thread {threads}
++        """
+ 
+ 
+ rule trim_quality:
+@@ -74,7 +92,6 @@ rule trim_quality:
+         start_threshold=Cfg["qc"]["leading"],
+         end_threshold=Cfg["qc"]["trailing"],
+         min_length=Cfg["qc"]["minlen"],
+-        compression=Cfg["qc"].get("compression", 5),
+     shell:
+         """
+         heyfastq trim-qual \
+@@ -117,9 +134,16 @@ rule remove_low_complexity:
+     params:
+         kmer_size=Cfg["qc"]["kmer_size"],
+         min_kscore=Cfg["qc"]["kz_threshold"],
+-        compression=Cfg["qc"].get("compression", 5),
+-    script:
+-        "../scripts/remove_low_complexity.py"
++    shell:
++        """
++        heyfastq filter-kscore \
++          --input {input.reads} \
++          --output {output.reads} \
++          --report {output.report} \
++          --kmer-size {params.kmer_size} \
++          --min-kscore {params.min_kscore} \
++          --threads {threads}
++        """
+ 
+ 
+ rule fastqc:
+@@ -147,7 +171,6 @@ rule fastqc:
+ 
+ 
+ rule fastqc_report:
+-    """make fastqc reports"""
+     input:
+         reports=expand(
+             QC_FP / "reports" / "{sample}_{rp}_fastqc/fastqc_data.txt",
+diff --git a/sunbeam/workflow/scripts/adapter_removal.py b/sunbeam/workflow/scripts/adapter_removal.py
+deleted file mode 100644
+index 332e8686..00000000
+--- a/sunbeam/workflow/scripts/adapter_removal.py
++++ /dev/null
+@@ -1,74 +0,0 @@
+-import subprocess as sp
+-import traceback
+-from pathlib import Path
+-from typing import Optional, TextIO
+-
+-
+-def f(log: TextIO) -> Optional[sp.CompletedProcess[str]]:
+-    input_reads = snakemake.input.reads  # type: ignore
+-    output_reads = snakemake.output.reads  # type: ignore
+-    failed_reads = snakemake.output.fail  # type: ignore
+-    json = snakemake.output.json  # type: ignore
+-    html = snakemake.output.html  # type: ignore
+-    adapter = snakemake.params.adapter  # type: ignore
+-    compression = snakemake.params.compression  # type: ignore
+-    threads = snakemake.threads  # type: ignore
+-
+-    adapter_fp = Path(adapter)
+-    if adapter_fp.is_file() and adapter_fp.stat().st_size > 0:
+-        log.write(f"Using custom adapter file: {adapter_fp}\n")
+-        adapter_strs = ["--adapter_fasta", str(adapter_fp)]
+-    elif len(input_reads) == 2:
+-        adapter_strs = ["--detect_adapter_for_pe"]
+-    else:
+-        log.write(
+-            "WARNING: Adapter detection isn't supported for single-end reads, you must provide an adapter file.\n"
+-        )
+-        return None
+-
+-    args = [
+-        "fastp",
+-        "--thread",
+-        str(threads),
+-        "--compression",
+-        str(compression),
+-        "-i",
+-        str(input_reads[0]),
+-        "-o",
+-        str(output_reads[0]),
+-        "--failed_out",
+-        str(failed_reads),
+-        "--disable_quality_filtering",
+-        "--disable_length_filtering",
+-        "--low_complexity_filter",
+-        "--json",
+-        str(json),
+-        "--html",
+-        str(html),
+-    ] + adapter_strs
+-
+-    if len(input_reads) == 2 and len(output_reads) == 2:
+-        args += ["-I", str(input_reads[1]), "-O", str(output_reads[1])]
+-    elif len(input_reads) == 1 and len(output_reads) == 1:
+-        pass
+-    else:
+-        raise ValueError("Input and output reads must both be single or paired-end.")
+-
+-    return sp.run(args, capture_output=True, text=True)
+-
+-
+-log_f = snakemake.log[0]  # type: ignore
+-with open(log_f, "w") as log:
+-    log.write("Initialized log and starting script...\n")
+-    result = None
+-    try:
+-        result = f(log)
+-    except BaseException as e:
+-        log.write(f"Error during run: {e}\n")
+-        log.write(traceback.format_exc())
+-        raise
+-    else:
+-        if result is not None:
+-            log.write(f"STDOUT: {result.stdout}\n")
+-            log.write(f"STDERR: {result.stderr}\n")
+-        log.write("Completed successfully.\n")
+diff --git a/sunbeam/workflow/scripts/remove_low_complexity.py b/sunbeam/workflow/scripts/remove_low_complexity.py
+deleted file mode 100755
+index 18f01f33..00000000
+--- a/sunbeam/workflow/scripts/remove_low_complexity.py
++++ /dev/null
+@@ -1,55 +0,0 @@
+-import traceback
+-from typing import TextIO
+-
+-
+-def f(log: TextIO):
+-    import os
+-    import subprocess as sp
+-
+-    input_reads = snakemake.input.reads  # type: ignore
+-    output_reads = snakemake.output.reads  # type: ignore
+-    output_report = snakemake.output.report  # type: ignore
+-    kmer_size = snakemake.params.kmer_size  # type: ignore
+-    min_kscore = snakemake.params.min_kscore  # type: ignore
+-    threads = snakemake.threads  # type: ignore
+-    compression = snakemake.params.compression  # type: ignore
+-
+-    args = [
+-        "heyfastq",
+-        "filter-kscore",
+-        "--input",
+-        *input_reads,
+-        "--output",
+-        *output_reads,
+-        "--report",
+-        output_report,
+-        "--kmer-size",
+-        str(kmer_size),
+-        "--min-kscore",
+-        str(min_kscore),
+-        "--threads",
+-        str(threads),
+-    ]
+-
+-    os.environ["HFQ_GZIP_COMPRESSION"] = str(compression)
+-    res = sp.run(args, capture_output=True, text=True)
+-    log.write(res.stdout)
+-    log.write(res.stderr)
+-    if res.returncode != 0:
+-        raise RuntimeError(
+-            f"heyfastq filter-kscore failed with exit code {res.returncode}"
+-        )
+-
+-
+-log_f = snakemake.log[0]  # type: ignore
+-with open(log_f, "w") as log:
+-    log.write("Initialized log and starting script...\n")
+-    stderr_capture = None
+-    try:
+-        f(log)
+-    except BaseException as e:
+-        log.write(f"Error during run: {e}\n")
+-        log.write(traceback.format_exc())
+-        raise
+-    else:
+-        log.write("Completed successfully.\n")
+diff --git a/tests/data/empty_adapters.fa b/tests/data/empty_adapters.fa
+deleted file mode 100644
+index f5d372a9..00000000
+--- a/tests/data/empty_adapters.fa
++++ /dev/null
+@@ -1,2 +0,0 @@
+-> A
+-A
+\ No newline at end of file
+diff --git a/tests/e2e/test_sunbeam_run.py b/tests/e2e/test_sunbeam_run.py
+index 9fc0ad6c..7a6ddc52 100755
+--- a/tests/e2e/test_sunbeam_run.py
++++ b/tests/e2e/test_sunbeam_run.py
+@@ -44,14 +44,6 @@ def test_sunbeam_run_with_single_end_reads(tmp_path, DATA_DIR):
+         ]
+     )
+ 
+-    Config(
+-        [
+-            "--modify",
+-            f"qc: {{adapter_template: {DATA_DIR / 'empty_adapters.fa'}}}",
+-            str(project_dir / "sunbeam_config.yml"),
+-        ]
+-    )
+-
+     with pytest.raises(SystemExit) as excinfo:
+         Run(
+             [

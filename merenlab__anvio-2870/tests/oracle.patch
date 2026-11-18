@@ -1,0 +1,855 @@
+diff --git a/anvio/bamops.py b/anvio/bamops.py
+index 2706d5871d..2f17a658a7 100644
+--- a/anvio/bamops.py
++++ b/anvio/bamops.py
+@@ -5,6 +5,7 @@
+ import os
+ import sys
+ import pysam
++import bisect
+ import numpy as np
+ import hashlib
+ 
+@@ -654,6 +655,7 @@ def __init__(self):
+         self.detection = 0.0
+         self.mean_Q2Q3 = 0.0
+         self.num_reads = 0
++        self.num_reads_per_split = None
+ 
+         self.read_iterator_dict = {
+             'fetch': self._fetch_iterator,
+@@ -678,7 +680,7 @@ def __setstate__(self, state):
+ 
+ 
+     def run(self, bam, contig_or_split, start=None, end=None, read_iterator='fetch',
+-            max_coverage=None, skip_coverage_stats=False, **kwargs):
++            max_coverage=None, skip_coverage_stats=False, split_boundaries=None, **kwargs):
+         """Loop through the bam pileup and calculate coverage over a defined region of a contig or split
+ 
+         Parameters
+@@ -709,6 +711,12 @@ def run(self, bam, contig_or_split, start=None, end=None, read_iterator='fetch',
+         skip_coverage_stats : bool, False
+             Should the call to process_c be skipped?
+ 
++        split_boundaries : list of (start, end) tuples, None
++            If provided, each read is assigned to exactly one of these regions (i.e., the splits of a
++            contig, sorted by their start positions), and self.num_reads_per_split will hold the number
++            of reads assigned to each region, in the same order. See `get_split_index_for_read` for how
++            reads are assigned.
++
+         **kwargs : **kwargs
+             kwargs are passed to the method chosen
+         """
+@@ -734,6 +742,12 @@ def run(self, bam, contig_or_split, start=None, end=None, read_iterator='fetch',
+         # a coverage array the size of the defined range is allocated in memory
+         c = np.zeros(end - start).astype(int)
+ 
++        if split_boundaries:
++            split_starts = [split_start for split_start, _ in split_boundaries]
++            num_reads_per_split = [0] * len(split_boundaries)
++        else:
++            num_reads_per_split = None
++
+         try:
+             read_iterator = self.read_iterator_dict[read_iterator]
+         except KeyError:
+@@ -746,9 +760,13 @@ def run(self, bam, contig_or_split, start=None, end=None, read_iterator='fetch',
+                 for start, end in read.get_blocks():
+                     c[start:end] += 1
+ 
++            if split_boundaries:
++                num_reads_per_split[self.get_split_index_for_read(read, split_boundaries, split_starts)] += 1
++
+             self.num_reads += 1
+ 
+         self.c = c
++        self.num_reads_per_split = num_reads_per_split
+ 
+         if max_coverage is not None:
+             if np.max(self.c) > max_coverage:
+@@ -764,6 +782,46 @@ def run(self, bam, contig_or_split, start=None, end=None, read_iterator='fetch',
+                 self.process_c(self.c)
+ 
+ 
++    def get_split_index_for_read(self, read, split_boundaries, split_starts):
++        """Returns the index of the split that contains most of the aligned bases of a read.
++
++        Aligned bases are those in the aligned blocks of the read (i.e., the same ones that contribute
++        to coverage). If multiple splits contain the same, largest number of aligned bases, the read is
++        assigned to the earliest of them (i.e., the split in which the alignment starts, when there is
++        an exact tie between two splits).
++
++        Parameters
++        ==========
++        read : pysam.AlignedSegment
++            The read to assign.
++        split_boundaries : list of (start, end) tuples
++            Split boundaries in contig coordinates, sorted by their start positions.
++        split_starts : list of int
++            Start positions of the splits in `split_boundaries`, provided separately to avoid
++            recomputing them for every read.
++        """
++
++        first_split_index = bisect.bisect_right(split_starts, read.reference_start) - 1
++
++        # the vast majority of reads will not cross a split boundary
++        if read.reference_end is None or read.reference_end <= split_boundaries[first_split_index][1]:
++            return first_split_index
++
++        num_aligned_bases = {}
++        for block_start, block_end in read.get_blocks():
++            split_index = bisect.bisect_right(split_starts, block_start) - 1
++            while block_start < block_end and split_index < len(split_boundaries):
++                overlap_end = min(block_end, split_boundaries[split_index][1])
++                num_aligned_bases[split_index] = num_aligned_bases.get(split_index, 0) + overlap_end - block_start
++                block_start = overlap_end
++                split_index += 1
++
++        if not num_aligned_bases:
++            return first_split_index
++
++        return max(num_aligned_bases, key=lambda split_index: (num_aligned_bases[split_index], -split_index))
++
++
+     def _fetch_iterator(self, bam, contig_name, start, end):
+         """Uses standard pysam fetch iterator from AlignmentFile objects, ignores unmapped reads"""
+ 
+diff --git a/anvio/contigops.py b/anvio/contigops.py
+index da336f2be7..b670da774d 100644
+--- a/anvio/contigops.py
++++ b/anvio/contigops.py
+@@ -47,12 +47,12 @@ def gen_split_name(parent_name, order):
+     return '_'.join([parent_name, 'split', '%05d' % (order + 1)])
+ 
+ 
+-def get_atomic_data(sample_id, contigs, atomic_data_field, zero_cov_splits=None):
++def get_atomic_data(sample_id, contigs, atomic_data_field, zero_cov_splits=None, zero_cov_contigs=None):
+     """Takes a list of contigops.Contig objects, and returns views for an atomic_data_field.
+ 
+-    If `zero_cov_splits` is provided (a set of split names), those splits are skipped
+-    since they have zero coverage and their data lives in the zero_coverage_splits table
+-    instead of the view tables.
++    If `zero_cov_splits` or `zero_cov_contigs` are provided (sets of split or contig names),
++    those items are skipped since they have zero coverage and their data lives in the
++    zero_coverage_splits and zero_coverage_contigs tables instead of the view tables.
+     """
+ 
+     atomic_data_contigs = []
+@@ -62,9 +62,9 @@ def get_atomic_data(sample_id, contigs, atomic_data_field, zero_cov_splits=None)
+     # at once. this was broken down into about 10 functions, but this structure seems to be the most efficient
+     # although it looks crappy:
+     for contig in contigs:
+-        contig_atomic_data = contig.get_atomic_data_dict(atomic_data_field)
+-
+-        atomic_data_contigs.append((contig.name, sample_id, contig_atomic_data), )
++        if not (zero_cov_contigs and contig.name in zero_cov_contigs):
++            contig_atomic_data = contig.get_atomic_data_dict(atomic_data_field)
++            atomic_data_contigs.append((contig.name, sample_id, contig_atomic_data), )
+ 
+         # contig is done, deal with splits in it:
+         for split in contig.splits:
+@@ -95,12 +95,17 @@ def get_atomic_data_dict(self, atomic_data_field):
+              'mean_coverage_Q2Q3': self.coverage.mean_Q2Q3,
+              'detection': self.coverage.detection,
+              'abundance': self.abundance,
+-             'variability': sum(s.auxiliary.variation_density for s in self.splits) if not self.skip_SNV_profiling else None}
++             'variability': sum(s.auxiliary.variation_density for s in self.splits) if not self.skip_SNV_profiling else None,
++             'num_reads': self.coverage.num_reads}
+ 
+         return d[atomic_data_field]
+ 
+ 
+     def analyze_coverage(self, bam, min_percent_identity):
++        # each read is assigned to the split that contains most of its aligned bases, so that the number
++        # of reads across all splits of a contig adds up to the number of reads of the contig
++        splits_in_order = sorted(self.splits, key=lambda split: split.start)
++        split_boundaries = [(split.start, split.end) for split in splits_in_order]
+ 
+         if min_percent_identity is None:
+             self.coverage.run(
+@@ -108,6 +113,7 @@ def analyze_coverage(self, bam, min_percent_identity):
+                 self,
+                 read_iterator='fetch',
+                 max_coverage=anvio.auxiliarydataops.DEFAULT_COVERAGE_MAX_VALUE,
++                split_boundaries=split_boundaries,
+             )
+         else:
+             self.coverage.run(
+@@ -115,9 +121,13 @@ def analyze_coverage(self, bam, min_percent_identity):
+                 self,
+                 read_iterator='fetch_filter_and_trim',
+                 max_coverage=anvio.auxiliarydataops.DEFAULT_COVERAGE_MAX_VALUE,
++                split_boundaries=split_boundaries,
+                 percent_id_cutoff=min_percent_identity,
+             )
+ 
++        num_reads_per_split = dict(zip([split.name for split in splits_in_order], self.coverage.num_reads_per_split))
++        self.coverage.num_reads_per_split = None
++
+         if len(self.splits) == 1:
+             # Coverage.process_c is a potentially expensive operation (taking up ~90% of the time of
+             # analyze_coverage when coverage is low (but when coverage is >500X, the time taken is
+@@ -136,12 +146,14 @@ def analyze_coverage(self, bam, min_percent_identity):
+             split.coverage.is_outlier = self.coverage.is_outlier
+             split.coverage.is_outlier_in_parent = self.coverage.is_outlier
+             split.coverage.mean_Q2Q3 = self.coverage.mean_Q2Q3
++            split.coverage.num_reads = self.coverage.num_reads
+             return
+ 
+         for split in self.splits:
+             split.coverage = anvio.bamops.Coverage()
+             split.coverage.c = self.coverage.c[split.start:split.end]
+             split.coverage.is_outlier_in_parent = self.coverage.is_outlier[split.start:split.end]
++            split.coverage.num_reads = num_reads_per_split[split.name]
+             split.coverage.process_c(split.coverage.c)
+ 
+ 
+@@ -172,7 +184,8 @@ def get_atomic_data_dict(self, atomic_data_field):
+              'mean_coverage_Q2Q3': self.coverage.mean_Q2Q3,
+              'detection': self.coverage.detection,
+              'abundance': self.abundance,
+-             'variability': self.auxiliary.variation_density if self.auxiliary else None}
++             'variability': self.auxiliary.variation_density if self.auxiliary else None,
++             'num_reads': self.coverage.num_reads}
+ 
+         return d[atomic_data_field]
+ 
+diff --git a/anvio/db.py b/anvio/db.py
+index 7a46b3b5e1..979d387c68 100644
+--- a/anvio/db.py
++++ b/anvio/db.py
+@@ -827,6 +827,43 @@ def get_view_data(self, view_table_name, split_names_of_interest=None, splits_ba
+                                                 splits_basic_info, log_norm_numeric_values)
+ 
+ 
++    def get_zero_value_tables_for_view_table(self, view_table_name):
++        """Returns the names of the tables that list (item, layer) pairs with zero values for a view table.
++
++        Profile databases do not store rows with zero values in view tables (and in tables that follow the
++        same structure, such as the number of reads tables). Instead, such (item, layer) pairs are listed in
++        dedicated tables, and `get_view_data` uses the tables returned by this function to add the zeros back.
++        Items with zero coverage are listed in zero_coverage tables, and apply to all view tables. Splits with
++        no reads assigned to them but nonzero coverage are listed in the zero_read_splits table, and only apply to
++        the number of reads table for splits (every contig with coverage has at least one read).
++        """
++
++        if view_table_name.endswith('_splits'):
++            zero_value_tables = [tables.zero_coverage_splits_table_name]
++        elif view_table_name.endswith('_contigs'):
++            zero_value_tables = [tables.zero_coverage_contigs_table_name]
++        else:
++            return []
++
++        if view_table_name == tables.num_reads_splits_table_name:
++            zero_value_tables.append(tables.zero_read_splits_table_name)
++
++        return zero_value_tables
++
++
++    def get_zero_value_dict_for_view_table(self, view_table_name, items_of_interest=None):
++        """Returns {item: set_of_layers} for all (item, layer) pairs with zero values for a view table."""
++
++        result = {}
++        for zero_value_table_name in self.get_zero_value_tables_for_view_table(view_table_name):
++            for item, layers in self._get_zero_cov_dict(zero_value_table_name, items_of_interest).items():
++                if item not in result:
++                    result[item] = set()
++                result[item].update(layers)
++
++        return result
++
++
+     def _get_zero_cov_dict(self, zero_cov_table_name, items_of_interest=None):
+         """Read a zero_coverage table and return {item: set_of_layers}.
+ 
+@@ -862,16 +899,8 @@ def _get_view_data_standard(self, view_table_name, split_names_of_interest=None,
+         coverage (whose rows are not stored in the view table).
+         """
+ 
+-        # Determine which zero-coverage table to consult, if any
+-        if view_table_name.endswith('_splits'):
+-            zero_cov_table = 'zero_coverage_splits'
+-        elif view_table_name.endswith('_contigs'):
+-            zero_cov_table = 'zero_coverage_contigs'
+-        else:
+-            zero_cov_table = None
+-
+-        # Read zero-coverage entries: {item: {layer1, layer2, ...}}
+-        zero_cov = self._get_zero_cov_dict(zero_cov_table, split_names_of_interest) if zero_cov_table else {}
++        # Read zero-value entries: {item: {layer1, layer2, ...}}
++        zero_cov = self.get_zero_value_dict_for_view_table(view_table_name, split_names_of_interest)
+ 
+         if split_names_of_interest:
+             split_names_formatted = ', '.join([f"'{split_name}'" for split_name in split_names_of_interest])
+@@ -946,7 +975,7 @@ def _get_view_data_contigs_expanded(self, view_table_name, split_names_of_intere
+             contig_names_of_interest = None
+ 
+         # Read zero-coverage contigs
+-        zero_cov = self._get_zero_cov_dict('zero_coverage_contigs', contig_names_of_interest)
++        zero_cov = self.get_zero_value_dict_for_view_table(view_table_name, contig_names_of_interest)
+ 
+         # Query view table for non-zero contig data
+         if contig_names_of_interest:
+diff --git a/anvio/dbops.py b/anvio/dbops.py
+index 6317b8a3e5..6d3af9a579 100644
+--- a/anvio/dbops.py
++++ b/anvio/dbops.py
+@@ -5301,7 +5301,7 @@ def init(self):
+ 
+         self.meta = dbi(self.db_path, expecting=self.db_type).get_self_table()
+ 
+-        for key in ['min_contig_length', 'SNVs_profiled', 'SCVs_profiled', 'INDELs_profiled',
++        for key in ['min_contig_length', 'SNVs_profiled', 'SCVs_profiled', 'INDELs_profiled', 'num_reads_stored',
+                     'merged', 'blank', 'items_ordered', 'report_variability_full', 'num_contigs',
+                     'min_coverage_for_variability', 'max_contig_length', 'num_splits',
+                     'total_length', 'skip_edges_for_variant_profiling']:
+@@ -5310,6 +5310,11 @@ def init(self):
+             except:
+                 pass
+ 
++        # profile databases that are not generated by anvi-profile or anvi-merge (such as those that are generated
++        # for ad hoc displays) do not have this key, and they do not have any number of reads data either
++        if 'num_reads_stored' not in self.meta:
++            self.meta['num_reads_stored'] = 0
++
+         self.samples = set([s.strip() for s in self.meta['samples'].split(',')])
+         for key in ['min_percent_identity', 'min_indel_fraction']:
+             try:
+@@ -5352,6 +5357,9 @@ def touch(self):
+         self.db.create_table(t.metabolite_abundances_table_name, t.metabolite_abundances_table_structure, t.metabolite_abundances_table_types)
+         self.db.create_table(t.zero_coverage_splits_table_name, t.zero_coverage_splits_table_structure, t.zero_coverage_splits_table_types)
+         self.db.create_table(t.zero_coverage_contigs_table_name, t.zero_coverage_contigs_table_structure, t.zero_coverage_contigs_table_types)
++        self.db.create_table(t.num_reads_splits_table_name, t.view_table_structure, t.view_table_types)
++        self.db.create_table(t.num_reads_contigs_table_name, t.view_table_structure, t.view_table_types)
++        self.db.create_table(t.zero_read_splits_table_name, t.zero_read_splits_table_structure, t.zero_read_splits_table_types)
+ 
+         return self.db
+ 
+diff --git a/anvio/docs/artifacts/profile-db.md b/anvio/docs/artifacts/profile-db.md
+index 42adecdc09..18ccb83c70 100644
+--- a/anvio/docs/artifacts/profile-db.md
++++ b/anvio/docs/artifacts/profile-db.md
+@@ -30,3 +30,56 @@ Technically, "profile-db" refers to a profile database that contains the data fr
+ ## Variants
+ 
+ Profile databases, like %(contigs-db)ss, are allowed to have different variants, though the only currently implemented variant, the %(trnaseq-profile-db)s, is for tRNA transcripts from tRNA-seq experiments. The default variant stored for "standard" profile databases is `unknown`. Variants should indicate that substantially different information is stored in the database. For instance, single codon variability is applicable to protein-coding genes but not tRNA transcripts, so SCV data is not recorded for the `trnaseq` variant. The $(trnaseq-workflow)s generates %(trnaseq-profile-db)ss using a very different approach to %(anvi-profile)s.
++
++## Info for Developers
++
++This section describes some implementation details of profile databases that are relevant to anyone writing code that reads from or writes to them.
++
++### Handling zero values
++
++To save space, profile databases do not store rows with zero values in the view tables (e.g., `mean_coverage_splits`, `detection_contigs`, and so on). This matters a lot when reads from a metagenome are mapped to a large collection of references, since most contigs and splits will have no coverage in most samples. Instead of writing the same zero to every view table, each (item, sample) pair without coverage is listed once in one of the following tables:
++
++* `zero_coverage_contigs`: contigs with no coverage in a given sample (columns `item` and `layer`, where `layer` is the sample name)
++* `zero_coverage_splits`: splits with no coverage in a given sample (same columns)
++
++These tables are filled by %(anvi-profile)s in two places:
++
++1. Before profiling, the BAM file index is used to find contigs that have no mapped reads at all. These contigs are not profiled, and they and all of their splits are added to the zero coverage tables (see `store_zero_coverage_for_skipped_splits` in `anvio/profiler.py`).
++2. After profiling, the remaining contigs and splits are checked for zero mean coverage. A contig can have zero coverage despite being counted in the BAM index if none of its reads survived filtering (for instance, when all of them are removed by a `--fetch-filter` or `--min-percent-identity`, or when they lack a CIGAR string or query sequence). Such contigs and all of their splits are added to the zero coverage tables. A split within an otherwise-covered contig can also have zero coverage if the reads do not map to that split region, in which case only that split is added to `zero_coverage_splits`.
++
++When single profiles are merged with %(anvi-merge)s, the zero value tables of all input profiles are concatenated. When a profile is split with %(anvi-split)s, the rows for the contigs and splits in each bin are copied over.
++
++When data are read from the database, the zero-values are added back into the returned data on-the-fly. `DB.get_view_data()` (in `anvio/db.py`) reads the non-zero rows from the view table, then uses `DB.get_zero_value_tables_for_view_table()` to find which zero value tables apply to it (the `_contigs` or `_splits` version, based on the suffix of the view table name), and fills in a value of 0 for every (item, sample) pair listed there. As a result, code that uses `get_view_data()` sees the complete matrix including zero values. Code that reads view tables directly (e.g., with `get_all_rows_from_table()`) will only see the non-zero rows, and therefore may need to additionally work with the zero value tables.
++
++{:.notice}
++Profile databases older than version 42 stored the explicit zero rows in the view tables. The migration to version 42 moved them into the zero coverage tables, and the migration to version 43 moved the remaining zero rows of contigs whose reads were all filtered out.
++
++### Number of reads tables
++
++Since version 43, profile databases store the number of reads that map to each contig and to each split in each sample, in the following tables:
++
++* `num_reads_contigs`: the number of reads per contig
++* `num_reads_splits`: the number of reads assigned to each split (see below)
++* `zero_read_splits`: splits that have nonzero coverage but no reads assigned to them
++
++The first two tables have the same structure as view tables (`entry_id`, `item`, `layer`, `value`), but they are not registered as views, so they are not shown in the interactive interface or used for clustering. They also follow the same convention for zero values: contigs and splits without coverage are not stored in these tables, since they are already listed in the zero coverage tables described above (and every contig with nonzero coverage has at least one read). A split with nonzero coverage, however, can still have zero reads assigned to it (see below), so such splits are listed in the `zero_read_splits` table, which is the counterpart to the `num_reads_splits` table.
++
++To get the complete data including zeros, use `get_view_data()` with these table names, just like for view tables. For `num_reads_contigs`, use `expand_to_splits=False`, since copying the read count of a contig to each of its splits would not make sense.
++
++The self table key `num_reads_stored` tells you whether these tables contain data. It is `False` (0) for blank profiles, and for databases migrated from older versions, in which case the tables exist but are empty, since the number of reads cannot be recovered without the BAM file. Code that uses these tables should check this key first, and ask the user to re-run %(anvi-profile)s if the read counts are missing. %(anvi-merge)s refuses to merge profiles with different values for this key (unless `--force` is used).
++
++**Which reads are counted**
++
++The number of reads in these tables is not necessarily the number of reads that map to a contig according to the BAM file. Only the reads that are actually used to compute coverage are counted, which means that the following are excluded:
++
++* reads that are removed by a `--fetch-filter`
++* reads with a percent identity below `--min-percent-identity`
++* reads without a CIGAR string or query sequence
++
++Note also that each alignment in the BAM file is counted, so (for paired-end data) the two reads in a pair are counted separately, and secondary or supplementary alignments are also counted unless a fetch filter removes them. In other words, the read count of a contig is the number of alignments that contribute to its coverage values. This keeps the read counts consistent with the coverage data stored in the same database, which is important for analyses that use both (such as the expected spread used in %(discov-stats)s).
++
++**How reads are assigned to splits**
++
++A read can span the boundary between two (or more) splits of a contig. To avoid counting such reads more than once, each read is assigned to exactly one split, so that the read counts of all splits of a contig add up to the read count of the contig. A read is assigned to the split that contains most of its aligned bases, that is, the bases in the aligned blocks of the read (the same ones that contribute to coverage, so soft-clipped bases, insertions, and deletions are not considered). If two splits contain the same number of aligned bases, the read is assigned to the earlier one. Reads that do not cross a split boundary (the vast majority) are simply assigned to the split in which they start. See `Coverage.get_split_index_for_read()` in `anvio/bamops.py` for the implementation.
++
++As a result of this assignment, a split can have nonzero coverage but zero reads assigned to it, if every read that covers it has most of its aligned bases in neighboring splits. This can happen, for example, with long reads that span multiple splits. These are the splits that are listed in the `zero_read_splits` table.
+diff --git a/anvio/merger.py b/anvio/merger.py
+index 073a76e305..df621f4f33 100644
+--- a/anvio/merger.py
++++ b/anvio/merger.py
+@@ -288,7 +288,8 @@ def sanity_check(self):
+                      ('report_variability_full', 'Whether to report full variability (--report-variability-full) flags'),
+                      ('SCVs_profiled', 'Profile SCVs flags (--profile-SCVs)'),
+                      ('SNVs_profiled', 'SNV profiling flags (--skip-SNV-profiling)'),
+-                     ('INDELs_profiled', 'Profile indels flags (--profile-indels)')]:
++                     ('INDELs_profiled', 'Profile indels flags (--profile-indels)'),
++                     ('num_reads_stored', 'The flag for whether the number of reads per split and contig were stored (profiles generated by older versions of anvi\'o lack them, and need to be re-profiled)')]:
+             v = set([r[k] for r in list(self.profile_dbs_info_dict.values())])
+             if len(v) > 1:
+                 if anvio.FORCE:
+@@ -447,6 +448,7 @@ def merge(self):
+         self.SCVs_profiled = C('SCVs_profiled')
+         self.SNVs_profiled = C('SNVs_profiled')
+         self.INDELs_profiled = int(C('INDELs_profiled'))
++        self.num_reads_stored = int(C('num_reads_stored'))
+         self.total_length = C('total_length')
+ 
+         if self.num_splits > self.max_num_splits_for_hierarchical_clustering and not self.enforce_hierarchical_clustering:
+@@ -488,6 +490,7 @@ def merge(self):
+                        'SNVs_profiled': self.SNVs_profiled,
+                        'SCVs_profiled': self.SCVs_profiled,
+                        'INDELs_profiled': self.INDELs_profiled,
++                       'num_reads_stored': self.num_reads_stored,
+                        'num_contigs': self.num_contigs,
+                        'num_splits': self.num_splits,
+                        'total_length': self.total_length,
+@@ -634,7 +637,7 @@ def gen_view_data_tables_from_atomic_data(self):
+         self.progress.new('Views')
+ 
+         # Merge zero_coverage tables from all input profiles
+-        for zero_cov_table in [tables.zero_coverage_splits_table_name, tables.zero_coverage_contigs_table_name]:
++        for zero_cov_table in [tables.zero_coverage_splits_table_name, tables.zero_coverage_contigs_table_name, tables.zero_read_splits_table_name]:
+             for input_profile_db_path in self.profile_dbs_info_dict:
+                 sample_id = self.profile_dbs_info_dict[input_profile_db_path]['sample_id']
+                 self.progress.update(f"Merging '{zero_cov_table}' from '{sample_id}'")
+@@ -648,26 +651,29 @@ def gen_view_data_tables_from_atomic_data(self):
+                     merged_db._exec_many('INSERT INTO %s VALUES (?,?)' % zero_cov_table, rows)
+                     merged_db.disconnect()
+ 
+-        for target in ['contigs', 'splits']:
+-            for essential_field in self.essential_fields:
+-                table_name_to_read_from = '_'.join([essential_field, target])
+-                for input_profile_db_path in self.profile_dbs_info_dict:
+-                    sample_id = self.profile_dbs_info_dict[input_profile_db_path]['sample_id']
+-                    self.progress.update(f"Reading '{essential_field}' of '{target}' in '{sample_id}'")
+-
+-                    profile_db = db.DB(input_profile_db_path, utils.get_required_version_for_db(input_profile_db_path), skip_rowid_prepend=True)
+-                    view_data_for_sample = profile_db.get_all_rows_from_table(table_name_to_read_from)
+-                    profile_db.disconnect()
+-
+-                    self.progress.update(f"Writing '{essential_field}' of '{target}' in '{sample_id}'")
+-                    table_name = '_'.join([essential_field, target])
+-                    TablesForViews(self.merged_profile_db_path,
+-                                   progress=self.progress) \
+-                                        .create_new_view(view_data=view_data_for_sample,
+-                                                         table_name=table_name,
+-                                                         append_mode=True,
+-                                                         view_name=essential_field if target == 'splits' else None,
+-                                                         skip_sanity_check=True)
++        # only the split-level tables of essential fields are registered as views. the number of reads tables are merged
++        # like view tables, but they are not registered as views, nor do we use them for clustering (they are empty if
++        # the input profiles did not store them)
++        view_tables_to_merge = [('_'.join([essential_field, target]), essential_field if target == 'splits' else None) for target in ['contigs', 'splits'] for essential_field in self.essential_fields]
++        view_tables_to_merge += [(tables.num_reads_splits_table_name, None), (tables.num_reads_contigs_table_name, None)]
++
++        for table_name, view_name in view_tables_to_merge:
++            for input_profile_db_path in self.profile_dbs_info_dict:
++                sample_id = self.profile_dbs_info_dict[input_profile_db_path]['sample_id']
++                self.progress.update(f"Reading '{table_name}' in '{sample_id}'")
++
++                profile_db = db.DB(input_profile_db_path, utils.get_required_version_for_db(input_profile_db_path), skip_rowid_prepend=True)
++                view_data_for_sample = profile_db.get_all_rows_from_table(table_name)
++                profile_db.disconnect()
++
++                self.progress.update(f"Writing '{table_name}' in '{sample_id}'")
++                TablesForViews(self.merged_profile_db_path,
++                               progress=self.progress) \
++                                    .create_new_view(view_data=view_data_for_sample,
++                                                     table_name=table_name,
++                                                     append_mode=True,
++                                                     view_name=view_name,
++                                                     skip_sanity_check=True)
+ 
+         # if SNVs were not profiled, remove all entries from variability tables:
+         if not self.SNVs_profiled:
+diff --git a/anvio/migrations/profile/v42_to_v43.py b/anvio/migrations/profile/v42_to_v43.py
+new file mode 100644
+index 0000000000..5d0f0512de
+--- /dev/null
++++ b/anvio/migrations/profile/v42_to_v43.py
+@@ -0,0 +1,211 @@
++#!/usr/bin/env python
++
++"""Migration script to add the number of reads mapped tables, and to move remaining zero-value rows
++from view tables into zero_coverage tables.
++
++This migration:
++  1. Creates the (empty) tables for the number of reads mapped per split and contig, and sets the
++     `num_reads_stored` flag to False, since this information cannot be recovered from the
++     existing data.
++  2. Moves (item, layer) pairs that have value=0 across all view tables into the zero_coverage tables.
++     Profile databases generated since v42 store explicit zero rows for contigs that were profiled
++     but ended up with zero coverage (i.e., none of their reads survived filtering). Such contigs
++     are now recorded in the zero_coverage tables, just like those skipped by the BAM index prefilter.
++
++IMPORTANT: the second step is destructive -- it modifies view tables in place. That part is wrapped
++in a single SQLite transaction so that a crash at any point leaves the view tables unchanged.
++"""
++
++import sys
++import argparse
++
++import anvio.dbinfo as dbinfo
++import anvio.terminal as terminal
++
++from anvio.errors import ConfigError
++
++current_version, next_version = [x[1:] for x in __name__.split('_to_')]
++
++essential_data_fields = ['std_coverage',
++                         'mean_coverage',
++                         'mean_coverage_Q2Q3',
++                         'detection',
++                         'abundance',
++                         'variability']
++
++num_reads_tables = [('num_reads_splits',  ['item', 'layer', 'value'], ['text', 'text', 'numeric']),
++                    ('num_reads_contigs', ['item', 'layer', 'value'], ['text', 'text', 'numeric']),
++                    ('zero_read_splits',  ['item', 'layer'],          ['text', 'text'])]
++
++run = terminal.Run()
++progress = terminal.Progress()
++
++
++def migrate(db_path):
++    if db_path is None:
++        raise ConfigError("No database path is given.")
++
++    profile_db_info = dbinfo.ProfileDBInfo(db_path)
++    if str(profile_db_info.version) != current_version:
++        raise ConfigError(f"The version of the provided profile database is {profile_db_info.version}, not the "
++                          f"required version, {current_version}, so this script cannot upgrade the database.")
++
++    progress.new("Migrating")
++    profile_db = profile_db_info.load_db()
++
++    progress.update("Creating tables for the number of reads mapped per split and contig")
++    existing_tables = profile_db.get_table_names()
++    for table_name, structure, types in num_reads_tables:
++        if table_name not in existing_tables:
++            profile_db.create_table(table_name, structure, types)
++
++    # set the self table flag to indicate that the new tables are empty to downstream programs
++    profile_db.set_meta_value('num_reads_stored', False)
++
++    existing_tables = profile_db.get_table_names()
++
++    # When SNVs were not profiled, the variability tables may be empty or contain None values, and
++    # should be excluded from both validation and zero-row deletion.
++    self_table = profile_db.get_table_as_dict('self')
++    SNVs_profiled = int(self_table['SNVs_profiled']['value']) if 'SNVs_profiled' in self_table else False
++
++    # We accumulate all SQL operations and execute them in a single transaction.
++    queued_operations = []
++    num_pairs_moved = {}
++
++    for target in ['splits', 'contigs']:
++        zero_cov_table = f'zero_coverage_{target}'
++        progress.update(f"Processing {target} view tables")
++
++        table_names = []
++        for field in essential_data_fields:
++            if field == 'variability' and not SNVs_profiled:
++                continue
++            table_name = f'{field}_{target}'
++            if table_name in existing_tables:
++                table_names.append(table_name)
++
++        # Use detection as the reference field to identify zero-coverage items. If detection = 0, all
++        # other fields must also be 0.
++        detection_table = f'detection_{target}'
++        if detection_table not in existing_tables or zero_cov_table not in existing_tables:
++            continue
++
++        progress.update(f"Reading {detection_table} for zero-detection pairs")
++        zero_pairs = set()
++        for entry_id, item, layer, value in profile_db.get_all_rows_from_table(detection_table):
++            if value == 0 or value == 0.0:
++                zero_pairs.add((item, layer))
++
++        if not zero_pairs:
++            continue
++
++        # Validate consistency across all other view tables. Pairs that have nonzero values in any
++        # other field, or that are missing rows in some view tables, stay in the view tables as-is.
++        progress.update(f"Validating {len(zero_pairs)} zero-coverage {target} across all fields")
++        inconsistent_pairs = set()
++        for table_name in table_names:
++            if table_name == detection_table:
++                continue
++
++            zero_pairs_found = set()
++            for entry_id, item, layer, value in profile_db.get_all_rows_from_table(table_name):
++                pair = (item, layer)
++                if pair in zero_pairs:
++                    zero_pairs_found.add(pair)
++                    if value != 0 and value != 0.0:
++                        inconsistent_pairs.add(pair)
++
++            inconsistent_pairs.update(zero_pairs - inconsistent_pairs - zero_pairs_found)
++
++        if inconsistent_pairs:
++            run.warning(f"This profile database had {len(inconsistent_pairs)} zero-detection {target[:-1]} pair(s) "
++                        f"with non-zero values in other fields, or with missing rows in some view tables. These pairs "
++                        f"will be left in the view tables as-is and will NOT be moved into the zero_coverage table. "
++                        f"The migration will proceed normally.")
++            zero_pairs -= inconsistent_pairs
++
++        # pairs that are somehow already listed in the zero_coverage table only need their rows deleted
++        already_listed = set(profile_db.get_all_rows_from_table(zero_cov_table))
++        pairs_to_insert = list(zero_pairs - already_listed)
++
++        if not zero_pairs:
++            continue
++
++        if pairs_to_insert:
++            queued_operations.append((f'INSERT INTO "{zero_cov_table}" (item, layer) VALUES (?, ?)', pairs_to_insert))
++
++        # Queue deletions from all view tables for these pairs. We use a temp table with an index
++        # to avoid O(n*m) full scans.
++        temp_table = f'_zero_pairs_{target}_TEMP'
++        queued_operations.append((f'CREATE TEMP TABLE "{temp_table}" (item text, layer text)', None))
++        queued_operations.append((f'INSERT INTO "{temp_table}" (item, layer) VALUES (?, ?)', list(zero_pairs)))
++        queued_operations.append((f'CREATE INDEX "_idx_{temp_table}" ON "{temp_table}" (item, layer)', None))
++
++        for table_name in table_names:
++            queued_operations.append((f'DELETE FROM "{table_name}" WHERE EXISTS '
++                                      f'(SELECT 1 FROM "{temp_table}" z WHERE z.item = "{table_name}".item AND z.layer = "{table_name}".layer)',
++                                      None))
++
++        queued_operations.append((f'DROP TABLE IF EXISTS "{temp_table}"', None))
++        num_pairs_moved[target] = len(zero_pairs)
++
++    # Execute everything in a single transaction
++    progress.update("Applying changes in a single transaction")
++
++    conn = profile_db.conn
++    conn.commit()
++    cursor = conn.cursor()
++
++    try:
++        cursor.execute('BEGIN IMMEDIATE')
++
++        for sql, params in queued_operations:
++            if params is not None:
++                cursor.executemany(sql, params)
++            else:
++                cursor.execute(sql)
++
++        # Update version inside the same transaction
++        cursor.execute("DELETE FROM self WHERE key = 'version'")
++        cursor.execute("INSERT INTO self VALUES ('version', ?)", (next_version,))
++
++        conn.commit()
++    except Exception:
++        conn.rollback()
++        progress.end()
++        raise
++
++    if num_pairs_moved:
++        progress.update("Reclaiming disk space")
++        profile_db._exec('VACUUM')
++
++    progress.update("Done")
++    profile_db.disconnect()
++
++    progress.end()
++
++    moved_msg = ""
++    if num_pairs_moved:
++        moved_msg = (f" In addition, {', '.join([f'{n} zero-coverage {target}' for target, n in num_pairs_moved.items()])} "
++                     f"(item/sample pairs) were moved from the view tables into the zero_coverage tables. These pairs were "
++                     f"left behind during the previous migration step because they did have reads mapping to them, yet all "
++                     f"those reads were filtered out so effectively their coverage (and other stats) are still zeros.")
++
++    run.info_single(f"Congratulations! Your profile database is now version {next_version}. This update added new tables "
++                    f"to store the number of reads that map to each split and contig, which is needed by some downstream "
++                    f"analyses such as the calculation of distribution of coverage (discov) scores. Please note that these tables are EMPTY "
++                    f"in your database, since this information cannot be recovered from the existing data. If you need it, "
++                    f"you will have to re-profile your BAM files with `anvi-profile`.{moved_msg}", nl_after=1, nl_before=1, mc='green')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=f"A simple script to upgrade an anvi'o profile database from version {current_version} to version {next_version}")
++    parser.add_argument("profile_db", metavar="PROFILE_DB", help=f"An anvi'o profile database of version {current_version}")
++    args, unknown = parser.parse_known_args()
++
++    try:
++        migrate(args.profile_db)
++    except ConfigError as e:
++        print(e)
++        sys.exit(-1)
+diff --git a/anvio/profiler.py b/anvio/profiler.py
+index 6df69727f8..a2ea329e7e 100644
+--- a/anvio/profiler.py
++++ b/anvio/profiler.py
+@@ -1415,6 +1415,7 @@ def init_dirs_and_dbs(self):
+                        'SNVs_profiled': not self.skip_SNV_profiling,
+                        'SCVs_profiled': self.profile_SCVs,
+                        'INDELs_profiled': not self.skip_INDEL_profiling,
++                       'num_reads_stored': not self.blank,
+                        'min_percent_identity': self.min_percent_identity or 0,
+                        'fetch_filter': self.fetch_filter,
+                        'min_coverage_for_variability': self.min_coverage_for_variability,
+@@ -2584,27 +2585,42 @@ def store_contigs_buffer(self):
+         self.generate_indels_table()
+         self.store_split_coverages()
+ 
+-        # Identify zero-coverage splits within covered contigs. These splits belong to
+-        # contigs that DID have reads, but the reads did not cover every split. Instead
+-        # of writing zero rows to all 12 view tables, we record them in
+-        # zero_coverage_splits and skip them during atomic data generation.
++        # Identify zero-coverage contigs and splits. A contig can have zero coverage despite being
++        # profiled if none of its reads survived (e.g., all were removed by read filters, or the BAM
++        # index counted alignments without a CIGAR or sequence). Such contigs, and all of their splits,
++        # are recorded in the zero_coverage tables just like the contigs skipped by the BAM index
++        # prefilter. Splits within covered contigs may also have zero coverage if the reads did not
++        # cover every split. Instead of writing zero rows to all view tables, we record all of these
++        # in zero_coverage tables and skip them during atomic data generation.
++        zero_cov_contig_names = set()
+         zero_cov_split_names = set()
+         for contig in self.contigs:
++            if contig.coverage.mean == 0:
++                zero_cov_contig_names.add(contig.name)
++                zero_cov_split_names.update(split.name for split in contig.splits)
++                continue
++
+             for split in contig.splits:
+                 if split.coverage.mean == 0:
+                     zero_cov_split_names.add(split.name)
+ 
+-        if zero_cov_split_names:
++        if zero_cov_contig_names or zero_cov_split_names:
+             profile_db = dbops.ProfileDatabase(self.profile_db_path, quiet=True)
+-            profile_db.db._exec_many(
+-                'INSERT INTO %s VALUES (?,?)' % t.zero_coverage_splits_table_name,
+-                [(name, self.sample_id) for name in zero_cov_split_names])
++            if zero_cov_contig_names:
++                profile_db.db._exec_many(
++                    'INSERT INTO %s VALUES (?,?)' % t.zero_coverage_contigs_table_name,
++                    [(name, self.sample_id) for name in zero_cov_contig_names])
++            if zero_cov_split_names:
++                profile_db.db._exec_many(
++                    'INSERT INTO %s VALUES (?,?)' % t.zero_coverage_splits_table_name,
++                    [(name, self.sample_id) for name in zero_cov_split_names])
+             profile_db.disconnect()
+ 
+         # the crux of the profiling
+         for atomic_data_field in self.essential_data_fields_for_anvio_profiles:
+             view_data_splits, view_data_contigs = contigops.get_atomic_data(self.sample_id, self.contigs, atomic_data_field,
+-                                                                            zero_cov_splits=zero_cov_split_names)
++                                                                            zero_cov_splits=zero_cov_split_names,
++                                                                            zero_cov_contigs=zero_cov_contig_names)
+ 
+             table_name = '_'.join([atomic_data_field, 'splits'])
+             TablesForViews(self.profile_db_path,
+@@ -2622,6 +2638,34 @@ def store_contigs_buffer(self):
+                                                  view_name=None,
+                                                  append_mode=True)
+ 
++        # the number of reads per split and contig are stored like atomic data. zero values
++        # are not stored: zero-coverage contigs and splits are already skipped (and every contig with coverage
++        # has at least one read), but a split with coverage may still have no reads assigned to it (if all reads
++        # covering it have most of their aligned bases in neighboring splits). those splits go into the
++        # zero_read_splits table instead
++        num_reads_splits, num_reads_contigs = contigops.get_atomic_data(self.sample_id, self.contigs, 'num_reads',
++                                                                        zero_cov_splits=zero_cov_split_names,
++                                                                        zero_cov_contigs=zero_cov_contig_names)
++        TablesForViews(self.profile_db_path,
++                       progress=self.progress) \
++                            .create_new_view(view_data=[d for d in num_reads_splits if d[2] > 0],
++                                             table_name=t.num_reads_splits_table_name,
++                                             view_name=None,
++                                             append_mode=True)
++
++        TablesForViews(self.profile_db_path,
++                       progress=self.progress) \
++                            .create_new_view(view_data=num_reads_contigs,
++                                             table_name=t.num_reads_contigs_table_name,
++                                             view_name=None,
++                                             append_mode=True)
++
++        zero_read_split_rows = [(item, layer) for item, layer, value in num_reads_splits if value == 0]
++        if zero_read_split_rows:
++            profile_db = dbops.ProfileDatabase(self.profile_db_path, quiet=True)
++            profile_db.db._exec_many('INSERT INTO %s VALUES (?,?)' % t.zero_read_splits_table_name, zero_read_split_rows)
++            profile_db.disconnect()
++
+ 
+     def check_contigs(self, num_contigs=None):
+         if not num_contigs:
+diff --git a/anvio/splitter.py b/anvio/splitter.py
+index 328183aadd..197b1ea9be 100644
+--- a/anvio/splitter.py
++++ b/anvio/splitter.py
+@@ -688,6 +688,11 @@ def do_profile_db(self):
+                 else:
+                     tables[new_table_name] = ('item', self.split_names)
+ 
++        # the number of reads tables follow the same structure as view tables (and are already created by `touch`)
++        tables[t.num_reads_splits_table_name] = ('item', self.split_names)
++        tables[t.num_reads_contigs_table_name] = ('item', contig_names_in_bin)
++        tables[t.zero_read_splits_table_name] = ('item', self.split_names)
++
+         # copy zero_coverage tables for splits/contigs in this bin
+         tables[t.zero_coverage_splits_table_name] = ('item', self.split_names)
+         tables[t.zero_coverage_contigs_table_name] = ('item', contig_names_in_bin)
+diff --git a/anvio/tables/__init__.py b/anvio/tables/__init__.py
+index 3ca40c9560..fd76ce9634 100644
+--- a/anvio/tables/__init__.py
++++ b/anvio/tables/__init__.py
+@@ -236,6 +236,18 @@
+ zero_coverage_contigs_table_structure = ['item', 'layer']
+ zero_coverage_contigs_table_types     = ['text', 'text' ]
+ 
++# the number of reads per split and per contig are stored in tables that follow the same structure as
++# view tables, but they are not meant to be displayed. we also need a table to store
++# the splits for which all mapped reads are mostly aligning to other splits, meaning that no reads
++# get assigned to them (ie, they have a read count of 0) since these are not included in the
++# zero_coverage_splits table above
++num_reads_splits_table_name  = 'num_reads_splits'
++num_reads_contigs_table_name = 'num_reads_contigs'
++
++zero_read_splits_table_name      = 'zero_read_splits'
++zero_read_splits_table_structure = ['item', 'layer']
++zero_read_splits_table_types     = ['text', 'text' ]
++
+ protein_abundances_table_name        = 'protein_abundances'
+ protein_abundances_table_structure   = ['protein_id', 'reference_source', 'reference_id', 'sample_name', 'abundance_value']
+ protein_abundances_table_types       = [  'numeric' ,       'text'      ,     'text'    ,     'text'   ,     'numeric'    ]
+@@ -411,6 +423,9 @@
+                                   'variability_contigs': True,
+                                   'zero_coverage_splits': False,
+                                   'zero_coverage_contigs': False,
++                                  'num_reads_splits': True,
++                                  'num_reads_contigs': True,
++                                  'zero_read_splits': False,
+                                   'gene_cluster_frequencies': True,
+                                   'gene_cluster_presence_absence': True,
+                                   'clusters': False,
+diff --git a/anvio/version.py b/anvio/version.py
+index 9dd7322397..fd0dc75274 100644
+--- a/anvio/version.py
++++ b/anvio/version.py
+@@ -18,7 +18,7 @@
+ # of these numbers, you better have a well-tested migration script
+ # ready to go along with that change!
+ contigs_db_version = "25"
+-profile_db_version = "42"
++profile_db_version = "43"
+ genes_db_version = "6"
+ pan_db_version = "21"
+ pangraph_db_version = "7"

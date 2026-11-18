@@ -1,0 +1,413 @@
+diff --git a/metagraph/integration_tests/test_build_weighted.py b/metagraph/integration_tests/test_build_weighted.py
+index 57123d390a..9b0118f8b2 100644
+--- a/metagraph/integration_tests/test_build_weighted.py
++++ b/metagraph/integration_tests/test_build_weighted.py
+@@ -362,6 +362,24 @@ def test_kmer_count_width_large(self, build, k_width_result):
+         self.assertEqual(stats_graph['nnz weights'], '2')
+         self.assertEqual(stats_graph['avg weight'], str(avg_count_expected))
+ 
++    @parameterized.expand([repr for repr in BUILDS if not (repr == 'bitmap' and PROTEIN_MODE)])
++    def test_header_abundance_counts(self, build):
++        """Test --count-kmers with k-mer abundances from FASTA headers (Logan format) for all graph types"""
++        representation, tmp_dir = build_params[build]
++        fasta_path = os.path.join(TEST_DATA_DIR, 'logan_30.fa')
++        outbase = os.path.join(self.tempdir.name, f'logan_graph_{representation}')
++        cmd = f'{METAGRAPH} build --graph {representation} --count-kmers -k 31 -o {outbase} {fasta_path}'
++        res = subprocess.run(cmd, shell=True)
++        self.assertEqual(res.returncode, 0)
++        weights_file = outbase + graph_file_extension[representation] + '.weights'
++        self.assertTrue(os.path.exists(weights_file))
++        stats_graph = self._get_stats(outbase + graph_file_extension[representation])
++        self.assertEqual(stats_graph['returncode'], 0)
++        self.assertEqual(stats_graph['k'], '31')
++        self.assertEqual(stats_graph['nnz weights'], '728')
++        self.assertEqual(stats_graph['avg weight'], '7.74863')
++        self.assertEqual(stats_graph['mode'], 'basic')
++        self.assertIn(stats_graph['nodes (k)'], ['728', '1079'])
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/metagraph/integration_tests/test_query.py b/metagraph/integration_tests/test_query.py
+index df3d1e0918..859641e73f 100644
+--- a/metagraph/integration_tests/test_query.py
++++ b/metagraph/integration_tests/test_query.py
+@@ -715,6 +715,61 @@ def test_query(self):
+         self.assertEqual(hashlib.sha224(res.stdout).hexdigest(), '1bd6c24373812064c3e17e73533de7b1e30baa3cca3a64b460e83cb4')
+ 
+ 
++@parameterized_class(('graph_repr', 'anno_repr'),
++    input_values=product(
++        [repr for repr in GRAPH_TYPES if not (repr == 'bitmap' and PROTEIN_MODE)],
++        [anno_type for anno_type in ANNO_TYPES if 'int_' in anno_type]
++    ),
++    class_name_func=get_test_class_name
++)
++class TestHeaderCounts(TestingBase):
++    @classmethod
++    def setUpClass(cls):
++        cls.tempdir = TemporaryDirectory()
++
++        cls.fasta_file = TEST_DATA_DIR + '/logan_30.fa'
++
++        cls.header_counts = []
++        with open(cls.fasta_file) as f:
++            for line in f:
++                if line.startswith('>'):
++                    label = line.split()[0][1:]
++                    for part in line.split():
++                        if part.startswith('ka:f:'):
++                            count = int(float(part.split(':')[2]) + 0.5)
++                            cls.header_counts.append((label, count))
++
++        cls.k = 31
++
++        cls._build_graph(cls.fasta_file, cls.tempdir.name + '/graph', cls.k, cls.graph_repr, 'basic')
++
++        cls._annotate_graph(
++            cls.fasta_file,
++            cls.tempdir.name + '/graph' + graph_file_extension[cls.graph_repr],
++            cls.tempdir.name + '/annotation',
++            cls.anno_repr,
++            anno_type='header'
++        )
++
++    def test_header_counts_query(self):
++        query_cmd = f'{METAGRAPH} query --query-mode counts -i {self.tempdir.name}/graph{graph_file_extension[self.graph_repr]} -a {self.tempdir.name}/annotation{anno_file_extension[self.anno_repr]} {self.fasta_file}'
++        res = subprocess.run(query_cmd.split(), stdout=PIPE)
++        self.assertEqual(res.returncode, 0)
++        output = res.stdout.decode().strip().split('\n')
++        expected_counts = {label: count for label, count in self.header_counts}
++        actual_counts = {}
++        for line in output:
++            parts = line.split('\t')
++            label = parts[1]
++            self.assertFalse(label in actual_counts, f"Duplicate label {label} in output")
++            actual_counts[label] = int(parts[2].split('=')[-1])
++        self.assertEqual(expected_counts, actual_counts)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.tempdir.cleanup()
++
++
+ @parameterized_class(('graph_repr', 'anno_repr'),
+     input_values=product(
+         [repr for repr in GRAPH_TYPES if not (repr == 'bitmap' and PROTEIN_MODE)],
+diff --git a/metagraph/src/cli/annotate.cpp b/metagraph/src/cli/annotate.cpp
+index 9bf62ebc2f..2dfb5cf183 100644
+--- a/metagraph/src/cli/annotate.cpp
++++ b/metagraph/src/cli/annotate.cpp
+@@ -35,6 +35,7 @@ void call_annotations(const std::string &file,
+                       size_t max_count,
+                       bool filename_anno,
+                       bool annotate_sequence_headers,
++                      bool parse_counts_from_headers,
+                       const std::string &fasta_anno_comment_delim,
+                       const std::string &fasta_header_delimiter,
+                       const std::vector<std::string> &anno_labels,
+@@ -58,7 +59,7 @@ void call_annotations(const std::string &file,
+                 labels.insert(labels.end(),
+                               variant_labels.begin(), variant_labels.end());
+ 
+-                callback(std::move(seq), labels);
++                callback(std::move(seq), labels, 1);
+ 
+                 total_seqs += 1;
+ 
+@@ -77,7 +78,7 @@ void call_annotations(const std::string &file,
+         read_kmers(
+             file,
+             [&](std::string_view sequence) {
+-                callback(std::string(sequence), labels);
++                callback(std::string(sequence), labels, 1);
+ 
+                 total_seqs += 1;
+ 
+@@ -93,6 +94,7 @@ void call_annotations(const std::string &file,
+         );
+     } else if (file_format(file) == "FASTA"
+                 || file_format(file) == "FASTQ") {
++        bool parsed_first_header = false;
+         read_fasta_file_critical(
+             file,
+             [&](kseq_t *read_stream) {
+@@ -110,7 +112,24 @@ void call_annotations(const std::string &file,
+                     }
+                 }
+ 
+-                callback(read_stream->seq.s, labels);
++                uint64_t abundance = 1;
++
++                if (parse_counts_from_headers) {
++                    if (auto count = read_stream->comment.s ? utils::parse_abundance(read_stream->comment.s) : std::nullopt) {
++                        abundance = *count;
++                        parsed_first_header = true;
++                    } else if (parsed_first_header) {
++                        mtg::common::logger->error("Inconsistent k-mer count headers in file '{}'", file);
++                        exit(1);
++                    } else {
++                        parse_counts_from_headers = false;
++                        mtg::common::logger->warn("No k-mer count found in header '{}', "
++                                                  "will treat all sequences as having k-mer count 1",
++                                                  read_stream->name.s);
++                    }
++                }
++
++                callback(read_stream->seq.s, labels, abundance);
+ 
+                 total_seqs += 1;
+ 
+@@ -252,10 +271,11 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+                 config.max_count,
+                 config.filename_anno,
+                 config.annotate_sequence_headers,
++                /*parse_counts_from_headers*/false,
+                 config.fasta_anno_comment_delim,
+                 config.fasta_header_delimiter,
+                 config.anno_labels,
+-                [&](std::string sequence, auto labels) {
++                [&](std::string sequence, auto labels, uint64_t) {
+                     if (config.num_kmers_in_seq
+                             && config.num_kmers_in_seq + k - 1 != sequence.size()) {
+                         logger->error("All input sequences must have the same"
+@@ -299,10 +319,11 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+             config.max_count,
+             config.filename_anno,
+             config.annotate_sequence_headers,
++            /*parse_counts_from_headers*/false,
+             config.fasta_anno_comment_delim,
+             config.fasta_header_delimiter,
+             config.anno_labels,
+-            [&](std::string sequence, auto labels) {
++            [&](std::string sequence, auto labels, uint64_t) {
+                 if (sequence.size() >= k) {
+                     batcher.push_and_pay(sequence.size(),
+                                          std::move(sequence), std::move(labels));
+@@ -358,8 +379,9 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+                     }
+                 );
+             } else {
+-                logger->warn("No k-mer counts found at '{}'. Every input k-mer"
+-                             " will have count 1.", counts_fname);
++                logger->warn("No k-mer counts found at '{}', "
++                             "will try reading counts from headers",
++                             counts_fname);
+                 call_annotations(
+                     file,
+                     config.refpath,
+@@ -369,14 +391,15 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+                     config.max_count,
+                     config.filename_anno,
+                     config.annotate_sequence_headers,
++                    /*parse_counts_from_headers*/true,
+                     config.fasta_anno_comment_delim,
+                     config.fasta_header_delimiter,
+                     config.anno_labels,
+-                    [&](std::string sequence, auto labels) {
++                    [&](std::string sequence, auto labels, uint64_t kmer_count) {
+                         if (sequence.size() >= k) {
+                             batcher.push_and_pay(sequence.size(),
+                                                  std::move(sequence), std::move(labels),
+-                                                 std::vector<uint64_t>(sequence.size() - k + 1, 1));
++                                                 std::vector<uint64_t>(sequence.size() - k + 1, kmer_count));
+                         }
+                     }
+                 );
+diff --git a/metagraph/src/cli/build.cpp b/metagraph/src/cli/build.cpp
+index d58cbde119..07cd4d234b 100644
+--- a/metagraph/src/cli/build.cpp
++++ b/metagraph/src/cli/build.cpp
+@@ -43,7 +43,7 @@ void push_sequences(const std::vector<std::string> &files,
+             1'000'000
+         );
+         parse_sequences_and_log(files[i], config, config.k,
+-            [&](std::string_view seq, uint32_t count) {
++            [&](std::string_view seq, auto count) {
+                 batcher.push_and_pay(seq.size(), seq, count);
+             }
+         );
+@@ -304,7 +304,7 @@ int build_graph(Config *config) {
+ 
+         for (const auto &file : files) {
+             parse_sequences_and_log(file, *config, graph->get_k(),
+-                [&graph](std::string_view seq, uint32_t) { graph->add_sequence(seq); }
++                [&graph](std::string_view seq, auto) { graph->add_sequence(seq); }
+             );
+         }
+ 
+@@ -320,7 +320,7 @@ int build_graph(Config *config) {
+ 
+             for (const auto &file : files) {
+                 parse_sequences_and_log(file, *config, graph->get_k(),
+-                    [&graph,&node_weights](std::string_view seq, uint32_t count) {
++                    [&graph,&node_weights](std::string_view seq, auto count) {
+                         graph->map_to_nodes_sequentially(seq,
+                             [&](auto node) { node_weights->add_weight(node, count); }
+                         );
+diff --git a/metagraph/src/cli/parse_sequences.hpp b/metagraph/src/cli/parse_sequences.hpp
+index b26c49c0a6..0ed0642daa 100644
+--- a/metagraph/src/cli/parse_sequences.hpp
++++ b/metagraph/src/cli/parse_sequences.hpp
+@@ -169,9 +169,31 @@ void parse_sequences(const std::string &file,
+             );
+ 
+         } else {
++            if (config.count_kmers) {
++                mtg::common::logger->warn("k-mer counts file not found for '{}', "
++                                          "will try reading counts from headers",
++                                          file);
++            }
++            bool parse_counts_from_headers = config.count_kmers, parsed_first_header = false;
+             read_fasta_file_critical(file, [&](kseq_t *read_stream) {
+-                // add read to the graph constructor as a callback
+-                call_sequence(std::string_view(read_stream->seq.s, read_stream->seq.l), 1);
++                uint64_t abundance = 1;
++                
++                if (parse_counts_from_headers) {
++                    if (auto count = read_stream->comment.s ? utils::parse_abundance(read_stream->comment.s) : std::nullopt) {
++                        abundance = *count;
++                        parsed_first_header = true;
++                    } else if (parsed_first_header) {
++                        mtg::common::logger->error("Inconsistent k-mer count headers in file '{}'", file);
++                        exit(1);
++                    } else {
++                        parse_counts_from_headers = false;
++                        mtg::common::logger->warn("No k-mer count found in header '{}', "
++                                                  "will treat all sequences as having k-mer count 1",
++                                                  read_stream->name.s);
++                    }
++                }
++
++                call_sequence(std::string_view(read_stream->seq.s, read_stream->seq.l), abundance);
+             }, config.forward_and_reverse);
+         }
+     } else {
+diff --git a/metagraph/src/common/utils/string_utils.cpp b/metagraph/src/common/utils/string_utils.cpp
+index 8e801baf78..a44e76df1a 100644
+--- a/metagraph/src/common/utils/string_utils.cpp
++++ b/metagraph/src/common/utils/string_utils.cpp
+@@ -1,6 +1,7 @@
+ #include "string_utils.hpp"
+ 
+ #include <cmath>
++#include <regex>
+ #include <cassert>
+ #include <algorithm>
+ 
+@@ -22,6 +23,18 @@ bool ends_with(const std::string &str, const std::string &suffix) {
+     return actual_suffix == suffix;
+ }
+ 
++// Try to parse ka:f:[abundance] or km:f:[abundance] from header
++// https://github.com/IndexThePlanet/Logan/blob/main/Unitigs.md
++std::optional<uint64_t> parse_abundance(const std::string &comment) {
++    std::smatch match;
++    std::regex abundance_regex(R"((ka|km):f:([0-9.eE+-]+))");
++    if (std::regex_search(comment, match, abundance_regex) && match.size() > 2) {
++        return std::max<uint64_t>(1, std::llround(std::stod(match[2].str())));
++    } else {
++        return std::nullopt;
++    }
++}
++
+ std::string remove_suffix(const std::string &str, const std::string &suffix) {
+     return ends_with(str, suffix)
+             ? str.substr(0, str.size() - suffix.size())
+diff --git a/metagraph/src/common/utils/string_utils.hpp b/metagraph/src/common/utils/string_utils.hpp
+index 3336280741..0ba9c7234a 100644
+--- a/metagraph/src/common/utils/string_utils.hpp
++++ b/metagraph/src/common/utils/string_utils.hpp
+@@ -4,6 +4,8 @@
+ #include <string>
+ #include <deque>
+ #include <vector>
++#include <cstdint>
++#include <optional>
+ 
+ 
+ namespace utils {
+@@ -12,6 +14,8 @@ bool starts_with(const std::string &str, const std::string &prefix);
+ 
+ bool ends_with(const std::string &str, const std::string &suffix);
+ 
++std::optional<uint64_t> parse_abundance(const std::string &comment);
++
+ std::string remove_suffix(const std::string &str, const std::string &suffix);
+ 
+ template <typename... String>
+diff --git a/metagraph/tests/data/logan_30.fa b/metagraph/tests/data/logan_30.fa
+new file mode 100644
+index 0000000000..d9b62cb110
+--- /dev/null
++++ b/metagraph/tests/data/logan_30.fa
+@@ -0,0 +1,70 @@
++>SRR11905265_0 ka:f:1.0    L:-:27885434:- 
++AAAAAAAAAAAAAAAAAAAAAACAGCCTCAG
++>SRR11905265_1 ka:f:4.8   L:+:26:+  L:-:27881327:- 
++AAAAAAAAAAAAAAAAAAAAAAACATGAGCAG
++>SRR11905265_2 ka:f:3.0   L:+:3843:+  L:-:27881359:- 
++AAAAAAAAAAAAAAAAAAAAAAAACCACAGTGGCTAAATAATA
++>SRR11905265_3 ka:f:3.6   L:+:14596464:+  L:-:24815728:- 
++AGGAAAAAAAAAAAAAAAAAAAAAACCACCCAGCATTCTCAGCTCTGTTAAACA
++>SRR11905265_4 ka:f:13.5   L:-:27807752:+ L:-:27885602:-  L:+:27:+ L:+:28:+ L:+:29:+ 
++AAAAAAAAAAAAAAAAAAAAAACCCAAAATT
++>SRR11905265_5 ka:f:1.0   L:+:30:+  
++AAAAAAAAAAAAAAAAAAAAAACCCCACCAG
++>SRR11905265_6 ka:f:6.9   L:-:27809252:+ L:-:27885817:-  L:+:3234556:- 
++AAAAAAAAAAAAAAAAAAAAAACCTCTTCCCTGGGTCACAGGTCAGGACTGGC
++>SRR11905265_7 ka:f:13.0   L:+:31:+ L:+:32:+  L:-:14688794:- L:-:27883441:- 
++AAAAAAAAAAAAAAAAAAAAAACTCCATCTC
++>SRR11905265_8 ka:f:4.0   L:-:27814611:- L:-:27886414:- L:-:27947736:-  L:+:35:+ L:+:15763450:+ 
++AAAAAAAAAAAAAAAAAAAAAAGAGAAAAAT
++>SRR11905265_9 ka:f:12.5   L:-:27814625:- L:-:27886449:-  L:+:36:+ L:+:37:+ 
++AAAAAAAAAAAAAAAAAAAAAAGAGAGGGGG
++>SRR11905265_10 ka:f:1.7   L:-:27883887:-  
++AAAAAAAAAAAAAAAAAAAAAAAGAGGGGTGGG
++>SRR11905265_11 ka:f:7.4   L:-:27883979:-  L:+:4749902:- L:+:20793920:- 
++AAAAAAAAAAAAAAAAAAAAAAGATTTCCAGTTTTACTTTTTAGTGGATATTAACATTTT
++CCAAATAAGATATGGTGGCAATGACAGACAACAGATTCAAGGCTTAGACAA
++>SRR11905265_12 ka:f:11.6   L:+:2509348:+ L:+:2509349:+  L:-:27756417:+ L:-:27883984:- 
++AAAAAAAAAAAAAAAAAAAAAAAGATTTTTGCTAGCTTCCCCAGAGATAGCAAAGCAGGG
++TGGATTGGAGCCAGAATGGTTTGAAATCCCAGCTCTGCTGCTGGTTCCTTGGATGATGCT
++GGCGAAGCTGCTCACTCCCTCCCTGCACGTCAGCTTTCTAAGAAAGTAACAGTTCCTGAC
++TCATGGAGGCGCCCA
++>SRR11905265_13 ka:f:1.9   L:+:436:+  L:-:27811977:+ L:-:27835077:+ L:-:27835078:- 
++AAAAAAAAAAAAAAAAAAAAAAAGCATACATTTGGGTC
++>SRR11905265_14 ka:f:2.0   L:+:451:+  L:-:27857815:+ L:-:27886797:- 
++AAAAAAAAAAAAAAAAAAAAAAGCCTTTCTGCTCATG
++>SRR11905265_15 ka:f:2.8   L:-:36076240:-  L:+:127:+ 
++CTCAGCAAAAAAAAAAAAAAAAAAAAAAAGCTTCAGTTCAG
++>SRR11905265_16 ka:f:26.0   L:-:27814742:- L:-:27853473:- L:-:27886877:- L:-:27947755:-  L:+:39:+ L:+:40:+ L:+:41:+ L:+:22764360:+ 
++AAAAAAAAAAAAAAAAAAAAAAGGAAAAAAT
++>SRR11905265_17 ka:f:3.2   L:-:27886983:-  L:+:475:+ 
++AAAAAAAAAAAAAAAAAAAAAAGGACCCAGAGATAGA
++>SRR11905265_18 ka:f:3.2   L:+:196:+  
++GAAAAAAAAAAAAAAAAAAAAAAGGAGAGACTGAAA
++>SRR11905265_19 ka:f:5.9   L:+:14424174:+ L:+:16644123:+  L:-:27814797:- L:-:27887041:- 
++AAAAAAAAAAAAAAAAAAAAAAGGATTTAGACAAAAAATCATGTATCATCAAGGAAGCAC
++TTGAT
++>SRR11905265_20 ka:f:2.0   L:+:42:+  L:-:27853312:- L:-:27884416:- 
++AAAAAAAAAAAAAAAAAAAAAAAGGCAGCATT
++>SRR11905265_21 ka:f:1.0   L:+:43:+  L:-:8555319:- L:-:27887074:- 
++AAAAAAAAAAAAAAAAAAAAAAGGCAGCCAG
++>SRR11905265_22 ka:f:3.7   L:-:27579912:-  L:+:201:+ 
++ACAAGATAGGCCAAAAAAAAAAAAAAAAAAAAAAGGCCATGTTTAAG
++>SRR11905265_23 ka:f:4.7   L:-:16951000:- L:-:35429161:-  L:+:16162397:+ 
++ACAAAAAAAAAAAAAAAAAAAAAAAGGGGAGCAGCCTCTAACTGTGGCTCCAGGGACCTC
++CCCCTTTCTGGAATCTCCC
++>SRR11905265_24 ka:f:8.3   L:-:12152931:+ L:-:27278215:+  L:+:25938194:+ 
++ACTATCACAGAAAAATGTTTTGATGTGATATACAACTTTATTTTTAATAGGGAAATCAAA
++TAGCTAAAGATTAAGACTGGGCTCTGAAGTCAGACCCAATTAGAATTCTAGTGTTTTGTA
++ACACTGGGGAAGTTACTTCAAATTTTTTAGCCCAGGTTTCATCATCTGACCAAAAAAAAA
++AAAAAAAAAAAAAGTGAGGGAGGGGGGATCTCCCAGAGTTGTTTTAAGAATAATATAAGC
++TGGGGGCAGGATATAGTTCAGTGGTAGAGTGCATGCTCAG
++>SRR11905265_25 ka:f:4.1   L:-:27814905:- L:-:27882537:-  L:+:142:+ 
++AAAAAAAAAAAAAAAAAAAAAATCATCATCACAT
++>SRR11905265_26 ka:f:14.0   L:-:1:- L:-:957876:- L:-:967317:-  L:+:46:+ 
++AAAAAAAAAAAAAAAAAAAAACATGAGCAGG
++>SRR11905265_27 ka:f:4.9   L:+:220:+ L:+:221:+  L:-:4:- 
++AAAAAAAAAAAAAAAAAAAAACCCAAAATTAAAAA
++>SRR11905265_28 ka:f:2.9   L:-:4:-  L:+:8086787:+ 
++AAAAAAAAAAAAAAAAAAAAACCCAAAATTGCTCAG
++>SRR11905265_29 ka:f:6.5   L:-:4:-  L:+:48:+ L:+:49:+ 
++AAAAAAAAAAAAAAAAAAAAACCCAAAATTT

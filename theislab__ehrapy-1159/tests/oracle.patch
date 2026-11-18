@@ -1,0 +1,377 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 54f3eb61..be2bead3 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -11,6 +11,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+   The survival models derive the duration and event from an `event_col` that is a longitudinal variable, so that `ep.tl.kaplan_meier(edata, event_col="SepsisLabel")` estimates the time to sepsis on PhysioNet 2019.
+   The event is whether the variable is ever 1, at the time of its first 1 in `edata.tem["interval_start_offset"]`, and observations without one are censored at their last non-missing value.
+   The fitted models hold the derived durations and events as `durations` and `event_observed`.
++* {func}`ep.pp.summarize_measurements <ehrapy.preprocessing.summarize_measurements>` summarizes the timepoints selected by `tem_names`, or several named windows such as the first 6 and the last 24 hours in columns `{var}_{stat}_{window}`, and `ep.ml` computes the features of its observation windows with it ([#1159](https://github.com/theislab/ehrapy/pull/1159)) @Zethson
+ * {func}`ep.tl.kaplan_meier <ehrapy.tools.kaplan_meier>` estimates the cumulative incidence of an `event_of_interest` with the Aalen-Johansen estimator when the event column holds competing events, {func}`ep.tl.nelson_aalen <ehrapy.tools.nelson_aalen>` its cause-specific cumulative hazard, and {func}`ep.pl.kaplan_meier <ehrapy.plot.kaplan_meier>` plots the cumulative incidence ([#1155](https://github.com/theislab/ehrapy/pull/1155)) @Zethson
+ 
+   Without `event_of_interest`, the univariate survival models raise an error for event columns with more than one event type instead of silently treating every event type as the same event.
+diff --git a/ehrapy/_compat.py b/ehrapy/_compat.py
+index 09f70642..c7be0e7e 100644
+--- a/ehrapy/_compat.py
++++ b/ehrapy/_compat.py
+@@ -20,7 +20,6 @@
+ if TYPE_CHECKING:
+     from collections.abc import Callable, Collection, Iterable, Mapping
+ 
+-    import pandas as pd
+     from ehrdata import EHRData
+ 
+     type Array = np.ndarray | DaskArray
+@@ -414,30 +413,3 @@ def _ensure_feature_types(edata: EHRData, layer: str | None, name: str) -> None:
+             "Infer them first with `ed.infer_feature_types(edata)`, which reads every value once."
+         )
+     ed.infer_feature_types(edata, layer=layer, output=None)
+-
+-
+-def _resolve_axis(index: pd.Index, names: Any, axis: str) -> tuple[np.ndarray, pd.Index]:
+-    n = len(index)
+-
+-    if names is None:
+-        pos = np.arange(n, dtype=int)
+-        return pos, index.take(pos)
+-
+-    if isinstance(names, slice):
+-        pos = np.arange(n, dtype=int)[names]
+-        return pos, index.take(pos)
+-
+-    if isinstance(names, (str, int, np.integer)):
+-        names_list = [names]
+-    else:
+-        names_list = list(names)
+-
+-    names_list = list(dict.fromkeys(names_list))
+-
+-    pos = index.get_indexer(names_list)
+-    if (pos < 0).any():
+-        missing = [names_list[i] for i, p in enumerate(pos) if p < 0]
+-        raise KeyError(f"{', '.join(str(x) for x in missing)} not found in edata.{axis}")
+-
+-    pos = pos.astype(int, copy=False)
+-    return pos, index.take(pos)
+diff --git a/ehrapy/_utils_axis.py b/ehrapy/_utils_axis.py
+new file mode 100644
+index 00000000..5f1dc359
+--- /dev/null
++++ b/ehrapy/_utils_axis.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++
++if TYPE_CHECKING:
++    import pandas as pd
++
++
++def _resolve_axis(index: pd.Index, names: Any, axis: str) -> tuple[np.ndarray, pd.Index]:
++    n = len(index)
++
++    if names is None:
++        pos = np.arange(n, dtype=int)
++        return pos, index.take(pos)
++
++    if isinstance(names, slice):
++        pos = np.arange(n, dtype=int)[names]
++        return pos, index.take(pos)
++
++    if isinstance(names, (str, int, np.integer)):
++        names_list = [names]
++    else:
++        names_list = list(names)
++
++    names_list = list(dict.fromkeys(names_list))
++
++    pos = index.get_indexer(names_list)
++    if (pos < 0).any():
++        missing = [names_list[i] for i, p in enumerate(pos) if p < 0]
++        raise KeyError(f"{', '.join(str(x) for x in missing)} not found in edata.{axis}")
++
++    pos = pos.astype(int, copy=False)
++    return pos, index.take(pos)
+diff --git a/ehrapy/ml/_features.py b/ehrapy/ml/_features.py
+index 6d187267..37b6b98f 100644
+--- a/ehrapy/ml/_features.py
++++ b/ehrapy/ml/_features.py
+@@ -39,23 +39,21 @@ def _features(
+     X = edata.X if layer is None else edata.layers[layer]
+     if task.rolling:
+         windows = task._windows(X.shape[2])
+-        summaries = {
+-            timepoint: summarize_measurements(
+-                edata[:, :, window], layer=layer, var_names=var_names, statistics=statistics
+-            )
+-            for timepoint, window in enumerate(windows)
+-            if window is not None
+-        }
+-        if not summaries:
++        observed = {str(t): window for t, window in enumerate(windows) if window is not None}
++        if not observed:
+             raise ValueError(f"No timepoint lies more than {task.gap} timepoints after another.")
+-        first = next(iter(summaries.values()))
+-        xp = array_namespace(first.X)
+-        missing = xp.full_like(first.X, np.nan)
+-        values = xp.stack([summaries[t].X if t in summaries else missing for t in range(len(windows))], axis=2)
+-        names = list(first.var_names)
++        summary = summarize_measurements(
++            edata, layer=layer, var_names=var_names, statistics=statistics, tem_names=observed
++        )
++        xp = array_namespace(summary.X)
++        names = [f"{var}_{statistic}" for var in var_names for statistic in statistics]
++        values = xp.reshape(summary.X, (summary.shape[0], len(names), len(observed)))
++        # Only the first timepoints lack a window.
++        missing = xp.full((*values.shape[:2], len(windows) - len(observed)), np.nan, dtype=values.dtype)
++        values = xp.concat([missing, values], axis=2)
+     elif X.ndim == 3:
+         summary = summarize_measurements(
+-            edata[:, :, task._window(X.shape[2])], layer=layer, var_names=var_names, statistics=statistics
++            edata, layer=layer, var_names=var_names, statistics=statistics, tem_names=task._window(X.shape[2])
+         )
+         values, names = summary.X, list(summary.var_names)
+     elif task.prediction_time is not None or task.observation_window is not None or task.gap:
+diff --git a/ehrapy/plot/_missing_values.py b/ehrapy/plot/_missing_values.py
+index 4cb17ab4..113cde8b 100644
+--- a/ehrapy/plot/_missing_values.py
++++ b/ehrapy/plot/_missing_values.py
+@@ -12,7 +12,8 @@
+ from fast_array_utils.conv import to_dense
+ from fast_array_utils.types import CSBase
+ 
+-from ehrapy._compat import _materialize, _resolve_axis
++from ehrapy._compat import _materialize
++from ehrapy._utils_axis import _resolve_axis
+ from ehrapy.plot._holoviews import load_hv_extensions
+ from ehrapy.preprocessing._missing_data import _missing_mask
+ 
+diff --git a/ehrapy/plot/_timeseries.py b/ehrapy/plot/_timeseries.py
+index 9e16a1fa..7bb816fc 100644
+--- a/ehrapy/plot/_timeseries.py
++++ b/ehrapy/plot/_timeseries.py
+@@ -6,7 +6,8 @@
+ import numpy as np
+ import pandas as pd
+ 
+-from ehrapy._compat import _materialize, _resolve_axis
++from ehrapy._compat import _materialize
++from ehrapy._utils_axis import _resolve_axis
+ from ehrapy.plot._holoviews import load_hv_extensions
+ 
+ if TYPE_CHECKING:
+diff --git a/ehrapy/preprocessing/_filter.py b/ehrapy/preprocessing/_filter.py
+index a03d8aca..1d3133e2 100644
+--- a/ehrapy/preprocessing/_filter.py
++++ b/ehrapy/preprocessing/_filter.py
+@@ -9,7 +9,8 @@
+ from fast_array_utils.conv import to_dense
+ from pandas.core.computation.parsing import BACKTICK_QUOTED_STRING, clean_column_name, tokenize_string
+ 
+-from ehrapy._compat import _materialize, _resolve_axis, _var_indices
++from ehrapy._compat import _materialize, _var_indices
++from ehrapy._utils_axis import _resolve_axis
+ from ehrapy.core._constants import MISSING_VALUE_COUNT_KEY_2D, MISSING_VALUE_COUNT_KEY_3D
+ from ehrapy.preprocessing._quality_control import _compute_missing_values
+ from ehrapy.preprocessing._summarize_measurements import _aggregate_time
+diff --git a/ehrapy/preprocessing/_summarize_measurements.py b/ehrapy/preprocessing/_summarize_measurements.py
+index 40e0edc5..176dca2a 100644
+--- a/ehrapy/preprocessing/_summarize_measurements.py
++++ b/ehrapy/preprocessing/_summarize_measurements.py
+@@ -1,7 +1,8 @@
+ from __future__ import annotations
+ 
++from collections.abc import Mapping
+ from functools import singledispatch
+-from typing import TYPE_CHECKING, Literal
++from typing import TYPE_CHECKING, Any, Literal
+ 
+ import array_api_extra as xpx
+ import numpy as np
+@@ -11,6 +12,7 @@
+ from fast_array_utils.types import CSBase, DaskArray
+ 
+ from ehrapy._compat import _map_variable_blocks, nanquantile
++from ehrapy._utils_axis import _resolve_axis
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Iterable, Sequence
+@@ -25,6 +27,7 @@ def summarize_measurements(
+     layer: str | None = None,
+     var_names: Iterable[str] | None = None,
+     statistics: Iterable[Statistic] = ("min", "max", "mean"),
++    tem_names: Any | Sequence[Any] | slice | Mapping[str, Any | Sequence[Any] | slice] | None = None,
+ ) -> EHRData:
+     """Summarizes numerical measurements into statistics such as their minimum, maximum and average values.
+ 
+@@ -34,14 +37,20 @@ def summarize_measurements(
+     `"slope"` is the least-squares change per timepoint, which only exists for 3D data.
+     For 2D data, rows that share an observation name are aggregated.
+ 
++    `tem_names` restricts the summary of 3D data to timepoints, such as the last 24 hours before a prediction.
++    A mapping of window names to timepoints summarizes every window, such as `{"first_6h": slice(0, 6), "last_24h": slice(-24, None)}`.
++
+     Args:
+         edata: Data object containing measurements.
+         layer: Layer to calculate the expanded measurements for.
+         var_names: For which measurements to determine the expanded measurements for. Defaults to None (all numerical measurements).
+         statistics: Which expanded measurements to calculate.
++        tem_names: Labels of `edata.tem.index` or a slice of timepoints to summarize, or a mapping of window names to such timepoints.
++            Defaults to None (all timepoints).
+ 
+     Returns:
+         A new data object with the statistic `stat` of the variable `var` in the column `f"{var}_{stat}"` of `.X`.
++        If `tem_names` is a mapping, the column of the window `window` is `f"{var}_{stat}_{window}"`.
+         For 3D data, it keeps the observations and `.obs` of `edata`.
+ 
+     Examples:
+@@ -54,6 +63,11 @@ def summarize_measurements(
+         >>> edata_summary.shape
+         (100, 30, 1)
+         >>> ep.pp.pca(edata_summary)
++        >>> edata_windows = ep.pp.summarize_measurements(
++        ...     edata, statistics=["mean"], tem_names={"early": slice(0, 5), "late": slice(5, None)}
++        ... )
++        >>> edata_windows.var_names[:2].tolist()
++        ['feature_0_mean_early', 'feature_0_mean_late']
+     """
+     X = edata.X if layer is None else edata.layers[layer]
+     var_names = edata.var_names if var_names is None else list(var_names)
+@@ -62,16 +76,38 @@ def summarize_measurements(
+     statistics = list(statistics)
+     if X.ndim != 3 and "slope" in statistics:
+         raise ValueError("The statistic 'slope' needs 3D data with a time axis.")
++    if X.ndim != 3 and tem_names is not None:
++        raise ValueError("`tem_names` needs 3D data with a time axis.")
+     values = X[:, edata.var_names.get_indexer(var_names)]
+-    var = pd.DataFrame(index=[f"{var}_{statistic}" for var in var_names for statistic in statistics])
++    names = [f"{var}_{statistic}" for var in var_names for statistic in statistics]
+ 
+     if X.ndim == 3:
++        windows = tem_names if isinstance(tem_names, Mapping) else {"": tem_names}
++        if not windows:
++            raise ValueError("`tem_names` must name at least one window.")
++        positions = [_resolve_axis(pd.Index(edata.tem.index), window, "tem_names")[0] for window in windows.values()]
++        if any(len(position) == 0 for position in positions):
++            raise ValueError("No timepoints selected (tem_names resolved to empty).")
+         xp = array_namespace(values)
+-        summary = xp.stack([_aggregate_time(values, statistic) for statistic in statistics], axis=2)
+-        return EHRData(X=xp.reshape(summary, (summary.shape[0], -1)), obs=edata.obs.copy(), var=var)
++        summary = xp.stack(
++            [
++                xp.stack([_aggregate_time(values[:, :, position], statistic) for position in positions], axis=2)
++                for statistic in statistics
++            ],
++            axis=2,
++        )
++        if isinstance(tem_names, Mapping):
++            names = [f"{name}_{window}" for name in names for window in windows]
++        return EHRData(
++            X=xp.reshape(summary, (summary.shape[0], -1)), obs=edata.obs.copy(), var=pd.DataFrame(index=names)
++        )
+ 
+     groups, observations = pd.factorize(edata.obs_names, sort=True)
+-    return EHRData(X=_summarize_groups(values, groups, statistics), obs=pd.DataFrame(index=observations), var=var)
++    return EHRData(
++        X=_summarize_groups(values, groups, statistics),
++        obs=pd.DataFrame(index=observations),
++        var=pd.DataFrame(index=names),
++    )
+ 
+ 
+ @singledispatch
+diff --git a/tests/get/test_get.py b/tests/get/test_get.py
+index bab69d1d..b4ac9322 100644
+--- a/tests/get/test_get.py
++++ b/tests/get/test_get.py
+@@ -55,7 +55,7 @@ def test_obs_df_3d_var_keys(edata_blobs_timeseries_small, statistic):
+ 
+     assert df.columns.tolist() == ["cluster", "feature_1", "feature_0"]
+     pd.testing.assert_series_equal(df["cluster"], edata.obs["cluster"])
+-    np.testing.assert_array_equal(df[["feature_1", "feature_0"]].to_numpy(), summary.X)
++    np.testing.assert_allclose(df[["feature_1", "feature_0"]].to_numpy(), summary.X, rtol=1e-12)
+ 
+ 
+ def test_obs_df_3d_timepoint(edata_blobs_timeseries_small):
+diff --git a/tests/preprocessing/test_summarize_measurements.py b/tests/preprocessing/test_summarize_measurements.py
+index eb649b0a..ac5a3078 100644
+--- a/tests/preprocessing/test_summarize_measurements.py
++++ b/tests/preprocessing/test_summarize_measurements.py
+@@ -103,8 +103,8 @@ def test_summarize_measurements_unknown_var(edata_blob_small):
+ 
+ @pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu)
+-@pytest.mark.parametrize("ndim", [2, 3])
+-def test_summarize_measurements_array_types(array_type, ndim, rng):
++@pytest.mark.parametrize(("ndim", "tem_names"), [(2, None), (3, None), (3, {"early": slice(0, 2), "late": ["2", "3"]})])
++def test_summarize_measurements_array_types(array_type, ndim, tem_names, rng):
+     if ndim == 3 and array_type.flags & Flags.Sparse:
+         pytest.skip("sparse arrays are 2D")
+     shape = (12, 3) if ndim == 2 else (6, 3, 4)
+@@ -118,11 +118,12 @@ def make_edata(X):
+         return ed.EHRData(shape=shape[:2], obs=obs, layers={DEFAULT_TEM_LAYER_NAME: X})
+ 
+     statistics = STATISTICS if ndim == 2 else [*STATISTICS, "slope"]
+-    expected = summarize_measurements(make_edata(X), layer=DEFAULT_TEM_LAYER_NAME, statistics=statistics)
++    kwargs = {"layer": DEFAULT_TEM_LAYER_NAME, "statistics": statistics, "tem_names": tem_names}
++    expected = summarize_measurements(make_edata(X), **kwargs)
+     edata = make_edata(array_type(X))
+ 
+     with forbid_dask_compute():
+-        result = summarize_measurements(edata, layer=DEFAULT_TEM_LAYER_NAME, statistics=statistics)
++        result = summarize_measurements(edata, **kwargs)
+ 
+     assert type(result.X) is type(edata.layers[DEFAULT_TEM_LAYER_NAME])
+     if array_type.flags & Flags.Dask:
+@@ -145,3 +146,49 @@ def test_summarize_measurements_2D_count_std(edata_to_expand):
+ def test_summarize_measurements_slope_needs_3D(edata_to_expand):
+     with pytest.raises(ValueError, match="needs 3D data"):
+         summarize_measurements(edata_to_expand, statistics=["slope"])
++
++
++@pytest.fixture
++def edata_hourly():
++    X = np.array([[[1.0, 2.0, np.nan, 4.0, 5.0, 6.0], [10.0, np.nan, np.nan, 40.0, 50.0, np.nan]]])
++    tem = pd.DataFrame(index=[f"h{hour}" for hour in range(6)])
++    return ed.EHRData(shape=(1, 2), var=pd.DataFrame(index=["hr", "lactate"]), tem=tem, layers={"tem": X})
++
++
++@pytest.mark.parametrize("tem_names", [slice(3, None), ["h3", "h4", "h5"]])
++def test_summarize_measurements_tem_names(edata_hourly, tem_names):
++    summary = summarize_measurements(
++        edata_hourly, layer="tem", statistics=["mean", "count", "first"], tem_names=tem_names
++    )
++
++    assert summary.var_names.tolist() == [
++        f"{var}_{stat}" for var in ["hr", "lactate"] for stat in ["mean", "count", "first"]
++    ]
++    np.testing.assert_array_equal(summary.X, [[5.0, 3.0, 4.0, 45.0, 2.0, 40.0]])
++
++
++def test_summarize_measurements_windows(edata_hourly):
++    summary = summarize_measurements(
++        edata_hourly,
++        layer="tem",
++        var_names=["lactate", "hr"],
++        statistics=["max", "count"],
++        tem_names={"first_3h": slice(0, 3), "last_2h": slice(-2, None), "h2": "h2"},
++    )
++
++    assert summary.var_names.tolist() == [
++        f"{var}_{stat}_{window}"
++        for var in ["lactate", "hr"]
++        for stat in ["max", "count"]
++        for window in ["first_3h", "last_2h", "h2"]
++    ]
++    np.testing.assert_array_equal(summary.X, [[10.0, 50.0, np.nan, 1.0, 1.0, 0.0, 2.0, 6.0, np.nan, 2.0, 2.0, 0.0]])
++
++
++def test_summarize_measurements_tem_names_errors(edata_hourly, edata_to_expand):
++    with pytest.raises(ValueError, match="needs 3D data"):
++        summarize_measurements(edata_to_expand, tem_names=slice(0, 1))
++    with pytest.raises(ValueError, match="No timepoints selected"):
++        summarize_measurements(edata_hourly, layer="tem", tem_names={"empty": slice(6, None)})
++    with pytest.raises(KeyError, match="h9 not found"):
++        summarize_measurements(edata_hourly, layer="tem", tem_names=["h9"])

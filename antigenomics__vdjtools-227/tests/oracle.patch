@@ -1,0 +1,166 @@
+diff --git a/docs/api.rst b/docs/api.rst
+index 3fffcf43..928c74ba 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -230,7 +230,11 @@ Leinster-Cobbold similarity-aware diversity profile + Rao's quadratic entropy.
+ ``vdjtools.stats.rarefaction``
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-Rarefaction / extrapolation curves.
++Rarefaction / extrapolation curves. ``subset_rarefaction_batch`` measures expected
++matched-subset richness at whole-library integer read depths using the native
++iNEXT engine. Population totals include unmatched reads; source clonotype rows
++remain separate. It supports interpolation only and returns ``sample``, ``m``
++and ``qD`` without uncertainty or subset-coverage estimates.
+ 
+ .. automodule:: vdjtools.stats.rarefaction
+    :members:
+diff --git a/pyproject.toml b/pyproject.toml
+index 8dfc5449..0721608b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "vdjtools"  # if the PyPI name is taken, fall back to a distinct dist name (cf. arda -> arda-mapper)
+-version = "5.5.0"
++version = "5.6.0"
+ description = "TCR/BCR repertoire analysis — Pgen/generation/inference, diversity, overlap, biomarkers (Python + C++)"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/python/vdjtools/model/__init__.py b/python/vdjtools/model/__init__.py
+index 39091662..78bd6e29 100644
+--- a/python/vdjtools/model/__init__.py
++++ b/python/vdjtools/model/__init__.py
+@@ -22,7 +22,7 @@
+     set_marginals,
+ )
+ from .model import Model
+-from .native import best_aa_scenarios, best_aa_scenarios_batch, gene_to_allele
++from .native import best_aa_scenarios, best_aa_scenarios_batch, gene_to_allele, pgen_aa, pgen_aa_batch
+ from .reference import (
+     cut_segment,
+     load_germline,
+@@ -88,4 +88,6 @@
+     "best_aa_scenarios",
+     "best_aa_scenarios_batch",
+     "gene_to_allele",
++    "pgen_aa",
++    "pgen_aa_batch",
+ ]
+diff --git a/python/vdjtools/stats/__init__.py b/python/vdjtools/stats/__init__.py
+index 47e6e56e..4f8a4c96 100644
+--- a/python/vdjtools/stats/__init__.py
++++ b/python/vdjtools/stats/__init__.py
+@@ -23,7 +23,7 @@
+     rarefaction_batch,
+     sample_coverage,
+ )
+-from .rarefaction import rarefaction
++from .rarefaction import rarefaction, subset_rarefaction_batch
+ from .shm import shm_entropy, shm_spectrum, shm_summary
+ from .spectratype import spectratype, vj_spectratype
+ from .usage import segment_usage, vj_usage
+@@ -44,6 +44,7 @@
+     "d50",
+     "functional_diversity",
+     "rarefaction",
++    "subset_rarefaction_batch",
+     "inext",
+     "inext_batch",
+     "rarefaction_batch",
+diff --git a/python/vdjtools/stats/rarefaction.py b/python/vdjtools/stats/rarefaction.py
+index 308896e9..a87353f4 100644
+--- a/python/vdjtools/stats/rarefaction.py
++++ b/python/vdjtools/stats/rarefaction.py
+@@ -75,3 +75,44 @@ def rarefaction(data, q=0, base="size", *, sizes=None, coverages=None,
+         return inext_coverage(data, q, coverages=coverages, knots=knots,
+                               se=se, nboot=nboot, conf=conf, seed=seed)
+     raise ValueError(f"base must be 'size' or 'coverage', got {base!r}")
++
++
++def subset_rarefaction_batch(samples, population_sizes, *, sizes, threads=0):
++    """Expected subset richness at whole-population read depths.
++
++    Keep each input source clonotype separate. Unmatched reads form one temporary
++    category for the existing native iNEXT batch engine; subtract its hypergeometric
++    presence probability. Only interpolation at integer depths is supported.
++    Returns sample, m and qD; no subset coverage or extrapolation is implied.
++    """
++    import numpy as np
++    from scipy.stats import hypergeom
++
++    vectors = [np.asarray(x, dtype=float) for x in samples]
++    totals = np.asarray(population_sizes, dtype=float)
++    depths = np.asarray(sizes, dtype=float)
++    if totals.shape != (len(vectors),) or not len(vectors):
++        raise ValueError("one population size per nonempty batch required")
++    if (not np.isfinite(totals).all() or (totals <= 0).any()
++            or (totals != np.floor(totals)).any()):
++        raise ValueError("positive integer population sizes required")
++    if (depths.ndim != 1 or not len(depths) or not np.isfinite(depths).all()
++            or (depths < 0).any() or (depths > totals.min()).any()
++            or (depths != np.floor(depths)).any()):
++        raise ValueError("integer depths within every population required")
++    for x, n in zip(vectors, totals):
++        if (x.ndim != 1 or not np.isfinite(x).all() or (x <= 0).any()
++                or (x != np.floor(x)).any() or x.sum() > n):
++            raise ValueError("positive integer subset counts with sum <= population required")
++    other = totals - np.array([x.sum() for x in vectors])
++    augmented = [np.append(x, u) if u else x for x, u in zip(vectors, other)]
++    curve = inext_batch(augmented, q=0, sizes=depths, se=False, threads=threads)
++    idx = curve['sample'].cast(pl.Int64).to_numpy()
++    m = curve['m'].to_numpy()
++    presence = hypergeom.sf(0, totals[idx], other[idx], m)
++    values = np.maximum(0., curve['qD'].to_numpy() - presence)
++    result = curve.select('sample', 'm').with_columns(pl.Series('qD', values))
++    if 0 in depths:
++        zero = pl.DataFrame({'sample': range(len(vectors)), 'm': [0]*len(vectors), 'qD': [0.]*len(vectors)})
++        result = pl.concat([zero, result]).sort('sample', 'm')
++    return result
+diff --git a/skills/vdjtools/SKILL.md b/skills/vdjtools/SKILL.md
+index 107cdb2d..e2087541 100644
+--- a/skills/vdjtools/SKILL.md
++++ b/skills/vdjtools/SKILL.md
+@@ -117,3 +117,14 @@ For source changes, use the repository environment and focused tests. For docs,
+ install the docs extra in that environment and run `env -C docs make html` with
+ zero warnings. Check examples against real signatures and CLI help. Do not rerun
+ completed analyses or refit published corpora merely to update documentation.
++
++## Matched-subset discovery
++
++`stats.subset_rarefaction_batch(samples, population_sizes, sizes=..., threads=...)`
++uses the existing native q=0 engine at whole-population integer depths. Inputs
++are positive source-clonotype count vectors, possibly empty; population totals
++include unmatched reads. It subtracts the temporary unmatched category through
++SciPy hypergeometric presence, and returns sample/m/qD. No extrapolation, SE or
++subset-coverage claim. For Shannon and Simpson rarefaction reuse
++`stats.inext_batch(q=(0,1,2))`; q=1 is exp(Shannon entropy), q=2 is inverse
++Simpson and Gini–Simpson equals 1-1/qD for q=2.
+diff --git a/tests/python/test_subset_rarefaction.py b/tests/python/test_subset_rarefaction.py
+new file mode 100644
+index 00000000..23e53bff
+--- /dev/null
++++ b/tests/python/test_subset_rarefaction.py
+@@ -0,0 +1,21 @@
++"""Subset discovery uses total reads, with exact finite-population oracles."""
++import math
++import numpy as np
++import pytest
++from vdjtools.stats import subset_rarefaction_batch
++
++
++def test_subset_batch_matches_exact_sampling_and_endpoints():
++    vectors=[[1,2],[],[8],[1]*8,[2,3]]
++    curve=subset_rarefaction_batch(vectors,[8]*5,sizes=range(9),threads=2)
++    assert curve.height==45
++    for i,x in enumerate(vectors):
++        got=curve.filter(curve['sample']==i)['qD'].to_numpy()
++        want=[sum(1-(math.comb(8-c,m) if 8-c>=m else 0)/math.comb(8,m) for c in x) for m in range(9)]
++        np.testing.assert_allclose(got,want,atol=1e-12)
++
++
++@pytest.mark.parametrize('counts,total,depths', [([1.5],8,[1]),([9],8,[1]),([1],0,[0]),([1],8,[9]),([1],8,[.5]),([float('nan')],8,[1])])
++def test_subset_rejects_invalid_inputs(counts,total,depths):
++    with pytest.raises(ValueError):
++        subset_rarefaction_batch([counts],[total],sizes=depths,threads=1)

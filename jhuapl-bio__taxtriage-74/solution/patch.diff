@@ -1,0 +1,615 @@
+diff --git a/conf/modules.config b/conf/modules.config
+index c18c4db4..c24921f5 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -76,9 +76,6 @@ process {
+     withName: SAMTOOLS_INDEX {
+         ext.args = ' -c '
+     }
+-    withName: SAMTOOLS_SORT{
+-        ext.prefix = { "${meta.id}.sorted" }
+-    }
+ 
+     withName: BCFTOOLS_CONSENSUS{
+         errorStrategy = 'ignore'
+@@ -146,7 +143,7 @@ process {
+         errorStrategy = { task.exitStatus in [143,137,104,134,139,1] ? 'retry' : 'ignore' }
+     }
+     withName: FILTER_MINIMAP2 {
+-        ext.args = ''
++        ext.args = '-N 1 -f 0.001'
+         memory = { check_max(36.GB * task.attempt * 2, 'memory') } // Starts with GB and doubles each attempt
+         maxRetries = 3
+         errorStrategy = { task.exitStatus in [143,137,104,134,139,1] ? 'retry' : 'finish' }
+diff --git a/docs/usage.md b/docs/usage.md
+index d89a1f4a..567d982e 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -114,6 +114,8 @@ work                # Directory containing the nextflow working files
+ | `--skip_multiqc`                                  | TRUE/FALSE, Skip multiqc final report   |
+ | `--minq <number>`                                     | What minimum quality would you want in your samples. Disabled if you run --skip_fastp. Default is 7 for Oxford Nanopore, 20 for Illumina   |
+ | `--minmapq <number>`                                     | What minimum mapping quality would you want in your sample alignments. Default is 5   |
++| `--mmap2_window <number>`                                     | What window size to use for alignment with minimap2. Default is 10 for minimap2 if disabled.   |
++| `--mmap2_fraction_filter <number>`                                     | filter out top FLOAT fraction of repetitive minimizers. Default is 0.0009 if disabled.  |
+ | `--organisms_file <file>`                                     | A single file that contains what organisms (name or taxid) you want to pull. You can enable this if you are skipping kraken2 as well    |
+ | `--subsample <number>`                                | Take a subsample of n reads from each sample. Useful if your data size is very large and you want a quick triage analysis                                                                                                                                                                                                                                                                                                         |
+ | `--reference_fasta <filepath>`                        | Location of a single reference fasta, multiple files (separate by space and within quotations ""), or a directory of fasta files to run alignment on RATHER than (or in addition to) downloading references from NCBI from post K2 or manual organism taxids/names. Useful if you know what you're looking for or have no internet connection to pull said references. Header format must be in the "all" format from NCBI's ftp [assembly site](https://ftp.ncbi.nlm.nih.gov/genomes/all/) and should be ">accession description" where there is a **space** following the accession with the organism chr/contig description of the sequence. Technically, the accession does not matter as the pipeline only needs to match the organism space that follows the first space in the header.              Example: **>NC_003663.2 Cowpox virus, complete genome**                                                                                                                                                                                                                           |
+diff --git a/modules/local/unmapped_minimap2.nf b/modules/local/unmapped_minimap2.nf
+new file mode 100644
+index 00000000..ec4a3552
+--- /dev/null
++++ b/modules/local/unmapped_minimap2.nf
+@@ -0,0 +1,53 @@
++process UNMAPPED_MINIMAP2 {
++    tag "$meta.id"
++    label 'process_medium'
++
++    conda (params.enable_conda ? 'bioconda::minimap2=2.21 bioconda::samtools=1.12' : null)
++    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
++        'https://depot.galaxyproject.org/singularity/mulled-v2-66534bcbb7031a148b13e2ad42583020b9cd25c4:1679e915ddb9d6b4abda91880c4b48857d471bd8-0' :
++        'biocontainers/mulled-v2-66534bcbb7031a148b13e2ad42583020b9cd25c4:1679e915ddb9d6b4abda91880c4b48857d471bd8-0' }"
++
++    input:
++    tuple val(meta), path(reads), path(reference)
++
++    output:
++    tuple val(meta), path("*.bam"), optional: true, emit: bam
++    path "versions.yml"           , emit: versions
++
++    when:
++    task.ext.when == null || task.ext.when
++
++    script:
++    def args = task.ext.args ?: ''
++    def prefix = task.ext.prefix ?: "${meta.id}"
++    // define mapx if paired end reads or single end illumina or single end oxford, match with regex ignore case
++    def mapx = ''
++    if (meta.platform =~ /(?i)illumina/) {
++        mapx = '-ax sr'
++    } else if (meta.platform =~ /(?i)pacbio/) {
++        mapx = '-ax map-hifi'
++    } else {
++        mapx = '-ax map-ont'
++    }
++    def input_reads = reads.findAll { it != null }.join(' ')
++    // def minmapq = minmapq ? " -q ${minmapq} " :  ""
++    def I_value = "${(task.memory.toMega() * Math.min(0.8 / task.cpus, 0.8)).longValue()}M"
++    def S_value = "${(task.memory.toMega() * Math.min(0.15 / task.cpus, 0.15)).longValue()}M"
++    // if input is illumina then use -ax sr else use -ax map-ont
++
++    """
++
++    minimap2 \\
++        $args $mapx \\
++        -a -t $task.cpus -I $I_value \\
++        $reference \\
++        $input_reads | \\
++        samtools sort -@ ${task.cpus} -m $S_value | \\
++        samtools view -@ ${task.cpus} -b -h -o ${prefix}.bam
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        minimap2: \$(minimap2 --version 2>&1)
++    END_VERSIONS
++    """
++}
+diff --git a/modules/nf-core/bowtie2/align/main.nf b/modules/nf-core/bowtie2/align/main.nf
+index 2a9dfc67..2dcd45b9 100644
+--- a/modules/nf-core/bowtie2/align/main.nf
++++ b/modules/nf-core/bowtie2/align/main.nf
+@@ -1,25 +1,22 @@
+ process BOWTIE2_ALIGN {
+     tag "$meta.id"
+-    label 'process_high'
++    label "process_high"
+ 
+     conda "bioconda::bowtie2=2.4.4 bioconda::samtools=1.16.1 conda-forge::pigz=2.6"
+     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+-        'https://depot.galaxyproject.org/singularity/mulled-v2-ac74a7f02cebcfcc07d8e8d1d750af9c83b4d45a:f70b31a2db15c023d641c32f433fb02cd04df5a6-0' :
+-        'biocontainers/mulled-v2-ac74a7f02cebcfcc07d8e8d1d750af9c83b4d45a:f70b31a2db15c023d641c32f433fb02cd04df5a6-0' }"
++        'https://depot.galaxyproject.org/singularity/mulled-v2-ac74a7f02cebcfcc07d8e8d1d750af9c83b4d45a:a0ffedb52808e102887f6ce600d092675bf3528a-0' :
++        'biocontainers/mulled-v2-ac74a7f02cebcfcc07d8e8d1d750af9c83b4d45a:a0ffedb52808e102887f6ce600d092675bf3528a-0' }"
+ 
+     input:
+-    tuple val(meta) , path(reads), path(index)
++    tuple val(meta) , path(reads), path(index) 
+     val   save_unaligned
+     val   sort_bam
++    val(minmapq)
+ 
+     output:
+-    tuple val(meta), path("*.sam")      , emit: sam     , optional:true
+-    tuple val(meta), path("*.bam")      , emit: bam     , optional:true
+-    tuple val(meta), path("*.cram")     , emit: cram    , optional:true
+-    tuple val(meta), path("*.csi")      , emit: csi     , optional:true
+-    tuple val(meta), path("*.crai")     , emit: crai    , optional:true
++    tuple val(meta), path("*.{bam,sam}"), emit: aligned
+     tuple val(meta), path("*.log")      , emit: log
+-    tuple val(meta), path("*fastq.gz")  , emit: fastq   , optional:true
++    tuple val(meta), path("*fastq.gz")  , emit: fastq, optional:true
+     path  "versions.yml"                , emit: versions
+ 
+     when:
+@@ -27,10 +24,15 @@ process BOWTIE2_ALIGN {
+ 
+     script:
+     def args = task.ext.args ?: ""
++    
+     def args2 = task.ext.args2 ?: ""
+     def prefix = task.ext.prefix ?: "${meta.id}"
+-
++    def minmapq = minmapq ? " -q ${minmapq} " :  ""
+     def unaligned = ""
++    def I_value = "${(task.memory.toMega() * Math.min(0.8 / task.cpus, 0.8)).longValue()}M"
++    def S_value = "${(task.memory.toMega() * Math.min(0.15 / task.cpus, 0.15)).longValue()}M"
++    def cpu_limit = task.cpus > 1 ? (task.cpus / 2).round().toInteger() : 1
++
+     def reads_args = ""
+     if (meta.single_end) {
+         unaligned = save_unaligned ? "--un-gz ${prefix}.unmapped.fastq.gz" : ""
+@@ -39,25 +41,23 @@ process BOWTIE2_ALIGN {
+         unaligned = save_unaligned ? "--un-conc-gz ${prefix}.unmapped.fastq.gz" : ""
+         reads_args = "-1 ${reads[0]} -2 ${reads[1]}"
+     }
+-
+-    def samtools_command = sort_bam ? 'sort' : 'view'
++    def samtools_command = sort_bam ? "sort -m ${S_value}  | samtools view -b -h $minmapq -o ${prefix}.bam" : "view  $minmapq -b -h -o ${prefix}.bam"
+     def extension_pattern = /(--output-fmt|-O)+\s+(\S+)/
+-    def extension_matcher =  (args2 =~ extension_pattern)
+-    def extension = extension_matcher.getCount() > 0 ? extension_matcher[0][2].toLowerCase() : "bam"
+-    // def reference = fasta && extension=="cram"  ? "--reference ${fasta}" : ""
+-    // if (!fasta && extension=="cram") error "Fasta reference is required for CRAM output"
++    def extension = (args2 ==~ extension_pattern) ? (args2 =~ extension_pattern)[0][2].toLowerCase() : "bam"
++
+     """
+     INDEX=`find -L ./ -name "*.rev.1.bt2" | sed "s/\\.rev.1.bt2\$//"`
+     [ -z "\$INDEX" ] && INDEX=`find -L ./ -name "*.rev.1.bt2l" | sed "s/\\.rev.1.bt2l\$//"`
+     [ -z "\$INDEX" ] && echo "Bowtie2 index files not found" 1>&2 && exit 1
++
+     bowtie2 \\
+         -x \$INDEX \\
+         $reads_args \\
+-        --threads $task.cpus \\
++        --threads $cpu_limit \\
+         $unaligned  \\
+         $args \\
+         2> >(tee ${prefix}.bowtie2.log >&2) \\
+-        | samtools $samtools_command $args2 --threads $task.cpus  -o ${prefix}.${extension} -
++        | samtools $samtools_command $args2 --threads $cpu_limit  -o ${prefix}.${extension} -
+ 
+     if [ -f ${prefix}.unmapped.fastq.1.gz ]; then
+         mv ${prefix}.unmapped.fastq.1.gz ${prefix}.unmapped_1.fastq.gz
+@@ -80,27 +80,12 @@ process BOWTIE2_ALIGN {
+     def prefix = task.ext.prefix ?: "${meta.id}"
+     def extension_pattern = /(--output-fmt|-O)+\s+(\S+)/
+     def extension = (args2 ==~ extension_pattern) ? (args2 =~ extension_pattern)[0][2].toLowerCase() : "bam"
+-    def create_unmapped = ""
+-    if (meta.single_end) {
+-        create_unmapped = save_unaligned ? "touch ${prefix}.unmapped.fastq.gz" : ""
+-    } else {
+-        create_unmapped = save_unaligned ? "touch ${prefix}.unmapped_1.fastq.gz && touch ${prefix}.unmapped_2.fastq.gz" : ""
+-    }
+-    // def reference = fasta && extension=="cram"  ? "--reference ${fasta}" : ""
+-    // if (!fasta && extension=="cram") error "Fasta reference is required for CRAM output"
+-
+-    def create_index = ""
+-    if (extension == "cram") {
+-        create_index = "touch ${prefix}.crai"
+-    } else if (extension == "bam") {
+-        create_index = "touch ${prefix}.csi"
+-    }
+ 
+     """
+     touch ${prefix}.${extension}
+-    ${create_index}
+     touch ${prefix}.bowtie2.log
+-    ${create_unmapped}
++    touch ${prefix}.unmapped_1.fastq.gz
++    touch ${prefix}.unmapped_2.fastq.gz
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/nf-core/hisat2/align/main.nf b/modules/nf-core/hisat2/align/main.nf
+index 5d07a316..299ab485 100644
+--- a/modules/nf-core/hisat2/align/main.nf
++++ b/modules/nf-core/hisat2/align/main.nf
+@@ -12,6 +12,7 @@ process HISAT2_ALIGN {
+     tuple val(meta), path(reads)
+     tuple val(meta2), path(index)
+     tuple val(meta3), file(splicesites)
++    val(minmapq)
+     
+     output:
+     tuple val(meta), path("*.bam")                   , emit: bam
+@@ -33,6 +34,8 @@ process HISAT2_ALIGN {
+     } else if (meta.strandedness == 'reverse') {
+         strandedness = meta.single_end ? '--rna-strandness R' : '--rna-strandness RF'
+     }
++    def mmq = minmapq ? " -q $minmapq" : ''
++    def S_value = "${(task.memory.toMega() * Math.min(0.15 / task.cpus, 0.15)).longValue()}M"
+     ss = "$splicesites" ? "--known-splicesite-infile $splicesites" : ''
+     def seq_center = params.seq_center ? "--rg-id ${prefix} --rg SM:$prefix --rg CN:${params.seq_center.replaceAll('\\s','_')}" : "--rg-id ${prefix} --rg SM:$prefix"
+     if (meta.single_end) {
+@@ -49,7 +52,7 @@ process HISAT2_ALIGN {
+             $seq_center \\
+             $unaligned \\
+             $args \\
+-            | samtools view -bS -F 4 -F 256 - > ${prefix}.bam
++            | samtools sort -@ ${task.cpus} -m $S_value | samtools view -bS -F 4 -F 256 $mmq  - > ${prefix}.bam
+ 
+         cat <<-END_VERSIONS > versions.yml
+         "${task.process}":
+@@ -74,7 +77,7 @@ process HISAT2_ALIGN {
+             --no-mixed \\
+             --no-discordant \\
+             $args \\
+-            | samtools view -bS -F 4 -F 8 -F 256 - > ${prefix}.bam
++            | samtools sort -@ ${task.cpus} -m $S_value | samtools view -bS -F 4 -F 8 -F 256 $mmq - > ${prefix}.bam
+ 
+         if [ -f ${prefix}.unmapped.fastq.1.gz ]; then
+             mv ${prefix}.unmapped.fastq.1.gz ${prefix}.unmapped_1.fastq.gz
+diff --git a/modules/nf-core/minimap2/align/main.nf b/modules/nf-core/minimap2/align/main.nf
+index 59c8e67c..85f46d2f 100644
+--- a/modules/nf-core/minimap2/align/main.nf
++++ b/modules/nf-core/minimap2/align/main.nf
+@@ -12,6 +12,7 @@ process MINIMAP2_ALIGN {
+     val bam_format
+     val cigar_paf_format
+     val cigar_bam
++    val(minmapq)
+ 
+     output:
+     tuple val(meta), path("*.paf"), optional: true, emit: paf
+@@ -34,23 +35,28 @@ process MINIMAP2_ALIGN {
+         mapx = '-ax map-ont'
+     }
+     def input_reads = reads.findAll { it != null }.join(' ')
+-    def I_value = "${(task.memory.toMega() * 0.85).longValue()}M" // 80% of allocated memory, append GB to end as a string
+-    def S_value = "${( ( task.memory.toMega() / task.cpus ) * 0.1).longValue()}M" // 20% of allocated memory, append GB to end as a string
+-    def bam_output = bam_format ? "-a | samtools view -@ ${task.cpus} -b -h -o ${prefix}.bam" : "-o ${prefix}.paf"
++    
++    def cpu_limit = task.cpus > 1 ? (task.cpus / 2).round().toInteger() : 1
++
++    def minmapq = minmapq ? " -q ${minmapq} " :  ""
++    def I_value = "${(task.memory.toMega() * Math.min(0.8 / task.cpus, 0.8)).longValue()}M"
++    def S_value = "${(task.memory.toMega() * Math.min(0.15 / task.cpus, 0.15)).longValue()}M"
++    def bam_output = bam_format ? "-a | samtools sort -@ ${cpu_limit} -m $S_value | samtools view $minmapq -@ ${cpu_limit} -b -h -o ${prefix}.bam" : "-o ${prefix}.paf"
+     def cigar_paf = cigar_paf_format && !bam_format ? "-c" : ''
+     def set_cigar_bam = cigar_bam && bam_format ? "-L" : ''
+     // if input is illumina then use -ax sr else use -ax map-ont
+-    
++    def mmap2_window   = params.mmap2_window  ? "-w ${params.mmap2_window}" : ''
++    def mmap2_fraction_filter = params.mmap2_fraction_filter ? " -f ${params.mmap2_fraction_filter}" : ''
+     """
+     
+     minimap2 \\
+         $args $mapx \\
+-        -t $task.cpus -I $I_value \\
++        -t $cpu_limit -I $I_value \\
+         $reference \\
+         $input_reads \\
+-        $cigar_paf \\
++        $cigar_paf $mmap2_window $mmap2_fraction_filter \\
+         $set_cigar_bam \\
+-        $bam_output
++        $bam_output 
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/modules/nf-core/samtools/merge/main.nf b/modules/nf-core/samtools/merge/main.nf
+index 94ca634f..6c4dfa6c 100644
+--- a/modules/nf-core/samtools/merge/main.nf
++++ b/modules/nf-core/samtools/merge/main.nf
+@@ -26,14 +26,16 @@ process SAMTOOLS_MERGE {
+     prefix   = task.ext.prefix ?: "${meta.id}"
+     def file_type = input_files[0].getExtension()
+     // def reference = fasta ? "--reference ${fasta}" : ""
++    def cpus = task.cpus > 1 ? task.cpus - 1 : 1
++    def S_value = "${(task.memory.toMega() * Math.min(0.15 / task.cpus, 0.15)).longValue()}M"
+ 
+     """
+     samtools \\
+-        merge \\
+-        --threads ${task.cpus-1} \\
++        merge -f \\
+         $args \\
+-        ${prefix}.${file_type} \\
+-        $input_files
++        --threads ${cpus} \\
++        -u - \\
++        $input_files | samtools sort -@ ${cpus} -m $S_value -o ${prefix}.bam
+ 
+     cat <<-END_VERSIONS > versions.yml
+     "${task.process}":
+diff --git a/nextflow.config b/nextflow.config
+index 7791e768..20c6f85f 100644
+--- a/nextflow.config
++++ b/nextflow.config
+@@ -63,6 +63,7 @@ params {
+     get_variants = null
+     reference_assembly = null
+     minmapq = 5
++    mmap2_fraction_filter = 0.0009
+     skip_realignment = null
+     skip_stats = null
+     skip_multiqc = null
+@@ -84,11 +85,13 @@ params {
+     genomes = null
+     assembly = null
+     top_hits_count = 400
+-
++    mmap2_window = null
++    mmap2_fraction_filter = null
+     db = null
+     subsample = null
+     k2_confidence = null
+     skip_consensus = null
++    skip_features = null
+     skip_variants = null
+     save_fastq_classified = null
+     subsample = null
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index bf5bf700..45df36f8 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -267,7 +267,18 @@
+                     "description": "Minimum MapQ Score for alignment",
+                     "fa_icon": "fas fa-file-signature"
+                 },
+-
++                "mmap2_window": {
++                    "type": "number",
++                    "default": null ,
++                    "description": "Window size for minimap2 alignment",
++                    "fa_icon": "fas fa-file-signature"
++                },
++                "mmap2_fraction_filter": {
++                    "type": "number",
++                    "default": null ,
++                    "description": "filter out top FLOAT fraction of repetitive minimizers",
++                    "fa_icon": "fas fa-file-signature"
++                },
+                 "bt2_indices": {
+                     "type": "string",
+                     "format": "file-path",
+@@ -386,13 +397,18 @@
+                     "fa_icon": "fas fa-file-signature",
+                     "default": false
+                 },
++                "skip_features": {
++                    "type": "boolean",
++                    "description": "Skip the feature download step(s). Used during the protein alignment step",
++                    "fa_icon": "fas fa-file-signature",
++                    "default": false
++                },
+                 "unknown_sample": {
+                     "type": "boolean",
+                     "description": "Dont consider HMP distributions",
+                     "fa_icon": "fas fa-file-signature",
+                     "default": false
+                 },
+-
+                 "reference_assembly": {
+                     "type": "boolean",
+                     "description": "Perform Reference-Based Assembly. Performs variant analysis by default (mandatory)",
+diff --git a/subworkflows/local/alignment.nf b/subworkflows/local/alignment.nf
+index 36054000..243b2a0e 100644
+--- a/subworkflows/local/alignment.nf
++++ b/subworkflows/local/alignment.nf
+@@ -8,7 +8,6 @@ include { MINIMAP2_ALIGN } from '../../modules/nf-core/minimap2/align/main'
+ include { MINIMAP2_INDEX } from '../../modules/nf-core/minimap2/index/main'
+ include { HISAT2_ALIGN } from '../../modules/nf-core/hisat2/align/main'
+ include { SAMTOOLS_DEPTH } from '../../modules/nf-core/samtools/depth/main'
+-include { SAMTOOLS_SORT } from '../../modules/nf-core/samtools/sort/main'
+ include { SAMTOOLS_FAIDX } from '../../modules/nf-core/samtools/faidx/main'
+ include { SAMTOOLS_INDEX } from '../../modules/nf-core/samtools/index/main'
+ include { SAMTOOLS_MERGE } from '../../modules/nf-core/samtools/merge/main'
+@@ -75,23 +74,21 @@ workflow ALIGNMENT {
+             return outputs
+         }.set { ch_fasta_files_for_alignment }
+ 
+-
+-
+     if (params.use_bt2){
+         BOWTIE2_ALIGN(
+             ch_fasta_files_for_alignment,
+             true,
+-            true
++            true,
++            params.minmapq
+         )
+-
+-        collected_bams = BOWTIE2_ALIGN.out.bam
+-
++        collected_bams = BOWTIE2_ALIGN.out.aligned
+     } else if (params.use_hisat2) {
+         // Set null for hisat2 splicesites
+         HISAT2_ALIGN(
+             ch_fasta_files_for_alignment.map{ m, fastq, fasta -> [m, fastq] },
+             ch_fasta_files_for_alignment.map{ m, fastq, fasta -> [m, fasta] },
+             ch_fasta_files_for_alignment.map{ m, fastq, fasta -> [m, null ] },
++            params.minmapq
+         )
+ 
+         collected_bams = HISAT2_ALIGN.out.bam
+@@ -100,7 +97,8 @@ workflow ALIGNMENT {
+             ch_fasta_files_for_alignment,
+             true,
+             true,
+-            true
++            true,
++            params.minmapq
+         )
+ 
+         collected_bams = MINIMAP2_ALIGN.out.bam
+@@ -115,7 +113,7 @@ workflow ALIGNMENT {
+         .set{ merged_bams_channel }
+ 
+     if (params.get_variants || params.reference_assembly){
+-        //     // // // branch out the samtools_sort output to nanopore and illumina
++        //     // // // branch out the samtools output to nanopore and illumina and pacbio
+         BCFTOOLS_MPILEUP(
+             ch_fasta_files_for_alignment.map{ m, bam, fasta -> [m, bam] },
+             ch_fasta_files_for_alignment.map{ m, bam, fasta -> fasta },
+@@ -130,7 +128,6 @@ workflow ALIGNMENT {
+         )
+         .set{ transposed_fastas }
+ 
+-
+         if (params.reference_assembly){
+             BCFTOOLS_CONSENSUS(
+                 ch_merged_mpileup
+@@ -152,15 +149,9 @@ workflow ALIGNMENT {
+     //  // // Unified channel from both merged and non-merged BAMs
+     SAMTOOLS_MERGE.out.bam.mix( branchedChannels.noMergeNeeded ).set { collected_bams }
+ 
+-    // sort the multi bams from the merge
+-    SAMTOOLS_SORT(
+-        collected_bams,
+-        params.minmapq
+-    )
+-
+     // // Join the channels on 'id' and append the BAM files to the fastq_reads entries
+     fastq_reads.map { item -> [item[0].id, item] } // Map to [id, originalItem]
+-        .join(SAMTOOLS_SORT.out.bam.map { item -> [item[0].id, item] }, by: 0)
++        .join(collected_bams.map { item -> [item[0].id, item] }, by: 0)
+         .map { joinedItems ->
+             def item1 = joinedItems[1] // Original item from Channel1
+             def item2 = joinedItems[2] // Original item from Channel2
+diff --git a/subworkflows/local/host_removal.nf b/subworkflows/local/host_removal.nf
+index 7d37b652..d0cc9bad 100644
+--- a/subworkflows/local/host_removal.nf
++++ b/subworkflows/local/host_removal.nf
+@@ -19,7 +19,6 @@
+ // #
+ 
+ include { MINIMAP2_ALIGN as FILTER_MINIMAP2 } from '../../modules/nf-core/minimap2/align/main'
+-include { SAMTOOLS_SORT as FILTER_MINIMAP2_SORT } from '../../modules/nf-core/samtools/sort/main'
+ include { MINIMAP2_INDEX as FILTER_MINIMAP2_INDEX } from '../../modules/nf-core/minimap2/index/main'
+ include { KRAKEN2_KRAKEN2 as FILTER_KRAKEN2 } from '../../modules/nf-core/kraken2/kraken2/main'
+ include { SAMTOOLS_VIEW } from '../../modules/nf-core/samtools/view/main'
+@@ -65,28 +64,17 @@ workflow HOST_REMOVAL {
+             // Run minimap2 module on all LONGREAD platforms reads and the same on ILLUMINA reads
+             // if ch_aligned_for_filter.shorteads is not empty
+             // Run minimap2 on all for host removal - as host removal outperforms bowtie2 for host false negative rate https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9040843/
+-            // FILTER_MINIMAP2_INDEX(
+-            //     [[id: 'reference'], ch_reference_fasta_removal]
+-            // )
+-
+-            // ch_reads_indx = ch_reads.join(
+-            //     FILTER_MINIMAP2_INDEX.out.index
+-            // )
+-            // ch_reads_indx.view()
+-
+ 
+             FILTER_MINIMAP2(
+                 ch_reads.map{ meta, reads -> return [meta, reads, ch_reference_fasta_removal] },
+                 true,
+                 true,
+-                true
+-            )
+-
+-            FILTER_MINIMAP2_SORT(
+-                FILTER_MINIMAP2.out.bam,
++                true,
+                 false
+             )
+-            ch_bam_hosts = FILTER_MINIMAP2_SORT.out.bam
++
++            ch_bam_hosts = FILTER_MINIMAP2.out.bam
++
+             REMOVE_HOSTREADS(
+                 ch_bam_hosts
+             )
+diff --git a/subworkflows/local/reference_prep.nf b/subworkflows/local/reference_prep.nf
+index 72204b30..ef1a20be 100644
+--- a/subworkflows/local/reference_prep.nf
++++ b/subworkflows/local/reference_prep.nf
+@@ -213,36 +213,37 @@ workflow  REFERENCE_PREP {
+         ch_mapped_assemblies.map{meta, fastas, mergedmap, mergedids -> return [meta, mergedmap] },
+         ch_assembly_txt
+     )
+-
+-    try {
+-        // Attempt to use the FEATURES_DOWNLOAD process
+-        FEATURES_DOWNLOAD(
+-            ch_mapped_assemblies.map { meta, fastas, listmaps, listids ->
+-                return [meta, listids]
+-            },
+-            ch_assembly_txt,
+-            true
+-        )
+-        ch_cds = FEATURES_DOWNLOAD.out.proteins
+-        ch_cds_to_taxids = FEATURES_DOWNLOAD.out.mapfile
+-    /* groovylint-disable-next-line CatchException */
+-    } catch (Exception e) {
+-        // On failure, fallback to an alternative channel
+-        ch_cds = ch_samples.map { meta, report ->
+-            return [meta, []]
+-        }
+-        ch_cds_to_taxids = ch_samples.map { meta, report ->
+-            return [meta, []]
++    if (!params.skip_realignment && !params.skip_features) {
++        try {
++            // Attempt to use the FEATURES_DOWNLOAD process
++            FEATURES_DOWNLOAD(
++                ch_mapped_assemblies.map { meta, fastas, listmaps, listids ->
++                    return [meta, listids]
++                },
++                ch_assembly_txt,
++                true
++            )
++            ch_cds = FEATURES_DOWNLOAD.out.proteins
++            ch_cds_to_taxids = FEATURES_DOWNLOAD.out.mapfile
++        /* groovylint-disable-next-line CatchException */
++        } catch (Exception e) {
++            // On failure, fallback to an alternative channel
++            ch_cds = ch_samples.map { meta, report ->
++                return [meta, []]
++            }
++            ch_cds_to_taxids = ch_samples.map { meta, report ->
++                return [meta, []]
++            }
+         }
+-    }
+-    try {
+-        FEATURES_TO_BED(
+-            FEATURES_DOWNLOAD.out.features
+-        )
+-        ch_bedfiles = FEATURES_TO_BED.out.bed
+-    } catch (Exception e) {
+-        ch_bedfiles = ch_samples.map { meta, report ->
+-            return [meta, []]
++        try {
++            FEATURES_TO_BED(
++                FEATURES_DOWNLOAD.out.features
++            )
++            ch_bedfiles = FEATURES_TO_BED.out.bed
++        } catch (Exception e) {
++            ch_bedfiles = ch_samples.map { meta, report ->
++                return [meta, []]
++            }
+         }
+     }
+     ch_mapped_assemblies = MAP_TAXID_ASSEMBLY.out.taxidmerged.join(
+diff --git a/tower.yml b/tower.yml
+index e0654a8e..617f6162 100644
+--- a/tower.yml
++++ b/tower.yml
+@@ -21,8 +21,14 @@ reports:
+     display: "Consensus Generation File"
+   "**/bcftools/*consensus.fa":
+     display: "Consensus Generation File"
+-  "**/samtools/*sorted.bam":
+-    display: "MAPQ Filtered and Sorted BAM File(s)"
++  "**/minimap2/*.bam":
++    display: "MAPQ Filtered and Sorted Minimap2 BAM File(s)"
++  "**/hisat2/*.bam":
++    display: "MAPQ Filtered and Sorted Hisat2 BAM File(s)"
++  "**/bowtie2/*.bam":
++    display: "MAPQ Filtered and Sorted Bowtie2 BAM File(s)"
++  "**/samtools/*.bam":
++    display: "MAPQ Filtered and Sorted and Merged (if multiple reference files) BAM File(s)"
+   "**/top/*top_report.tsv":
+     display: "Top Taxa Per Rank post-Kraken2"
+   "**/top/krakenreport.merged_mqc.tsv":

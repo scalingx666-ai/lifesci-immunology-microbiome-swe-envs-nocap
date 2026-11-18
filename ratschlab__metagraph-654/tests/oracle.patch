@@ -1,0 +1,524 @@
+diff --git a/metagraph/src/common/bloom_filter.cpp b/metagraph/src/common/bloom_filter.cpp
+index 5b090a5c63..8ad48e9669 100644
+--- a/metagraph/src/common/bloom_filter.cpp
++++ b/metagraph/src/common/bloom_filter.cpp
+@@ -80,11 +80,10 @@ bool BloomFilter::check(uint64_t hash) const {
+  */
+ 
+ // compute Bloom filter hashes in batches of 4
+-inline const uint64_t*
++inline size_t
+ batch_insert_avx2(BloomFilter &bloom,
+                   const uint32_t num_hash_functions_,
+-                  const uint64_t *hashes_begin,
+-                  const uint64_t *hashes_end) {
++                  std::span<const uint64_t> hashes) {
+     assert(num_hash_functions_);
+ 
+     auto &filter_ = bloom.data();
+@@ -107,7 +106,9 @@ batch_insert_avx2(BloomFilter &bloom,
+     simde__m256i *updates_cast = reinterpret_cast<simde__m256i*>(&updates_store);
+ 
+     // check four input elements (represented by hashes) at a time
+-    for (; hashes_begin + 4 <= hashes_end; hashes_begin += 4) {
++    size_t i = 0;
++    for (; hashes.size() - i >= 4; i += 4) {
++        const uint64_t *hashes_begin = hashes.data() + i;
+         simde__m256i block_indices
+             = restrict_to_mask_epi64(hashes_begin, size, block_mask_out);
+         alignas(32) uint64_t block_index_array[4];
+@@ -177,7 +178,7 @@ batch_insert_avx2(BloomFilter &bloom,
+                            [&](uint64_t h) { return bloom.check(h); }));
+     }
+ 
+-    return hashes_begin;
++    return i;
+ }
+ 
+ // Helper for Bloom filter
+@@ -193,8 +194,7 @@ SIMDE_FUNCTION_ATTRIBUTES simde__m128i cvtepi64_epi32(simde__m256i v) {
+ // compute Bloom filter hashes in batches of 4
+ inline uint64_t
+ batch_check_avx2(const BloomFilter &bloom,
+-                 const uint64_t *hashes_begin,
+-                 const uint64_t *hashes_end,
++                 std::span<const uint64_t> hashes,
+                  const uint64_t num_hash_functions_,
+                  const std::function<void(size_t)> &present_index_callback) {
+     assert(num_hash_functions_);
+@@ -214,7 +214,8 @@ batch_check_avx2(const BloomFilter &bloom,
+ 
+     // check four input elements (represented by hashes) at a time
+     size_t i = 0;
+-    for (; hashes_begin + 4 <= hashes_end; hashes_begin += 4) {
++    for (; hashes.size() - i >= 4; i += 4) {
++        const uint64_t *hashes_begin = hashes.data() + i;
+         simde__m256i block_indices = restrict_to_mask_epi64(hashes_begin, size, block_mask_out);
+         alignas(32) uint64_t block_index_array[4];
+         simde_mm256_store_si256(reinterpret_cast<simde__m256i*>(block_index_array), block_indices);
+@@ -303,58 +304,46 @@ batch_check_avx2(const BloomFilter &bloom,
+                 present_index_callback(i + 3);
+ 
+         }
+-
+-        i += 4;
+     }
+ 
+     return i;
+ }
+ 
+-void BloomFilter::insert(const uint64_t *hashes_begin, const uint64_t *hashes_end) {
++void BloomFilter::insert(std::span<const uint64_t> hashes) {
+     if (!num_hash_functions_) {
+-        assert(std::all_of(hashes_begin, hashes_end,
++        assert(std::all_of(hashes.begin(), hashes.end(),
+                            [&](uint64_t hash) { return check(hash); }));
+ 
+         return;
+     }
+ 
+-    const uint64_t *it = batch_insert_avx2(*this, num_hash_functions_,
+-                                           hashes_begin, hashes_end);
++    size_t i = batch_insert_avx2(*this, num_hash_functions_, hashes);
+ 
+     // insert residual
+-    for (; it < hashes_end; ++it) {
+-        insert(*it);
+-        assert(check(*it));
++    for (; i < hashes.size(); ++i) {
++        insert(hashes[i]);
++        assert(check(hashes[i]));
+     }
+ 
+-    assert(std::all_of(hashes_begin, hashes_end,
++    assert(std::all_of(hashes.begin(), hashes.end(),
+                        [&](uint64_t hash) { return check(hash); }));
+ }
+ 
+-void BloomFilter::check(const uint64_t *hashes_begin,
+-                        const uint64_t *hashes_end,
++void BloomFilter::check(std::span<const uint64_t> hashes,
+                         const std::function<void(size_t)> &present_index_callback) const {
+-    assert(hashes_end >= hashes_begin);
+-
+-    const size_t num_elements = hashes_end - hashes_begin;
+-
+     if (!num_hash_functions_) {
+-        for (size_t i = 0; i < num_elements; ++i) {
++        for (size_t i = 0; i < hashes.size(); ++i) {
+             present_index_callback(i);
+         }
+ 
+         return;
+     }
+ 
+-    size_t i = batch_check_avx2(*this,
+-                                hashes_begin,
+-                                hashes_end,
+-                                num_hash_functions_,
+-                                present_index_callback);
++    size_t i = batch_check_avx2(*this, hashes, num_hash_functions_, present_index_callback);
+ 
+     // check residual
+-    for (; i < num_elements; ++i) {
+-        if (check(hashes_begin[i]))
++    for (; i < hashes.size(); ++i) {
++        if (check(hashes[i]))
+             present_index_callback(i);
+     }
+ }
+diff --git a/metagraph/src/common/bloom_filter.hpp b/metagraph/src/common/bloom_filter.hpp
+index 2b688bc862..abf2540e1b 100644
+--- a/metagraph/src/common/bloom_filter.hpp
++++ b/metagraph/src/common/bloom_filter.hpp
+@@ -4,6 +4,7 @@
+ #include <functional>
+ #include <iostream>
+ #include <cmath>
++#include <span>
+ 
+ #include <sdsl/int_vector.hpp>
+ 
+@@ -48,7 +49,7 @@ class BloomFilter {
+     /**
+      * Insert a batch of elements into the Bloom filter by hash value
+      */
+-    void insert(const uint64_t *hashes_begin, const uint64_t *hashes_end);
++    void insert(std::span<const uint64_t> hashes);
+ 
+     /**
+      * Check an element for presence in the Bloom filter. Returns false if
+@@ -61,20 +62,16 @@ class BloomFilter {
+      * Check a batch of elements in the Bloom filter and call present_index_callback
+      * for the correspoding indices for each present hash.
+      */
+-    void check(const uint64_t *hashes_begin,
+-               const uint64_t *hashes_end,
++    void check(std::span<const uint64_t> hashes,
+                const std::function<void(size_t)> &present_index_callback) const;
+ 
+     /**
+      * Check a batch of elements in the Bloom filter and report their
+      * presence/absence.
+      */
+-    inline sdsl::bit_vector check(const uint64_t *hashes_begin,
+-                                  const uint64_t *hashes_end) const {
+-        assert(hashes_end >= hashes_begin);
+-
+-        sdsl::bit_vector presence(hashes_end - hashes_begin, false);
+-        check(hashes_begin, hashes_end, [&](size_t i) { presence[i] = true; });
++    inline sdsl::bit_vector check(std::span<const uint64_t> hashes) const {
++        sdsl::bit_vector presence(hashes.size(), false);
++        check(hashes, [&](size_t i) { presence[i] = true; });
+         return presence;
+     }
+ 
+diff --git a/metagraph/src/graph/alignment/aligner_chainer.cpp b/metagraph/src/graph/alignment/aligner_chainer.cpp
+index 35dd62a026..2e8d397973 100644
+--- a/metagraph/src/graph/alignment/aligner_chainer.cpp
++++ b/metagraph/src/graph/alignment/aligner_chainer.cpp
+@@ -255,8 +255,7 @@ call_seed_chains_both_strands(const IDBGAligner &aligner,
+                                 + cur_seed.get_query_view().size() - prev_end;
+ 
+                 if (dist == coord_dist && cur_seed.get_nodes().size() >= dist) {
+-                    prev_seed.expand({ cur_seed.get_nodes().end() - dist,
+-                                       cur_seed.get_nodes().end() });
++                    prev_seed.expand(std::span(cur_seed.get_nodes()).last(dist));
+                     cur_seed = Seed();
+                 }
+             }
+diff --git a/metagraph/src/graph/alignment/alignment.cpp b/metagraph/src/graph/alignment/alignment.cpp
+index 059c6dacc4..a9ad12cfe5 100644
+--- a/metagraph/src/graph/alignment/alignment.cpp
++++ b/metagraph/src/graph/alignment/alignment.cpp
+@@ -17,6 +17,12 @@ namespace align {
+ 
+ using mtg::common::logger;
+ 
++void Seed::expand(std::span<const node_index> next) {
++    query_view_ = std::string_view(query_view_.data(), query_view_.size() + next.size());
++    end_clipping_ -= next.size();
++    nodes_.insert(nodes_.end(), next.begin(), next.end());
++}
++
+ std::string Alignment::format_coords(const annot::LabelEncoder<> &encoder) const {
+     if (!label_coordinates.size())
+         return "";
+diff --git a/metagraph/src/graph/alignment/alignment.hpp b/metagraph/src/graph/alignment/alignment.hpp
+index d06ee5b217..8e87cd43a7 100644
+--- a/metagraph/src/graph/alignment/alignment.hpp
++++ b/metagraph/src/graph/alignment/alignment.hpp
+@@ -5,6 +5,7 @@
+ #include <memory>
+ #include <ostream>
+ #include <string>
++#include <span>
+ #include <vector>
+ 
+ #include <json/json.h>
+@@ -73,11 +74,7 @@ class Seed {
+ 
+     // Add more nodes to the Seed. This assumes that the original query has |next|
+     // extra characters and that the updated path still spells the query view.
+-    void expand(const std::vector<node_index> &next) {
+-        query_view_ = std::string_view(query_view_.data(), query_view_.size() + next.size());
+-        end_clipping_ -= next.size();
+-        nodes_.insert(nodes_.end(), next.begin(), next.end());
+-    }
++    void expand(std::span<const node_index> next);
+ 
+     const annot::LabelEncoder<> *label_encoder = nullptr;
+ 
+diff --git a/metagraph/src/kmer/kmer_bloom_filter.cpp b/metagraph/src/kmer/kmer_bloom_filter.cpp
+index 2f277900b1..38cfea717e 100644
+--- a/metagraph/src/kmer/kmer_bloom_filter.cpp
++++ b/metagraph/src/kmer/kmer_bloom_filter.cpp
+@@ -130,7 +130,7 @@ ::add_sequence(std::string_view sequence) {
+     AlignedVector<uint64_t> hashes;
+     hashes.reserve(sequence.size() - k_ + 1);
+     call_valid_kmers(*this, sequence, [&](uint64_t hash) { hashes.push_back(hash); });
+-    filter_.insert(hashes.data(), hashes.data() + hashes.size());
++    filter_.insert(hashes);
+ 
+     // invalid k-mers may be false positives
+     assert(sdsl::util::cnt_one_bits(check_kmer_presence(sequence)) >= hashes.size());
+@@ -155,14 +155,14 @@ ::add_sequences(const std::function<void(const CallString&)> &generate_sequences
+             return;
+ 
+         if (buffer.capacity() < buffer.size() + sequence.size() - k_ + 1) {
+-            filter_.insert(buffer.data(), buffer.data() + buffer.size());
++            filter_.insert(buffer);
+             buffer.clear();
+         }
+ 
+         call_valid_kmers(*this, sequence, [&](uint64_t hash) { buffer.push_back(hash); });
+     });
+ 
+-    filter_.insert(buffer.data(), buffer.data() + buffer.size());
++    filter_.insert(buffer);
+ }
+ 
+ template <class KmerHasher>
+@@ -178,7 +178,7 @@ ::check_kmer_presence(std::string_view sequence) const {
+ 
+     assert(i == hashes.size());
+ 
+-    return filter_.check(hashes.data(), hashes.data() + hashes.size());
++    return filter_.check(hashes);
+ }
+ 
+ template <class KmerHasher>
+diff --git a/metagraph/src/kmer/kmer_extractor.cpp b/metagraph/src/kmer/kmer_extractor.cpp
+index 3a8e7c624e..2e6cf39762 100644
+--- a/metagraph/src/kmer/kmer_extractor.cpp
++++ b/metagraph/src/kmer/kmer_extractor.cpp
+@@ -426,7 +426,7 @@ __VA_ARGS__ KmerExtractorT<LogSigma>
+ 
+ KmerExtractorTDecl()
+ ::KmerExtractorT(const char alph[],
+-                 const uint8_t char_to_code[128],
++                 std::span<const uint8_t, 128> char_to_code,
+                  const std::vector<uint8_t> &complement_code)
+       : alphabet(alph),
+         char_to_code_(char_to_code),
+@@ -439,7 +439,7 @@ ::KmerExtractorT(const char alph[],
+ 
+ KmerExtractorTDecl(typename KmerExtractorT<LogSigma>::TAlphabet)
+ ::encode(char s) const {
+-    return ::encode(s, char_to_code_);
++    return ::encode(s, char_to_code_.data());
+ }
+ 
+ KmerExtractorTDecl(char)
+@@ -449,7 +449,7 @@ ::decode(TAlphabet c) const {
+ 
+ KmerExtractorTDecl(std::vector<typename KmerExtractorT<LogSigma>::TAlphabet>)
+ ::encode(std::string_view sequence) const {
+-    return ::encode(sequence, char_to_code_);
++    return ::encode(sequence, char_to_code_.data());
+ }
+ 
+ KmerExtractorTDecl(std::string)
+diff --git a/metagraph/src/kmer/kmer_extractor.hpp b/metagraph/src/kmer/kmer_extractor.hpp
+index 4526e52c9e..4784eb3670 100644
+--- a/metagraph/src/kmer/kmer_extractor.hpp
++++ b/metagraph/src/kmer/kmer_extractor.hpp
+@@ -2,6 +2,7 @@
+ #define __KMER_EXTRACTOR_HPP__
+ 
+ #include <cstdint>
++#include <span>
+ #include <string>
+ #include <vector>
+ 
+@@ -115,19 +116,19 @@ class KmerExtractorT {
+ 
+     #if _PROTEIN_GRAPH
+     KmerExtractorT(const char Alphabet[] = alphabets::kAlphabetProtein,
+-                   const uint8_t CharToCode[128] = alphabets::kCharToProtein,
++                   std::span<const uint8_t, 128> CharToCode = alphabets::kCharToProtein,
+                    const std::vector<uint8_t> &complement_code = alphabets::kComplementMapProtein);
+     #elif _DNA_CASE_SENSITIVE_GRAPH
+     KmerExtractorT(const char Alphabet[] = alphabets::kAlphabetDNACaseSent,
+-                   const uint8_t CharToCode[128] = alphabets::kCharToDNACaseSent,
++                   std::span<const uint8_t, 128> CharToCode = alphabets::kCharToDNACaseSent,
+                    const std::vector<uint8_t> &complement_code = alphabets::kComplementMapDNACaseSent);
+     #elif _DNA5_GRAPH
+     KmerExtractorT(const char Alphabet[] = alphabets::kAlphabetDNA5,
+-                   const uint8_t CharToCode[128] = alphabets::kCharToDNA,
++                   std::span<const uint8_t, 128> CharToCode = alphabets::kCharToDNA,
+                    const std::vector<uint8_t> &complement_code = alphabets::kComplementMapDNA);
+     #elif _DNA_GRAPH
+     KmerExtractorT(const char Alphabet[] = alphabets::kAlphabetDNA,
+-                   const uint8_t CharToCode[128] = alphabets::kCharToDNA,
++                   std::span<const uint8_t, 128> CharToCode = alphabets::kCharToDNA,
+                    const std::vector<uint8_t> &complement_code = alphabets::kComplementMapDNA);
+     #else
+     static_assert(false,
+@@ -178,7 +179,8 @@ class KmerExtractorT {
+     }
+ 
+   private:
+-    const TAlphabet *char_to_code_;
++    // The lookup table is borrowed and must outlive the extractor.
++    std::span<const TAlphabet, 128> char_to_code_;
+     const std::vector<TAlphabet> complement_code_;
+ };
+ 
+diff --git a/metagraph/tests/common/test_bloom_filter.cpp b/metagraph/tests/common/test_bloom_filter.cpp
+index 11c6a71ad8..b594ae2117 100644
+--- a/metagraph/tests/common/test_bloom_filter.cpp
++++ b/metagraph/tests/common/test_bloom_filter.cpp
+@@ -69,6 +69,49 @@ double expected_fpr(const BloomFilter &filter, size_t num_elements) {
+                     filter.num_hash_functions());
+ }
+ 
++TEST(BloomFilter, batch_views_match_scalar_at_simd_boundaries) {
++    std::vector<uint64_t> hashes(10);
++    for (size_t i = 0; i < hashes.size(); ++i)
++        hashes[i] = hasher(i);
++
++    for (uint32_t num_hashes : { 0, 1, 2, 3, 4, 5, 8, 13 }) {
++        for (size_t count = 0; count <= 9; ++count) {
++            SCOPED_TRACE(::testing::Message() << "hashes=" << num_hashes << ", count=" << count);
++            auto input = std::span<const uint64_t>(hashes).subspan(1, count);
++            BloomFilter scalar(512, num_hashes), batch(512, num_hashes);
++            for (uint64_t hash : input)
++                scalar.insert(hash);
++            batch.insert(input);
++            ASSERT_EQ(scalar.data(), batch.data());
++            EXPECT_EQ(sdsl::bit_vector(count, true), batch.check(input));
++            std::vector<size_t> input_indices;
++            batch.check(input, [&](size_t i) { input_indices.push_back(i); });
++            ASSERT_EQ(count, input_indices.size());
++            for (size_t i = 0; i < count; ++i)
++                EXPECT_EQ(i, input_indices[i]);
++
++            sdsl::bit_vector expected(hashes.size(), false);
++            std::vector<size_t> expected_indices;
++            for (size_t i = 0; i < hashes.size(); ++i) {
++                expected[i] = scalar.check(hashes[i]);
++                if (expected[i])
++                    expected_indices.push_back(i);
++            }
++            EXPECT_EQ(expected, batch.check(hashes));
++            std::vector<size_t> indices;
++            batch.check(hashes, [&](size_t i) { indices.push_back(i); });
++            EXPECT_EQ(expected_indices, indices);
++
++            // An empty default view can have a null data pointer.
++            const std::span<const uint64_t> empty;
++            batch.insert(empty);
++            EXPECT_EQ(0u, batch.check(empty).size());
++            batch.check(empty, [](size_t) { FAIL() << "Callback on empty view"; });
++            EXPECT_EQ(scalar.data(), batch.data());
++        }
++    }
++}
++
+ TEST(BloomFilter, insert_and_check) {
+     constexpr uint64_t max_num_hash_functions = 10;
+ 
+@@ -130,7 +173,7 @@ TEST(BloomFilter, batch_insert_and_check) {
+                 insert(check, hashes[i], filter.num_hash_functions());
+             }
+ 
+-            filter.insert(hashes.data(), hashes.data() + num_elements);
++            filter.insert(hashes);
+             ASSERT_EQ(check, filter.data());
+ 
+             for (size_t i = 0; i < num_elements; ++i) {
+@@ -174,14 +217,13 @@ TEST(BloomFilter, batch_insert_and_batch_check) {
+                 insert(check, hashes[i], filter.num_hash_functions());
+             }
+ 
+-            filter.insert(hashes.data(), hashes.data() + num_elements);
++            filter.insert(hashes);
+             ASSERT_EQ(check, filter.data());
+ 
+             EXPECT_EQ(
+                 num_elements,
+                 sdsl::util::cnt_one_bits(
+-                    filter.check(hashes.data(),
+-                                 hashes.data() + num_elements)
++                    filter.check(hashes)
+                 )
+             );
+ 
+@@ -198,7 +240,7 @@ TEST(BloomFilter, batch_insert_and_batch_check) {
+                 EXPECT_EQ(checks[i - num_elements], filter.check(next_hashes.back()));
+             }
+ 
+-            EXPECT_EQ(checks, filter.check(next_hashes.data(), next_hashes.data() + 1000));
++            EXPECT_EQ(checks, filter.check(next_hashes));
+ 
+             TEST_COUT << "Elements: " << num_elements << std::endl
+                       << "Bloom filter: " << filter.size() << " bits; "
+@@ -229,15 +271,15 @@ TEST(BloomFilter, batch_insert_and_batch_check_callback) {
+                 insert(check, hashes[i], filter.num_hash_functions());
+             }
+ 
+-            filter.insert(hashes.data(), hashes.data() + num_elements);
++            filter.insert(hashes);
+             ASSERT_EQ(check, filter.data());
+ 
+-            auto result = filter.check(hashes.data(), hashes.data() + num_elements);
++            auto result = filter.check(hashes);
+ 
+             EXPECT_EQ(num_elements, sdsl::util::cnt_one_bits(result));
+ 
+             size_t j = 0;
+-            filter.check(hashes.data(), hashes.data() + num_elements,
++            filter.check(hashes,
+                          [&](size_t i) {
+                              ASSERT_GT(result.size(), i);
+                              while (j < i) {
+@@ -260,7 +302,7 @@ TEST(BloomFilter, batch_insert_and_batch_check_callback) {
+                 EXPECT_EQ(checks[i - num_elements], filter.check(next_hashes.back()));
+             }
+ 
+-            EXPECT_EQ(checks, filter.check(next_hashes.data(), next_hashes.data() + 1000));
++            EXPECT_EQ(checks, filter.check(next_hashes));
+ 
+             TEST_COUT << "Elements: " << num_elements << std::endl
+                       << "Bloom filter: " << filter.size() << " bits; "
+diff --git a/metagraph/tests/graph/test_aligner_chain.cpp b/metagraph/tests/graph/test_aligner_chain.cpp
+index 331713ddc6..90cb20bc33 100644
+--- a/metagraph/tests/graph/test_aligner_chain.cpp
++++ b/metagraph/tests/graph/test_aligner_chain.cpp
+@@ -14,6 +14,20 @@ using namespace mtg::graph::align;
+ using namespace mtg::test;
+ using namespace mtg::kmer;
+ 
++TEST(Seed, expand_from_borrowed_tail) {
++    const std::string query = "ACGTAC";
++    Seed seed(std::string_view(query).substr(0, 3), { 1 }, false, 0, 0, 3);
++    std::vector<Seed::node_index> continuation = { 99, 2, 3, 4 };
++    seed.expand(std::span(continuation).last(3));
++    continuation.clear();
++    EXPECT_EQ((std::vector<Seed::node_index>{ 1, 2, 3, 4 }), seed.get_nodes());
++    EXPECT_EQ(query, seed.get_query_view());
++    EXPECT_EQ(0u, seed.get_end_clipping());
++    seed.expand({});
++    EXPECT_EQ(4u, seed.size());
++    EXPECT_EQ(query, seed.get_query_view());
++}
++
+ template <typename Graph>
+ class DBGAlignerPostChainTest : public DeBruijnGraphTest<Graph> {};
+ 
+diff --git a/metagraph/tests/test_kmer_extractor.cpp b/metagraph/tests/test_kmer_extractor.cpp
+index d44c59629f..71a48703c1 100644
+--- a/metagraph/tests/test_kmer_extractor.cpp
++++ b/metagraph/tests/test_kmer_extractor.cpp
+@@ -1,6 +1,8 @@
+ #include "gtest/gtest.h"
+ 
+ #include <numeric>
++#include <array>
++#include <type_traits>
+ 
+ #include "kmer/kmer_extractor.hpp"
+ #include "common/utils/string_utils.hpp"
+@@ -27,6 +29,21 @@ TYPED_TEST_SUITE(ExtractKmers2Bit, KmerTypes);
+ const KmerExtractor2Bit kmer_extractor;
+ 
+ 
++static_assert(std::is_constructible_v<KmerExtractor2Bit, const char*, std::array<uint8_t, 128>&>);
++static_assert(!std::is_constructible_v<KmerExtractor2Bit, const char*, std::array<uint8_t, 127>&>);
++
++TEST(KmerExtractor2Bit, borrows_fixed_size_lookup_table) {
++    KmerExtractor2Bit default_encoder;
++    std::array<uint8_t, 128> table;
++    for (size_t i = 0; i < table.size(); ++i)
++        table[i] = default_encoder.encode(i);
++    KmerExtractor2Bit encoder(default_encoder.alphabet.c_str(), table);
++    table['A'] = default_encoder.encode('T');
++    EXPECT_EQ(default_encoder.encode('T'), encoder.encode('A'));
++    EXPECT_EQ(default_encoder.encode('C'), encoder.encode('C'));
++    EXPECT_EQ(table[0], encoder.encode(char(-1)));
++}
++
+ TEST(KmerExtractor2Bit, encode_decode) {
+     KmerExtractor2Bit encoder;
+     EXPECT_EQ('A', encoder.decode(encoder.encode('A')));

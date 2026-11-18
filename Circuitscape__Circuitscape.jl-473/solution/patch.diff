@@ -1,0 +1,360 @@
+diff --git a/src/core.jl b/src/core.jl
+index 16347b1d..a8b37ff3 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -363,9 +363,9 @@ function solve(prob::GraphProblem{T,V}, solver::Union{CholmodSolver, PardisoSolv
+             !write_cum_cur_map_only  && !write_max_cur_maps &&
+             isempty(exclude)
+         get_shortcut_resistances = true
+-        @info("Triggering resistance calculation shortcut")
++        log && @info("Triggering resistance calculation shortcut")
+         num_pairs, _ = get_num_pairs_shortcut(cc, points, exclude, orig_pts)
+-        @info("Total number of pair solves has been reduced to $num_pairs ")
++        log && @info("Total number of pair solves has been reduced to $num_pairs")
+     end
+     shortcut = Shortcut(get_shortcut_resistances, voltmatrix, shortcut_res)
+ 
+diff --git a/src/io.jl b/src/io.jl
+index 1a313b63..635115fb 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -12,11 +12,27 @@ function IncludeExcludePairs(V)
+ end
+ Base.isempty(t::IncludeExcludePairs) = t.mode == :undef
+ 
++"""
++    exclude_pairs_from(included_pairs)
++
++Node ID pairs to exclude, derived from an include/exclude matrix. In `:include`
++mode every pair *not* marked is excluded; in `:exclude` mode only the marked
++pairs are. Shared by the raster and network paths.
++"""
++function exclude_pairs_from(included_pairs::IncludeExcludePairs{V}) where V
++    mat = included_pairs.include_pairs
++    point_ids = included_pairs.point_ids
++    target = included_pairs.mode == :include ? V(0) : V(1)
++    [(point_ids[i], point_ids[j]) for j in axes(mat, 2) for i in axes(mat, 1)
++        if mat[i,j] == target && mat[j,i] == target]
++end
++
+ struct NetworkData{T,V} <: Data
+     coords::Tuple{Vector{V},Vector{V},Vector{T}}
+     fp::Vector{V}
+     source_map::Matrix{T}
+     ground_map::Matrix{T}
++    included_pairs::IncludeExcludePairs{V}
+ end
+ 
+ struct RasterMeta
+@@ -325,7 +341,7 @@ function _txt_list_reader(filename, T, habitatmeta)
+     pts_remapped
+ end
+ 
+-function read_included_pairs(V, filename)
++function read_included_pairs(V, filename; starts_from_zero = false)
+ 
+     f = _open(filename)
+     filetype = _guess_file_type(filename, f)
+@@ -342,6 +358,10 @@ function read_included_pairs(V, filename)
+         included_pairs = readdlm(filename, skipstart=2)
+         point_ids = V.(included_pairs[:,1])
+         deleteat!(point_ids, 1)
++        # Network graphs numbered from 0 are shifted to 1-based on load, so the
++        # IDs named here move with them. Never infer this from the data: in a
++        # raster include file 0 means "no matching focal node" (issue #341).
++        starts_from_zero && (point_ids = point_ids .+ V(1))
+         included_pairs = included_pairs[2:end, 2:end]
+         map!(x -> x > maxval ? 0 : x, included_pairs, included_pairs)
+         idx = findall(x -> x >= minval, included_pairs)
+@@ -358,6 +378,8 @@ function read_included_pairs(V, filename)
+             pl[1,:] = included_pairs
+             included_pairs = pl
+         end
++        starts_from_zero && (included_pairs = included_pairs .+ 1)
++
+         point_ids = V.(sort!(unique(included_pairs)))
+         idx = findall(x -> x == 0 , point_ids)
+         if length(idx) > 0
+@@ -414,7 +436,14 @@ function get_network_data(T, V, cfg)::NetworkData{T,V}
+         ground_list = Matrix{T}(undef,0,0)
+     end
+ 
+-    NetworkData((i,j,v), fp, source_list, ground_list)
++    if cfg.use_included_pairs && is_pairwise
++        included_pairs = read_included_pairs(V, cfg.included_pairs_file;
++                                             starts_from_zero = starts_from_zero)
++    else
++        included_pairs = IncludeExcludePairs(V)
++    end
++
++    NetworkData((i,j,v), fp, source_list, ground_list, included_pairs)
+ end
+ 
+ function load_raster_data(T, V, cfg)::RasterData{T,V}
+diff --git a/src/network/pairwise.jl b/src/network/pairwise.jl
+index f091b495..864ee10a 100644
+--- a/src/network/pairwise.jl
++++ b/src/network/pairwise.jl
+@@ -48,8 +48,17 @@ function compute_graph_data(data::NetworkData{T,V}, cfg)::GraphProblem{T,V} wher
+ 
+     G = @timeit CSTIMER "construct graph laplacian" laplacian!(A)
+ 
+-    # T = eltype(i)
+-    exclude_pairs = Tuple{V,V}[]
++    # Include/exclude pairs. In include mode focal points absent from the file
++    # are dropped, mirroring the raster path (issue #341).
++    included_pairs = data.included_pairs
++    fp = data.fp
++    if isempty(included_pairs)
++        exclude_pairs = Tuple{V,V}[]
++    else
++        included_pairs.mode == :include &&
++            (fp = filter(x -> x in included_pairs.point_ids, fp))
++        exclude_pairs = exclude_pairs_from(included_pairs)
++    end
+     solver = get_solver(cfg)
+ 
+     nodemap = Matrix{V}(undef,0,0)
+@@ -59,7 +68,7 @@ function compute_graph_data(data::NetworkData{T,V}, cfg)::GraphProblem{T,V} wher
+ 
+ 	cum = initialize_cum_vectors(data.coords, size(G,1))
+ 
+-    GraphProblem(G, cc, data.fp, data.fp, 
++    GraphProblem(G, cc, fp, fp, 
+                 exclude_pairs, nodemap, polymap, hbmeta, cellmap, cum, solver)
+ 
+ end
+diff --git a/src/raster/onetoall.jl b/src/raster/onetoall.jl
+index 507bb2f8..56a9c74f 100644
+--- a/src/raster/onetoall.jl
++++ b/src/raster/onetoall.jl
+@@ -30,7 +30,6 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+     four_neighbors = flags.four_neighbors
+ 
+     if use_included_pairs
+-        points_unique = included_pairs.point_ids
+         prune_points!(points_rc, included_pairs.point_ids)
+         if use_variable_strengths
+             strengths = prune_strengths(strengths, included_pairs.point_ids)
+@@ -80,8 +79,13 @@ function onetoall_kernel(data::RasterData{T,V}, flags, cfg)::Matrix{T} where {T,
+         @info("Solving point $i of $num_points_to_solve")
+         n = points_unique[i]
+         if use_included_pairs
++            # `i` indexes the focal points present in the raster, but the
++            # include matrix is indexed by position in `point_ids`. These differ
++            # whenever the file names an ID the point raster does not contain,
++            # so look the row up by node ID rather than reusing `i` (issue #341).
++            row = findfirst(isequal(n), point_ids)
+             for j = 1:size(point_ids,1)
+-                if i != j && included_pairs.include_pairs[i,j] == mode
++                if j != row && included_pairs.include_pairs[row,j] == mode
+                     exclude = point_ids[j]
+                     map!(x -> x == exclude ? 0 : x, point_map, point_map)
+                 end
+diff --git a/src/raster/pairwise.jl b/src/raster/pairwise.jl
+index 06549c68..6667e72e 100644
+--- a/src/raster/pairwise.jl
++++ b/src/raster/pairwise.jl
+@@ -236,33 +236,13 @@ end
+ 
+ function generate_exclude_pairs(points_rc, included_pairs::IncludeExcludePairs{V}) where V
+ 
+-    exclude_pairs_array = Tuple{V,V}[]
+-    mat = included_pairs.include_pairs
+-    point_ids = included_pairs.point_ids
+-
++    # Include mode prunes focal nodes not mentioned in the include file;
++    # exclude mode keeps every node and only drops the listed pairs.
+     if included_pairs.mode == :include
+-        # Include mode: prune focal nodes not mentioned in the include file,
+-        # and exclude pairs among remaining nodes that aren't explicitly included
+-        prune_points!(points_rc, point_ids)
+-        for j = 1:size(mat, 2)
+-            for i = 1:size(mat, 1)
+-                if mat[i,j] == 0 && mat[j,i] == 0
+-                    push!(exclude_pairs_array, (point_ids[i], point_ids[j]))
+-                end
+-            end
+-        end
+-    else
+-        # Exclude mode: don't prune any nodes, just exclude the listed pairs
+-        for j = 1:size(mat, 2)
+-            for i = 1:size(mat, 1)
+-                if mat[i,j] == 1 && mat[j,i] == 1
+-                    push!(exclude_pairs_array, (point_ids[i], point_ids[j]))
+-                end
+-            end
+-        end
++        prune_points!(points_rc, included_pairs.point_ids)
+     end
+ 
+-    exclude_pairs_array
++    exclude_pairs_from(included_pairs)
+ end
+ 
+ function construct_node_map(gmap, polymap::Matrix{V}) where V
+diff --git a/test/issue341.jl b/test/issue341.jl
+index d2557f68..3d44c161 100644
+--- a/test/issue341.jl
++++ b/test/issue341.jl
+@@ -459,3 +459,160 @@ let
+     # Node IDs need not be contiguous or sorted; indices are into `pts`
+     @test Circuitscape.pairs_to_solve([10, 6, 1], [(6,10)]) == [(1,3), (2,3)]
+ end
++
++# Shared tail for the raster ini files below.
++const _INI_TAIL_341 = """
++[Connection scheme for raster habitat data]
++connect_four_neighbors_only = True
++connect_using_avg_resistances = True
++[Output options]
++write_cur_maps = False
++write_volt_maps = False
++write_cum_cur_map_only = False
++write_max_cur_maps = False
++compress_grids = False
++log_transform_maps = False
++set_null_currents_to_nodata = False
++set_null_voltages_to_nodata = False
++[Calculation options]
++solver = cg+amg
++[Short circuit regions (aka polygons)]
++use_polygons = False
++polygon_file = None
++[Options for advanced mode]
++ground_file_is_resistances = False
++source_file = None
++remove_src_or_gnd = keepall
++ground_file = None
++use_unit_currents = False
++use_direct_grounds = False
++[Options for one-to-all and all-to-one modes]
++use_variable_source_strengths = False
++variable_source_file = None
++[Mask file]
++use_mask = False
++mask_file = None
++[Version]
++version = unknown
++"""
++
++_asc_hdr_341(n) = "ncols $n\nnrows $n\nxllcorner 0\nyllcorner 0\ncellsize 1\nNODATA_value -9999\n"
++
++# Test 9: one-to-all must index the include matrix by node ID, not by position
++# among the focal points present in the raster. The two differ as soon as the
++# include file names an ID the point raster does not contain, which silently
++# grounded the wrong nodes.
++let
++    dir = mktempdir()
++    write(joinpath(dir, "cell.asc"),
++          _asc_hdr_341(5) * join(fill(join(fill("1", 5), " "), 5), "\n") * "\n")
++    # Raster contains nodes 2, 3, 4 only.
++    write(joinpath(dir, "pts.asc"), _asc_hdr_341(5) *
++          "2 0 0 0 3\n0 0 0 0 0\n0 0 0 0 0\n0 0 0 0 0\n4 0 0 0 0\n")
++    # Node 1 is named in the file but absent from the raster, shifting every
++    # include-matrix row by one relative to the surviving focal points.
++    write(joinpath(dir, "include.txt"), "mode\tinclude\n1\t2\n3\t4\n")
++    ini = joinpath(dir, "job.ini")
++    write(ini, """[Circuitscape mode]
++data_type = raster
++scenario = one-to-all
++[Habitat raster or graph]
++habitat_file = $(joinpath(dir, "cell.asc"))
++habitat_map_is_resistances = True
++[Options for pairwise and one-to-all and all-to-one modes]
++point_file = $(joinpath(dir, "pts.asc"))
++use_included_pairs = True
++included_pairs_file = $(joinpath(dir, "include.txt"))
++output_file = $(joinpath(dir, "out.out"))
++""" * _INI_TAIL_341)
++    r = compute(ini)
++    @test size(r) == (3, 2)
++    @test r[:, 1] == [2.0, 3.0, 4.0]
++    # Node 2's only listed partner (1) is absent, so it has nothing to ground to.
++    @test r[1, 2] == -1
++    # Nodes 3 and 4 are each other's only partner, so both see the same
++    # single-source/single-ground resistance.
++    @test r[2, 2] > 0
++    @test r[2, 2] ≈ r[3, 2]
++end
++
++# Test 10: network mode must honour the include file too — it used to be read
++# and then discarded, so every pair was solved.
++let
++    dir = mktempdir()
++    # Path graph 1-2-3-4 with unit conductances.
++    write(joinpath(dir, "graph.txt"), "1\t2\t1.0\n2\t3\t1.0\n3\t4\t1.0\n")
++    write(joinpath(dir, "fp.txt"), "1\n2\n3\n4\n")
++    write(joinpath(dir, "include.txt"), "mode\tinclude\n1\t2\n")
++    ini = joinpath(dir, "job.ini")
++    write(ini, """[Circuitscape mode]
++data_type = network
++scenario = pairwise
++[Habitat raster or graph]
++habitat_file = $(joinpath(dir, "graph.txt"))
++habitat_map_is_resistances = False
++[Options for pairwise and one-to-all and all-to-one modes]
++point_file = $(joinpath(dir, "fp.txt"))
++use_included_pairs = True
++included_pairs_file = $(joinpath(dir, "include.txt"))
++output_file = $(joinpath(dir, "out.out"))
++""" * _INI_TAIL_341)
++    r = compute(ini)
++    # Nodes 3 and 4 are not named in the include file, so they are dropped.
++    @test size(r) == (3, 3)
++    @test r[1, 2] == 1.0
++    @test r[1, 3] == 2.0
++    # Adjacent nodes on a unit-conductance path graph.
++    @test r[2, 3] ≈ 1.0
++end
++
++# Test 11: exclude_pairs_from derives the excluded node ID pairs from the matrix
++let
++    inc = Circuitscape.IncludeExcludePairs(:include, [1, 2, 3],
++                                           [0 1 0; 1 0 0; 0 0 0])
++    ex = Circuitscape.exclude_pairs_from(inc)
++    # (1,2) is the only included pair, so every other combination is excluded.
++    @test (1, 3) in ex && (3, 1) in ex
++    @test (2, 3) in ex && (3, 2) in ex
++    @test !((1, 2) in ex) && !((2, 1) in ex)
++
++    exc = Circuitscape.IncludeExcludePairs(:exclude, [1, 2, 3],
++                                           [0 1 0; 1 0 0; 0 0 0])
++    ex2 = Circuitscape.exclude_pairs_from(exc)
++    # Only the listed pair is excluded.
++    @test (1, 2) in ex2 && (2, 1) in ex2
++    @test !((1, 3) in ex2) && !((2, 3) in ex2)
++end
++
++# Test 12: network graphs numbered from 0 are shifted to 1-based on load, so the
++# IDs in the include file must shift with them. Previously the unshifted file IDs
++# were matched against shifted focal points, selecting the neighbouring pair.
++let
++    dir = mktempdir()
++    # 0-based path graph with distinct resistances, so picking the wrong pair
++    # gives a different number: 0-1 = 1, 1-2 = 5, 2-3 = 1.
++    write(joinpath(dir, "graph.txt"), "0\t1\t1.0\n1\t2\t5.0\n2\t3\t1.0\n")
++    write(joinpath(dir, "fp.txt"), "0\n1\n2\n3\n")
++    write(joinpath(dir, "include.txt"), "mode\tinclude\n1\t2\n")
++    ini = joinpath(dir, "job.ini")
++    write(ini, """[Circuitscape mode]
++data_type = network
++scenario = pairwise
++[Habitat raster or graph]
++habitat_file = $(joinpath(dir, "graph.txt"))
++habitat_map_is_resistances = True
++[Options for pairwise and one-to-all and all-to-one modes]
++point_file = $(joinpath(dir, "fp.txt"))
++use_included_pairs = True
++included_pairs_file = $(joinpath(dir, "include.txt"))
++output_file = $(joinpath(dir, "out.out"))
++""" * _INI_TAIL_341)
++    r = compute(ini)
++    @test size(r) == (3, 3)
++    # Node IDs come back shifted to 1-based, as load_graph reports for 0-based input.
++    @test r[1, 2] == 2.0
++    @test r[1, 3] == 3.0
++    # The requested pair is the 5.0 resistor, not the adjacent 1.0 one.
++    @test r[2, 3] ≈ 5.0
++end
++

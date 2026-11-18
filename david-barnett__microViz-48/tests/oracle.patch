@@ -1,0 +1,896 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index cc5122f7..1b4d526f 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -1,6 +1,6 @@
+ Package: microViz
+ Title: Microbiome Data Analysis and Visualization
+-Version: 0.9.1
++Version: 0.9.1.9001
+ Authors@R: 
+     person(given = "David",
+            family = "Barnett",
+diff --git a/NEWS.md b/NEWS.md
+index 59c31cc4..800a0430 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,3 +1,11 @@
++# microViz (development version)
++
++## Features
++- `ps_dedupe` now allows keeping a specified number of samples per group, not just one, which could be useful for e.g. keeping the first 2 samples per participant or site.
++
++## Fixes 
++- `ps_dedupe` now deduplicates samples correctly when duplicates are specified with multiple variables, and provides a labelling-only mode to check duplicate identification result before removal.
++
+ # microViz 0.9.1
+ 
+ ## Features
+diff --git a/R/ps_dedupe.R b/R/ps_dedupe.R
+index dde2f0c0..72a06827 100644
+--- a/R/ps_dedupe.R
++++ b/R/ps_dedupe.R
+@@ -1,22 +1,44 @@
+ #' De-duplicate phyloseq samples
+ #'
+ #' @description
+-#' Use 1 or more variables in the sample_data to identify and remove duplicate samples (leaving 1 per category).
++#' Use one or more variables in the sample_data to identify and
++#' remove duplicate samples (leaving one sample per group).
+ #'
+ #' __methods:__
+-#' - method = "readcount" keeps the one sample in each duplicate group with the highest total number of reads according to sample_sums
+-#' - method = "first" keeps the first sample in each duplicate group encountered in the row order of the sample_data
+-#' - method = "last" keeps the last sample in each duplicate group encountered in the row order of the sample_data
++#' - method = "readcount" keeps the one sample in each duplicate group
++#' with the highest total number of reads (phyloseq::sample_sums)
++#' - method = "first" keeps the first sample in each duplicate group
++#' encountered in the row order of the sample_data
++#' - method = "last" keeps the last sample in each duplicate group
++#' encountered in the row order of the sample_data
++#' - method = "random" keeps a random sample from each duplicate group
++#' (set.seed for reproducibility)
++#'
++#' More than one "duplicate" sample can be kept per group by setting `n` samples > 1.
+ #'
+ #' @details
+ #' What happens when duplicated samples have exactly equal readcounts in method = "readcount"?
+ #' The first encountered maximum is kept (in sample_data row order, like method = "first")
+ #'
+-#' @param ps phyloseq with sample data
+-#' @param vars names of variables, whose (combined) levels identify groups from which only 1 sample is desired
++#' @param ps phyloseq object
++#' @param vars
++#' names of variables, whose (combined) levels identify groups
++#' from which only 1 sample is desired
+ #' @param method
+-#' keep 1 sample with max "readcount" or the "first" or "last" samples encountered in given sample_data order for each dupe group
+-#' @param verbose message names of samples removed if TRUE (or "debug" for more info, when method = "readcount")
++#' keep sample with max "readcount" or the "first" or "last" or "random"
++#' samples encountered in given sample_data order for each duplicate group
++#' @param verbose message about number of groups, and number of samples dropped?
++#' @param n number of 'duplicates' to keep per group, defaults to 1
++#' @param .keep_group_var keep grouping variable .GROUP. in phyloseq object?
++#' @param .keep_readcount keep readcount variable .READCOUNT. in phyloseq object?
++#' @param .message_IDs message sample names of dropped variables?
++#' @param .label_only
++#' if TRUE, the samples will NOT be filtered, just labelled with a new logical
++#' variable .KEEP_SAMPLE.
++#' @param .keep_all_taxa
++#' keep all taxa after removing duplicates?
++#' If FALSE, the default, taxa are removed if they never occur in any of
++#' the retained samples
+ #'
+ #' @return phyloseq object
+ #' @export
+@@ -46,80 +68,78 @@
+ ps_dedupe <- function(ps,
+                       vars,
+                       method = "readcount",
+-                      verbose = TRUE) {
+-  ps_df <- samdatAsDataframe(ps)
++                      verbose = TRUE,
++                      n = 1,
++                      .keep_group_var = FALSE,
++                      .keep_readcount = FALSE,
++                      .message_IDs = FALSE,
++                      .label_only = FALSE,
++                      .keep_all_taxa = FALSE
++){
++  # Check inputs
++  if (!inherits(ps, "phyloseq")) stop("ps must be a phyloseq object")
++  if (!rlang::is_character(vars)) stop("vars must be character")
++  psCheckVariables(ps = ps, vars = vars)
++  method <- rlang::arg_match(method, values = c("readcount", "first", "last", "random"))
++  if (!rlang::is_scalar_integerish(n) || n < 1) stop('n must be a positive number')
++  if (!rlang::is_bool(verbose)) stop("verbose must be TRUE or FALSE")
++  if (!rlang::is_bool(.keep_group_var)) stop(".keep_group_var must be TRUE or FALSE")
++  if (!rlang::is_bool(.keep_readcount)) stop(".keep_readcount must be TRUE or FALSE")
++  if (!rlang::is_bool(.message_IDs)) stop(".message_IDs must be TRUE or FALSE")
++  if (!rlang::is_bool(.label_only)) stop(".label_only must be TRUE or FALSE")
++  if (!rlang::is_bool(.keep_all_taxa)) stop(".keep_all_taxa must be TRUE or FALSE")
+ 
+-  ps_df[[".temp_grouping_var"]] <- interaction(ps_df[, vars])
++  # End of input checks
+ 
+-  dupe_names <- unique(
+-    ps_df[[".temp_grouping_var"]][duplicated(ps_df[, ".temp_grouping_var"])]
++  # get sample data and compute new (temporary?) variables
++  df <- samdat_tbl(ps, sample_names_col = "._ID_.")
++  df[[".GROUP."]] <- purrr::pmap_chr(
++    .l = df[, vars, drop = FALSE], .f = function(...) paste(..., sep = "_")
+   )
+-  no_dupe_samples <-
+-    rownames(ps_df)[!ps_df[[".temp_grouping_var"]] %in% dupe_names]
++  if (.keep_group_var) phyloseq::sample_data(ps)[[".GROUP."]] <- df[[".GROUP."]]
++
++  if (method == "readcount") {
++    ps <- ps_counts(data = ps, warn = "error") # stop if data are not counts
++    df[[".READCOUNT."]] <- phyloseq::sample_sums(x = ps)
++    if (.keep_readcount) {
++      phyloseq::sample_data(ps)[[".READCOUNT."]] <- df[[".READCOUNT."]]
++    }
++  }
+ 
+-  rejects_message <- function(rejects) {
+-    message(
+-      length(rejects), " samples being removed:\n",
+-      paste0(rejects, collapse = "; ")
+-    )
++  # deduplicate data
++  df <- dplyr::group_by(.data = df, .data[[".GROUP."]])
++  if (verbose) {
++    nDup <- dplyr::count(df)[["n"]]
++    nPerGroup <- paste(unique(range(nDup)), collapse = " to ")
++    message(length(nDup), " groups: with ", nPerGroup, " samples each")
+   }
+ 
+-  keepers <- switch(
++  dfDedupe <- switch(
+     EXPR = method,
+     "readcount" = {
+-      ps_df[[".temp_readcount_var"]] <- phyloseq::sample_sums(ps)
+-      ps_df[[".temp_sample_id_var"]] <- rownames(ps_df)
+-      ps_df <-
+-        dplyr::filter(ps_df, .data[[".temp_grouping_var"]] %in% dupe_names)
+-      ps_df <- dplyr::group_by(ps_df, .data[[".temp_grouping_var"]])
+-      df_sum <-
+-        dplyr::summarise(ps_df, max = max(.data[[".temp_readcount_var"]]))
+-
+-      keepers <- unlist(
+-        sapply(dupe_names, function(dn) {
+-          dupe_group <- ps_df[ps_df$.temp_grouping_var == dn, ]
+-          max_reads <- df_sum$max[df_sum$.temp_grouping_var == dn][[1]]
+-          keepers <- dupe_group$.temp_sample_id_var[
+-            dupe_group$.temp_readcount_var == max_reads
+-          ]
+-          if (identical(verbose, "debug")) {
+-            to_drop <- dupe_group$.temp_sample_id_var != keepers[[1]]
+-            message(
+-              "\ngroup = ", dn, "\n",
+-              nrow(dupe_group), " dupes", "\nmax_reads = ", max_reads,
+-              "\nmatches = ",
+-              paste(keepers, collapse = "; "), "\nkeeping: ", keepers[[1]],
+-              "\ndropping: ",
+-              paste(dupe_group$.temp_sample_id_var[to_drop], collapse = "; ")
+-            )
+-          }
+-          keepers[[1]]
+-        })
++      dplyr::slice_max(
++        .data = df, order_by = .data[[".READCOUNT."]], with_ties = FALSE, n = n
+       )
+-
+-      if (!isFALSE(verbose)) {
+-        rejects <-
+-          ps_df$.temp_sample_id_var[!ps_df$.temp_sample_id_var %in% keepers]
+-        rejects_message(rejects)
+-      }
+-      union(keepers, no_dupe_samples)
+-    },
+-    "first" = {
+-      keepers <- !duplicated(ps_df[[".temp_grouping_var"]])
+-      if (!isFALSE(verbose)) {
+-        rejects_message(rownames(ps_df)[!keepers])
+-      }
+-      keepers
+     },
+-    "last" = {
+-      keepers <- !duplicated(ps_df[[".temp_grouping_var"]], fromLast = TRUE)
+-      if (!isFALSE(verbose)) {
+-        rejects_message(rownames(ps_df)[!keepers])
+-      }
+-      keepers
+-    }
++    "first" = dplyr::slice_head(df, n = n),
++    "last" = dplyr::slice_tail(df, n = n),
++    "random" = dplyr::slice_sample(df, n = n, replace = FALSE, weight_by = NULL)
+   )
+ 
+-  # prune phyloseq object samples
+-  phyloseq::prune_samples(x = ps, samples = keepers)
++  # message about progress
++  if (verbose) message("Dropped ", nrow(df) - nrow(dfDedupe), " samples.")
++  if (.message_IDs) {
++    message(paste(dplyr::setdiff(df$._ID_., dfDedupe$._ID_.), collapse = ", "))
++  }
++
++  # label samples to keep
++  phyloseq::sample_data(ps)[['.KEEP_SAMPLE.']] <- df$._ID_. %in% dfDedupe$._ID_.
++  if (.label_only) return(ps) # early exit without filtering
++
++  # filter samples
++  ps <- ps_filter(ps, .data$.KEEP_SAMPLE., .keep_all_taxa = .keep_all_taxa)
++  phyloseq::sample_data(ps)[['.KEEP_SAMPLE.']] <- NULL
++
++  return(ps)
+ }
++
+diff --git a/man/ps_dedupe.Rd b/man/ps_dedupe.Rd
+index 89b41a7d..3832f3fa 100644
+--- a/man/ps_dedupe.Rd
++++ b/man/ps_dedupe.Rd
+@@ -4,29 +4,65 @@
+ \alias{ps_dedupe}
+ \title{De-duplicate phyloseq samples}
+ \usage{
+-ps_dedupe(ps, vars, method = "readcount", verbose = TRUE)
++ps_dedupe(
++  ps,
++  vars,
++  method = "readcount",
++  verbose = TRUE,
++  n = 1,
++  .keep_group_var = FALSE,
++  .keep_readcount = FALSE,
++  .message_IDs = FALSE,
++  .label_only = FALSE,
++  .keep_all_taxa = FALSE
++)
+ }
+ \arguments{
+-\item{ps}{phyloseq with sample data}
++\item{ps}{phyloseq object}
++
++\item{vars}{names of variables, whose (combined) levels identify groups
++from which only 1 sample is desired}
++
++\item{method}{keep sample with max "readcount" or the "first" or "last" or "random"
++samples encountered in given sample_data order for each duplicate group}
++
++\item{verbose}{message about number of groups, and number of samples dropped?}
+ 
+-\item{vars}{names of variables, whose (combined) levels identify groups from which only 1 sample is desired}
++\item{n}{number of 'duplicates' to keep per group, defaults to 1}
+ 
+-\item{method}{keep 1 sample with max "readcount" or the "first" or "last" samples encountered in given sample_data order for each dupe group}
++\item{.keep_group_var}{keep grouping variable .GROUP. in phyloseq object?}
+ 
+-\item{verbose}{message names of samples removed if TRUE (or "debug" for more info, when method = "readcount")}
++\item{.keep_readcount}{keep readcount variable .READCOUNT. in phyloseq object?}
++
++\item{.message_IDs}{message sample names of dropped variables?}
++
++\item{.label_only}{if TRUE, the samples will NOT be filtered, just labelled with a new logical
++variable .KEEP_SAMPLE.}
++
++\item{.keep_all_taxa}{keep all taxa after removing duplicates?
++If FALSE, the default, taxa are removed if they never occur in any of
++the retained samples}
+ }
+ \value{
+ phyloseq object
+ }
+ \description{
+-Use 1 or more variables in the sample_data to identify and remove duplicate samples (leaving 1 per category).
++Use one or more variables in the sample_data to identify and
++remove duplicate samples (leaving one sample per group).
+ 
+ \strong{methods:}
+ \itemize{
+-\item method = "readcount" keeps the one sample in each duplicate group with the highest total number of reads according to sample_sums
+-\item method = "first" keeps the first sample in each duplicate group encountered in the row order of the sample_data
+-\item method = "last" keeps the last sample in each duplicate group encountered in the row order of the sample_data
++\item method = "readcount" keeps the one sample in each duplicate group
++with the highest total number of reads (phyloseq::sample_sums)
++\item method = "first" keeps the first sample in each duplicate group
++encountered in the row order of the sample_data
++\item method = "last" keeps the last sample in each duplicate group
++encountered in the row order of the sample_data
++\item method = "random" keeps a random sample from each duplicate group
++(set.seed for reproducibility)
+ }
++
++More than one "duplicate" sample can be kept per group by setting \code{n} samples > 1.
+ }
+ \details{
+ What happens when duplicated samples have exactly equal readcounts in method = "readcount"?
+diff --git a/tests/testthat/_snaps/ps_dedupe/dedupe_group.csv b/tests/testthat/_snaps/ps_dedupe/dedupe_group.csv
+new file mode 100644
+index 00000000..7817b7ab
+--- /dev/null
++++ b/tests/testthat/_snaps/ps_dedupe/dedupe_group.csv
+@@ -0,0 +1,223 @@
++"","x"
++"1","4_DI_obese"
++"2","2_HE_lean"
++"3","2_HE_overweight"
++"4","2_HE_obese"
++"5","2_HE_overweight"
++"6","2_HE_obese"
++"7","2_HE_obese"
++"8","2_HE_overweight"
++"9","2_HE_lean"
++"10","3_HE_lean"
++"11","3_HE_overweight"
++"12","3_HE_obese"
++"13","3_HE_overweight"
++"14","3_HE_obese"
++"15","3_HE_obese"
++"16","3_HE_overweight"
++"17","3_HE_lean"
++"18","4_DI_lean"
++"19","4_DI_overweight"
++"20","4_DI_obese"
++"21","4_DI_overweight"
++"22","4_DI_obese"
++"23","4_DI_obese"
++"24","4_DI_overweight"
++"25","4_DI_lean"
++"26","5_DI_lean"
++"27","5_DI_overweight"
++"28","5_DI_obese"
++"29","5_DI_overweight"
++"30","5_DI_obese"
++"31","5_DI_obese"
++"32","1_ED_overweight"
++"33","1_ED_overweight"
++"34","1_ED_overweight"
++"35","1_ED_lean"
++"36","1_ED_obese"
++"37","1_ED_overweight"
++"38","1_ED_obese"
++"39","1_ED_lean"
++"40","1_ED_obese"
++"41","6_ED_overweight"
++"42","6_ED_overweight"
++"43","6_ED_overweight"
++"44","6_ED_lean"
++"45","6_ED_obese"
++"46","6_ED_overweight"
++"47","6_ED_obese"
++"48","6_ED_lean"
++"49","6_ED_obese"
++"50","1_ED_lean"
++"51","1_ED_lean"
++"52","1_ED_obese"
++"53","6_ED_lean"
++"54","6_ED_lean"
++"55","6_ED_obese"
++"56","1_ED_lean"
++"57","1_ED_lean"
++"58","1_ED_lean"
++"59","1_ED_obese"
++"60","1_ED_overweight"
++"61","1_ED_obese"
++"62","6_ED_lean"
++"63","6_ED_lean"
++"64","6_ED_lean"
++"65","6_ED_obese"
++"66","6_ED_overweight"
++"67","6_ED_obese"
++"68","1_ED_overweight"
++"69","1_ED_lean"
++"70","6_ED_overweight"
++"71","1_ED_obese"
++"72","6_ED_obese"
++"73","1_ED_obese"
++"74","4_DI_lean"
++"75","4_DI_lean"
++"76","4_DI_obese"
++"77","4_DI_overweight"
++"78","4_DI_obese"
++"79","4_DI_lean"
++"80","4_DI_lean"
++"81","4_DI_obese"
++"82","5_DI_lean"
++"83","5_DI_lean"
++"84","5_DI_lean"
++"85","5_DI_obese"
++"86","5_DI_obese"
++"87","5_DI_lean"
++"88","5_DI_obese"
++"89","2_HE_lean"
++"90","2_HE_lean"
++"91","2_HE_lean"
++"92","2_HE_obese"
++"93","2_HE_obese"
++"94","2_HE_lean"
++"95","2_HE_obese"
++"96","3_HE_lean"
++"97","3_HE_lean"
++"98","3_HE_obese"
++"99","3_HE_obese"
++"100","4_DI_lean"
++"101","5_DI_overweight"
++"102","5_DI_lean"
++"103","2_HE_overweight"
++"104","3_HE_lean"
++"105","3_HE_overweight"
++"106","3_HE_obese"
++"107","3_HE_lean"
++"108","3_HE_lean"
++"109","2_HE_overweight"
++"110","2_HE_overweight"
++"111","2_HE_overweight"
++"112","2_HE_lean"
++"113","2_HE_obese"
++"114","2_HE_overweight"
++"115","2_HE_obese"
++"116","2_HE_lean"
++"117","2_HE_overweight"
++"118","2_HE_lean"
++"119","3_HE_overweight"
++"120","3_HE_overweight"
++"121","3_HE_overweight"
++"122","3_HE_lean"
++"123","3_HE_obese"
++"124","3_HE_overweight"
++"125","3_HE_obese"
++"126","3_HE_lean"
++"127","3_HE_obese"
++"128","3_HE_overweight"
++"129","3_HE_lean"
++"130","4_DI_overweight"
++"131","4_DI_overweight"
++"132","4_DI_overweight"
++"133","4_DI_lean"
++"134","4_DI_obese"
++"135","4_DI_overweight"
++"136","4_DI_obese"
++"137","4_DI_lean"
++"138","4_DI_overweight"
++"139","4_DI_lean"
++"140","5_DI_overweight"
++"141","5_DI_overweight"
++"142","5_DI_overweight"
++"143","5_DI_lean"
++"144","5_DI_obese"
++"145","5_DI_overweight"
++"146","5_DI_obese"
++"147","5_DI_lean"
++"148","5_DI_obese"
++"149","5_DI_overweight"
++"150","2_HE_obese"
++"151","3_HE_obese"
++"152","4_DI_obese"
++"153","5_DI_obese"
++"154","2_HE_obese"
++"155","2_HE_obese"
++"156","2_HE_obese"
++"157","2_HE_overweight"
++"158","2_HE_overweight"
++"159","2_HE_overweight"
++"160","2_HE_obese"
++"161","2_HE_obese"
++"162","3_HE_obese"
++"163","3_HE_obese"
++"164","3_HE_overweight"
++"165","3_HE_overweight"
++"166","3_HE_overweight"
++"167","3_HE_obese"
++"168","3_HE_obese"
++"169","5_DI_obese"
++"170","5_DI_obese"
++"171","5_DI_overweight"
++"172","5_DI_overweight"
++"173","4_DI_obese"
++"174","4_DI_obese"
++"175","4_DI_overweight"
++"176","4_DI_overweight"
++"177","6_ED_obese"
++"178","1_ED_obese"
++"179","1_ED_overweight"
++"180","1_ED_overweight"
++"181","1_ED_overweight"
++"182","1_ED_obese"
++"183","1_ED_obese"
++"184","6_ED_obese"
++"185","6_ED_overweight"
++"186","6_ED_overweight"
++"187","4_DI_obese"
++"188","4_DI_obese"
++"189","5_DI_overweight"
++"190","5_DI_obese"
++"191","5_DI_obese"
++"192","6_ED_overweight"
++"193","6_ED_obese"
++"194","6_ED_obese"
++"195","2_HE_overweight"
++"196","2_HE_obese"
++"197","3_HE_overweight"
++"198","3_HE_obese"
++"199","4_DI_overweight"
++"200","4_DI_obese"
++"201","5_DI_overweight"
++"202","5_DI_obese"
++"203","1_ED_overweight"
++"204","1_ED_obese"
++"205","6_ED_overweight"
++"206","6_ED_obese"
++"207","1_ED_lean"
++"208","1_ED_overweight"
++"209","1_ED_obese"
++"210","1_ED_overweight"
++"211","1_ED_obese"
++"212","1_ED_obese"
++"213","1_ED_overweight"
++"214","1_ED_lean"
++"215","6_ED_lean"
++"216","6_ED_overweight"
++"217","6_ED_obese"
++"218","6_ED_overweight"
++"219","6_ED_obese"
++"220","6_ED_obese"
++"221","6_ED_overweight"
++"222","6_ED_lean"
+diff --git a/tests/testthat/_snaps/ps_dedupe/dedupe_readcount.csv b/tests/testthat/_snaps/ps_dedupe/dedupe_readcount.csv
+new file mode 100644
+index 00000000..0f651799
+--- /dev/null
++++ b/tests/testthat/_snaps/ps_dedupe/dedupe_readcount.csv
+@@ -0,0 +1,223 @@
++"","x"
++"1",8459
++"2",21086
++"3",28883
++"4",13245
++"5",17350
++"6",19746
++"7",14636
++"8",22026
++"9",8426
++"10",17256
++"11",26895
++"12",25238
++"13",16702
++"14",16987
++"15",18643
++"16",14384
++"17",18972
++"18",7370
++"19",15084
++"20",22413
++"21",13246
++"22",15541
++"23",21000
++"24",14286
++"25",19805
++"26",6396
++"27",15646
++"28",17857
++"29",9690
++"30",10373
++"31",16367
++"32",10585
++"33",13399
++"34",7648
++"35",12372
++"36",8880
++"37",14175
++"38",20975
++"39",9864
++"40",8625
++"41",7669
++"42",5006
++"43",10410
++"44",16010
++"45",13604
++"46",20509
++"47",16120
++"48",9956
++"49",14400
++"50",11351
++"51",10819
++"52",10979
++"53",8412
++"54",23529
++"55",16757
++"56",1776
++"57",12207
++"58",10503
++"59",6531
++"60",14325
++"61",13984
++"62",8326
++"63",11732
++"64",9614
++"65",8529
++"66",8869
++"67",10920
++"68",8168
++"69",14956
++"70",9328
++"71",10521
++"72",10391
++"73",10011
++"74",12859
++"75",5841
++"76",10831
++"77",21120
++"78",11927
++"79",12557
++"80",11438
++"81",18378
++"82",12927
++"83",10672
++"84",6486
++"85",11005
++"86",15388
++"87",13371
++"88",15076
++"89",14175
++"90",9834
++"91",15059
++"92",12360
++"93",15394
++"94",14074
++"95",16589
++"96",14160
++"97",13637
++"98",13764
++"99",13505
++"100",7136
++"101",18742
++"102",8971
++"103",15572
++"104",13295
++"105",11740
++"106",18476
++"107",18195
++"108",18799
++"109",10412
++"110",13855
++"111",16804
++"112",17086
++"113",15317
++"114",15682
++"115",15440
++"116",12604
++"117",11575
++"118",19340
++"119",13089
++"120",10677
++"121",10592
++"122",10235
++"123",16337
++"124",11420
++"125",20632
++"126",10931
++"127",13955
++"128",11896
++"129",13947
++"130",13264
++"131",7079
++"132",14496
++"133",14873
++"134",10383
++"135",6465
++"136",13437
++"137",8657
++"138",7279
++"139",6829
++"140",8892
++"141",6020
++"142",13850
++"143",18509
++"144",12323
++"145",8450
++"146",10696
++"147",5624
++"148",12364
++"149",15913
++"150",16725
++"151",12525
++"152",15066
++"153",14913
++"154",11545
++"155",14941
++"156",20920
++"157",11168
++"158",15176
++"159",15238
++"160",17197
++"161",18804
++"162",12388
++"163",14833
++"164",5541
++"165",20941
++"166",17133
++"167",17722
++"168",15920
++"169",15275
++"170",10611
++"171",8607
++"172",7009
++"173",13521
++"174",7804
++"175",8212
++"176",8094
++"177",13531
++"178",9731
++"179",8779
++"180",17833
++"181",17784
++"182",11633
++"183",14501
++"184",6639
++"185",7567
++"186",9558
++"187",11471
++"188",9691
++"189",12852
++"190",11993
++"191",7888
++"192",11950
++"193",11667
++"194",7535
++"195",4477
++"196",4606
++"197",7875
++"198",10098
++"199",5757
++"200",18909
++"201",10153
++"202",15058
++"203",10638
++"204",12222
++"205",6697
++"206",15319
++"207",18956
++"208",23131
++"209",17983
++"210",17856
++"211",14939
++"212",19791
++"213",21633
++"214",19040
++"215",8355
++"216",14940
++"217",20964
++"218",11027
++"219",17354
++"220",18474
++"221",13572
++"222",21494
+diff --git a/tests/testthat/test-ps_dedupe.R b/tests/testthat/test-ps_dedupe.R
+index 27d13a3e..cf6ff951 100644
+--- a/tests/testthat/test-ps_dedupe.R
++++ b/tests/testthat/test-ps_dedupe.R
+@@ -1,28 +1,107 @@
+-library(phyloseq)
+-data("dietswap", package = "microbiome")
+ 
+-ps1 <- ps_dedupe(
+-  dietswap,
+-  method = "first", verbose = FALSE,
+-  vars = c("timepoint", "group", "bmi_group")
+-)
++test_that("ps_dedupe errors appropriately'", {
+ 
+-ps2 <- ps_dedupe(
+-  dietswap,
+-  method = "readcount", verbose = FALSE,
+-  vars = c("timepoint", "group", "bmi_group")
+-)
++  library(phyloseq)
++  data("dietswap", package = "microbiome")
++  v <- c("timepoint", "group", "bmi_group")
++  expect_error(
++    ps_dedupe(dietswap, method = "frst", verbose = FALSE,  vars = v),
++    regexp = 'must be one of "readcount", "first", "last", or "random"'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, n = 0),
++    regexp = 'n must be a positive number'
++  )
++  expect_error(ps_dedupe(dietswap, vars = NULL), "vars must be character")
++  expect_error(
++    ps_dedupe(dietswap, vars = "why"),
++    'why is not a variable in phyloseq sample_data'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, verbose = "true"),
++    regexp = 'verbose must be TRUE or FALSE'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, .keep_group_var = "true"),
++    regexp = '.keep_group_var must be TRUE or FALSE'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, .keep_readcount = "true"),
++    regexp = '.keep_readcount must be TRUE or FALSE'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, .message_IDs = "true"),
++    regexp = '.message_IDs must be TRUE or FALSE'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, .label_only = "true"),
++    regexp = '.label_only must be TRUE or FALSE'
++  )
++  expect_error(
++    ps_dedupe(dietswap, vars = v, .keep_all_taxa = "true"),
++    regexp = '.keep_all_taxa must be TRUE or FALSE'
++  )
++})
+ 
+ 
+-test_that("ps_dedupe method = readcount gives same nsamples as method = first", {
+-  expect_equal(nsamples(ps1), nsamples(ps2))
+-})
++test_that("ps_dedupe methods all gives same nsamples", {
+ 
++  local_edition(3)
++  library(phyloseq)
++  data("dietswap", package = "microbiome")
++  v <- c("timepoint", "group", "bmi_group")
++  ps1 <- ps_dedupe(dietswap, method = "first", verbose = FALSE,  vars = v)
++  ps2 <- ps_dedupe(dietswap, method = "readcount", verbose = FALSE, vars = v)
++  ps3 <- ps_dedupe(dietswap, method = "last", verbose = FALSE, vars = v)
++  ps4 <- ps_dedupe(dietswap, method = "random", verbose = FALSE, vars = v)
++  ps5 <- ps_dedupe(dietswap, verbose = FALSE, vars = v, n = 2)
+ 
+-test_that("ps_dedupe method = first example works", {
++  expect_equal(nsamples(ps1), nsamples(ps2))
+   expect_equal(nsamples(ps1), 18)
+-})
++  expect_equal(nsamples(ps3), 18)
++  expect_equal(nsamples(ps4), 18)
++  expect_equal(nsamples(ps5), 36)
+ 
+-test_that("ps_dedupe dietswap readcount example works", {
+-  expect_equal(nsamples(ps2), 18)
++  # check messages
++  suppressMessages(
++    expect_message(
++      ps_dedupe(dietswap, verbose = TRUE, vars = v),
++      regexp = "18 groups: with 8 to 15 samples"
++    )
++  )
++  suppressMessages(
++    expect_message(
++      ps_dedupe(dietswap, verbose = TRUE, vars = v),
++      regexp = "Dropped 204 samples."
++    )
++  )
++  suppressMessages(
++    expect_message(
++      ps_dedupe(dietswap, verbose = TRUE, vars = c("subject", "timepoint")),
++      regexp = "Dropped 0 samples."
++    )
++  )
++  expect_message(
++    ps_dedupe(
++      ps = dietswap, vars = "timepoint", n = 37,
++      .message_IDs = TRUE, verbose = FALSE
++    ),
++    regexp = 'Sample-56, Sample-164'
++  )
++
++  # label only works, including keeping vars
++  psLab <- ps_dedupe(
++    ps = dietswap, verbose = FALSE, vars = v, .label_only = TRUE,
++    .keep_group_var = TRUE, .keep_readcount = TRUE
++  )
++  expect_identical(phyloseq::nsamples(psLab), 222L)
++  expect_identical(sample_names(psLab), sample_names(dietswap))
++  expect_identical(psLab@sam_data$subject, dietswap@sam_data$subject)
++  expect_identical(psLab@sam_data$.KEEP_SAMPLE. %>% sum, 18L)
++  expect_snapshot_csv("dedupe_group", psLab@sam_data$.GROUP.)
++  expect_snapshot_csv("dedupe_readcount", psLab@sam_data$.READCOUNT.)
++  expect_identical(psLab@sam_data$.READCOUNT., unname(sample_sums(dietswap)))
+ })
++
++
++

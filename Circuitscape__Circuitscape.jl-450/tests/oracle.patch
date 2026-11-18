@@ -1,0 +1,497 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index de974e96..3e769a9a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -19,7 +19,6 @@ jobs:
+         version:
+           - '1'
+         os:
+-          - ubuntu-latest
+           - windows-latest
+         arch:
+           - x64
+@@ -42,20 +41,36 @@ jobs:
+           file: lcov.info
+           token: ${{ secrets.CODECOV_TOKEN }}
+ 
+-  test-pardiso:
+-    name: Pardiso Extension Tests
+-    runs-on: ubuntu-latest
++  test-with-pardiso:
++    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
++    runs-on: ${{ matrix.os }}
++    strategy:
++      fail-fast: false
++      matrix:
++        version:
++          - '1'
++        os:
++          - ubuntu-latest
++        arch:
++          - x64
+     steps:
+       - uses: actions/checkout@v6
+       - uses: julia-actions/setup-julia@v2
+         with:
+-          version: '1'
++          version: ${{ matrix.version }}
++          arch: ${{ matrix.arch }}
+       - uses: julia-actions/cache@v3
++      - uses: julia-actions/julia-buildpkg@v1
+       - run: |
+           julia --project -e '
+             using Pkg
+             Pkg.add("Pardiso")
+             Pkg.test()'
++      - uses: julia-actions/julia-processcoverage@v1
++      - uses: codecov/codecov-action@v6
++        with:
++          file: lcov.info
++          token: ${{ secrets.CODECOV_TOKEN }}
+ 
+   docs:
+     name: Documentation
+diff --git a/.gitignore b/.gitignore
+index 59feab3b..8131dbbd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,4 @@ temp/
+ local
+ .Trash-0/
+ docs/build
++test/output/
+diff --git a/src/core.jl b/src/core.jl
+index d233849c..ca4ff073 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -162,8 +162,7 @@ function solve(prob::GraphProblem{T,V}, ::AMGSolver, flags, cfg, log)::Matrix{T}
+         component_data = ComponentData(comp, matrix, local_nodemap, hbmeta, cellmap)
+ 
+         function f(i)
+-            # Each task needs its own workspace (mutable scratch vectors)
+-            # but shares the AMG hierarchy (levels, operators) which is read-only
++            # Each task needs its own workspace (scratch vectors are mutable)
+             ml = P.ml
+             local_P = aspreconditioner(AlgebraicMultigrid.MultiLevel(
+                 ml.levels, ml.final_A, ml.coarse_solver,
+@@ -217,7 +216,7 @@ function solve(prob::GraphProblem{T,V}, ::AMGSolver, flags, cfg, log)::Matrix{T}
+ 
+                         # Solve system
+                         # csinfo("Solving points $pi and $pj")
+-                        log && csinfo("Solving pair $(d[(pi,pj)]) of $num", cfg.suppress_messages)
++                        log && haskey(d, (pi,pj)) && csinfo("Solving pair $(d[(pi,pj)]) of $num", cfg.suppress_messages)
+                         t2 = @elapsed v = solve_linear_system(matrix, current, local_P)
+                         csinfo("Time taken to solve linear system = $t2 seconds", cfg.suppress_messages)
+ 
+@@ -488,7 +487,8 @@ end
+ # TODO: In the pardiso case, we're not really constructing the factor
+ # So can we make this consistent?
+ function construct_cholesky_factor(matrix, ::CholmodSolver, suppress_info::Bool)
+-    t = @elapsed factor = cholesky(matrix + sparse(10eps()*I,size(matrix)...))
++    T = eltype(matrix)
++    t = @elapsed factor = cholesky(matrix + sparse(T(10)*eps(T)*I,size(matrix)...))
+     csinfo("Time taken to construct cholesky factor = $t", suppress_info)
+     factor
+ end
+diff --git a/src/out.jl b/src/out.jl
+index 0fe59474..f43946a9 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -116,12 +116,14 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+ end
+ 
+ function write_currents(node_curr_arr, branch_curr_arr, name, cfg)
+-   pref = split(cfg.output_file, ".out")[1]
+-   # 1e-6 because we guarantee only 6 digits of precision on solve
+-   idx = findall(x -> !isapprox(x, 0.0, atol = 1e-6), branch_curr_arr[:,3])
+-   branch_curr_arr = branch_curr_arr[idx, :]
+-   writedlm("$(pref)_node_currents$(name).txt", node_curr_arr, '\t')
+-   writedlm("$(pref)_branch_currents$(name).txt", branch_curr_arr, '\t')
++    lock(IO_LOCK) do
++        pref = split(cfg.output_file, ".out")[1]
++        # 1e-6 because we guarantee only 6 digits of precision on solve
++        idx = findall(x -> !isapprox(x, 0.0, atol = 1e-6), branch_curr_arr[:,3])
++        branch_curr_arr = branch_curr_arr[idx, :]
++        writedlm("$(pref)_node_currents$(name).txt", node_curr_arr, '\t')
++        writedlm("$(pref)_branch_currents$(name).txt", branch_curr_arr, '\t')
++    end
+ end
+ 
+ _append_name_to_node_currents(node_currents, cc) = [cc node_currents]
+@@ -411,14 +413,14 @@ function write_volt_maps(name, output, component_data, flags, cfg)
+ end
+ 
+ function write_voltages(output, name, voltages::Vector{T}, cc) where {T}
++    lock(IO_LOCK) do
++        volt_arr = zeros(T, size(voltages, 1), 2)
++        volt_arr[:,1] = cc
++        volt_arr[:,2] = voltages
+ 
+-    volt_arr = zeros(T, size(voltages, 1), 2)
+-    volt_arr[:,1] = cc
+-    volt_arr[:,2] = voltages
+-
+-    pref = split(output, ".out")[1]
+-    writedlm("$(pref)_voltages$(name).txt", volt_arr)
+-
++        pref = split(output, ".out")[1]
++        writedlm("$(pref)_voltages$(name).txt", volt_arr)
++    end
+ end
+ 
+ function _create_voltage_map(voltages::Vector{T}, nodemap, hbmeta) where {T}
+@@ -490,6 +492,12 @@ function write_raster(fn_prefix::String,
+                       wkt::String,
+                       transform,
+                       file_format::String)
++    lock(IO_LOCK) do
++        _write_raster(fn_prefix, array, wkt, transform, file_format)
++    end
++end
++
++function _write_raster(fn_prefix, array, wkt, transform, file_format)
+     # transponse array back to columns by rows
+     array_t = permutedims(array, [2, 1])
+ 
+diff --git a/src/run.jl b/src/run.jl
+index 0d60c46f..5ba3f40e 100644
+--- a/src/run.jl
++++ b/src/run.jl
+@@ -16,8 +16,8 @@ function compute(path::String)
+     update_logging!(cfg)
+     write_config(cfg)
+     T = cfg.precision == pr_single ? Float32 : Float64
+-    if T == Float32 && (cfg.solver == st_cholmod || cfg.solver == st_pardiso)
+-        cswarn("Cholmod & Pardiso solver modes work only in double precision. Switching precision to double.")
++    if T == Float32 && cfg.solver == st_pardiso
++        cswarn("Pardiso solver works only in double precision. Switching precision to double.")
+         T = Float64
+     end
+     V = cfg.use_64bit_indexing ? Int64 : Int32
+diff --git a/src/utils.jl b/src/utils.jl
+index e5d1a7ef..101b0ca2 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -3,6 +3,7 @@ export  accumulate_current_maps,
+         calculate_max_current_map
+ 
+ const CUM_LOCK = ReentrantLock()
++const IO_LOCK = ReentrantLock()
+ 
+ mutable struct MutablePair{T,V}
+ 	first::T
+diff --git a/test/output/.gitignore b/test/output/.gitignore
+deleted file mode 100644
+index 18bd5020..00000000
+--- a/test/output/.gitignore
++++ /dev/null
+@@ -1,5 +0,0 @@
+-*.txt
+-*.out
+-*.ini
+-*.asc
+-*.prj
+\ No newline at end of file
+diff --git a/test/runtests.jl b/test/runtests.jl
+index 32cada9b..e2103bcd 100644
+--- a/test/runtests.jl
++++ b/test/runtests.jl
+@@ -2,22 +2,19 @@ using Circuitscape
+ using Test
+ using Logging
+ 
++Logging.disable_logging(Logging.Warn)
++
+ include("test_utils.jl")
+ 
+-# Unit tests for internals
++clean_output()
++
+ @testset "Unit tests" begin
+     include("internal.jl")
+ end
+ 
+-@testset "Issue 341: included pairs" begin
+-    include("issue341.jl")
+-end
+-
+-for f in (compute, compute_cholmod, compute_parallel)
+-    runtests(f)
+-end
++runtests(solver="cg+amg", parallel=true)
++runtests(solver="cholmod", parallel=true)
+ 
+-# Run Pardiso tests only if Pardiso.jl is available and MKL is present
+ pardiso_available = try
+     @eval using Pardiso
+     Pardiso.MKLPardisoSolver()
+@@ -26,5 +23,13 @@ catch
+     false
+ end
+ if pardiso_available
+-    runtests(compute_pardiso)
++    runtests(solver="pardiso", parallel=true)
++else
++    println("Skipping Pardiso tests (MKL not available)")
++end
++
++@testset "Issue 341: included pairs" begin
++    include("issue341.jl")
+ end
++
++clean_output()
+diff --git a/test/test_utils.jl b/test/test_utils.jl
+index edcdfaa6..b9ca575d 100644
+--- a/test/test_utils.jl
++++ b/test/test_utils.jl
+@@ -2,62 +2,29 @@ using Circuitscape
+ using Test
+ using DelimitedFiles
+ 
+-import Circuitscape: parse_config, _compute, SINGLE, CHOLMOD, PARDISO, TRUELIST, cswarn,
+-                     CSConfig, pr_single, st_cholmod, st_pardiso, _precision_str
++import Circuitscape: parse_config, CSConfig
+ 
+-function compute_cholmod(str, batch_size = 5)
+-    cfg = parse_config(str)
+-    T = cfg.precision == pr_single ? Float32 : Float64
+-    V = cfg.use_64bit_indexing ? Int64 : Int32
+-    if T == Float32
+-        cswarn("Cholmod supports only double precision. Changing precision to double.")
+-        T = Float64
+-    end
+-    # Rebuild config with cholmod solver and batch size
+-    d = Dict{String,String}(cfg)
+-    d["solver"] = "cholmod"
+-    d["cholmod_batch_size"] = string(batch_size)
+-    cfg2 = CSConfig(d)
+-    _compute(T, V, cfg2)
+-end
+-
+-function compute_pardiso(str, batch_size = 5)
+-    cfg = parse_config(str)
+-    T = cfg.precision == pr_single ? Float32 : Float64
+-    V = cfg.use_64bit_indexing ? Int64 : Int32
+-    if T == Float32
+-        cswarn("Pardiso supports only double precision. Changing precision to double.")
+-        T = Float64
+-    end
+-    # Rebuild config with pardiso solver and batch size
+-    d = Dict{String,String}(cfg)
+-    d["solver"] = "pardiso"
+-    d["cholmod_batch_size"] = string(batch_size)
+-    cfg2 = CSConfig(d)
+-    _compute(T, V, cfg2)
++"""Clean the test output directory."""
++function clean_output()
++    outdir = joinpath(@__DIR__, "output")
++    rm(outdir, force=true, recursive=true)
++    mkpath(outdir)
+ end
+ 
+-function compute_single(str)
+-    cfg = parse_config(str)
+-    # Rebuild config with single precision
+-    d = Dict{String,String}(cfg)
+-    d["precision"] = "single"
+-    cfg2 = CSConfig(d)
+-    V = cfg2.use_64bit_indexing ? Int64 : Int32
+-    T = Float32
+-    if cfg2.solver == st_cholmod || cfg2.solver == st_pardiso
+-        cswarn("Cholmod and Pardiso support only double precision. Changing precision to double.")
+-        T = Float64
+-    end
+-    _compute(T, V, cfg2)
+-end
++"""
++    compute_with(str; solver, precision, parallel)
+ 
+-function compute_parallel(str, n_processes = 2)
++Run a Circuitscape job with overridden settings.
++"""
++function compute_with(str::String;
++                      solver::String = "",
++                      precision::String = "",
++                      parallel::Bool = false)
+     cfg = parse_config(str)
+-    # Rebuild config with parallel settings
+     d = Dict{String,String}(cfg)
+-    d["parallelize"] = "true"
+-    d["max_parallel"] = "$(n_processes)"
++    solver != "" && (d["solver"] = solver)
++    precision != "" && (d["precision"] = precision)
++    parallel && (d["parallelize"] = "true")
+     compute(d)
+ end
+ 
+@@ -87,22 +54,28 @@ function test_problem(str)
+     end
+ end
+ 
+-function runtests(f = compute)
+-
+-    str = if f == compute_single
+-            "Single"
+-          else
+-            "Double"
+-          end
++"""
++    runtests(; solver, precision, parallel, label)
++
++Run the full Circuitscape test suite with the given settings.
++"""
++function runtests(; solver::String = "", precision::String = "",
++                    parallel::Bool = false, label::String = "")
++    if label == ""
++        parts = String[]
++        push!(parts, solver == "" ? "CG+AMG" : uppercase(solver))
++        push!(parts, parallel ? "parallel" : "sequential")
++        push!(parts, precision == "single" ? "Float32" : "Float64")
++        label = join(parts, ", ")
++    end
+ 
+-    is_single = false
+-    tol = 1e-6
+-    str == "Single" && (is_single = true; tol = 1e-4)
++    is_single = precision == "single"
++    tol = is_single ? 1e-4 : 1e-6
++    f(str) = compute_with(str; solver, precision, parallel)
+ 
+-    @testset "$str Precision Tests" begin
++    @testset "$label" begin
+         @testset "Network Pairwise" begin
+             for i = 1:3
+-                @info("Testing sgNetworkVerify$i")
+                 r = f("input/network/sgNetworkVerify$(i).ini")
+                 x = readdlm("output_verify/sgNetworkVerify$(i)_resistances.out")
+                 valx = x[2:end, 2:end]
+@@ -112,19 +85,16 @@ function runtests(f = compute)
+                 pts_r = r[2:end,1]
+                 @test pts_x .+ 1 == pts_r
+                 compare_all_output("sgNetworkVerify$(i)", is_single)
+-                @info("Test sgNetworkVerify$i passed")
+             end
+         end
+ 
+         @testset "Network Advanced" begin
+             for i = 1:3
+-                @info("Testing mgNetworkVerify$i")
+                 r = f("input/network/mgNetworkVerify$(i).ini")
+                 x = readdlm("output_verify/mgNetworkVerify$(i)_voltages.txt")
+                 @. x[:,1] = x[:,1] + 1
+                 @test sum(abs2, x - r) < tol
+                 compare_all_output("mgNetworkVerify$(i)", is_single)
+-                @info("Test mgNetworkVerify$i passed")
+             end
+         end
+ 
+@@ -134,52 +104,43 @@ function runtests(f = compute)
+                     continue
+                 end
+ 
+-                @info("Testing sgVerify$i")
+                 r = f("input/raster/pairwise/$i/sgVerify$(i).ini")
+                 x = readdlm("output_verify/sgVerify$(i)_resistances.out")
+                 _x = readdlm("output/sgVerify$(i)_resistances.out")
+                 @test sum(abs2, _x - r) < tol
+                 @test sum(abs2, x - r) < tol
+                 compare_all_output("sgVerify$(i)", is_single)
+-                @info("Test sgVerify$i passed")
+             end
+         end
+ 
+         @testset "Raster Advanced" begin
+             for i in 1:6
+-                @info("Testing mgVerify$i")
+                 r = f("input/raster/advanced/$i/mgVerify$(i).ini")
+                 compare_all_output("mgVerify$(i)")
+-                @info("Test mgVerify$i passed")
+             end
+         end
+ 
+         @testset "Raster One to All" begin
+             for i in 1:13
+-                @info("Testing oneToAllVerify$i")
+                 r = f("input/raster/one_to_all/$i/oneToAllVerify$(i).ini")
+                 x = readdlm("output_verify/oneToAllVerify$(i)_resistances.out")
+                 @test sum(abs2, x - r) < tol
+                 compare_all_output("oneToAllVerify$(i)", is_single)
+-                @info("Test oneToAllVerify$i passed")
+             end
+         end
+ 
+         @testset "Raster All to One" begin
+             for i in 1:12
+-                @info("Testing allToOneVerify$i")
+                 r = f("input/raster/all_to_one/$i/allToOneVerify$(i).ini")
+                 x = readdlm("output_verify/allToOneVerify$(i)_resistances.out")
+                 @test sum(abs2, x - r) < tol
+                 compare_all_output("allToOneVerify$(i)", is_single)
+-                @info("Test allToOneVerify$i passed")
+             end
+         end
+     end
+ end
+ 
+ function compare_all_output(str, is_single = false)
+-
+     gen_list, list_to_comp = generate_lists(str)
+     tol = is_single ?  1e-4 : 1e-6
+ 
+@@ -187,38 +148,29 @@ function compare_all_output(str, is_single = false)
+         !occursin("_", f) && continue
+         occursin("resistances", f) && continue
+ 
+-        @info("Testing $f")
+-
+         if endswith(f, "asc")
+             r = read_aagrid("output/$f")
+             x = get_comp(list_to_comp, f)
+             @test compare_aagrid(r, x, tol)
+-            @info("Test $f passed")
+-
+         elseif occursin("Network", f)
+             if occursin("branch", f)
+                 r = read_branch_currents("output/$f")
+                 x = !startswith(f, "mg") ? get_network_comp(list_to_comp, f) : readdlm("output_verify/$f")
+                 @test compare_branch(r, x, tol)
+-                @info("Test $f passed")
+             else
+                 r = read_node_currents("output/$f")
+                 x = !startswith(f, "mg") ? get_network_comp(list_to_comp, f) : readdlm("output_verify/$f")
+                 @test compare_node(r, x, tol)
+-                @info("Test $f passed")
+             end
+         end
+     end
+-
+ end
+ 
+ list_of_files(str, pref) = readdir(pref) |> y -> filter(x -> startswith(x, "$(str)_"), y)
+ generate_lists(str) = list_of_files(str, "output/"), list_of_files(str, "output_verify/")
+ read_branch_currents(str) = readdlm(str)
+ read_node_currents(str) = readdlm(str)
+-
+ read_aagrid(file) = readdlm(file, skipstart = 6)
+-
+ compare_aagrid(r::Matrix{T}, x::Matrix{T}, tol = 1e-6) where T = sum(abs2, x - r) < tol
+ 
+ function get_comp(list_to_comp, f)
+@@ -250,17 +202,3 @@ function compare_node(r, x, tol = 1e-6)
+     @. x[:,1] = x[:,1] + 1
+     sum(abs2, sortslices(r, dims=1) - sortslices(x, dims=1)) < tol
+ end
+-
+-function change_to_test_path()
+-    origpath = pwd()
+-    pkgpath = Base.pathof(Circuitscape)
+-    cd(joinpath(dirname(pkgpath), "..", "test"))
+-    origpath
+-end
+-
+-function runtest(str)
+-    origpath = change_to_test_path()
+-    prob = test_problem(str)
+-    compute(prob)
+-    cd(origpath)
+-end

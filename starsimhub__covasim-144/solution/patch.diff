@@ -1,0 +1,157 @@
+diff --git a/.platform/covasim-deployment.yaml b/.platform/covasim-deployment.yaml
+index ea1bba2d5..b3d58015c 100644
+--- a/.platform/covasim-deployment.yaml
++++ b/.platform/covasim-deployment.yaml
+@@ -37,7 +37,24 @@ spec:
+         name: covasim
+         ports:
+         - containerPort: 80
+-        resources: {}
+-      restartPolicy: Always
++        readinessProbe:
++          exec:
++            command:
++            - curl
++            - --max-time
++            - "10"
++            - http://127.0.0.1:8097/healthcheck
++          initialDelaySeconds: 30
++          periodSeconds: 5
++          failureThreshold: 30
++        livenessProbe:
++          exec:
++            command:
++            - curl
++            - --max-time
++            - "10"
++            - http://127.0.0.1:8097/healthcheck
++          initialDelaySeconds: 240
++          periodSeconds: 5
+ status: {}
+ 
+diff --git a/covasim/utils.py b/covasim/utils.py
+index 9c8643f48..599081a2c 100644
+--- a/covasim/utils.py
++++ b/covasim/utils.py
+@@ -70,7 +70,7 @@ def sample(dist=None, par1=None, par2=None, size=None):
+ def set_seed(seed=None):
+     ''' Reset the random seed -- complicated because of Numba '''
+ 
+-    @nb.njit((nb.int32,))
++    @nb.njit((nb.int32,), cache=True)
+     def set_seed_numba(seed):
+         return np.random.seed(seed)
+ 
+@@ -153,7 +153,7 @@ def multinomial(probs, repeats):
+     return np.searchsorted(np.cumsum(probs), np.random.random(repeats))
+ 
+ 
+-@nb.njit((nb.int32,)) # This hugely increases performance
++@nb.njit((nb.int32,), cache=True) # This hugely increases performance
+ def poisson(rate):
+     ''' A Poisson trial '''
+     return np.random.poisson(rate, 1)[0]
+@@ -165,7 +165,7 @@ def binomial_filter(prob, arr):
+     return arr[(np.random.random(len(arr)) < prob).nonzero()[0]]
+ 
+ 
+-@nb.njit((nb.int32, nb.int32)) # This hugely increases performance
++@nb.njit((nb.int32, nb.int32), cache=True) # This hugely increases performance
+ def choose(max_n, n):
+     '''
+     Choose a subset of items (e.g., people) without replacement.
+@@ -182,7 +182,7 @@ def choose(max_n, n):
+     return np.random.choice(max_n, n, replace=False)
+ 
+ 
+-@nb.njit((nb.int32, nb.int32)) # This hugely increases performance
++@nb.njit((nb.int32, nb.int32), cache=True) # This hugely increases performance
+ def choose_r(max_n, n):
+     '''
+     Choose a subset of items (e.g., people), with replacement.
+@@ -222,7 +222,7 @@ def choose_w(probs, n, unique=True):
+ 
+ #%% The core Covasim functions -- compute the infections
+ 
+-@nb.njit((    nb.float32[:], nb.float32[:], nb.bool_[:], nb.bool_[:], nb.bool_[:],   nb.float32,  nb.float32, nb.float32))
++@nb.njit((    nb.float32[:], nb.float32[:], nb.bool_[:], nb.bool_[:], nb.bool_[:],   nb.float32,  nb.float32, nb.float32), cache=True)
+ def compute_probs(rel_trans,       rel_sus,        symp,        diag,        quar, asymp_factor, diag_factor, quar_trans):
+     ''' Calculate relative transmissibility and susceptibility '''
+     f_asymp    =  symp + ~symp * asymp_factor # Asymptomatic factor, changes e.g. [0,1] with a factor of 0.8 to [0.8,1.0]
+@@ -233,7 +233,7 @@ def compute_probs(rel_trans,       rel_sus,        symp,        diag,        qua
+     return rel_trans, rel_sus
+ 
+ 
+-@nb.njit((    nb.float32, nb.int32[:], nb.int32[:], nb.float32[:], nb.float32[:], nb.float32[:]))
++@nb.njit((    nb.float32, nb.int32[:], nb.int32[:], nb.float32[:], nb.float32[:], nb.float32[:]), cache=True)
+ def compute_targets(beta,     sources,     targets,   layer_betas,     rel_trans,       rel_sus):
+     ''' The heaviest step of the model -- figure out who gets infected on this timestep '''
+     betas           = beta * layer_betas  * rel_trans[sources] * rel_sus[targets] # Calculate the raw transmission probabilities
+diff --git a/covasim/webapp/cova_app.py b/covasim/webapp/cova_app.py
+index 4e5e8f77e..d75962dad 100644
+--- a/covasim/webapp/cova_app.py
++++ b/covasim/webapp/cova_app.py
+@@ -3,7 +3,9 @@
+ '''
+ 
+ # Key imports
++
+ import covasim as cv
++import flask
+ import os
+ import sys
+ import numpy as np
+@@ -33,6 +35,11 @@
+ die      = False # Whether or not to raise exceptions instead of continuing
+ 
+ 
++# Define a get API for readiness in kubernetes
++@app.route('/healthcheck')
++def healthcheck():
++    return flask.jsonify(dict(status="ok"))
++
+ def log_err(message:str, ex:Exception):
+     tex = traceback.TracebackException.from_exception(ex)
+     out = f"{message} {traceback.format_exception_only(tex.exc_type, tex)}"
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 90e9421ce..0f9892868 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -2,7 +2,7 @@ FROM continuumio/miniconda3:latest
+ 
+ ENV PATH="/opt/conda/bin:${PATH}"
+ 
+-RUN apt-get -y update && apt-get install -y nginx supervisor
++RUN apt-get -y update && apt-get install -y nginx supervisor curl
+ 
+ # conda has its own gcc. Install it so we can compile required packages.
+ RUN conda install gcc_linux-64
+@@ -22,6 +22,8 @@ WORKDIR /app
+ COPY docker/docker_nginx.conf /etc/nginx/sites-enabled/default
+ 
+ RUN python3 -m pip install .
++# bytcode compile python libraries to improve startup times
++RUN python3 -m compileall $(python3 -c "import covasim,os;print(os.path.dirname(covasim.__file__))" | tail -n 1)
+ RUN cd data && ./run_scrapers
+ 
+ CMD /etc/init.d/nginx restart && supervisord -c docker/supervisord.conf
+diff --git a/docker/supervisord.conf b/docker/supervisord.conf
+index e820c2fc0..c68988a0b 100644
+--- a/docker/supervisord.conf
++++ b/docker/supervisord.conf
+@@ -2,7 +2,7 @@
+ nodaemon=true
+ 
+ [program:app]
+-command=gunicorn --reload --workers=8 --bind=127.0.0.1:8097 covasim.webapp.cova_app:flask_app
++command=gunicorn --workers=8 --bind=127.0.0.1:8097 covasim.webapp.cova_app:flask_app --timeout 240 --error-logfile -
+ stdout_logfile=/dev/stdout
+ stdout_logfile_maxbytes=0
+ stdout_logfile=/dev/stderr
+@@ -10,4 +10,4 @@ stdout_logfile_maxbytes=0
+ autostart=true
+ autorestart=true
+ startsecs=10
+-stopwaitsecs=600
++stopwaitsecs=600
+\ No newline at end of file

@@ -1,0 +1,194 @@
+diff --git a/.github/workflows/qiita-ci.yml b/.github/workflows/qiita-ci.yml
+index a54ce20e3..0d9e40ca2 100644
+--- a/.github/workflows/qiita-ci.yml
++++ b/.github/workflows/qiita-ci.yml
+@@ -8,7 +8,9 @@ on:
+ jobs:
+   # derived from https://github.com/actions/example-services/blob/master/.github/workflows/postgres-service.yml
+   main:
+-    runs-on: ubuntu-latest
++    # pinned: ubuntu-latest moved to Ubuntu 26 on 2026-10-19, which ships no
++    # preinstalled Miniconda and no Python 3.9
++    runs-on: ubuntu-24.04
+ 
+     strategy:
+       matrix:
+@@ -241,7 +243,7 @@ jobs:
+ 
+   coveralls_finish:
+     needs: main
+-    runs-on: ubuntu-latest
++    runs-on: ubuntu-24.04
+     steps:
+       - name: Coveralls Finished
+         uses: AndreMiras/coveralls-python-action@develop
+@@ -250,7 +252,7 @@ jobs:
+           parallel-finished: true
+ 
+   lint:
+-    runs-on: ubuntu-latest
++    runs-on: ubuntu-24.04
+     steps:
+       - name: ruff
+         uses: actions/setup-python@v2
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f0c10260e..1dad3d6c8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,13 @@
+ # Qiita changelog
+ 
+ 
++Unreleased
++----------
++
++* Changing the visibility of an artifact now requires edit permissions on its study or analysis; before, any authenticated user could change it in a public study. [#3524](https://github.com/qiita-spots/qiita/pull/3524).
++* Fixed the access checks that took a study being public as meaning its artifacts are public. A study is public if *any* of its artifacts is public, so in a study with mixed visibilities the files, prep information and artifact pages of the non-public artifacts were reachable by any authenticated user; `validate_filepath_access_by_user` and `check_artifact_access` now ignore the study's public status when the artifact itself is not public.
++
++
+ Version 2026.01
+ ---------------
+ 
+diff --git a/qiita_db/meta_util.py b/qiita_db/meta_util.py
+index 58c002464..0eaff5a6d 100644
+--- a/qiita_db/meta_util.py
++++ b/qiita_db/meta_util.py
+@@ -148,8 +148,11 @@ def validate_filepath_access_by_user(user, filepath_id):
+             else:
+                 study = artifact.study
+                 if study:
+-                    # let's take the visibility via the Study
+-                    return artifact.study.has_access(user)
++                    # let's take the visibility via the Study. Note that
++                    # no_public is required: a study is public if ANY of its
++                    # artifacts is public (infer_status), so a public study
++                    # tells us nothing about this, non public, artifact
++                    return artifact.study.has_access(user, no_public=True)
+                 else:
+                     analysis = artifact.analysis
+                     return analysis in (user.private_analyses | user.shared_analyses)
+@@ -169,13 +172,15 @@ def validate_filepath_access_by_user(user, filepath_id):
+             # however, the prep info file could not have any artifacts attached
+             # , in that case we will use the study access level
+             if a is None:
+-                return qdb.study.Study(pt.study_id).has_access(user)
++                return qdb.study.Study(pt.study_id).has_access(user, no_public=True)
+             else:
+-                if a.visibility == "public" or a.study.has_access(user):
++                if a.visibility == "public" or a.study.has_access(user, no_public=True):
+                     return True
+                 else:
+                     for c in a.descendants.nodes():
+-                        if c.visibility == "public" or c.study.has_access(user):
++                        if c.visibility == "public" or c.study.has_access(
++                            user, no_public=True
++                        ):
+                             return True
+             return False
+         # analyses
+diff --git a/qiita_db/test/test_meta_util.py b/qiita_db/test/test_meta_util.py
+index a8989dbdb..7c60ecfd9 100644
+--- a/qiita_db/test/test_meta_util.py
++++ b/qiita_db/test/test_meta_util.py
+@@ -43,6 +43,15 @@ def _set_artifact_public(self):
+             "UPDATE qiita.artifact SET visibility_id = %d" % id_status
+         )
+ 
++    def _set_artifact_visibility(self, artifact_id, visibility):
++        # note that this is done via SQL, and not via Artifact.visibility, so
++        # the change is NOT propagated to the rest of the tree; that is what
++        # lets us build a study with mixed visibilities
++        qdb.sql_connection.perform_as_transaction(
++            "UPDATE qiita.artifact SET visibility_id = %s WHERE artifact_id = %s",
++            [qdb.util.convert_to_id(visibility, "visibility"), artifact_id],
++        )
++
+     def test_validate_filepath_access_by_user(self):
+         self._set_artifact_private()
+ 
+@@ -167,6 +176,29 @@ def test_validate_filepath_access_by_user(self):
+         qdb.analysis.Analysis(1).share(user)
+         qdb.study.Study.delete(study.id)
+ 
++    def test_validate_filepath_access_by_user_mixed_visibility(self):
++        # a study is public if ANY of its artifacts is public (infer_status),
++        # so the artifacts of that study that are NOT public have to stay
++        # protected; demo has no access to Study(1)
++        self._set_artifact_private()
++        user = qdb.user.User("demo@microbio.me")
++
++        # artifact 1 -> filepaths 1, 2; artifact 2 -> 3, 4, 5;
++        # artifact 6 -> 12; all of them in Study(1)
++        for i in [1, 2, 3, 4, 5, 12]:
++            self.assertFalse(qdb.meta_util.validate_filepath_access_by_user(user, i))
++
++        # making a single artifact public is enough for the whole study to
++        # report itself as public
++        self._set_artifact_visibility(6, "public")
++        self.assertEqual(qdb.study.Study(1).status, "public")
++
++        # the public artifact is now reachable ...
++        self.assertTrue(qdb.meta_util.validate_filepath_access_by_user(user, 12))
++        # ... but the ones that are still private are not
++        for i in [1, 2, 3, 4, 5]:
++            self.assertFalse(qdb.meta_util.validate_filepath_access_by_user(user, i))
++
+     def test_get_lat_longs(self):
+         # no public studies should return an empty array
+         obs = qdb.meta_util.get_lat_longs()
+diff --git a/qiita_pet/handlers/artifact_handlers/base_handlers.py b/qiita_pet/handlers/artifact_handlers/base_handlers.py
+index 72f2909e1..037316411 100644
+--- a/qiita_pet/handlers/artifact_handlers/base_handlers.py
++++ b/qiita_pet/handlers/artifact_handlers/base_handlers.py
+@@ -53,7 +53,10 @@ def check_artifact_access(user, artifact):
+     else:
+         analysis = artifact.analysis
+         if study:
+-            if not study.has_access(user):
++            # no_public is required: a study is public if ANY of its artifacts
++            # is public (infer_status), so a public study tells us nothing
++            # about this, non public, artifact
++            if not study.has_access(user, no_public=True):
+                 raise QiitaHTTPError(403, "Access denied to study %s" % artifact.id)
+         elif analysis:
+             if not analysis.has_access(user):
+diff --git a/qiita_pet/handlers/artifact_handlers/tests/test_base_handlers.py b/qiita_pet/handlers/artifact_handlers/tests/test_base_handlers.py
+index d6db82096..10a976df4 100644
+--- a/qiita_pet/handlers/artifact_handlers/tests/test_base_handlers.py
++++ b/qiita_pet/handlers/artifact_handlers/tests/test_base_handlers.py
+@@ -22,7 +22,9 @@
+ from qiita_db.logger import LogEntry
+ from qiita_db.processing_job import ProcessingJob
+ from qiita_db.software import Command, Parameters
++from qiita_db.sql_connection import perform_as_transaction
+ from qiita_db.user import User
++from qiita_db.util import convert_to_id
+ from qiita_pet.exceptions import QiitaHTTPError
+ from qiita_pet.handlers.artifact_handlers.base_handlers import (
+     artifact_patch_request,
+@@ -73,6 +75,25 @@ def test_check_artifact_access(self):
+         a.visibility = "public"
+         check_artifact_access(demo_u, a)
+ 
++    def test_check_artifact_access_mixed_visibility(self):
++        # a study is public if ANY of its artifacts is public (infer_status),
++        # so a non public artifact of that study has to stay protected
++        demo_u = User("demo@microbio.me")
++        a = Artifact(1)
++        self.assertEqual(a.visibility, "private")
++
++        # artifact 6 belongs to the same study as artifact 1; setting it via
++        # SQL so the change is not propagated to the rest of the tree
++        perform_as_transaction(
++            "UPDATE qiita.artifact SET visibility_id = %s WHERE artifact_id = %s",
++            [convert_to_id("public", "visibility"), 6],
++        )
++        self.assertEqual(a.study.status, "public")
++
++        # artifact 1 is still private, so demo must not get through
++        with self.assertRaises(HTTPError):
++            check_artifact_access(demo_u, a)
++
+     def _assert_summary_equal(self, obs, exp):
+         "Utility function for testing the artifact summary get request"
+         obs_files = obs.pop("files")

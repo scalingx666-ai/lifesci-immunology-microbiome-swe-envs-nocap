@@ -1,0 +1,799 @@
+diff --git a/metagraph/external-libraries/sdsl-lite b/metagraph/external-libraries/sdsl-lite
+index 8dcbd1c799..47e4ebd8ee 160000
+--- a/metagraph/external-libraries/sdsl-lite
++++ b/metagraph/external-libraries/sdsl-lite
+@@ -1 +1 @@
+-Subproject commit 8dcbd1c799272ed4b0691f81df8864f1d1b2527c
++Subproject commit 47e4ebd8eeb24f6e3de399db06ae1934037ed59f
+diff --git a/metagraph/src/annotation/representation/column_compressed/annotate_column_compressed.cpp b/metagraph/src/annotation/representation/column_compressed/annotate_column_compressed.cpp
+index 4a14876503..b4c9e5ac09 100644
+--- a/metagraph/src/annotation/representation/column_compressed/annotate_column_compressed.cpp
++++ b/metagraph/src/annotation/representation/column_compressed/annotate_column_compressed.cpp
+@@ -534,7 +534,7 @@ bool ColumnCompressed<Label>::merge_load(const std::vector<std::string> &filenam
+                 if (col == bitmatrix_.size()) {
+                     bitmatrix_.emplace_back(std::move(column));
+                 } else {
+-                    assert(bitmatrix_.at(col).get());
++                    assert(bitmatrix_.at(col).get() || cached_columns_.Cached(col));
+                     decompress_bitmap(col) |= *column;
+                 }
+             } else {
+diff --git a/metagraph/src/common/utils/file_utils.cpp b/metagraph/src/common/utils/file_utils.cpp
+index 6236b70573..9c3e8598aa 100644
+--- a/metagraph/src/common/utils/file_utils.cpp
++++ b/metagraph/src/common/utils/file_utils.cpp
+@@ -16,7 +16,7 @@
+ #include <stdio.h>
+ #endif
+ 
+-#include <sdsl/memory_management.hpp>
++#include <sdsl/shared_mapper.hpp>
+ 
+ #include "common/logger.hpp"
+ 
+@@ -76,7 +76,7 @@ bool with_madvise() {
+ std::unique_ptr<std::ifstream> open_ifstream(const std::string &filename, bool mmap_stream) {
+     std::unique_ptr<std::ifstream> in;
+     if (mmap_stream) {
+-        in.reset(new sdsl::mmap_ifstream(filename, std::ios_base::binary));
++        in.reset(new sdsl::shared_mapper_ifstream(filename, std::ios_base::binary));
+     } else {
+         in.reset(new named_ifstream(filename, std::ios_base::binary));
+     }
+@@ -111,7 +111,7 @@ void madvise_random_range(std::istream &f, std::streamoff start, std::streamoff
+ 
+ void load_mmap_random(const std::string &filename, std::streamoff offset,
+                       const std::function<void(std::istream &)> &fn) {
+-    sdsl::mmap_ifstream in(filename);
++    sdsl::shared_mapper_ifstream in(filename);
+     in.seekg(offset, std::ios_base::beg);
+     fn(in);
+     madvise_random_range(in, offset);
+diff --git a/metagraph/src/common/vectors/annotation_vector_io.hpp b/metagraph/src/common/vectors/annotation_vector_io.hpp
+new file mode 100644
+index 0000000000..711beed833
+--- /dev/null
++++ b/metagraph/src/common/vectors/annotation_vector_io.hpp
+@@ -0,0 +1,61 @@
++#ifndef MTG_ANNOTATION_VECTOR_IO_HPP
++#define MTG_ANNOTATION_VECTOR_IO_HPP
++#include <cstdint>
++#include <cstring>
++#include <istream>
++#include <ostream>
++#include <span>
++#include <stdexcept>
++#include <sdsl/packed_vector_view.hpp>
++#include <sdsl/shared_mapper.hpp>
++namespace mtg::detail {
++// Read and write the existing MetaGraph annotation-vector format:
++// a 64-bit bit count, an optional width byte, then the packed payload.
++// SDSL provides the shared packed view and ownership conversion.
++template <uint8_t Width> class annotation_vector_io : public sdsl::packed_vector_view<Width> {
++    using base = sdsl::packed_vector_view<Width>;
++    using vector_type = sdsl::int_vector<Width>;
++
++  public:
++    annotation_vector_io() = default;
++    using base::base;
++    const base &packed() const { return *this; }
++    void load(std::istream &in) {
++        base next;
++        if (auto *stream = dynamic_cast<sdsl::mmap_ifstream *>(&in)) {
++            auto owner = stream->get_mmap_context();
++            auto pos = in.tellg();
++            if (pos < 0 || !owner)
++                throw std::ios_base::failure("Invalid mapped vector position");
++            uint64_t offset = pos, header = 8 + (Width == 0), bits;
++            if (offset > owner->file_size_bytes() || header > owner->file_size_bytes() - offset)
++                throw std::ios_base::failure("Packed vector header outside file");
++            std::memcpy(&bits, owner->data() + offset, 8);
++            uint8_t width = Width ? Width : owner->data()[offset + 8];
++            std::span<const std::byte> file(reinterpret_cast<const std::byte *>(owner->data()),
++                                            owner->file_size_bytes());
++            next = base::from_bytes(owner, file.subspan(offset + header), bits, width);
++            in.seekg(header + next.bytes().size(), std::ios_base::cur);
++        } else {
++            vector_type value;
++            value.load(in);
++            next = base(std::move(value));
++        }
++        if (!in)
++            throw std::ios_base::failure("Cannot load packed vector view");
++        static_cast<base &>(*this) = std::move(next);
++    }
++    void serialize(std::ostream &out) const {
++        auto bits = this->bit_size();
++        out.write(reinterpret_cast<const char *>(&bits), 8);
++        if constexpr (Width == 0) {
++            auto w = this->width();
++            out.write(reinterpret_cast<const char *>(&w), 1);
++        }
++        auto bytes = this->bytes();
++        if (!bytes.empty())
++            out.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
++    }
++};
++} // namespace mtg::detail
++#endif
+diff --git a/metagraph/src/common/vectors/bit_vector.cpp b/metagraph/src/common/vectors/bit_vector.cpp
+index 2cde98e010..129bdbe823 100644
+--- a/metagraph/src/common/vectors/bit_vector.cpp
++++ b/metagraph/src/common/vectors/bit_vector.cpp
+@@ -35,7 +35,7 @@ Vector bit_vector::convert_to() {
+         sdsl::bit_vector bv;
+         if (auto *bv_stat = dynamic_cast<bit_vector_stat*>(this)) {
+             // stat -> anything else
+-            bv = std::move(bv_stat->vector_);
++            bv = bv_stat->take_owned();
+         } else {
+             // anything -> anything (slower: with full reconstruction)
+             bv = to_vector();
+@@ -91,7 +91,7 @@ Vector bit_vector::copy_to() const {
+         sdsl::bit_vector bv;
+         if (auto *bv_stat = dynamic_cast<const bit_vector_stat*>(this)) {
+             // copy stat -> anything else
+-            bv = bv_stat->vector_;
++            bv = bv_stat->to_vector();
+         } else {
+             // anything -> anything (slower: with full reconstruction)
+             bv = to_vector();
+diff --git a/metagraph/src/common/vectors/bit_vector_sdsl.hpp b/metagraph/src/common/vectors/bit_vector_sdsl.hpp
+index 083b3547c4..af875e380c 100644
+--- a/metagraph/src/common/vectors/bit_vector_sdsl.hpp
++++ b/metagraph/src/common/vectors/bit_vector_sdsl.hpp
+@@ -13,6 +13,7 @@
+ #include "common/serialization.hpp"
+ #include "vector_algorithm.hpp"
+ #include "bit_vector.hpp"
++#include "annotation_vector_io.hpp"
+ 
+ 
+ template <class bv_type, class rank_1_type, class select_1_type, class select_0_type>
+@@ -31,13 +32,13 @@ class bit_vector_sdsl : public bit_vector {
+     explicit bit_vector_sdsl(uint64_t size = 0, bool value = false)
+       : bit_vector_sdsl(sdsl::bit_vector(size, value)) {}
+     explicit bit_vector_sdsl(const sdsl::bit_vector &vector)
+-      : vector_(vector), rk1_(&vector_), slct1_(&vector_), slct0_(&vector_),
+-        num_set_bits_(rk1_(vector_.size())) {}
++      : vector_(vector), rk1_(&packed()), slct1_(&packed()), slct0_(&packed()),
++        num_set_bits_(rk1_(packed().size())) {}
+     explicit bit_vector_sdsl(const bit_vector_sdsl &other) { *this = other; }
+ 
+     bit_vector_sdsl(sdsl::bit_vector&& vector)
+-      : vector_(std::move(vector)), rk1_(&vector_), slct1_(&vector_), slct0_(&vector_),
+-        num_set_bits_(rk1_(vector_.size())) {}
++      : vector_(std::move(vector)), rk1_(&packed()), slct1_(&packed()), slct0_(&packed()),
++        num_set_bits_(rk1_(packed().size())) {}
+     bit_vector_sdsl(bit_vector_sdsl&& other) { *this = std::move(other); }
+     bit_vector_sdsl(std::initializer_list<bool> init)
+       : bit_vector_sdsl(sdsl::bit_vector(init.begin(), init.end())) {}
+@@ -64,7 +65,7 @@ class bit_vector_sdsl : public bit_vector {
+     inline bool load(std::istream &in) override;
+     inline void serialize(std::ostream &out) const override;
+ 
+-    inline uint64_t size() const override { return vector_.size(); }
++    inline uint64_t size() const override { return packed().size(); }
+     inline uint64_t num_set_bits() const override { return num_set_bits_; }
+ 
+     inline void call_ones_in_range(uint64_t begin, uint64_t end,
+@@ -74,7 +75,7 @@ class bit_vector_sdsl : public bit_vector {
+ 
+     inline sdsl::bit_vector to_vector() const override;
+ 
+-    inline const bv_type& data() const { return vector_; }
++    inline const auto &data() const { return packed(); }
+ 
+     /**
+      * Predict space taken by the vector with given its parameters in bits.
+@@ -87,7 +88,17 @@ class bit_vector_sdsl : public bit_vector {
+     }
+ 
+   private:
+-    bv_type vector_;
++    using storage_type = std::conditional_t<std::is_same_v<bv_type, sdsl::bit_vector>,
++        mtg::detail::annotation_vector_io<1>, bv_type>;
++    const auto &packed() const {
++        if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) return vector_.packed();
++        else return vector_;
++    }
++    sdsl::bit_vector take_owned() {
++        if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) return std::move(vector_).into_owned();
++        else return to_vector();
++    }
++    storage_type vector_;
+     rank_1_type rk1_;
+     select_1_type slct1_;
+     select_0_type slct0_;
+@@ -101,11 +112,11 @@ bit_vector_sdsl<bv_type, rank_1_type, select_1_type, select_0_type>
+ ::operator=(const bit_vector_sdsl &other) {
+     vector_ = other.vector_;
+     rk1_ = other.rk1_;
+-    rk1_.set_vector(&vector_);
++    rk1_.set_vector(&packed());
+     slct1_ = other.slct1_;
+-    slct1_.set_vector(&vector_);
++    slct1_.set_vector(&packed());
+     slct0_ = other.slct0_;
+-    slct0_.set_vector(&vector_);
++    slct0_.set_vector(&packed());
+     num_set_bits_ = other.num_set_bits_;
+     return *this;
+ }
+@@ -116,11 +127,11 @@ bit_vector_sdsl<bv_type, rank_1_type, select_1_type, select_0_type>
+ ::operator=(bit_vector_sdsl&& other) noexcept {
+     vector_ = std::move(other.vector_);
+     rk1_ = std::move(other.rk1_);
+-    rk1_.set_vector(&vector_);
++    rk1_.set_vector(&packed());
+     slct1_ = std::move(other.slct1_);
+-    slct1_.set_vector(&vector_);
++    slct1_.set_vector(&packed());
+     slct0_ = std::move(other.slct0_);
+-    slct0_.set_vector(&vector_);
++    slct0_.set_vector(&packed());
+     num_set_bits_ = other.num_set_bits_;
+     return *this;
+ }
+@@ -158,7 +169,7 @@ ::inverse_select(uint64_t id) const {
+     if constexpr(is_rrr<bv_type>{}) {
+         // TODO: implement inverse_select for sdsl::rrr_vector<15>
+         if constexpr(bv_type::block_size != 15) {
+-            std::pair<bool, uint64_t> pair = vector_.inverse_select(id);
++            std::pair<bool, uint64_t> pair = packed().inverse_select(id);
+             pair.second += pair.first;
+             return pair;
+         }
+@@ -174,7 +185,7 @@ ::conditional_rank1(uint64_t id) const {
+     if constexpr(is_rrr<bv_type>{}) {
+         // TODO: implement conditional_rank for sdsl::rrr_vector<15>
+         if constexpr(bv_type::block_size != 15) {
+-            return vector_.conditional_rank(id);
++            return packed().conditional_rank(id);
+         }
+     }
+     return bit_vector::conditional_rank1(id);
+@@ -187,11 +198,11 @@ ::next1(uint64_t id) const {
+     assert(id < size());
+ 
+     if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+-        auto next = next_bit(vector_, id, bv_traits<bv_type>::MAX_ITER_BIT_VECTOR);
+-        if (next < vector_.size())
++        auto next = next_bit(packed(), id, bv_traits<bv_type>::MAX_ITER_BIT_VECTOR);
++        if (next < packed().size())
+             return next;
+ 
+-        if (vector_.size() - id <= bv_traits<bv_type>::MAX_ITER_BIT_VECTOR)
++        if (packed().size() - id <= bv_traits<bv_type>::MAX_ITER_BIT_VECTOR)
+             return size();
+ 
+         uint64_t rk = rank1(id) + 1;
+@@ -208,7 +219,7 @@ ::prev1(uint64_t id) const {
+     assert(id < size());
+ 
+     if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+-        auto prev = prev_bit(vector_, id, bv_traits<bv_type>::MAX_ITER_BIT_VECTOR);
++        auto prev = prev_bit(packed(), id, bv_traits<bv_type>::MAX_ITER_BIT_VECTOR);
+         if (prev <= id)
+             return prev;
+ 
+@@ -250,10 +261,10 @@ ::load(std::istream &in) {
+         if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+             load_number(in);
+         }
+-        rk1_.load(in, &vector_);
+-        slct1_.load(in, &vector_);
+-        slct0_.load(in, &vector_);
+-        num_set_bits_ = rk1_(vector_.size());
++        rk1_.load(in, &packed());
++        slct1_.load(in, &packed());
++        slct0_.load(in, &packed());
++        num_set_bits_ = rk1_(packed().size());
+         return in.good();
+ 
+     } catch (const std::bad_alloc &exception) {
+@@ -286,7 +297,7 @@ sdsl::bit_vector
+ bit_vector_sdsl<bv_type, rank_1_type, select_1_type, select_0_type>
+ ::to_vector() const {
+     if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+-        return vector_;
++        return vector_.to_owned();
+     } else {
+         return bit_vector::to_vector_adaptive(
+             bv_traits<bv_type>::SEQ_BITWISE_WORD_ACCESS_VS_SELECT_FACTOR
+@@ -303,7 +314,7 @@ ::call_ones_in_range(uint64_t begin, uint64_t end,
+     assert(end <= size());
+ 
+     if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+-        ::call_ones(vector_, begin, end, callback);
++        ::call_ones(packed(), begin, end, callback);
+     } else {
+         bit_vector::call_ones_adaptive(begin, end, callback,
+             bv_traits<bv_type>::SEQ_BITWISE_WORD_ACCESS_VS_SELECT_FACTOR
+@@ -319,7 +330,10 @@ ::add_to(sdsl::bit_vector *other) const {
+     assert(other->size() == size());
+ 
+     if constexpr(std::is_same_v<bv_type, sdsl::bit_vector>) {
+-        *other |= vector_;
++        auto words = packed().data();
++        const uint64_t num_words = (size() + 63) / 64;
++        for (uint64_t i = 0; i < num_words; ++i)
++            other->data()[i] |= words[i];
+     } else {
+         bit_vector::add_to_adaptive(other,
+             bv_traits<bv_type>::SEQ_BITWISE_WORD_ACCESS_VS_SELECT_FACTOR
+@@ -407,26 +421,25 @@ ::bv_traits<sdsl::int_vector<t_width>> {
+ };
+ 
+ template <class bv_type, class rank_1_type, class select_1_type, class select_0_type>
+-template <uint8_t t_b, uint8_t t_pat_len>
+-struct bit_vector_sdsl<bv_type, rank_1_type, select_1_type, select_0_type>
+-::bv_traits<sdsl::rank_support_v5<t_b, t_pat_len>> {
++template <uint8_t t_b, uint8_t t_pat_len, class Vector>
++struct bit_vector_sdsl<bv_type, rank_1_type, select_1_type,
++                       select_0_type>::bv_traits<sdsl::rank_support_v5<t_b, t_pat_len, Vector>> {
+     static inline uint64_t predict_size(uint64_t size, uint64_t /*num_set_bits*/) {
+-        return sizeof(sdsl::rank_support_v5<t_b, t_pat_len>) * 8
+-            + footprint_rank_support_v5(size);
++        return sizeof(sdsl::rank_support_v5<t_b, t_pat_len, Vector>) * 8 +
++               footprint_rank_support_v5(size);
+     }
+ };
+ 
+ template <class bv_type, class rank_1_type, class select_1_type, class select_0_type>
+-template <uint8_t t_b, uint8_t t_pat_len>
+-struct bit_vector_sdsl<bv_type, rank_1_type, select_1_type, select_0_type>
+-::bv_traits<sdsl::select_support_mcl<t_b, t_pat_len>> {
++template <uint8_t t_b, uint8_t t_pat_len, class Vector>
++struct bit_vector_sdsl<bv_type, rank_1_type, select_1_type,
++                       select_0_type>::bv_traits<sdsl::select_support_mcl<t_b, t_pat_len, Vector>> {
+     static inline uint64_t predict_size(uint64_t size, uint64_t num_set_bits) {
+-        return sizeof(sdsl::select_support_mcl<t_b, t_pat_len>) * 8
+-            + footprint_select_support_mcl(size, num_set_bits);
++        return sizeof(sdsl::select_support_mcl<t_b, t_pat_len, Vector>) * 8 +
++               footprint_select_support_mcl(size, num_set_bits);
+     }
+ };
+ 
+-
+ template <uint32_t k_sblock_rate = 16>
+ using bit_vector_hyb
+     = bit_vector_sdsl<sdsl::hyb_vector<k_sblock_rate>,
+@@ -448,10 +461,9 @@ using bit_vector_rrr
+                       typename sdsl::rrr_vector<block_size>::select_1_type,
+                       typename sdsl::rrr_vector<block_size>::select_0_type>;
+ 
+-using bit_vector_stat
+-    = bit_vector_sdsl<sdsl::bit_vector,
+-                      sdsl::rank_support_v5<1>,
+-                      sdsl::select_support_mcl<1>,
+-                      sdsl::select_support_scan<0>>;
++using bit_vector_stat =
++    bit_vector_sdsl<sdsl::bit_vector, sdsl::rank_support_v5<1, 1, sdsl::packed_vector_view<1>>,
++                    sdsl::select_support_mcl<1, 1, sdsl::packed_vector_view<1>>,
++                    sdsl::select_support_scan<0, 1, sdsl::packed_vector_view<1>>>;
+ 
+ #endif // __BIT_VECTOR_SDSL_HPP__
+diff --git a/metagraph/src/common/vectors/bitmap.cpp b/metagraph/src/common/vectors/bitmap.cpp
+index 9e16ef35d8..124e491f19 100644
+--- a/metagraph/src/common/vectors/bitmap.cpp
++++ b/metagraph/src/common/vectors/bitmap.cpp
+@@ -32,11 +32,25 @@ bool bitmap::operator==(const bitmap &other) const {
+         }
+         if (dynamic_cast<const bitmap_vector*>(bitmap_p[i])) {
+             bv_p[i] = &dynamic_cast<const bitmap_vector&>(*bitmap_p[i]).data();
+-        } else if (dynamic_cast<const bit_vector_stat*>(bitmap_p[i])) {
+-            bv_p[i] = &dynamic_cast<const bit_vector_stat&>(*bitmap_p[i]).data();
+         }
+     }
+ 
++    auto stat0 = dynamic_cast<const bit_vector_stat *>(bitmap_p[0]);
++    auto stat1 = dynamic_cast<const bit_vector_stat *>(bitmap_p[1]);
++    auto equal_words = [](const auto &a, const auto &b) {
++        for (uint64_t i = 0; i < a.size(); i += 64) {
++            auto n = std::min<uint64_t>(64, a.size() - i);
++            if (a.get_int(i, n) != b.get_int(i, n))
++                return false;
++        }
++        return true;
++    };
++    if (stat0 && stat1)
++        return equal_words(stat0->data(), stat1->data());
++    if (stat0 && bv_p[1])
++        return equal_words(stat0->data(), *bv_p[1]);
++    if (bv_p[0] && stat1)
++        return equal_words(*bv_p[0], stat1->data());
+     if (bv_p[0] && bv_p[1]) {
+         return *bv_p[0] == *bv_p[1];
+     } else if (dynamic_cast<const bitmap_set*>(bitmap_p[0])
+@@ -178,9 +192,9 @@ bitmap_vector::bitmap_vector(const sdsl::bit_vector &vector)
+ bitmap_vector::bitmap_vector(std::initializer_list<bool> init)
+       : bitmap_vector(sdsl::bit_vector(init.begin(), init.end())) {}
+ 
+-bitmap_vector::bitmap_vector(sdsl::bit_vector&& vector) noexcept
++bitmap_vector::bitmap_vector(sdsl::bit_vector&& vector)
+       : num_set_bits_(sdsl::util::cnt_one_bits(vector)),
+-        bit_vector_(std::move(vector)) {}
++        bit_vector_(vector.is_mapped() ? sdsl::bit_vector(vector) : std::move(vector)) {}
+ 
+ void bitmap_vector::set(uint64_t id, bool val) {
+     if (bit_vector_[id] == val)
+@@ -210,7 +224,7 @@ bitmap_vector& bitmap_vector::operator|=(const bitmap &other) {
+         *this |= dynamic_cast<const bitmap_adaptive &>(other).data();
+ 
+     } else if (dynamic_cast<const bit_vector_stat*>(&other)) {
+-        bit_vector_ |= dynamic_cast<const bit_vector_stat &>(other).data();
++        other.add_to(&bit_vector_);
+         num_set_bits_ = sdsl::util::cnt_one_bits(bit_vector_);
+ 
+     } else if (dynamic_cast<const bit_vector_adaptive*>(&other)) {
+@@ -259,7 +273,7 @@ bitmap_adaptive::bitmap_adaptive(std::initializer_list<bool> bitmap)
+ bitmap_adaptive::bitmap_adaptive(uint64_t size, std::initializer_list<uint64_t> bits)
+       : bitmap_adaptive(size, std::set<uint64_t>(bits)) {}
+ 
+-bitmap_adaptive::bitmap_adaptive(sdsl::bit_vector&& vector) noexcept
++bitmap_adaptive::bitmap_adaptive(sdsl::bit_vector&& vector)
+       : bitmap_(new bitmap_vector(std::move(vector))) {}
+ 
+ bitmap_adaptive::bitmap_adaptive(uint64_t size, std::set<uint64_t>&& bits) noexcept
+diff --git a/metagraph/src/common/vectors/bitmap.hpp b/metagraph/src/common/vectors/bitmap.hpp
+index b5b855a5eb..9a23735238 100644
+--- a/metagraph/src/common/vectors/bitmap.hpp
++++ b/metagraph/src/common/vectors/bitmap.hpp
+@@ -88,7 +88,7 @@ class bitmap_vector : public bitmap_dyn {
+     explicit bitmap_vector(uint64_t size = 0, bool value = 0);
+ 
+     explicit bitmap_vector(const sdsl::bit_vector &vector);
+-    bitmap_vector(sdsl::bit_vector&& vector) noexcept;
++    bitmap_vector(sdsl::bit_vector&& vector);
+     bitmap_vector(std::initializer_list<bool> bitmap);
+ 
+     void set(uint64_t id, bool val) override;
+@@ -120,7 +120,7 @@ class bitmap_adaptive : public bitmap_dyn {
+     explicit bitmap_adaptive(uint64_t size = 0, bool value = 0);
+ 
+     explicit bitmap_adaptive(const sdsl::bit_vector &vector);
+-    bitmap_adaptive(sdsl::bit_vector&& vector) noexcept;
++    bitmap_adaptive(sdsl::bit_vector&& vector);
+     bitmap_adaptive(std::initializer_list<bool> bitmap);
+ 
+     bitmap_adaptive(uint64_t size, const std::set<uint64_t> &bits);
+diff --git a/metagraph/src/common/vectors/vector_algorithm.hpp b/metagraph/src/common/vectors/vector_algorithm.hpp
+index 4affe51e6c..2bf914f7e5 100644
+--- a/metagraph/src/common/vectors/vector_algorithm.hpp
++++ b/metagraph/src/common/vectors/vector_algorithm.hpp
+@@ -567,15 +567,15 @@ next_bit(const t_int_vec &v, uint64_t idx, uint64_t max_steps) {
+     assert(idx < v.bit_size());
+ 
+     uint64_t pos  = idx >> 6;
+-    uint64_t node = v.data()[pos];
++    uint64_t node = sdsl::detail::load_unaligned(v.data() + pos);
+     node >>= (idx & 0x3F);
+     if (node)
+         return std::min(idx + sdsl::bits::lo(node), v.bit_size());
+ 
+     uint64_t end = idx + std::min(max_steps, v.bit_size() - idx);
+     for (++pos; (pos << 6) < end; ++pos) {
+-        if (v.data()[pos])
+-            return std::min((pos << 6) | sdsl::bits::lo(v.data()[pos]), v.bit_size());
++        if (uint64_t word = sdsl::detail::load_unaligned(v.data() + pos))
++            return std::min((pos << 6) | sdsl::bits::lo(word), v.bit_size());
+     }
+     return v.bit_size();
+ }
+@@ -588,7 +588,7 @@ prev_bit(const t_int_vec &v, uint64_t idx, uint64_t max_steps) {
+     assert(idx < v.bit_size());
+ 
+     int64_t pos  = idx >> 6;
+-    uint64_t node = v.data()[pos];
++    uint64_t node = sdsl::detail::load_unaligned(v.data() + pos);
+     node <<= 63 - (idx & 0x3F);
+     if (node)
+         return idx - (63 - sdsl::bits::hi(node));
+@@ -597,8 +597,8 @@ prev_bit(const t_int_vec &v, uint64_t idx, uint64_t max_steps) {
+     int64_t r_end_word = ((idx + 1 - std::min(idx + 1, max_steps)) >> 6) - 1;
+     assert(r_end_word >= -1);
+     for (--pos; pos > r_end_word; --pos) {
+-        if (v.data()[pos])
+-            return (pos << 6) | sdsl::bits::hi(v.data()[pos]);
++        if (uint64_t word = sdsl::detail::load_unaligned(v.data() + pos))
++            return (pos << 6) | sdsl::bits::hi(word);
+     }
+     return v.bit_size();
+ }
+diff --git a/metagraph/tests/annotation/test_annotation_column.cpp b/metagraph/tests/annotation/test_annotation_column.cpp
+index a8e7af929c..1e3d29c09c 100644
+--- a/metagraph/tests/annotation/test_annotation_column.cpp
++++ b/metagraph/tests/annotation/test_annotation_column.cpp
+@@ -6,6 +6,7 @@
+ #include "annotation/representation/column_compressed/annotate_column_compressed.hpp"
+ #include "annotation/representation/row_compressed/annotate_row_compressed.hpp"
+ #include "common/threads/threading.hpp"
++#include "common/utils/file_utils.hpp"
+ 
+ 
+ namespace {
+@@ -86,4 +87,47 @@ TEST(ColumnCompressed, GetColumn) {
+     EXPECT_TRUE(annotation.get_column("Label8")[4]);
+ }
+ 
++TEST(ColumnCompressed, MergeMappedDenseColumns) {
++    const uint64_t rows = 1024;
++    const auto first_file = test_dump_basename + "_mapped_first";
++    const auto second_file = test_dump_basename + "_mapped_second";
++    annot::ColumnCompressed<> first(rows), second(rows);
++    std::vector<uint64_t> even, odd;
++    for (uint64_t i = 0; i < rows; ++i)
++        (i % 2 ? odd : even).push_back(i);
++    first.add_labels(even, { "shared" });
++    second.add_labels(odd, { "shared" });
++    first.serialize(first_file);
++    second.serialize(second_file);
++
++    const auto read_bytes = [](const std::string &path) {
++        std::ifstream in(path, std::ios::binary);
++        return std::string(std::istreambuf_iterator<char>(in), {});
++    };
++    const auto first_bytes = read_bytes(first_file + first.file_extension());
++    const auto second_bytes = read_bytes(second_file + second.file_extension());
++    struct MmapSetting {
++        bool previous = utils::with_mmap();
++        MmapSetting() { utils::set_mmap(true); }
++        ~MmapSetting() { utils::set_mmap(previous); }
++    } mmap_setting;
++    annot::ColumnCompressed<> merged;
++    ASSERT_TRUE(merged.merge_load({ first_file, second_file, first_file }));
++    EXPECT_EQ(rows, merged.get_column("shared").num_set_bits());
++    for (uint64_t i = 0; i < rows; ++i)
++        EXPECT_TRUE(merged.get_column("shared")[i]);
++    const auto output = test_dump_basename + "_mapped_merged";
++    merged.serialize(output);
++    annot::ColumnCompressed<> restored;
++    ASSERT_TRUE(restored.load(output));
++    EXPECT_EQ(merged.get_column("shared"), restored.get_column("shared"));
++    // Updating the merged bitmap must leave each mapped input unchanged.
++    ASSERT_TRUE(restored.load(first_file));
++    EXPECT_EQ(rows / 2, restored.get_column("shared").num_set_bits());
++    for (uint64_t i = 0; i < rows; ++i)
++        EXPECT_EQ(i % 2 == 0, restored.get_column("shared")[i]);
++    EXPECT_EQ(first_bytes, read_bytes(first_file + first.file_extension()));
++    EXPECT_EQ(second_bytes, read_bytes(second_file + second.file_extension()));
++}
++
+ } // namespace
+diff --git a/metagraph/tests/test_bitmap.cpp b/metagraph/tests/test_bitmap.cpp
+index fde8a02c81..55ec9dd133 100644
+--- a/metagraph/tests/test_bitmap.cpp
++++ b/metagraph/tests/test_bitmap.cpp
+@@ -1018,4 +1018,231 @@ TEST(sdsl_bit_vector, count_ones_every_third_zero) {
+     }
+ }
+ 
++TEST(BitmapVector, MoveKeepsOwnedStorage) {
++    sdsl::bit_vector bits(1024, 0);
++    const auto *data = bits.data();
++    bitmap_vector editable(std::move(bits));
++    EXPECT_EQ(data, editable.data().data());
++    editable.set(17, true);
++    EXPECT_TRUE(editable[17]);
++}
++
++TEST(BitmapVector, MoveMappedStorageBecomesWritable) {
++    const auto filename = test_dump_basename + "_mapped_move";
++    sdsl::bit_vector original(1024, 0);
++    original[7] = true;
++    {
++        std::ofstream out(filename, std::ios::binary);
++        original.serialize(out);
++    }
++    for (bool adaptive : { false, true }) {
++        sdsl::mmap_ifstream in(filename, std::ios::binary);
++        sdsl::bit_vector mapped;
++        mapped.load(in);
++        ASSERT_TRUE(mapped.is_mapped());
++        // Keep a separate view alive to check that edits do not reach the file.
++        sdsl::mmap_ifstream check_in(filename, std::ios::binary);
++        sdsl::bit_vector view;
++        view.load(check_in);
++        ASSERT_TRUE(view.is_mapped());
++        std::unique_ptr<bitmap_dyn> editable;
++        if (adaptive)
++            editable = std::make_unique<bitmap_adaptive>(std::move(mapped));
++        else
++            editable = std::make_unique<bitmap_vector>(std::move(mapped));
++        editable->set(7, false);
++        editable->set(17, true);
++        bitmap_vector added(1024, false);
++        added.set(31, true);
++        *editable |= added;
++        EXPECT_FALSE((*editable)[7]);
++        EXPECT_TRUE((*editable)[17]);
++        EXPECT_TRUE((*editable)[31]);
++        EXPECT_EQ(2u, editable->num_set_bits());
++        EXPECT_EQ(original, view);
++    }
++    std::ifstream in(filename, std::ios::binary);
++    sdsl::bit_vector restored;
++    restored.load(in);
++    EXPECT_EQ(original, restored);
++}
++
++TEST(BitmapVector, SharedMappedViewOwnsMutationSeparately) {
++    for (size_t offset = 0; offset < 8; ++offset) {
++        const auto filename = test_dump_basename + "_shared_view";
++        sdsl::bit_vector expected(4096, 0);
++        expected[7] = 1;
++        bit_vector_stat original(expected);
++        {
++            std::ofstream out(filename, std::ios::binary);
++            out << std::string(offset, 'x');
++            original.serialize(out);
++        }
++        bit_vector_stat view;
++        {
++            sdsl::mmap_ifstream in(filename);
++            in.seekg(offset);
++            ASSERT_TRUE(view.load(in));
++        }
++        bit_vector_stat alias(view);
++        reference_based_test(alias, expected);
++        bit_vector_stat moved(std::move(alias));
++        reference_based_test(moved, expected);
++        alias = moved;
++        reference_based_test(alias, expected);
++        // Immutable copies share storage, while mutable conversion has its own buffer.
++        EXPECT_EQ(view.data().data(), alias.data().data());
++        auto owned = view.convert_to<sdsl::bit_vector>();
++        ASSERT_NE(static_cast<const void *>(owned.data()),
++                  static_cast<const void *>(alias.data().bytes().data()));
++        owned[7] = 0;
++        owned[17] = 1;
++        EXPECT_TRUE(alias[7]);
++        EXPECT_FALSE(alias[17]);
++        EXPECT_EQ(1u, alias.rank1(4095));
++        EXPECT_EQ(7u, alias.select1(1));
++        owned.resize(8192);
++        EXPECT_TRUE(owned[17]);
++        sdsl::mmap_ifstream in(filename);
++        bit_vector_stat restored;
++        in.seekg(offset);
++        ASSERT_TRUE(restored.load(in));
++        EXPECT_EQ(expected, restored.to_vector());
++    }
++}
++
++
++TEST(BitmapVector, SharedMappedDenseUnionBoundaries) {
++    const auto filename = test_dump_basename + "_mapped_union";
++    for (uint64_t size : {0, 1, 63, 64, 65, 257, 4097}) {
++        sdsl::bit_vector source_bits(size, 0), target_bits(size, 0);
++        for (uint64_t i = 0; i < size; ++i) {
++            source_bits[i] = i % 3 == 0;
++            target_bits[i] = i % 5 == 0;
++        }
++        if (size) {
++            source_bits[size - 1] = 1;
++            target_bits[size - 1] = 0;
++        }
++        auto expected = target_bits;
++        expected |= source_bits;
++        for (size_t offset = 0; offset < 8; ++offset) {
++            {
++                std::ofstream out(filename, std::ios::binary);
++                out << std::string(offset, 'x');
++                bit_vector_stat(source_bits).serialize(out);
++            }
++            auto file_bytes = [&] {
++                std::ifstream in(filename, std::ios::binary);
++                return std::string(std::istreambuf_iterator<char>(in), {});
++            };
++            const auto before = file_bytes();
++            bit_vector_stat source;
++            {
++                sdsl::shared_mapper_ifstream in(filename);
++                in.seekg(offset);
++                ASSERT_TRUE(source.load(in));
++            }
++            auto target = target_bits;
++            source.add_to(&target);
++            EXPECT_EQ(expected, target);
++            bitmap_vector accumulator(target_bits);
++            accumulator |= source;
++            accumulator |= source;
++            reference_based_test(accumulator, expected);
++            EXPECT_EQ(source_bits, source.to_vector());
++            EXPECT_EQ(before, file_bytes());
++        }
++    }
++}
++
++
++TEST(BitmapVector, SharedOwnedViewDetachesOnlyWhenAliased) {
++    using mtg::detail::annotation_vector_io;
++    sdsl::bit_vector source(65, 0);
++    source[64] = 1;
++    const auto *allocation = source.data();
++    annotation_vector_io<1> unique(std::move(source));
++    auto moved = std::move(unique).into_owned();
++    EXPECT_EQ(allocation, moved.data());
++    annotation_vector_io<1> view(std::move(moved));
++    auto alias = view;
++    auto detached = std::move(view).into_owned();
++    EXPECT_NE(allocation, detached.data());
++    detached[64] = 0;
++    EXPECT_EQ(1u, alias[64]);
++    detached.resize(129);
++    EXPECT_EQ(65u, alias.size());
++    EXPECT_EQ(1u, alias[64]);
++}
++
++TEST(BitmapVector, SharedViewSequentialLoadAndFailedLoad) {
++    using mtg::detail::annotation_vector_io;
++    const auto filename = test_dump_basename + "_sequential_views";
++    const auto bad_file = test_dump_basename + "_truncated_view";
++    for (size_t offset = 0; offset < 8; ++offset) {
++        sdsl::bit_vector a(65, 0), b(257, 1);
++        a[64] = 1;
++        {
++            std::ofstream out(filename, std::ios::binary);
++            out << std::string(offset, 'x');
++            a.serialize(out);
++            b.serialize(out);
++            out.put('!');
++        }
++        annotation_vector_io<1> first, second;
++        {
++            sdsl::mmap_ifstream in(filename);
++            in.seekg(offset);
++            first.load(in);
++            second.load(in);
++            EXPECT_EQ('!', in.get());
++        }
++        EXPECT_EQ(a, first.to_owned());
++        EXPECT_EQ(b, second.to_owned());
++        auto alias = first;
++        auto moved = std::move(alias);
++        EXPECT_EQ(a, moved.to_owned());
++        EXPECT_EQ(0u, alias.size());
++        {
++            std::ofstream out(bad_file, std::ios::binary);
++            const uint64_t size = 4096;
++            out.write(reinterpret_cast<const char *>(&size), sizeof(size));
++        }
++        sdsl::mmap_ifstream bad(bad_file);
++        EXPECT_THROW(first.load(bad), std::exception);
++        EXPECT_EQ(a, first.to_owned());
++        std::stringstream owned;
++        a.serialize(owned);
++        b.serialize(owned);
++        first.load(owned);
++        second.load(owned);
++        EXPECT_EQ(a, first.to_owned());
++        const void *allocation = first.bytes().data();
++        auto editable = std::move(first).into_owned();
++        EXPECT_EQ(allocation, static_cast<const void *>(editable.data()));
++        EXPECT_EQ(a, editable);
++        EXPECT_TRUE(first.empty());
++        EXPECT_EQ(b, second.to_owned());
++        EXPECT_EQ(a, moved.to_owned());
++    }
++}
++
++
++TEST(BitmapVector, SharedMappedColumnRejectsTruncatedSupport) {
++    const auto filename = test_dump_basename + "_truncated_column";
++    bit_vector_stat original(4096, true);
++    std::stringstream serialized;
++    original.serialize(serialized);
++    const auto bytes = serialized.str();
++    for (size_t length : {size_t(7), bytes.size() / 2, bytes.size() - 1}) {
++        std::ofstream out(filename, std::ios::binary);
++        out.write(bytes.data(), length);
++        out.close();
++        sdsl::mmap_ifstream in(filename);
++        bit_vector_stat loaded;
++        EXPECT_FALSE(loaded.load(in));
++    }
++}
++
+ } // namespace

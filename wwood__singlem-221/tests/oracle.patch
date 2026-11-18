@@ -1,0 +1,575 @@
+diff --git a/singlem/appraiser.py b/singlem/appraiser.py
+index 178cbf44..3c830ca6 100644
+--- a/singlem/appraiser.py
++++ b/singlem/appraiser.py
+@@ -2,6 +2,7 @@
+ import os
+ import sys
+ import tempfile
++from bird_tool_utils import iterable_chunks
+ 
+ from .otu_table import OtuTable
+ from .archive_otu_table import ArchiveOtuTable
+@@ -366,6 +367,130 @@ def mean(l):
+             if unaccounted_for_otu_table_io:
+                 unaccounted_for_table.write_to(unaccounted_for_otu_table_io, fields_to_print=binned_table.fields)
+ 
++    def streaming_appraise(self, **kwargs):
++        '''Streaming appraisal function that sinks results to files immediately.'''
++        genome_otu_table_collection = kwargs.pop('genome_otu_table_collection')
++        metagenome_otu_table_collection = kwargs.pop('metagenome_otu_table_collection')
++        sequence_identity = kwargs.pop('sequence_identity', None)
++        output_found_in = kwargs.pop('output_found_in', False)
++        window_size = kwargs.pop('window_size')
++        binned_otu_table_io = kwargs.pop('binned_otu_table_io', None)
++        unbinned_otu_table_io = kwargs.pop('unbinned_otu_table_io', None)
++        threads=kwargs.pop('threads', 1)
++
++        if len(kwargs) > 0:
++            raise Exception("Unexpected arguments detected: %s" % kwargs)
++
++        logging.info("Using streaming mode for appraisal")
++        binned_otu_table_header = True
++        unbinned_otu_table_header = True
++        for otu_table, found in self._appraise_streaming(
++            metagenome_otu_table_collection,
++            genome_otu_table_collection,
++            sequence_identity,
++            output_found_in,
++            window_size,
++            threads=threads
++        ):
++            if output_found_in:
++                if found:
++                    if binned_otu_table_io:
++                        otu_table.write_to(binned_otu_table_io, fields_to_print=otu_table.fields, print_header=binned_otu_table_header)
++                        binned_otu_table_header = False
++                else:
++                    if unbinned_otu_table_io:
++                        otu_table.write_to(unbinned_otu_table_io, fields_to_print=otu_table.fields, print_header=unbinned_otu_table_header)
++                        unbinned_otu_table_header = False
++            else:
++                if found:
++                    if binned_otu_table_io:
++                        otu_table.write_to(binned_otu_table_io, print_header=binned_otu_table_header)
++                        binned_otu_table_header = False
++                else:
++                    if unbinned_otu_table_io:
++                        otu_table.write_to(unbinned_otu_table_io, print_header=unbinned_otu_table_header)
++                        unbinned_otu_table_header = False
++
++            if binned_otu_table_io:
++                binned_otu_table_io.flush()
++            if unbinned_otu_table_io:
++                unbinned_otu_table_io.flush()
++
++    def _appraise_streaming(self, metagenome_otu_table_collection,
++                                found_otu_collection,
++                                sequence_identity,
++                                output_found_in,
++                                window_size,
++                                threads=1):
++        '''Streaming version of appraise to handle large OTU tables with minimal memory usage.'''
++
++        if sequence_identity:
++            logging.info("Appraising with %i sequence identity cutoff " % sequence_identity)
++            max_divergence = window_size * (1 - sequence_identity)
++            max_divergence = round(max_divergence)
++            sys.stdout.write("# Appraised using max divergence %i (%i%% ANI)\n" % (max_divergence, round(100 * sequence_identity)))
++        else:
++            max_divergence = 0
++        logging.info("Using max divergence of %i for appraising" % max_divergence)
++
++        tmp = tempfile.TemporaryDirectory()
++        sdb_path = os.path.join(tmp.name, "tmp.sdb")
++        sequence_database = SequenceDatabase()
++        sequence_database.create_from_otu_table(sdb_path, found_otu_collection, sequence_database_methods = [SMAFA_NAIVE_INDEX_FORMAT])
++        sdb_tmp = sequence_database.acquire(sdb_path)
++
++        querier = Querier()
++        for chunk in iterable_chunks(metagenome_otu_table_collection, 50_000_000):
++            logging.info("Processing chunk of %i OTUs" % len(chunk))
++            otus_with_hits = []
++            otu_table_with_hits = OtuTable()
++            otus_without_hits = []
++            otu_table_without_hits = OtuTable()
++
++            chunk = [o for o in chunk if o is not None]
++            # Sort queries by marker to ensure proper grouping
++            sorted_chunk = sorted(chunk, key=lambda x: x.marker)
++
++            queries = querier.query_with_queries(
++                sorted_chunk, sdb_tmp, max_divergence,
++                SMAFA_NAIVE_INDEX_FORMAT, SequenceDatabase.NUCLEOTIDE_TYPE,
++                1, None, True, None,
++                threads=threads, continue_on_missing_genes=True
++                )
++
++            query_map = {}
++            for query in queries:
++                if query.query not in query_map:
++                    query_map[query.query] = []
++                query_map[query.query].append(query.subject.sample_name)
++
++            for otu in chunk:
++                if otu in query_map:
++                    if output_found_in:
++                        for hit_genome in query_map[otu]:
++                            otu.add_found_data(hit_genome)
++                    otus_with_hits.append(otu)
++                else:
++                    if output_found_in:
++                        otu.add_found_data('')
++                    otus_without_hits.append(otu)
++
++            if otus_with_hits:
++                if output_found_in:
++                    otu_table_with_hits.add_with_extras(otus_with_hits, ['found_in'])
++                else:
++                    otu_table_with_hits.add(otus_with_hits)
++                yield otu_table_with_hits, True
++
++            if otus_without_hits:
++                if output_found_in:
++                    otu_table_without_hits.add_with_extras(otus_without_hits, ['found_in'])
++                else:
++                    otu_table_without_hits.add(otus_without_hits)
++                yield otu_table_without_hits, False
++
++        tmp.cleanup()
++
+ 
+ class AppraisalBuildingBlock:
+     '''Can represent binned OTUs or assembled OTUs'''
+diff --git a/singlem/main.py b/singlem/main.py
+index 786f0525..dbe8b215 100755
+--- a/singlem/main.py
++++ b/singlem/main.py
+@@ -417,6 +417,9 @@ def main():
+     appraise_otu_table_group.add_argument('--output-found-in', action='store_true', help="Output sample name (genome or assembly) the hit was found in")
+     appraise_otu_table_group.add_argument('--output-style', help="Style of output OTU tables", default=OTU_TABLE_OUTPUT_FORMAT,
+                                           choices=[OTU_TABLE_OUTPUT_FORMAT, ARCHIVE_TABLE_OUTPUT_FORMAT])
++    appraise_otu_table_group.add_argument('--stream-inputs', action='store_true', help="Stream input OTU tables, saving RAM. Only works with --output-otu-table and transformation options do not work [expert option].")
++    default_appraise_threads = 1
++    appraise_otu_table_group.add_argument('--threads', type=int, metavar='num_threads', help='Use this many threads when processing streaming inputs [default %i]' % default_appraise_threads, default=default_appraise_threads)
+ 
+     seqs_description = 'Find the best window position for a SingleM package'
+     seqs_parser = bird_argparser.new_subparser('seqs', seqs_description)
+@@ -1081,7 +1084,7 @@ def main():
+                                 gene_description = args.gene_description,
+                                 force = args.force)
+     elif args.subparser_name == 'appraise':
+-        from singlem.otu_table_collection import OtuTableCollection
++        from singlem.otu_table_collection import OtuTableCollection, StreamingOtuTableCollection
+         from singlem.appraiser import Appraiser
+         from singlem.metapackage import Metapackage
+ 
+@@ -1093,29 +1096,47 @@ def main():
+ 
+         appraiser = Appraiser()
+ 
+-        metagenomes = OtuTableCollection()
+-        if args.metagenome_otu_tables:
+-            for table in args.metagenome_otu_tables:
+-                with open(table) as f:
+-                    metagenomes.add_otu_table(f)
+-        if args.metagenome_archive_otu_tables:
+-            for table in args.metagenome_archive_otu_tables:
+-                with open(table) as f:
+-                    metagenomes.add_archive_otu_table(f)
+-
+-        logging.info("Removing hits that are not assigned to their target domains")
++        if args.stream_inputs:
++            logging.info("Preparing file IO for streaming inputs")
++            metagenomes = StreamingOtuTableCollection()
++            file_io = []
++            if args.metagenome_otu_tables:
++                for table in args.metagenome_otu_tables:
++                    table_io = open(table)
++                    metagenomes.add_otu_table(table_io)
++                    file_io.append(open(table))
++            if args.metagenome_archive_otu_tables:
++                for table in args.metagenome_archive_otu_tables:
++                    table_io = open(table)
++                    metagenomes.add_archive_otu_table(table_io)
++                    file_io.append(open(table))
++        else:
++            metagenomes = OtuTableCollection()
++            if args.metagenome_otu_tables:
++                for table in args.metagenome_otu_tables:
++                    with open(table) as f:
++                        metagenomes.add_otu_table(f)
++            if args.metagenome_archive_otu_tables:
++                for table in args.metagenome_archive_otu_tables:
++                    with open(table) as f:
++                        metagenomes.add_archive_otu_table(f)
++
+         if args.metapackage:
+             pkgs = Metapackage.acquire(args.metapackage).singlem_packages
+         else:
+             mpkg = Metapackage.acquire_default()
+             pkgs = mpkg.singlem_packages
+ 
+-        o2 = OtuTableCollection()
+-        if args.metagenome_archive_otu_tables:
+-            o2.archive_table_objects.append(metagenomes.exclude_off_target_hits(pkgs, return_archive_table=True))
++        if args.stream_inputs:
++            logging.info("Removing non-target hits is not compatible with streaming inputs")
+         else:
+-            o2.otu_table_objects.append(metagenomes.exclude_off_target_hits(pkgs))
+-        metagenomes = o2
++            logging.info("Removing hits that are not assigned to their target domains")
++            o2 = OtuTableCollection()
++            if args.metagenome_archive_otu_tables:
++                o2.archive_table_objects.append(metagenomes.exclude_off_target_hits(pkgs, return_archive_table=True))
++            else:
++                o2.otu_table_objects.append(metagenomes.exclude_off_target_hits(pkgs))
++            metagenomes = o2
+ 
+         if args.genome_otu_tables or args.genome_archive_otu_tables:
+             genomes = OtuTableCollection()
+@@ -1157,14 +1178,6 @@ def main():
+         if genomes is None and assemblies is None:
+             raise Exception("Appraise must be run with genomes and/or assemblies.")
+ 
+-        app = appraiser.appraise(genome_otu_table_collection=genomes,
+-                                metagenome_otu_table_collection=metagenomes,
+-                                assembly_otu_table_collection=assemblies,
+-                                output_found_in = args.output_found_in,
+-                                sequence_identity=(args.sequence_identity if args.imperfect else None),
+-                                packages=pkgs,
+-                                window_size=DEFAULT_WINDOW_SIZE)
+-
+         if args.output_binned_otu_table:
+             output_binned_otu_table_io = open(args.output_binned_otu_table,'w')
+         if args.output_unbinned_otu_table:
+@@ -1174,35 +1187,69 @@ def main():
+         if args.output_unaccounted_for_otu_table:
+             output_unaccounted_for_otu_table_io = open(args.output_unaccounted_for_otu_table,'w')
+ 
+-        if args.plot_basename or args.plot:
+-            if args.plot and args.plot_basename:
+-                raise Exception("Cannot specify both --plot and --plot-basename")
+-            if args.plot:
+-                app.plot(
+-                    cluster_identity=args.sequence_identity,
+-                    doing_assembly=assemblies is not None,
+-                    doing_binning=genomes is not None,
+-                    gene_to_plot=args.plot_marker,
+-                    output_svg=args.plot)
+-            else:
+-                app.plot(
+-                    output_svg_base=args.plot_basename,
+-                    cluster_identity=args.sequence_identity,
+-                    doing_assembly=assemblies is not None,
+-                    doing_binning=genomes is not None)
+-
+-        appraiser.print_appraisal(
+-            app,
+-            packages=pkgs,
+-            doing_binning = genomes is not None,
+-            doing_assembly = assemblies is not None,
+-            output_found_in = args.output_found_in,
+-            output_style = args.output_style,
+-            binned_otu_table_io=output_binned_otu_table_io if args.output_binned_otu_table else None,
+-            unbinned_otu_table_io=output_unbinned_otu_table_io if args.output_unbinned_otu_table else None,
+-            assembled_otu_table_io=output_assembled_otu_table_io if args.output_assembled_otu_table else None,
+-            unaccounted_for_otu_table_io=output_unaccounted_for_otu_table_io \
+-            if args.output_unaccounted_for_otu_table else None)
++        if args.stream_inputs:
++            if args.assembly_otu_tables or args.assembly_archive_otu_tables:
++                raise Exception("Streaming inputs is not currently known to work with assembly OTU tables")
++            if args.output_assembled_otu_table:
++                raise Exception("Streaming inputs is not currently known to work with --output-assembled-otu-table")
++            if not (args.output_binned_otu_table and (args.output_unbinned_otu_table or args.output_unaccounted_for_otu_table)):
++                raise Exception("--stream-inputs requires --output-binned-otu-table and --output-unbinned-otu-table to be defined")
++            if args.output_unaccounted_for_otu_table and args.output_unbinned_otu_table:
++                raise Exception("Cannot specify both --output-unaccounted-for-otu-table and --output-unbinned-otu-table")
++            if args.output_unaccounted_for_otu_table:
++                output_unbinned_otu_table_io = output_unaccounted_for_otu_table_io
++
++            appraiser.streaming_appraise(
++                genome_otu_table_collection=genomes,
++                metagenome_otu_table_collection=metagenomes,
++                output_found_in=args.output_found_in,
++                sequence_identity=(args.sequence_identity if args.imperfect else None),
++                window_size=DEFAULT_WINDOW_SIZE,
++                binned_otu_table_io=output_binned_otu_table_io if args.output_binned_otu_table else None,
++                unbinned_otu_table_io=output_unbinned_otu_table_io if (args.output_unbinned_otu_table or args.output_unaccounted_for_otu_table) else None,
++                threads=args.threads,
++            )
++            for f in file_io:
++                f.close()
++        else:
++            app = appraiser.appraise(genome_otu_table_collection=genomes,
++                                    metagenome_otu_table_collection=metagenomes,
++                                    assembly_otu_table_collection=assemblies,
++                                    output_found_in = args.output_found_in,
++                                    sequence_identity=(args.sequence_identity if args.imperfect else None),
++                                    packages=pkgs,
++                                    window_size=DEFAULT_WINDOW_SIZE)
++
++            if args.plot_basename or args.plot:
++                if args.plot and args.plot_basename:
++                    raise Exception("Cannot specify both --plot and --plot-basename")
++                if args.plot:
++                    app.plot(
++                        cluster_identity=args.sequence_identity,
++                        doing_assembly=assemblies is not None,
++                        doing_binning=genomes is not None,
++                        gene_to_plot=args.plot_marker,
++                        output_svg=args.plot)
++                else:
++                    app.plot(
++                        output_svg_base=args.plot_basename,
++                        cluster_identity=args.sequence_identity,
++                        doing_assembly=assemblies is not None,
++                        doing_binning=genomes is not None)
++
++            appraiser.print_appraisal(
++                app,
++                packages=pkgs,
++                doing_binning = genomes is not None,
++                doing_assembly = assemblies is not None,
++                output_found_in = args.output_found_in,
++                output_style = args.output_style,
++                binned_otu_table_io=output_binned_otu_table_io if args.output_binned_otu_table else None,
++                unbinned_otu_table_io=output_unbinned_otu_table_io if args.output_unbinned_otu_table else None,
++                assembled_otu_table_io=output_assembled_otu_table_io if args.output_assembled_otu_table else None,
++                unaccounted_for_otu_table_io=output_unaccounted_for_otu_table_io \
++                if args.output_unaccounted_for_otu_table else None)
++
+         if args.output_binned_otu_table: output_binned_otu_table_io.close()
+         if args.output_unbinned_otu_table: output_unbinned_otu_table_io.close()
+         if args.output_assembled_otu_table: output_assembled_otu_table_io.close()
+diff --git a/singlem/otu_table_entry.py b/singlem/otu_table_entry.py
+index 4e8c07ef..97c7dfda 100644
+--- a/singlem/otu_table_entry.py
++++ b/singlem/otu_table_entry.py
+@@ -26,6 +26,7 @@ def within_taxonomy(self, target_taxonomy):
+ 
+     def add_found_data(self, found_in):
+         if 'found_in' not in self.fields:
++            self.fields = self.fields.copy()  # Create a copy to avoid global modifications
+             self.fields.append('found_in')
+             self.data.append(found_in)
+         else:
+diff --git a/singlem/querier.py b/singlem/querier.py
+index ec09639f..91f09dc1 100644
+--- a/singlem/querier.py
++++ b/singlem/querier.py
+@@ -11,6 +11,7 @@
+ from bird_tool_utils import iterable_chunks
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
++from concurrent.futures import ThreadPoolExecutor
+ 
+ from .sequence_database import SequenceDatabase
+ from . import sequence_database
+@@ -50,7 +51,7 @@ def query(self, **kwargs):
+         query_results = self.query_with_queries(
+             queries, db, max_divergence, search_method, sequence_type, 
+             max_nearest_neighbours=max_nearest_neighbours, max_search_nearest_neighbours=max_search_nearest_neighbours, \
+-            preload_db=preload_db, limit_per_sequence=limit_per_sequence, continue_on_missing_genes=continue_on_missing_genes)
++            preload_db=preload_db, limit_per_sequence=limit_per_sequence, continue_on_missing_genes=continue_on_missing_genes, threads=num_threads)
+         # Only reason not to stream would be so that the queries are returned in the same order as passed in. eh for now.
+         do_stream = True
+         if not do_stream:
+@@ -168,7 +169,7 @@ def prepare_query_sequences(self, otus, num_threads):
+         logging.info("Sorted {} OTU queries ..".format(total_otu_count))
+         return MarkerSortedQueryInput(sorted_io)
+ 
+-    def query_with_queries(self, queries, sdb, max_divergence, search_method, sequence_type, max_nearest_neighbours, max_search_nearest_neighbours, preload_db, limit_per_sequence, continue_on_missing_genes=False):
++    def query_with_queries(self, queries, sdb, max_divergence, search_method, sequence_type, max_nearest_neighbours, max_search_nearest_neighbours, preload_db, limit_per_sequence, continue_on_missing_genes=False, threads=1):
+         if max_divergence == 0 and sequence_type == SequenceDatabase.NUCLEOTIDE_TYPE:
+             if limit_per_sequence != None:
+                 raise Exception("limit-per-sequence has not been implemented for nucleotide queries with max-divergence 0 yet")
+@@ -191,7 +192,7 @@ def query_with_queries(self, queries, sdb, max_divergence, search_method, sequen
+                 queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, naive=False, preload_db=preload_db, max_search_nearest_neighbours=max_search_nearest_neighbours, limit_per_sequence=limit_per_sequence)
+         elif search_method == 'smafa-naive':
+             return self.query_by_sequence_similarity_with_smafa_naive(
+-                queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, preload_db=preload_db, limit_per_sequence=limit_per_sequence, continue_on_missing_genes=continue_on_missing_genes)
++                queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, preload_db=preload_db, limit_per_sequence=limit_per_sequence, continue_on_missing_genes=continue_on_missing_genes, threads=threads)
+         else:
+             raise Exception("Unknown search method {}".format(search_method))
+ 
+@@ -339,7 +340,7 @@ def query_by_sequence_similarity_with_scann(self, queries, sdb, max_divergence,
+                             if num_reported >= max_nearest_neighbours:
+                                 break
+ 
+-    def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, preload_db=False, limit_per_sequence=None, continue_on_missing_genes=False):
++    def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, preload_db=False, limit_per_sequence=None, continue_on_missing_genes=False, threads=1):
+         logging.info("Searching with SMAFA NAIVE by {} sequence ..".format(sequence_type))
+ 
+         for marker, marker_queries in itertools.groupby(queries, lambda x: x.marker):
+@@ -366,8 +367,9 @@ def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_diverg
+                     raise Exception("Unexpected sequence_type")
+             
+             # Actually do searches, in batches
+-            for chunked_queries1 in iterable_chunks(marker_queries, 1000):
+-                chunked_queries = list([a for a in chunked_queries1 if a is not None]) # Remove trailing Nones from the iterable
++            def process_chunk(chunked_queries1):
++                """Process a single chunk of queries."""
++                chunked_queries = list([a for a in chunked_queries1 if a is not None])  # Remove trailing Nones from the iterable
+ 
+                 if sequence_type == SequenceDatabase.NUCLEOTIDE_TYPE:
+                     pass
+@@ -400,6 +402,7 @@ def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_diverg
+                     batch_for_db_divs = []
+ 
+                 # Read the output
++                results = []
+                 previous_query_index = None
+                 previous_query_index_num_reported = 0
+                 for line in smafa_stdout.splitlines():
+@@ -429,13 +432,13 @@ def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_diverg
+                             otu.coverage = preloaded_db.coverage[entry_i]
+                             otu.taxonomy = preloaded_db.taxonomy[entry_i]
+                             if sequence_type == SequenceDatabase.NUCLEOTIDE_TYPE:
+-                                yield QueryResult(chunked_queries[query_index], otu, div)
++                                results.append(QueryResult(chunked_queries[query_index], otu, div))
+                             else:
+                                 # Below not actually used - smafa doesn't handle proteins (yet)
+-                                yield QueryResult(
++                                results.append(QueryResult(
+                                     chunked_queries[query_index], otu, div, 
+                                     query_protein_sequence=query_protein_sequences[i],
+-                                    subject_protein_sequence=preloaded_db.protein_sequence[entry_i])
++                                    subject_protein_sequence=preloaded_db.protein_sequence[entry_i]))
+                     else:
+                         # Query in batch as this should be faster than doing individually
+                         batch_for_db_queries.append(chunked_queries[query_index])
+@@ -448,7 +451,15 @@ def query_by_sequence_similarity_with_smafa_naive(self, queries, sdb, max_diverg
+                         query_protein_sequence=query_protein_sequences[i] if sequence_type == SequenceDatabase.PROTEIN_TYPE else None,
+                         limit_per_sequence=limit_per_sequence):
+ 
+-                        yield qres
++                        results.append(qres)
++
++                return results
++
++            with ThreadPoolExecutor(max_workers=threads) as executor:
++                futures = [executor.submit(process_chunk, chunk) for chunk in iterable_chunks(marker_queries, 1000)]
++                for future in futures:
++                    for result in future.result():
++                        yield result
+ 
+ 
+     def query_by_sequence_similarity_with_annoy(self, queries, sdb, max_divergence, sequence_type, max_nearest_neighbours, max_search_nearest_neighbours=None, limit_per_sequence=None):
+@@ -732,4 +743,3 @@ def limit_per_sequence(self, limit_per_sequence):
+         ''' shuffle and truncate once up front '''
+         self.indices.apply(np.random.shuffle)
+         self.indices = pd.Series([a[:limit_per_sequence] for a in self.indices])
+-        
+\ No newline at end of file
+diff --git a/test/test_appraise.py b/test/test_appraise.py
+index 43aaad5c..0c512314 100644
+--- a/test/test_appraise.py
++++ b/test/test_appraise.py
+@@ -36,7 +36,7 @@
+ 
+ sys.path = [os.path.join(os.path.dirname(os.path.realpath(__file__)),'..')]+sys.path
+ from singlem.appraiser import Appraiser
+-from singlem.otu_table_collection import OtuTableCollection
++from singlem.otu_table_collection import OtuTableCollection, StreamingOtuTableCollection
+ from singlem.otu_table import OtuTable
+ from singlem.metapackage import Metapackage
+ 
+@@ -1223,6 +1223,97 @@ def test_appraise_default_cutoff(self):
+                 expected2 = expected_header + "\n".join(["\t".join(x.split()) for x in expected.split("\n")])
+                 self.assertEqual(expected2, extern.run(cmd))
+ 
++    def test_streaming_otu_table(self):
++        metagenome_otu_table = [
++            self.headers,
++            ['4.12.ribosomal_protein_L11_rplK','minimal','GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC','7','17.07','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales'],
++            ['4.11.ribosomal_protein_L10','minimal','CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG','4','9.76','Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales; f__Staphylococcaceae; g__Staphylococcus']
++            ]
++        metagenomes = "\n".join(["\t".join(x) for x in metagenome_otu_table])
++
++        genomes_otu_table = [
++            self.headers,
++            ['4.12.ribosomal_protein_L11_rplK','genome','GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC','1','1.02','Root; d__Bacteria; p__Firmicutes; c__Bacilli'],
++            ['4.12.ribosomal_protein_L11_rplK','genome2','GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC','1','1.02','Root; d__Bacteria; p__Firmicutes; c__Bacilli'],
++            ['4.11.ribosomal_protein_L10','genome','GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC','1','1.01','Root; d__Bacteria; p__Firmicutes; c__Bacilli'],
++            ]
++        genomes = "\n".join(["\t".join(x) for x in genomes_otu_table])
++
++        appraiser = Appraiser()
++        metagenome_collection = StreamingOtuTableCollection()
++        metagenome_collection.add_otu_table(StringIO(metagenomes))
++        genome_collection = OtuTableCollection()
++        genome_collection.add_otu_table(StringIO(genomes))
++        output_binned_otu_table_io = StringIO()
++        output_unbinned_otu_table_io = StringIO()
++        appraiser.streaming_appraise(genome_otu_table_collection=genome_collection,
++                                metagenome_otu_table_collection=metagenome_collection,
++                                window_size=DEFAULT_WINDOW_SIZE,
++                                output_found_in=True,
++                                binned_otu_table_io=output_binned_otu_table_io,
++                                unbinned_otu_table_io=output_unbinned_otu_table_io,
++                                sequence_identity=0.96,
++                                )
++
++        expected_binned = [
++            self.headers + ["found_in"],
++            ["4.12.ribosomal_protein_L11_rplK", "minimal", "GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC", "7", "17.07", "Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales", "genome,genome2"],
++            ""
++        ]
++        expected_binned = "\n".join(["\t".join(x) for x in expected_binned])
++        observed_binned = output_binned_otu_table_io.getvalue()
++        self.assertEqual(expected_binned, observed_binned)
++
++        expected_unbinned = [
++            self.headers + ["found_in"],
++            ["4.11.ribosomal_protein_L10", "minimal", "CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG", "4", "9.76", "Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales; f__Staphylococcaceae; g__Staphylococcus", ""],
++            ""
++        ]
++        expected_unbinned = "\n".join(["\t".join(x) for x in expected_unbinned])
++        observed_unbinned = output_unbinned_otu_table_io.getvalue()
++        self.assertEqual(expected_unbinned, observed_unbinned)
++
++    def test_streaming_otu_table_cmdline(self):
++        with in_tempdir():
++            cmd = (
++                "{} appraise --stream-inputs "
++                "--metagenome-otu-tables {}/appraise_example3/reads.otu_table.tsv "
++                "--genome-otu-tables {}/appraise_example3/bins.otu_table.tsv "
++                "--metapackage {}/four_package.smpkg "
++                "--output-binned-otu-table binned.otu_table.tsv "
++                "--output-unaccounted-for-otu-table unbinned.otu_table.tsv "
++                "--imperfect --sequence-identity 0.96 "
++                "--threads 8 "
++            ).format(
++                path_to_script,
++                path_to_data,
++                path_to_data,
++                path_to_data
++            )
++            extern.run(cmd)
++
++            expected_binned = [
++                self.headers,
++                ["4.12.ribosomal_protein_L11_rplK", "minimal", "GGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTGAACATC", "7", "17.07", "Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales"],
++                ""
++            ]
++            expected_binned = "\n".join(["\t".join(x) for x in expected_binned])
++
++            expected_unbinned = [
++                self.headers,
++                ["4.11.ribosomal_protein_L10", "minimal", "CCTGCAGGTAAAGCGAATCCAGCACCACCAGTTGGTCCAGCATTAGGTCAAGCAGGTGTG", "4", "9.76", "Root; d__Bacteria; p__Firmicutes; c__Bacilli; o__Bacillales; f__Staphylococcaceae; g__Staphylococcus"],
++                ""
++            ]
++            expected_unbinned = "\n".join(["\t".join(x) for x in expected_unbinned])
++
++            with open('binned.otu_table.tsv') as f:
++                observed_binned = "".join(f.readlines())
++            with open('unbinned.otu_table.tsv') as f:
++                observed_unbinned = "".join(f.readlines())
++
++            self.assertEqual(expected_binned, observed_binned)
++            self.assertEqual(expected_unbinned, observed_unbinned)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

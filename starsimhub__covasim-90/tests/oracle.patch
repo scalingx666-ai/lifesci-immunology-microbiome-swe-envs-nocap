@@ -1,0 +1,283 @@
+diff --git a/covasim/webapp/cova_app.js b/covasim/webapp/cova_app.js
+index 7bc7b70cb..4125c38eb 100644
+--- a/covasim/webapp/cova_app.js
++++ b/covasim/webapp/cova_app.js
+@@ -16,6 +16,57 @@ const PlotlyChart = {
+         }
+         );
+     },
++    updated() {
++        this.$nextTick(function () {
++            let x = JSON.parse(this.graph.json);
++            x.responsive = true;
++            Plotly.react(this.graph.id, x);
++        });
++    }
++};
++
++const interventionTableConfig = {
++    social_distance: {
++        formTitle: "Social Distancing",
++        fields: [{key: 'start', type: 'number', label: 'Start Day'},
++            {key: 'end', type: 'number', label: 'End Day'},
++            {label: 'Effectiveness', key: 'level', type: 'select', options: [{label: 'Aggressive Effectiveness', value: 'aggressive'}, {label: 'Moderate Effectiveness', value: 'moderate'}, {label: 'Mild Effectiveness', value: 'mild'}]}],
++        handleSubmit: function(event) {
++            const start = parseInt(event.target.elements.start.value);
++            const end = parseInt(event.target.elements.end.value);
++            const level = event.target.elements.level.value;
++            return {start, end, level};
++        }
++    },
++    school_closures: {
++        formTitle: "School closures",
++        fields: [{key: 'start', type: 'number', label: 'Start Day'}, {key: 'end', type: 'number', label: 'End Day'}],
++        handleSubmit: function(event) {
++            const start = parseInt(event.target.elements.start.value);
++            const end = parseInt(event.target.elements.end.value);
++            return {start, end};
++        }
++    },
++    symptomatic_testing: {
++        formTitle: "Symptomatic testing",
++        fields: [{key: 'start', type: 'number', label: 'Start Day'}, {key: 'end', type: 'number', label: 'End Day'}, {label: 'Accuracy', key: 'level', type: 'select', options: [{label: '60% Accuracy', value: '60'}, {label: '90% Accuracy', value: '90'},]}],
++        handleSubmit: function(event) {
++            const start = parseInt(event.target.elements.start.value);
++            const end = parseInt(event.target.elements.end.value);
++            const level = parseInt(event.target.elements.level.value);
++            return {start, end, level};
++        }
++    },
++    contract_tracing: {
++        formTitle: "Contract tracing",
++        fields: [{key: 'start', type: 'number', label: 'Start Day'}, {key: 'end', type: 'number', label: 'End Day'}],
++        handleSubmit: function(event) {
++            const start = parseInt(event.target.elements.start.value);
++            const end = parseInt(event.target.elements.end.value);
++            return {start, end};
++        }
++  }
++
+ };
+ 
+ 
+@@ -33,6 +84,8 @@ var vm = new Vue({
+             historyIdx: 0,
+             sim_pars: {},
+             epi_pars: {},
++            intervention_pars: {},
++            intervention_figs: {},
+             show_animation: false,
+             result: { // Store currently displayed results
+                 graphs: [],
+@@ -40,6 +93,8 @@ var vm = new Vue({
+                 files: {},
+             },
+             paramError: {},
++            scenarioError: {},
++            interventionTableConfig,
+             running: false,
+             err: '',
+             reset_options: ['Example'],//, 'Seattle', 'Wuhan', 'Global'],
+@@ -66,7 +121,35 @@ var vm = new Vue({
+     },
+ 
+     methods: {
++        async addIntervention(scenarioKey, event) {
++            const intervention = this.interventionTableConfig[scenarioKey].handleSubmit(event);
++            const key = scenarioKey;
++            if (!this.intervention_pars[key]) {
++                this.$set(this.intervention_pars, key, []);
++            }
++            // validate intervention
++            const notValid = !intervention.end || !intervention.start || intervention.end <= intervention.start || this.intervention_pars[key].some(({start, end}) => {
++                return start <= intervention.start && end >= intervention.start ||
++                    start <= intervention.end && end >= intervention.end ||
++                    intervention.start <= start && intervention.end >= end;
++            });
++            if (notValid) {
++                this.$set(this.scenarioError, scenarioKey, `Please enter a valid day range`);
++                return;
++            }
++            this.$set(this.scenarioError, scenarioKey, '');
+ 
++            this.intervention_pars[key].push(intervention);
++            const result = this.intervention_pars[key].sort((a, b) => a.start - b.start);
++            this.$set(this.intervention_pars, key, result);
++            const response = await sciris.rpc('get_gnatt', [this.intervention_pars, this.interventionTableConfig]);
++            this.intervention_figs = response.data;
++        },
++        async deleteIntervention(scenarioKey, index) {
++            this.$delete(this.intervention_pars[scenarioKey], index);
++            const response = await sciris.rpc('get_gnatt', [this.intervention_pars, this.interventionTableConfig]);
++            this.intervention_figs = response.data;
++        },
+         async get_version() {
+             const response = await sciris.rpc('get_version');
+             this.version = response.data;
+@@ -82,7 +165,7 @@ var vm = new Vue({
+ 
+             // Run a a single sim
+             try {
+-                const response = await sciris.rpc('run_sim', [this.sim_pars, this.epi_pars, this.show_animation]);
++                const response = await sciris.rpc('run_sim', [this.sim_pars, this.epi_pars, this.intervention_pars, this.show_animation]);
+                 this.result.graphs = response.data.graphs;
+                 this.result.files = response.data.files;
+                 this.result.summary = response.data.summary;
+diff --git a/covasim/webapp/cova_app.py b/covasim/webapp/cova_app.py
+index a5d37a369..301847997 100644
+--- a/covasim/webapp/cova_app.py
++++ b/covasim/webapp/cova_app.py
+@@ -8,6 +8,7 @@
+ import sys
+ import numpy as np
+ import plotly.graph_objects as go
++import plotly.figure_factory as ff
+ import sciris as sc
+ import base64 # Download/upload-specific import
+ import json
+@@ -97,6 +98,44 @@ def get_defaults(region=None, merge=False):
+ 
+     return output
+ 
++def map_social_distance(scenario, web_pars):
++    '''map social distance to intervention'''
++    interventions = []
++    for timeline in scenario:
++        start = timeline['start']
++        end = timeline['end']
++        level = timeline['level'] # aggressive, moderate, mild
++
++    web_pars['interventions'] = None
++
++def map_school_closures(scenario, web_pars):
++    '''map social distance to intervention'''
++    interventions = []
++    for timeline in scenario:
++        start = timeline['start']
++        end = timeline['end']
++
++    web_pars['interventions'] = None
++
++def map_symptomatic_testing(scenario, web_pars):
++    '''map social distance to intervention'''
++    interventions = []
++    for timeline in scenario:
++        start = timeline['start']
++        end = timeline['end']
++        level = timeline['level'] # 60, 90
++
++    web_pars['interventions'] = None
++
++def map_contract_tracing(scenario, web_pars):
++    '''map social distance to intervention'''
++    interventions = []
++    for timeline in scenario:
++        start = timeline['start']
++        end = timeline['end']
++        level = timeline['level'] # 60, 90
++
++    web_pars['interventions'] = None
+ 
+ @app.register_RPC()
+ def get_version():
+@@ -114,9 +153,22 @@ def upload_pars(fname):
+         raise KeyError(f'Parameters file must have keys "sim_pars" and "epi_pars", not {parameters.keys()}')
+     return parameters
+ 
++@app.register_RPC()
++def get_gnatt(intervention_pars=None, intervention_config=None):
++    df = []
++    for key,scenario in intervention_pars.items():
++        for timeline in scenario:
++            task = intervention_config[key]['formTitle']
++            level = task + ' ' + str(timeline.get('level', ''))
++            df.append(dict(Task=task, Start=timeline['start'], Finish=timeline['end'], Level= level))
++
++    fig = ff.create_gantt(df, height=400, index_col='Level', title='Intervention timeline',
++                        show_colorbar=True, group_tasks=True, showgrid_x=True, showgrid_y=True)
++    fig.update_xaxes(type='linear')
++    return {'json': fig.to_json(), 'id': 'test'}
+ 
+ @app.register_RPC()
+-def run_sim(sim_pars=None, epi_pars=None, show_animation=False, verbose=True):
++def run_sim(sim_pars=None, epi_pars=None, intervention_pars=None, show_animation=False, verbose=True):
+     ''' Create, run, and plot everything '''
+ 
+     err = ''
+@@ -162,6 +214,18 @@ def run_sim(sim_pars=None, epi_pars=None, show_animation=False, verbose=True):
+         if web_pars['web_int_day'] is not None:
+             web_pars['interventions'] = cv.change_beta(days=web_pars.pop('web_int_day'), changes=(1-web_pars.pop('web_int_eff')))
+ 
++        switcher = {
++            'social_distance': map_social_distance,
++            'school_closures': map_school_closures,
++            'symptomatic_testing': map_symptomatic_testing,
++            'contract_tracing': map_contract_tracing
++        }
++        if intervention_pars is not None:
++            for key,scenario in intervention_pars.items():
++                func = switcher.get(key)
++                func(scenario, web_pars)
++
++
+         # Handle CFR -- ignore symptoms and set to 1
+         web_pars['prognoses'] = sc.dcp(orig_pars['prognoses'])
+         web_pars['rel_symp_prob']   = 1e4 # Arbitrarily large
+diff --git a/covasim/webapp/index.html b/covasim/webapp/index.html
+index ddfbf9fd5..d5d6e0c0c 100644
+--- a/covasim/webapp/index.html
++++ b/covasim/webapp/index.html
+@@ -100,7 +100,52 @@ <h5 class="modal-title" id="exampleModalLabel">About Covasim</h5>
+             </b-tooltip>
+           </div>
+         </fieldset>
+-
++        <fieldset class="col-md-12">
++          <plotly-chart v-if="intervention_figs && intervention_figs.id" :graph="intervention_figs" :key="intervention_figs.id" ></plotly-chart>
++          <legend>Intervention Scenarios</legend>
++          <ul class="nav nav-tabs">
++            <li v-for="(scenario, scenarioKey, index) in interventionTableConfig" class="nav-item"><a data-toggle="tab" class="nav-link" v-bind:class="[index === 0 ? 'active' : '']" :href="'#' + scenarioKey">{{scenario.formTitle}}</a></li>
++          </ul>
++          <div class="tab-content">
++            <div :id="scenarioKey" class="tab-pane fade" v-bind:class="[index === 0 ? 'active show' : '']" v-for="(scenario, scenarioKey, index) in interventionTableConfig">
++              <div>
++                <legend>{{scenario.formTitle}}</legend>
++                <form @submit.prevent="(e) => addIntervention(scenarioKey, e)">
++                  <div class="form-group">
++                    <div class="input-group mb-3">
++                      <template v-for="field in scenario.fields">
++                        <input max="180" min="1" :placeholder="field.label" :name="field.key" :aria-label="field.label" class="form-control" v-if="field.type !== 'select'" :type="field.type" >
++                        <select class="form-control" :name="field.key" v-else>
++                            <option v-for="option in field.options" :value="option.value">{{option.label}}</option>
++                        </select>
++                      </template>
++                      <div class="input-group-append">
++                        <button class="btn btn-outline-secondary" type="submit">Add a scenario</button>
++                      </div>
++                    </div>
++                  </div>
++                </form>
++                <span aria-live="assertive" v-if="scenarioError[scenarioKey]" class="text-danger form-error">{{scenarioError[scenarioKey]}}</span>
++                <div v-if="intervention_pars[scenarioKey] && intervention_pars[scenarioKey].length > 0">
++                  <table class="table">
++                    <thead>
++                      <tr>
++                        <th scope="col" v-for="field in scenario.fields">{{field.label}}</th>
++                        <th scope="col"> </th>
++                      </tr>
++                    </thead>
++                    <tbody>
++                      <tr v-for="(intervention, index) in intervention_pars[scenarioKey]">
++                        <th v-for="field in scenario.fields" scope="row">{{intervention[field.key]}}</th>
++                        <td><button @click="deleteIntervention(scenarioKey, index)" class="btn btn-outline-secondary" type="button">Delete</button></td>
++                      </tr>
++                    </tbody>
++                  </table>
++                </div>
++              </div>
++            </div>
++          </div>
++        </fieldset>
+       </div>
+ 
+       <!-- Run button -->

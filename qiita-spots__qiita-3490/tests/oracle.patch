@@ -1,0 +1,164 @@
+diff --git a/qiita_pet/handlers/artifact_handlers/base_handlers.py b/qiita_pet/handlers/artifact_handlers/base_handlers.py
+index a1f5f9463..f57a4c6b7 100644
+--- a/qiita_pet/handlers/artifact_handlers/base_handlers.py
++++ b/qiita_pet/handlers/artifact_handlers/base_handlers.py
+@@ -134,7 +134,9 @@ def artifact_summary_get_request(user, artifact_id):
+     # Check if the artifact is editable by the given user
+     study = artifact.study
+     analysis = artifact.analysis
+-    if artifact_type == 'job-output-folder':
++    # if is a folder and has no parents, it means that is an SPP job and
++    # nobody should be able to change anything about it
++    if artifact_type == 'job-output-folder' and not artifact.parents:
+         editable = False
+     else:
+         editable = study.can_edit(user) if study else analysis.can_edit(user)
+diff --git a/qiita_pet/handlers/software.py b/qiita_pet/handlers/software.py
+index 54526a3d0..67030c9e0 100644
+--- a/qiita_pet/handlers/software.py
++++ b/qiita_pet/handlers/software.py
+@@ -74,6 +74,7 @@ def _default_parameters_parsing(node):
+         # for easy look up and merge of output_names
+         main_nodes = dict()
+         not_used_nodes = {n.id: n for n in graph.nodes}
++        standalone_input = None
+         for i, (x, y) in enumerate(graph.edges):
+             if x.id in not_used_nodes:
+                 del not_used_nodes[x.id]
+@@ -89,10 +90,16 @@ def _default_parameters_parsing(node):
+             if i == 0:
+                 # we are in the first element so we can specifically select
+                 # the type we are looking for
+-                if at in input_x[0][1]:
++                if input_x and at in input_x[0][1]:
+                     input_x[0][1] = at
+-                else:
++                elif input_x:
+                     input_x[0][1] = '** WARNING, NOT DEFINED **'
++                else:
++                    # if we get to this point it means that the workflow has a
++                    # multiple commands starting from the main single input,
++                    # thus is fine to link them to the same raw data
++                    standalone_input = vals_x[0]
++                    input_x = [['', at]]
+ 
+             name_x = vals_x[0]
+             name_y = vals_y[0]
+@@ -106,6 +113,8 @@ def _default_parameters_parsing(node):
+                         name = inputs[b]
+                     else:
+                         name = 'input_%s_%s' % (name_x, b)
++                        if standalone_input is not None:
++                            standalone_input = name
+                     vals = [name, a, b]
+                     if vals not in nodes:
+                         inputs[b] = name
+@@ -149,21 +158,25 @@ def _default_parameters_parsing(node):
+ 
+         wparams = w.parameters
+ 
+-        # adding nodes without edges
+-        # as a first step if not_used_nodes is not empty we'll confirm that
+-        # nodes/edges are empty; in theory we should never hit this
+-        if not_used_nodes and (nodes or edges):
+-            raise ValueError(
+-                'Error, please check your workflow configuration')
++        # This case happens when a workflow has 2 commands from the initial
++        # artifact and one of them has more processing after
++        if not_used_nodes and (nodes or edges) and standalone_input is None:
++            standalone_input = edges[0][0]
+ 
+         # note that this block is similar but not identical to adding connected
+         # nodes
+         for i, (_, x) in enumerate(not_used_nodes.items()):
+             vals_x, input_x, output_x = _default_parameters_parsing(x)
+-            if at in input_x[0][1]:
++            if input_x and at in input_x[0][1]:
+                 input_x[0][1] = at
+-            else:
++            elif input_x:
+                 input_x[0][1] = '** WARNING, NOT DEFINED **'
++            else:
++                # if we get to this point it means that these are "standalone"
++                # commands, thus is fine to link them to the same raw data
++                if standalone_input is None:
++                    standalone_input = vals_x[0]
++                input_x = [['', at]]
+ 
+             name_x = vals_x[0]
+             if vals_x not in (nodes):
+@@ -173,7 +186,16 @@ def _default_parameters_parsing(node):
+                         name = inputs[b]
+                     else:
+                         name = 'input_%s_%s' % (name_x, b)
+-                    nodes.append([name, a, b])
++                    # if standalone_input == name_x then this is the first time
++                    # we are processing a standalone command so we need to add
++                    # the node and store the name of the node for future usage
++                    if standalone_input is None:
++                        nodes.append([name, a, b])
++                    elif standalone_input == name_x:
++                        nodes.append([name, a, b])
++                        standalone_input = name
++                    else:
++                        name = standalone_input
+                     edges.append([name, vals_x[0]])
+                 for a, b in output_x:
+                     name = 'output_%s_%s' % (name_x, b)
+diff --git a/qiita_pet/test/test_software.py b/qiita_pet/test/test_software.py
+index c9baecd67..cc3fd01f3 100644
+--- a/qiita_pet/test/test_software.py
++++ b/qiita_pet/test/test_software.py
+@@ -57,6 +57,52 @@ def test_get(self):
+         self.assertIn('FASTA upstream workflow', body)
+         DefaultWorkflow(2).active = True
+ 
++    def test_retrive_workflows_standalone(self):
++        # let's create a new workflow, add 1 commands, and make parameters not
++        # required to make sure the stanalone is "active"
++        with TRN:
++            # 5 per_sample_FASTQ
++            sql = """INSERT INTO qiita.default_workflow
++                     (name, artifact_type_id, description, parameters)
++                     VALUES ('', 5, '', '{"prep": {}, "sample": {}}')
++                     RETURNING default_workflow_id"""
++            TRN.add(sql)
++            wid = TRN.execute_fetchlast()
++            # 11 is per-sample-FASTQ split libraries commands
++            sql = """INSERT INTO qiita.default_workflow_node
++                     (default_workflow_id, default_parameter_set_id)
++                     VALUES (%s, 11)
++                     RETURNING default_workflow_node_id"""
++            TRN.add(sql, [wid])
++            nid = TRN.execute_fetchflatten()
++            sql = """UPDATE qiita.command_parameter SET required = false"""
++            TRN.add(sql)
++            TRN.execute()
++
++        # here we expect 1 input node and 1 edge
++        obs = _retrive_workflows(True)[-1]
++        exp_value = f'input_params_{nid[0]}_per_sample_FASTQ'
++        self.assertEqual(1, len(
++            [x for x in obs['nodes'] if x[0] == exp_value]))
++        self.assertEqual(1, len(
++            [x for x in obs['edges'] if x[0] == exp_value]))
++
++        # now let's insert another command using the same input
++        with TRN:
++            # 12 is per-sample-FASTQ split libraries commands
++            sql = """INSERT INTO qiita.default_workflow_node
++                     (default_workflow_id, default_parameter_set_id)
++                     VALUES (%s, 12)"""
++            TRN.add(sql, [wid])
++            TRN.execute()
++
++        # we should still have 1 node but now with 2 edges
++        obs = _retrive_workflows(True)[-1]
++        self.assertEqual(1, len(
++            [x for x in obs['nodes'] if x[0] == exp_value]))
++        self.assertEqual(2, len(
++            [x for x in obs['edges'] if x[0] == exp_value]))
++
+     def test_retrive_workflows(self):
+         # we should see all 3 workflows
+         DefaultWorkflow(2).active = False

@@ -1,0 +1,276 @@
+diff --git a/atlas/workflow/envs/dram.yaml b/atlas/workflow/envs/dram.yaml
+index 61013f7f..63cfbd65 100644
+--- a/atlas/workflow/envs/dram.yaml
++++ b/atlas/workflow/envs/dram.yaml
+@@ -1,8 +1,5 @@
+ channels:
+   - conda-forge
+   - bioconda
+-  - defaults
+ dependencies:
+-  - dram=1.3
+-  - python-dateutil
+-  - scipy <1.9 # # https://github.com/biocore/scikit-bio/issues/1818
++  - dram >=1.4, <1.5
+\ No newline at end of file
+diff --git a/atlas/workflow/rules/dram.smk b/atlas/workflow/rules/dram.smk
+index 8069c95c..ee1d8827 100644
+--- a/atlas/workflow/rules/dram.smk
++++ b/atlas/workflow/rules/dram.smk
+@@ -2,13 +2,20 @@ DBDIR = config["database_dir"]
+ 
+ 
+ def get_dram_config(wildcards):
+-    return config.get("dram_config_file", f"{DBDIR}/DRAM.config")
++
++    old_dram_path = f"{DBDIR}/Dram"
++    if Path(old_dram_path).exists():
++        logger.error(
++            f"Detected an old database for DRAM in {old_dram_path}. You can delete it."
++        )
++
++    return config.get("dram_config_file", f"{DBDIR}/DRAM/DRAM.config")
+ 
+ 
+ rule dram_download:
+     output:
+-        dbdir=directory(f"{DBDIR}/Dram/"),
+-        config=f"{DBDIR}/DRAM.config",
++        dbdir=directory(f"{DBDIR}/DRAM/db/"),
++        config=f"{DBDIR}/DRAM/DRAM.config",
+     threads: config["threads"]
+     resources:
+         mem=config["mem"],
+@@ -38,7 +45,7 @@ rule DRAM_set_db_loc:
+     input:
+         get_dram_config,
+     output:
+-        touch(f"{DBDIR}/dram_config_imported"),
++        touch(f"{DBDIR}/DRAM/dram_config_imported"),
+     threads: 1
+     conda:
+         "../envs/dram.yaml"
+@@ -104,25 +111,18 @@ rule concat_annotations:
+         expand("genomes/annotations/dram/{annotation}", annotation=DRAM_ANNOTATON_FILES),
+     resources:
+         time=config["runtime"]["default"],
+-    #     mem = config['mem']
+     run:
+-        # from utils import io
++        from utils import io
++
+         for i, annotation_file in enumerate(DRAM_ANNOTATON_FILES):
+ 
+             input_files = [
+                 os.path.join(dram_folder, annotation_file) for dram_folder in input
+             ]
+ 
+-            # drop files that don't exist for rrna and trna
+-            if not i == 0:
+-                input_files = [f for f in input_files if os.path.exists(f)]
+-
+-            shell(f"head -n1 {input_files[0]} > {output[i]} ")
+-            for f in input_files:
+-                shell(f"tail -n+2 {f} >> {output[i]}")
+-
+-        # io.pandas_concat(input_files, output[i],sep='\t',index_col=0, axis=0)
+-
++            io.pandas_concat(
++                input_files, output[i], sep="\t", index_col=0, axis=0, disk_based=True
++            )
+ 
+ 
+ rule DRAM_destill:
+diff --git a/atlas/workflow/scripts/DRAM_get_all_modules.py b/atlas/workflow/scripts/DRAM_get_all_modules.py
+index f3457061..e5d7b6ce 100644
+--- a/atlas/workflow/scripts/DRAM_get_all_modules.py
++++ b/atlas/workflow/scripts/DRAM_get_all_modules.py
+@@ -43,14 +43,16 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ 
+ 
+ # get db_locs and read in dbs
+-database_handler = DatabaseHandler()
+-if "module_step_form" not in database_handler.dram_sheet_locs:
++database_handler = DatabaseHandler(logger=logging)
++
++
++if "module_step_form" not in database_handler.config["dram_sheets"]:
+     raise ValueError(
+         "Module step form location must be set in order to summarize genomes"
+     )
+ 
+ module_steps_form = pd.read_csv(
+-    database_handler.dram_sheet_locs["module_step_form"], sep="\t"
++    database_handler.config["dram_sheets"]["module_step_form"], sep="\t"
+ )
+ 
+ all_module_nets = {
+diff --git a/atlas/workflow/scripts/utils/io.py b/atlas/workflow/scripts/utils/io.py
+index a66d7941..96a8c482 100644
+--- a/atlas/workflow/scripts/utils/io.py
++++ b/atlas/workflow/scripts/utils/io.py
+@@ -1,6 +1,10 @@
+ import os
+ import gzip as gz
+ 
++import logging
++
++logger = logging.getLogger("io")
++
+ 
+ def simplify_path(path, remove_gz=True):
+     """Removes dir and extension from a filepath.
+@@ -66,6 +70,94 @@ def symlink_relative(files, input_dir, output_dir):
+         os.symlink(os.path.join(input_dir_rel, f), os.path.join(output_dir, f))
+ 
+ 
++def _pandas_concat_in_memory(
++    input_tables,
++    output_table,
++    sep,
++    index_col,
++    axis,
++    read_arguments,
++    save_arguments,
++    concat_arguments,
++):
++
++    import pandas as pd
++
++    Tables = [
++        pd.read_csv(file, index_col=index_col, sep=sep, **read_arguments)
++        for file in input_tables
++    ]
++
++    out = pd.concat(Tables, axis=axis, **concat_arguments).sort_index()
++
++    del Tables
++
++    out.to_csv(output_table, sep=sep, **save_arguments)
++
++
++def _pandas_concat_disck_based(
++    input_tables,
++    output_table,
++    sep,
++    index_col,
++    read_arguments,
++    save_arguments,
++    headers=None,
++):
++
++    """combine different tables but one after the other in disck based"""
++
++    import pandas as pd
++
++    try:
++        from tqdm import tqdm
++    except ImportError:
++        tqdm = tuple
++
++    if headers is not None:
++        try:
++            headers = list(headers)
++        except Exception as e:
++            raise Exception("headers should be a list-like") from e
++
++    else:
++        # read all_headers
++        headers = set()
++        for file in input_tables:
++
++            head = pd.read_csv(
++                file, index_col=index_col, sep=sep, nrows=2, dtype=str, **read_arguments
++            )
++
++            headers.update(list(head.columns))
++
++        headers = list(headers)
++        logger.info(f"Infered folowing list of headers {headers}")
++
++    # parse one file after another
++
++    logger.info("Read an append table by table")
++    for file in tqdm(input_tables):
++
++        # read full table
++        table = pd.read_csv(
++            file, index_col=index_col, sep=sep, dtype=str, **read_arguments
++        )
++        # set to common header
++        table = table.reindex(headers,axis=1)
++
++        if file == input_tables[0]:
++            mode = "w"
++            print_header = True
++        else:
++            mode = "a"
++            print_header = False
++
++        table.to_csv(
++            output_table, sep=sep, mode=mode, header=print_header, **save_arguments
++        )
++
++
+ def pandas_concat(
+     input_tables,
+     output_table,
+@@ -75,32 +167,46 @@ def pandas_concat(
+     read_arguments=None,
+     save_arguments=None,
+     concat_arguments=None,
++    disk_based=False,
++    headers=None,
+ ):
+     """
+     Uses pandas to read,concatenate and save tables using pandas.concat
+     """
+ 
+-    import pandas as pd
+-
+     if read_arguments is None:
+         read_arguments = {}
+     if save_arguments is None:
+         save_arguments = {}
+-    if concat_arguments is None:
+-        concat_arguments = {}
+ 
+     if type(input_tables) == str:
+         input_tables = [input_tables]
+ 
+-    Tables = [
+-        pd.read_csv(file, index_col=index_col, sep=sep, **read_arguments)
+-        for file in input_tables
+-    ]
++    common_arrguments = dict(
++        input_tables=input_tables,
++        output_table=output_table,
++        sep=sep,
++        index_col=index_col,
++        read_arguments=read_arguments,
++        save_arguments=save_arguments,
++    )
+ 
+-    out = pd.concat(Tables, axis=axis, **concat_arguments).sort_index()
++    if disk_based:
+ 
+-    del Tables
++        if concat_arguments is not None:
++            raise Exception(
++                f"cannot hanndle concat arguments by disck based append, got {concat_arguments}"
++            )
+ 
+-    out.to_csv(output_table, sep=sep, **save_arguments)
++        assert axis == 0, "Can only append on axis= 0"
++
++        _pandas_concat_disck_based(headers=headers, **common_arrguments)
++
++    else:
++        # in memory concat
++        if concat_arguments is None:
++            concat_arguments = {}
+ 
+-    del out
++        _pandas_concat_in_memory(
++            axis=axis, concat_arguments=concat_arguments, **common_arrguments
++        )

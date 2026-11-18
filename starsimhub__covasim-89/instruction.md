@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** WIP: Reorder UI input fields
+
+## Description
+
+![covasimReorder](https://user-images.githubusercontent.com/2318860/78906999-f2e1e500-7a34-11ea-9070-dcd4e1782c49.gif)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `3b55f28cdaba`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

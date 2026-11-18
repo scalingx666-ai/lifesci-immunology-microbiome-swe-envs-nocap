@@ -1,0 +1,506 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4e478c42..24329e17 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,47 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.5.6
++
++### Fixed — a concurrent fetch could publish a half-extracted reference
++
++2.5.5 made the mmseqs **index** build safe under concurrency. The **reference fetch** that runs just
++before it had the same disease, and it was the more dangerous of the two.
++
++`paths.database_dir` decides "is the reference here?" by testing whether `<cache>/database/vdj/` is a
++directory. Its mere existence is the gate. So anything that lets `vdj/` become visible before it is
++complete does not produce a slow download or a crash — it makes every *other* arda process search an
++**incomplete reference** and report success over nothing.
++
++Two things let that happen:
++
++* **No lock.** arda is routinely run concurrently against the same cache — the Nextflow module
++  launches one process per sample, a SLURM array one per task — so on first use in a fresh
++  environment all of them fetched into the same path at once.
++* **A cross-filesystem move.** The old code extracted into `/tmp` and called `shutil.move`.
++  `shutil.move` is a rename only *within* one filesystem; across a boundary it silently degrades to a
++  recursive **copy** — and `/tmp` and `~/.cache` normally are two different filesystems. So `vdj/` was
++  populated file by file, in full view of everyone else. It also `rmtree`'d the existing tree before
++  writing the new one, deleting files a concurrent reader could be mid-search on.
++
++The fetch now holds a build lock, extracts into a staging directory **inside the destination** (so the
++swap is a rename, not a copy), and publishes with a single `os.replace`. `vdj/` is either absent or
++complete — never in between. Under `--force` the old tree is *renamed* aside rather than deleted, so a
++reader already holding its files keeps them.
++
++The lock is now one implementation (`arda._locking.build_lock`) shared by the reference fetch and the
++index build, rather than two copies of the same loop.
++
++### Changed
++
++* `seqtree>=0.4` (was `>=0.2`). Clonotype output is unchanged — `examples/rnaseq/clones.tsv`
++  reproduces bit-for-bit.
++* Docs: corrected the memory guidance. Peak RSS tracks **repertoire richness**, not read depth —
++  mapping is flat (~300–400 MB at any depth), but Stage 3 holds the clone set, so a B-cell-rich tumour
++  peaked at 2.7 GB (28k clonotypes) while a colder sample with *more* reads used 314 MB. The old
++  "< 400 MB, independent of read depth" was measured before the Stage-3 assembler existed and would
++  have OOM-killed anyone sizing a SLURM or Nextflow memory directive from it. Budget ~4 GB.
++
+ ## 2.5.5
+ 
+ Two ways a correct arda install could still fail to work. Both hit the delivery path.
+diff --git a/docs/conf.py b/docs/conf.py
+index ab6d0272..624a3891 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -8,7 +8,7 @@
+ project = "arda"
+ author = "Mikhail Shugay"
+ copyright = "2026, Mikhail Shugay"
+-release = "2.5.5"
++release = "2.5.6"
+ 
+ extensions = [
+     "sphinx.ext.autodoc",
+diff --git a/pyproject.toml b/pyproject.toml
+index ca044a46..5ff54b1c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.5.5"
++version = "2.5.6"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+@@ -27,7 +27,7 @@ dependencies = [
+     # work, and past every smoke test, because `arda --version` succeeds without it. seqtree ships
+     # the same 12 wheels on the same platforms as arda (py3.10-3.13, linux/mac/win) and pulls no
+     # runtime deps of its own, so requiring it costs nothing.
+-    "seqtree>=0.2",
++    "seqtree>=0.4",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index 3c5ca7ef..3865c218 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.5.5"
++__version__ = "2.5.6"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/_database_fetch.py b/src/arda/_database_fetch.py
+index 61e68d61..78972de7 100644
+--- a/src/arda/_database_fetch.py
++++ b/src/arda/_database_fetch.py
+@@ -18,6 +18,7 @@
+ from pathlib import Path
+ 
+ from . import __version__
++from ._locking import build_lock
+ from ._mmseqs_fetch import _download  # reuse the hardened UA/retry downloader
+ 
+ _ASSET = "arda-reference-vdj.tar.gz"
+@@ -32,38 +33,76 @@ def reference_url(version: str | None = None) -> str:
+ def fetch_database(dest: Path, *, force: bool = False, version: str | None = None) -> Path:
+     """Download + extract the reference (``vdj/<org>/...``) into ``dest``; return ``dest``.
+ 
+-    Skips the download if ``dest/vdj`` already exists (unless ``force``). Extraction rejects
+-    symlinks/hardlinks and any path that escapes the temp dir (same guards as the mmseqs
+-    fetch), then moves the ``vdj`` tree into place atomically-ish.
++    Skips the download if ``dest/vdj`` already exists (unless ``force``).
++
++    **``vdj/`` must never be visible in a partial state**, because its mere existence is the gate
++    every other arda process tests (``paths.database_dir``) — a half-populated tree is not a slow
++    download, it is a silent wrong answer. Two things guarantee that:
++
++    * a :func:`~arda._locking.build_lock`, because arda is routinely run concurrently against the
++      same cache (one Nextflow process per sample, one SLURM task per array index), and on first use
++      in a fresh environment all of them would otherwise fetch into the same path at once;
++    * extraction into ``dest`` itself, then a single :func:`os.replace`. The extraction directory has
++      to be a *sibling* of the target for that to be a rename: the previous code extracted into
++      ``/tmp`` and called ``shutil.move``, which silently degrades to a recursive **copy** across
++      filesystems (``/tmp`` and ``~/.cache`` usually are different ones) — populating ``vdj/`` file
++      by file, in full view of every other process.
++
++    Extraction still rejects symlinks/hardlinks and any path escaping the staging dir.
+     """
+     dest = Path(dest)
+-    if (dest / "vdj").is_dir() and not force:
++    target = dest / "vdj"
++    if target.is_dir() and not force:
+         return dest
+     dest.mkdir(parents=True, exist_ok=True)
++
++    # Under --force the work is ours by definition; otherwise whoever installed vdj/ has done it.
++    done = (lambda: False) if force else target.is_dir
++    with build_lock(dest / ".vdj.lock", done=done) as ours:
++        if not ours:
++            return dest
++        _fetch_into(dest, target, version)
++    return dest
++
++
++def _fetch_into(dest: Path, target: Path, version: str | None) -> None:
++    """Download, verify and stage the reference beside ``target``, then swap it in atomically."""
+     url = reference_url(version)
+     print(f"[arda] fetching reference database (one-time): {url}", file=sys.stderr)
+-    with tempfile.TemporaryDirectory(prefix="arda_db_") as td:
+-        tmp = Path(td)
+-        tarball = tmp / _ASSET
++    # dir=dest, not /tmp: os.replace below is only a rename -- and only atomic -- within one filesystem.
++    staging = Path(tempfile.mkdtemp(dir=dest, prefix=".arda_db_"))
++    try:
++        tarball = staging / _ASSET
+         _download(url, tarball)
+         with tarfile.open(tarball) as tf:
+-            tmp_resolved = tmp.resolve()
++            staged = staging.resolve()
+             for member in tf.getmembers():
+                 if member.issym() or member.islnk():
+                     raise RuntimeError(f"Refusing to extract link from archive: {member.name}")
+-                member_path = (tmp / member.name).resolve()
+-                if not str(member_path).startswith(str(tmp_resolved) + os.sep):
++                member_path = (staging / member.name).resolve()
++                if not str(member_path).startswith(str(staged) + os.sep):
+                     raise RuntimeError(f"Refusing to extract path outside temp dir: {member.name}")
+-            tf.extractall(tmp)
++            tf.extractall(staging)
+         # tarball root holds vdj/ (created with `tar -C database ... vdj`); tolerate a nested layout.
+-        src = tmp / "vdj"
++        src = staging / "vdj"
+         if not src.is_dir():
+-            src = next((p for p in tmp.rglob("vdj") if p.is_dir()), None)
++            src = next((p for p in staging.rglob("vdj") if p.is_dir()), None)
+         if src is None:
+             raise RuntimeError(f"Unexpected reference archive layout in {_ASSET} (no vdj/)")
+-        target = dest / "vdj"
++
+         if target.exists():
+-            shutil.rmtree(target)
+-        shutil.move(str(src), str(target))
++            # os.replace refuses a non-empty destination directory, so retire the old tree first.
++            # Renaming it (rather than deleting it) keeps a reader that is mid-search on the old
++            # files alive: it holds inodes, and those survive until it closes them.
++            retired = dest / f".vdj.old.{os.getpid()}"
++            shutil.rmtree(retired, ignore_errors=True)
++            os.replace(target, retired)
++            try:
++                os.replace(src, target)
++            finally:
++                shutil.rmtree(retired, ignore_errors=True)
++        else:
++            os.replace(src, target)
++    finally:
++        shutil.rmtree(staging, ignore_errors=True)
+     print(f"[arda] installed reference -> {dest}", file=sys.stderr)
+-    return dest
+diff --git a/src/arda/_locking.py b/src/arda/_locking.py
+new file mode 100644
+index 00000000..e5c22cfe
+--- /dev/null
++++ b/src/arda/_locking.py
+@@ -0,0 +1,53 @@
++"""A cross-process build lock, for the two places arda races with itself.
++
++arda is routinely run concurrently against the **same** cache: the Nextflow module launches one
++process per sample and a SLURM array one per task. On first use in a fresh environment every one of
++them finds no reference and no mmseqs index, and starts building the same thing into the same path.
++
++Both races have the same shape and the same silent failure: an artifact whose mere *presence* is the
++"already built" gate becomes visible before it is complete, so every other process happily uses a
++half-written one and reports success over nothing.
++"""
++
++from __future__ import annotations
++
++import time
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager
++from pathlib import Path
++
++LOCK_TIMEOUT_S = 900
++"""These builds take seconds. Fifteen minutes means a dead lock, not a slow one."""
++
++
++@contextmanager
++def build_lock(lock: Path, *, done: Callable[[], bool]) -> Iterator[bool]:
++    """Serialize a build at ``lock``. Yields ``True`` if the work is ours, ``False`` if it is done.
++
++    ``mkdir`` is the lock: it is atomic on POSIX and Windows, needs no dependency, and leaves nothing
++    to clean up but an empty directory.
++
++    ``done()`` is checked while waiting *and* again after acquiring, because the common case is not
++    contention over the work — it is that the process we queued behind already finished it, and there
++    is nothing left for us to do.
++    """
++    deadline = time.monotonic() + LOCK_TIMEOUT_S
++    lock.parent.mkdir(parents=True, exist_ok=True)
++    while True:
++        try:
++            lock.mkdir()
++            break
++        except FileExistsError:
++            if done():  # the holder finished while we waited
++                yield False
++                return
++            if time.monotonic() > deadline:
++                raise TimeoutError(
++                    f"waited {LOCK_TIMEOUT_S}s for another arda process to finish {lock.parent}. "
++                    f"If no other arda run is active, remove {lock} and retry."
++                )
++            time.sleep(0.5)
++    try:
++        yield not done()  # won the lock, but someone may have finished just before we took it
++    finally:
++        lock.rmdir()
+diff --git a/src/arda/annotate/mapper.py b/src/arda/annotate/mapper.py
+index d04d3d0d..6c2c7057 100644
+--- a/src/arda/annotate/mapper.py
++++ b/src/arda/annotate/mapper.py
+@@ -12,12 +12,12 @@
+ import shutil
+ import tempfile
+ import threading
+-import time
+ from pathlib import Path
+ 
+ import polars as pl
+ 
+ from .. import mmseqs
++from .._locking import build_lock
+ from ..paths import data_dir, vdj_dir
+ from ..refbuild.translate import reverse_complement
+ from . import io as seqio
+@@ -100,44 +100,24 @@ def _committed_index(organism: str, seqtype: str, target_fasta: Path | None = No
+     return None
+ 
+ 
+-_LOCK_TIMEOUT_S = 900   # an mmseqs createdb of the reference takes seconds; 15 min is a dead-lock, not slowness
+-
+-
+ def _createdb_atomic(target_fasta: Path, db: Path, dbtype: int) -> None:
+     """Build an mmseqs DB at ``db``, safely when several arda processes start at once.
+ 
+     `mmseqs createdb` writes ~6 sibling files (``db``, ``db.index``, ``db_h``, ``db_h.index``,
+     ``db.dbtype``, ``db.lookup``). Building them in place is not safe, and arda is routinely run
+-    concurrently against the SAME reference: the Nextflow module launches one process **per sample**,
+-    and a SLURM array one per task. On first use in a fresh environment every one of them finds no
+-    index and starts building it into the same paths.
++    concurrently against the SAME reference (see :mod:`arda._locking`): every process finds no index
++    and starts building it into the same paths.
+ 
+     They then interleave writes -- and `build_index` additionally unlinks the files another process
+     is mid-read on. The observed failure is silent and total: a 0-byte ``db``, after which every read
+     fails to map (``0/200000 reads mapped, loci={}``) with no error and a clean exit code.
+ 
+-    So: hold a lock (``mkdir`` is atomic on POSIX and Windows), build into a private temp dir, and
+-    move the finished files into place with ``db`` **last** -- readers test ``db.exists()``, so it
+-    must not appear until its siblings are all there. A killed builder leaves a temp dir, never a
+-    half-built DB that looks complete.
++    So: hold the build lock, build into a private temp dir, and move the finished files into place
++    with ``db`` **last** -- readers test ``db.exists()``, so it must not appear until its siblings are
++    all there. A killed builder leaves a temp dir, never a half-built DB that looks complete.
+     """
+-    lock = db.parent / f".{db.name}.lock"
+-    deadline = time.monotonic() + _LOCK_TIMEOUT_S
+-    while True:
+-        try:
+-            lock.mkdir()
+-            break
+-        except FileExistsError:
+-            if db.exists():          # another builder finished while we waited
+-                return
+-            if time.monotonic() > deadline:
+-                raise TimeoutError(
+-                    f"waited {_LOCK_TIMEOUT_S}s for another arda process to build {db}. "
+-                    f"If no other run is active, remove {lock} and retry."
+-                )
+-            time.sleep(0.5)
+-    try:
+-        if db.exists():              # won the race, but someone else got there first
++    with build_lock(db.parent / f".{db.name}.lock", done=db.exists) as ours:
++        if not ours:
+             return
+         tmp = db.parent / f".{db.name}.tmp.{os.getpid()}"
+         shutil.rmtree(tmp, ignore_errors=True)
+@@ -150,8 +130,6 @@ def _createdb_atomic(target_fasta: Path, db: Path, dbtype: int) -> None:
+                 os.replace(f, db.parent / f.name)
+         finally:
+             shutil.rmtree(tmp, ignore_errors=True)
+-    finally:
+-        lock.rmdir()
+ 
+ 
+ def _cached_target_db(target_fasta: Path, organism: str, seqtype: str) -> Path:
+diff --git a/tests/unit/test_database_fetch_atomic.py b/tests/unit/test_database_fetch_atomic.py
+new file mode 100644
+index 00000000..b2f4959b
+--- /dev/null
++++ b/tests/unit/test_database_fetch_atomic.py
+@@ -0,0 +1,156 @@
++"""``vdj/`` must never be visible half-populated -- its existence is the gate.
++
++`paths.database_dir` decides "is the reference already here?" by testing whether ``vdj/`` is a
++directory. So anything that makes ``vdj/`` appear before it is complete does not cause a slow
++download or a crash -- it causes every *other* arda process to search an incomplete reference and
++report success over nothing.
++
++Two ways that happened, both fixed here:
++
++* **No lock.** The Nextflow module runs one process per sample, a SLURM array one per task; on first
++  use in a fresh cache they all fetch at once, into the same path.
++* **A cross-filesystem move.** The old code extracted into ``/tmp`` and called ``shutil.move``, which
++  is a rename only *within* one filesystem and silently degrades to a recursive **copy** across them
++  -- and ``/tmp`` and ``~/.cache`` normally are two different filesystems. So ``vdj/`` got populated
++  file by file, in full view of everyone else.
++"""
++
++import multiprocessing as mp
++import os
++import tarfile
++import time
++from pathlib import Path
++
++import pytest
++
++from arda import _database_fetch as dbf
++
++# Enough files that a file-by-file copy has a wide window to be caught in the act.
++_ORGANISMS = [f"org{i}" for i in range(12)]
++
++
++def _make_tarball(path: Path) -> None:
++    """A stand-in reference archive: vdj/<org>/alleles.fasta, as the real asset is laid out."""
++    stage = path.parent / "stage"
++    for org in _ORGANISMS:
++        d = stage / "vdj" / org
++        d.mkdir(parents=True, exist_ok=True)
++        (d / "alleles.fasta").write_text(f">{org}\nACGT\n" * 200)
++    with tarfile.open(path, "w:gz") as tf:
++        tf.add(stage / "vdj", arcname="vdj")
++
++
++def _complete(vdj: Path) -> bool:
++    return all((vdj / o / "alleles.fasta").is_file() for o in _ORGANISMS)
++
++
++def _fetch(dest: str) -> None:
++    """One arda process fetching the reference into a shared cache."""
++    tarball = Path(dest).parent / "asset.tar.gz"
++
++    def fake_download(url, out):
++        time.sleep(0.05)  # a real download is not instant; give the racers room to interleave
++        out.write_bytes(tarball.read_bytes())
++
++    dbf._download = fake_download
++    dbf.fetch_database(Path(dest))
++
++
++def _watch(dest: str) -> str:
++    """Another arda process: the moment `vdj/` exists it is considered usable -- is it?"""
++    vdj = Path(dest) / "vdj"
++    for _ in range(4000):
++        if vdj.is_dir():
++            # No sleep: the whole point is what a reader sees the instant the gate opens.
++            return "complete" if _complete(vdj) else f"PARTIAL: {len(list(vdj.iterdir()))} of {len(_ORGANISMS)}"
++        time.sleep(0.002)
++    return "never appeared"
++
++
++def test_a_reader_never_sees_a_partially_extracted_reference(tmp_path):
++    """Catches any file-by-file materialization of ``vdj/`` (verified: swap the `os.replace` for a
++    `copytree` and this reports ``PARTIAL: 5 of 12``).
++
++    It does **not** by itself reproduce the shipped bug, and that is worth knowing rather than
++    assuming: the old `shutil.move` is a plain rename when source and destination share a
++    filesystem, which they do under pytest's tmp_path. It only degrades to a copy across a
++    filesystem boundary -- i.e. in production, where the staging dir was ``/tmp`` and the cache is
++    ``~/.cache``. `test_staging_is_a_sibling_of_the_target` is the deterministic guard for that.
++    """
++    dest = tmp_path / "database"
++    dest.mkdir()
++    _make_tarball(tmp_path / "asset.tar.gz")
++
++    watcher = mp.Pool(1)
++    async_result = watcher.apply_async(_watch, (str(dest),))
++    fetcher = mp.Process(target=_fetch, args=(str(dest),))
++    fetcher.start()
++    saw = async_result.get(timeout=60)
++    fetcher.join()
++    watcher.close()
++
++    assert saw == "complete", (
++        f"a concurrent arda process saw {saw}. `vdj/` became visible before it was fully "
++        "extracted, and its existence is what every other process uses to decide the reference "
++        "is ready."
++    )
++
++
++def test_concurrent_fetchers_download_once_and_leave_one_good_tree(tmp_path):
++    dest = tmp_path / "database"
++    dest.mkdir()
++    _make_tarball(tmp_path / "asset.tar.gz")
++
++    with mp.Pool(4) as pool:
++        pool.map(_fetch, [str(dest)] * 4)
++
++    assert _complete(dest / "vdj"), "the reference tree is incomplete after 4 concurrent fetchers"
++    leftovers = [p.name for p in dest.iterdir() if p.name != "vdj"]
++    assert not leftovers, f"staging/lock dirs left behind: {leftovers}"
++
++
++def test_force_replaces_the_tree_without_ever_exposing_a_partial_one(tmp_path):
++    dest = tmp_path / "database"
++    dest.mkdir()
++    _make_tarball(tmp_path / "asset.tar.gz")
++    _fetch(str(dest))
++
++    stale = dest / "vdj" / "org0" / "alleles.fasta"
++    stale.write_text(">stale\n")
++    dbf.fetch_database(dest, force=True)
++
++    assert _complete(dest / "vdj")
++    assert stale.read_text() != ">stale\n", "--force did not actually replace the old tree"
++    assert not [p.name for p in dest.iterdir() if p.name != "vdj"], "staging dirs left behind"
++
++
++@pytest.mark.skipif(os.name == "nt", reason="POSIX rename semantics")
++def test_staging_is_a_sibling_of_the_target(tmp_path):
++    """The staging dir must live in `dest`, or `os.replace` is a cross-device copy, not a rename.
++
++    This is the actual defect: `/tmp` and `~/.cache` are usually different filesystems, so the old
++    `shutil.move` silently copied `vdj/` into place file by file instead of renaming it.
++    """
++    dest = tmp_path / "database"
++    dest.mkdir()
++    _make_tarball(tmp_path / "asset.tar.gz")
++    seen: list[Path] = []
++
++    real_mkdtemp = dbf.tempfile.mkdtemp
++
++    def spy(*a, **kw):
++        d = real_mkdtemp(*a, **kw)
++        seen.append(Path(d))
++        return d
++
++    dbf.tempfile.mkdtemp = spy
++    try:
++        _fetch(str(dest))
++    finally:
++        dbf.tempfile.mkdtemp = real_mkdtemp
++
++    assert seen, "no staging directory was created"
++    assert seen[0].parent == dest, (
++        f"staged in {seen[0].parent}, not in {dest}: os.replace across filesystems is a copy, "
++        "which is exactly the bug"
++    )

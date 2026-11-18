@@ -1,0 +1,508 @@
+diff --git a/atlas/make_config.py b/atlas/make_config.py
+index b4013875..1c2fe5cf 100644
+--- a/atlas/make_config.py
++++ b/atlas/make_config.py
+@@ -158,22 +158,6 @@ def make_default_config():
+     config["annotations"] = ["gtdb_taxonomy", "checkm_taxonomy", "gtdb_tree"]
+     config["rename_mags_contigs"] = True
+ 
+-    config["genome_dereplication"] = dict(
+-        filter=dict(noFilter=False, length=5000, completeness=50, contamination=10),
+-        score=dict(
+-            completeness=1,
+-            contamination=5,
+-            N50=0.5,
+-            length=0,
+-        ),
+-        ANI=0.95,
+-        overlap=0.6,
+-        opt_parameters="",
+-    )
+-
+-    config["cat_range"] = 5
+-    config["cat_fraction"] = 0.3
+-
+     config["runtime"] = {"default": 5, "assembly": 24, "long": 12, "simplejob": 1}
+ 
+     return config
+diff --git a/atlas/template_config.yaml b/atlas/template_config.yaml
+index f2dff536..478366e4 100644
+--- a/atlas/template_config.yaml
++++ b/atlas/template_config.yaml
+@@ -178,19 +178,13 @@ DASTool:
+   score_threshold: 0.5              #Score threshold until selection algorithm will keep selecting bins [0..1].
+ 
+ genome_dereplication:
+-  ANI: 0.975                        ## Genome dreplication threshold
+-  overlap: 0.2                      ## more info https://drep.readthedocs.io/en/latest/choosing_parameters.html
++  ANI: 97.5                        ## Genome dreplication threshold
++  overlap: 0.50                  # See more on https://wwood.github.io/galah/galah-cluster.html
+   opt_parameters: ""
+-  filter:
+-      noFilter: false
+-      length: 5000
+-      completeness: 50
+-      contamination: 10
+-  score:
+-      completeness: 1
+-      contamination: 5
+-      N50: 0.5
+-      length: 0
++  quality_formula: "Parks2020_reduced" # completeness-5*contamination-5*num_contigs/100-5*num_ambiguous_bases/100000
++  
++genome_min_completeness: 50
++genome_max_contamination: 10
+ 
+ rename_mags_contigs: true        #Rename contigs of representative MAGs
+ 
+@@ -219,7 +213,7 @@ genecatalog:
+   minlength_nt: 270             # min length 
+   minid: 0.90                   # min id for gene clustering for the main gene catalog used for annotation
+   coverage: 0.9
+-  extra: ""
++  extra: " --precluster-method finch "
+   SubsetSize: 500000
+ 
+ eggNOG_use_virtual_disk: false   # coping the eggNOG DB to a virtual disk can sppeed up the annotation
+diff --git a/atlas/workflow/Snakefile b/atlas/workflow/Snakefile
+index bb8d059d..1b48202b 100644
+--- a/atlas/workflow/Snakefile
++++ b/atlas/workflow/Snakefile
+@@ -325,7 +325,7 @@ def get_genome_annotations():
+ 
+ rule genomes:
+     input:
+-        "genomes/Dereplication/dereplicated_genomes",
++        "genomes/genomes",
+         "genomes/counts/median_coverage_genomes.tsv",
+         "genomes/counts/raw_counts_genomes.tsv",
+         "genomes/clustering/allbins2genome.tsv",
+diff --git a/atlas/workflow/config/default_config.yaml b/atlas/workflow/config/default_config.yaml
+index f8186200..ccc3afa8 100644
+--- a/atlas/workflow/config/default_config.yaml
++++ b/atlas/workflow/config/default_config.yaml
+@@ -1,4 +1,13 @@
+ 
+ 
+ gene_annotations:
+-  - eggNOG
+\ No newline at end of file
++  - eggNOG
++
++genome_dereplication:
++  ANI: 97.5                        ## Genome dreplication threshold
++  overlap: 0.5                  # See more on https://wwood.github.io/galah/galah-cluster.html
++  opt_parameters: ""
++  quality_formula: "Parks2020_reduced" # completeness-5*contamination-5*num_contigs/100-5*num_ambiguous_bases/100000
++  
++genome_min_completeness: 50
++genome_max_contamination: 10
+\ No newline at end of file
+diff --git a/atlas/workflow/envs/galah.yaml b/atlas/workflow/envs/galah.yaml
+new file mode 100644
+index 00000000..82488f68
+--- /dev/null
++++ b/atlas/workflow/envs/galah.yaml
+@@ -0,0 +1,6 @@
++channels:
++  - conda-forge
++  - bioconda
++  - defaults
++dependencies:
++  - galah
+\ No newline at end of file
+diff --git a/atlas/workflow/rules/genomes.smk b/atlas/workflow/rules/genomes.smk
+index d4981840..aea0d38e 100644
+--- a/atlas/workflow/rules/genomes.smk
++++ b/atlas/workflow/rules/genomes.smk
+@@ -39,11 +39,11 @@ rule all_contigs2bins:
+ 
+ 
+ localrules:
+-    get_quality_for_dRep_from_checkm,
++    merge_checkm_for_dereplication,
+     merge_checkm,
+ 
+ 
+-rule get_quality_for_dRep_from_checkm:
++rule merge_checkm_for_dereplication:
+     input:
+         "reports/genomic_bins_{binner}.tsv".format(binner=config["final_binner"]),
+     output:
+@@ -53,10 +53,12 @@ rule get_quality_for_dRep_from_checkm:
+ 
+         D = pd.read_csv(input[0], index_col=0, sep="\t")
+ 
+-        D.index = D.index.astype(str) + ".fasta"
++
+         D.index.name = "genome"
++
+         D.columns = D.columns.str.lower()
+-        D.iloc[:, :3].to_csv(output[0])
++        D = D[["completeness", "contamination"]]
++        D.to_csv(output[0])
+ 
+ 
+ rule merge_checkm:
+@@ -98,56 +100,59 @@ rule merge_checkm:
+                 shutil.copyfileobj(open(fasta, "rb"), fout)
+ 
+ 
++def get_dereplication_arguments(key):
++    "key = completeness or contamination"
++
++    if "filter" in config["genome_dereplication"]:
++        logger.info(
++            "The configuration for dereplication has changed. For now I will try to be backward compatible, but please update your config file. https://metagenome-atlas.readthedocs.io/en/latest/usage/configuration.html#detailed-configuration"
++        )
++
++        return config["genome_dereplication"]["filter"][key]
++
++    else:
++        if key == "completeness":
++            return config["genome_min_completeness"]
++        elif key == "contamination":
++            return config["genome_max_contamination"]
++        else:
++            raise ValueError("key must be completeness, contamination")
++
++
+ rule dereplication:
+     input:
+-        "genomes/all_bins",
++        dir="genomes/all_bins",
+         quality="genomes/quality.csv",
+     output:
+-        directory("genomes/Dereplication/dereplicated_genomes"),
++        dir=temp(directory("genomes/dereplicated_genomes")),
++        mapping_file=temp("genomes/clustering/allbins2genome_oldname.tsv"),
+     threads: config["threads"]
+     log:
+         "logs/genomes/dereplication.log",
+-    shadow:
+-        "shallow"
+     conda:
+-        "%s/dRep.yaml" % CONDAENV
++        "../envs/galah.yaml"
+     params:
+-        filter=(
+-            " --noQualityFiltering "
+-            if config["genome_dereplication"]["filter"]["noFilter"]
+-            else ""
+-        ),
+-        filter_length=config["genome_dereplication"]["filter"]["length"],
+-        filter_completeness=config["genome_dereplication"]["filter"]["completeness"],
+-        filter_contamination=config["genome_dereplication"]["filter"]["contamination"],
+         ANI=config["genome_dereplication"]["ANI"],
+-        overlap=config["genome_dereplication"]["overlap"],
+-        completeness_weight=config["genome_dereplication"]["score"]["completeness"],
+-        contamination_weight=config["genome_dereplication"]["score"]["contamination"],
+-        #not in table
+-        N50_weight=config["genome_dereplication"]["score"]["N50"],
+-        size_weight=config["genome_dereplication"]["score"]["length"],
++        quality_formula=config["genome_dereplication"]["quality_formula"],
++        min_completeness=get_dereplication_arguments("completeness"),
++        max_contamination=get_dereplication_arguments("contamination"),
+         opt_parameters=config["genome_dereplication"]["opt_parameters"],
+-        work_directory=lambda wc, output: os.path.dirname(output[0]),
++        min_overlap=config["genome_dereplication"]["overlap"],
+     shell:
+-        " rm -rf {params.work_directory} ;"
+-        " dRep dereplicate "
+-        " --genomes {input[0]}/*.fasta "
+-        " --genomeInfo {input.quality} "
+-        " {params.filter} "
+-        " --length {params.filter_length} "
+-        " --completeness {params.filter_completeness} "
+-        " --contamination {params.filter_contamination} "
+-        " --S_ani {params.ANI} "
+-        " --S_algorithm fastANI "
+-        " --cov_thresh {params.overlap} "
+-        " --completeness_weight {params.completeness_weight} "
+-        " --contamination_weight {params.contamination_weight} "
+-        " --N50_weight {params.N50_weight} "
+-        " --size_weight {params.size_weight} "
+-        " --processors {threads} "
++        " galah cluster "
++        " --genome-fasta-directory {input.dir}"
++        " --genome-fasta-extension fasta "
++        " --genome-info {input.quality} "
++        " --ani {params.ANI} "
++        " --min-aligned-fraction {params.min_overlap} "
+         " {params.opt_parameters} "
+-        " {params.work_directory} "
++        " --min-completeness {params.min_completeness} "
++        " --max-contamination {params.max_contamination} "
++        " --quality-formula {params.quality_formula} "
++        " --threads {threads} "
++        " --output-representative-fasta-directory {output.dir} "
++        " --output-cluster-definition {output.mapping_file} "
++        " --precluster-method finch "
+         " &> {log} "
+ 
+ 
+@@ -157,12 +162,13 @@ localrules:
+ 
+ checkpoint rename_genomes:
+     input:
+-        genomes="genomes/Dereplication/dereplicated_genomes",
++        genomes="genomes/dereplicated_genomes",
++        mapping_file="genomes/clustering/allbins2genome_oldname.tsv",
+     output:
+         dir=directory("genomes/genomes"),
+         mapfile_contigs="genomes/clustering/contig2genome.tsv",
+-        mapfile_genomes="genomes/clustering/old2newID.tsv",
+-        mapfile_bins="genomes/clustering/allbins2genome.tsv",
++        mapfile_old2mag="genomes/clustering/old2newID.tsv",
++        mapfile_allbins2mag="genomes/clustering/allbins2genome.tsv",
+     params:
+         rename_contigs=config["rename_mags_contigs"],
+     shadow:
+diff --git a/atlas/workflow/rules/qc.smk b/atlas/workflow/rules/qc.smk
+index 05699a25..e7691d73 100644
+--- a/atlas/workflow/rules/qc.smk
++++ b/atlas/workflow/rules/qc.smk
+@@ -158,20 +158,20 @@ rule get_read_stats:
+             tmp_file = os.path.join(subfolder, "read_stats.tmp")
+             shell(
+                 """
+-                                                                mkdir -p {subfolder} 2> {log}
+-
+-                                                                reformat.sh {params_in} \
+-                                                                bhist={subfolder}/base_hist.txt \
+-                                                                qhist={subfolder}/quality_by_pos.txt \
+-                                                                lhist={subfolder}/readlength.txt \
+-                                                                gchist={subfolder}/gc_hist.txt \
+-                                                                gcbins=auto \
+-                                                                bqhist={subfolder}/boxplot_quality.txt \
+-                                                                threads={threads} \
+-                                                                overwrite=true \
+-                                                                -Xmx{mem}G \
+-                                                                2> >(tee -a {log} {tmp_file} )
+-                                                                """.format(
++                                                                                        mkdir -p {subfolder} 2> {log}
++
++                                                                                        reformat.sh {params_in} \
++                                                                                        bhist={subfolder}/base_hist.txt \
++                                                                                        qhist={subfolder}/quality_by_pos.txt \
++                                                                                        lhist={subfolder}/readlength.txt \
++                                                                                        gchist={subfolder}/gc_hist.txt \
++                                                                                        gcbins=auto \
++                                                                                        bqhist={subfolder}/boxplot_quality.txt \
++                                                                                        threads={threads} \
++                                                                                        overwrite=true \
++                                                                                        -Xmx{mem}G \
++                                                                                        2> >(tee -a {log} {tmp_file} )
++                                                                                        """.format(
+                     subfolder=subfolder,
+                     params_in=params_in,
+                     log=log,
+diff --git a/atlas/workflow/scripts/rename_genecatalog.py b/atlas/workflow/scripts/rename_genecatalog.py
+index 50d44c3c..229a9a65 100644
+--- a/atlas/workflow/scripts/rename_genecatalog.py
++++ b/atlas/workflow/scripts/rename_genecatalog.py
+@@ -60,6 +60,6 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+                 gene_id = rep2gene.loc[gene_name]
+ 
+                 fout.write(f">{gene_id} {gene_name}\n")
+-                
++
+             else:
+                 fout.write(line)
+diff --git a/atlas/workflow/scripts/rename_genomes.py b/atlas/workflow/scripts/rename_genomes.py
+index e96359f5..42b22c95 100644
+--- a/atlas/workflow/scripts/rename_genomes.py
++++ b/atlas/workflow/scripts/rename_genomes.py
+@@ -1,106 +1,110 @@
+-import os, sys
+-import argparse
+-from snakemake.io import glob_wildcards
++#! /usr/bin/env python
+ 
+-from atlas import utils
+-import pandas as pd
+ 
++import sys, os
++import logging, traceback
+ 
+-def rename_genomes(
+-    input_folder, mapfile_genomes, mapfile_contigs, output_dir, rename_contigs=True
+-):
++logging.basicConfig(
++    filename=snakemake.log[0],
++    level=logging.INFO,
++    format="%(asctime)s %(message)s",
++    datefmt="%Y-%m-%d %H:%M:%S",
++)
+ 
+-    file_name = f"{input_folder}/{{binid}}.fasta"
+-    (bin_ids,) = glob_wildcards(file_name)
+ 
+-    old2new_name = dict(
+-        zip(bin_ids, utils.gen_names_for_range(len(bin_ids), prefix="MAG"))
++def handle_exception(exc_type, exc_value, exc_traceback):
++    if issubclass(exc_type, KeyboardInterrupt):
++        sys.__excepthook__(exc_type, exc_value, exc_traceback)
++        return
++
++    logging.error(
++        "".join(
++            [
++                "Uncaught exception: ",
++                *traceback.format_exception(exc_type, exc_value, exc_traceback),
++            ]
++        )
+     )
+-    os.makedirs(output_dir)
+-
+-    with open(mapfile_contigs, "w") as out_contigs, open(
+-        mapfile_genomes, "w"
+-    ) as old2new_mapping_file:
+-        old2new_mapping_file.write(f"BinID\tMAG\n")
+-        for binid in bin_ids:
+-
+-            fasta_in = file_name.format(binid=binid)
+-            new_name = old2new_name[binid]
+-
+-            old2new_mapping_file.write(f"{binid}\t{new_name}\n")
+-
+-            fasta_out = os.path.join(output_dir, f"{new_name}.fasta")
+-
+-            # write names of contigs in mapping file
+-            with open(fasta_in) as ffi, open(fasta_out, "w") as ffo:
+-                Nseq = 0
+-                for line in ffi:
+-                    if line[0] == ">":
+-                        Nseq += 1
+-                        if rename_contigs:
+-                            new_header = f"{new_name}_{Nseq}"
+-                        else:
+-                            new_header = line[1:].strip().split()[0]
+-                        out_contigs.write(f"{new_header}\t{new_name}\n")
+-                        ffo.write(f">{new_header}\n")
+-                    else:
+-                        ffo.write(line)
+ 
+ 
+-def genome2cluster(Drep_folder):
++# Install exception handler
++sys.excepthook = handle_exception
+ 
+-    Cdb = pd.read_csv(os.path.join(Drep_folder, "..", "data_tables", "Cdb.csv"))
+-    Cdb.index = Cdb.genome  # location changes
+ 
+-    Wdb = pd.read_csv(os.path.join(Drep_folder, "..", "data_tables", "Wdb.csv"))
+-    Wdb.index = Wdb.cluster
+-    map_genome2cluster = Cdb.secondary_cluster.map(Wdb.genome)
++from snakemake.io import glob_wildcards
+ 
+-    return map_genome2cluster
++from atlas import utils
++import pandas as pd
+ 
+ 
+-def get_mapfile_bins(mapfile_bins, dereplication, old2new):
++# load mapping file  with old names
++# tsv with format
++# path/to/rep.fasta path/to/bin.fasta
+ 
+-    Genome_map = genome2cluster(dereplication)
++mapping = pd.read_csv(
++    snakemake.input.mapping_file, sep="\t", usecols=[0,1], header=None
++)
++mapping.columns = ["Rep_path","Bin_path"]
+ 
+-    Genome_map.index = Genome_map.index.str.replace(".fasta", "")
+-    Genome_map = Genome_map.str.replace(".fasta", "")
++# go from path to id
++mapping[[ "Representative","Bin"]] = mapping.applymap(
++    lambda x: os.path.basename(x).replace(".fasta", "")
++)
++mapping.set_index("Bin", inplace=True)
+ 
+-    old2new_name = pd.read_csv(old2new, index_col=0, squeeze=True, sep="\t")
+-    Genome_map = Genome_map.map(old2new_name)
+ 
+-    Genome_map.sort_values(inplace=True)
+-    Genome_map.name = "MAG"
++# standardize names of representatives
++# MAG001 ....
++representatives = mapping.Representative.unique()
++old2new_name = dict(
++    zip(representatives, utils.gen_names_for_range(len(representatives), prefix="MAG"))
++)
++mapping["MAG"] = mapping.Representative.map(old2new_name)
+ 
+-    Genome_map.to_csv(mapfile_bins, sep="\t", header=True)
+ 
++# write cluster attribution
++mapping[["MAG", "Representative"]].to_csv(
++    snakemake.output.mapfile_allbins2mag, sep="\t", header=True
++)
+ 
+-if __name__ == "__main__":
++# write out old2new ids
++old2new = mapping.loc[representatives, "MAG"]
++old2new.index.name = "Representative"
++old2new.to_csv(snakemake.output.mapfile_old2mag, sep="\t", header=True)
+ 
+-    try:
+-        log = open(snakemake.log[0], "w")
+-        sys.stderr = log
+-        sys.stdout = log
++#### Write genomes and contig to genome mapping file
+ 
+-        rename_genomes(
+-            input_folder=snakemake.input.genomes,
+-            output_dir=snakemake.output.dir,
+-            mapfile_genomes=snakemake.output.mapfile_genomes,
+-            mapfile_contigs=snakemake.output.mapfile_contigs,
+-            rename_contigs=snakemake.params.rename_contigs,
+-        )
++output_dir = snakemake.output.dir
++mapfile_contigs = snakemake.output.mapfile_contigs
++rename_contigs = snakemake.params.rename_contigs
+ 
+-        get_mapfile_bins(
+-            mapfile_bins=snakemake.output.mapfile_bins,
+-            dereplication=snakemake.input.genomes,
+-            old2new=snakemake.output.mapfile_genomes,
+-        )
+ 
+-    except NameError:
+-        p = argparse.ArgumentParser()
+-        p.add_argument("--input-folder")
+-        p.add_argument("--output-dir")
+-        p.add_argument("--mapfile-genomes")
+-        p.add_argument("--mapfile-contigs")
+-        args = vars(p.parse_args())
+-        rename_genomes(**args)
++os.makedirs(output_dir)
++
++with open(mapfile_contigs, "w") as out_contigs:
++    for rep, row in mapping.loc[representatives].iterrows():
++
++        fasta_in = row.Rep_path
++        new_name = row.MAG
++
++        fasta_out = os.path.join(output_dir, f"{row.MAG}.fasta")
++
++        # write names of contigs in mapping file
++        with open(fasta_in) as ffi, open(fasta_out, "w") as ffo:
++            Nseq = 0
++            for line in ffi:
++                # if header line
++                if line[0] == ">":
++                    Nseq += 1
++
++                    if rename_contigs:
++                        new_header = f"{row.MAG}_{Nseq}"
++                    else:
++                        new_header = line[1:].strip().split()[0]
++
++                    # write to contig to mapping file
++                    out_contigs.write(f"{new_header}\t{row.MAG}\n")
++                    # write to fasta file
++                    ffo.write(f">{new_header}\n")
++                else:
++                    ffo.write(line)

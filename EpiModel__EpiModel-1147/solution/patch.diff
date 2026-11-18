@@ -1,0 +1,107 @@
+diff --git a/NEWS.md b/NEWS.md
+index 2e9b404f..f1fbfdd0 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -13,6 +13,7 @@
+ 
+ -   `netsim()` and `netdx()` with `ncores > 1` now warn when modules or network model formulas refer to global objects or functions from attached packages, which multisession workers do not have, and `?netsim` has a new Parallel Simulation section on making such code self-contained (#1104).
+ -   `netsim()` now stops with an error naming the module when a module returns `dat` with an R attribute set on it, which is what happens when magrittr is attached after EpiModel and masks `set_attr()` (#1120).
++-   `get_posit_ids()` and `is_active_unique_ids()` are faster at 100,000 nodes, with identical output: a few unique IDs are found by binary search (#1147).
+ -   `dissolution_coefs()` now warns when a duration is at or above 90% of the departure ceiling, `1 / (2 * d.rate - d.rate^2)`, naming the duration, and its error at the ceiling gives the ceiling and points at the duration before `d.rate` (#1138).
+ -   `simulate_dat()` passes the installed ergm version to the term initializers through `term.options`, which otherwise read it from disk every time a term is initialized, with identical output (#1146).
+ -   EpiModel no longer imports or links to Rcpp. Its one compiled helper, `shiftVec()`, which `delete_vertices()` uses to renumber vertex IDs after departures, is now plain C registered through R's native routine interface (#1140).
+diff --git a/R/net.fn.accessor.R b/R/net.fn.accessor.R
+index a2f19441..118d1497 100644
+--- a/R/net.fn.accessor.R
++++ b/R/net.fn.accessor.R
+@@ -892,8 +892,17 @@ get_posit_ids <- function(dat, unique_ids = NULL) {
+   if (is.null(unique_ids)) {
+     return(seq_along(get_attr(dat, "active")))
+   }
+-  posit_ids <- base::match(unique_ids, get_attr(dat, "unique_id"))
+-  if (any(is.na(posit_ids))) {
++  all_unique_ids <- get_attr(dat, "unique_id")
++  if (length(unique_ids) * 16 < length(all_unique_ids)) {
++    # unique IDs are in increasing order: binary search finds a few of them
++    posit_ids <- findInterval(unique_ids, all_unique_ids)
++    posit_ids[posit_ids == 0L] <- NA_integer_
++    posit_ids[all_unique_ids[posit_ids] != unique_ids] <- NA_integer_
++  } else {
++    # match() is several times faster on doubles than on consecutive integers
++    posit_ids <- base::match(as.numeric(unique_ids), as.numeric(all_unique_ids))
++  }
++  if (anyNA(posit_ids)) {
+     warning(
+       "While converting `unique_ids` to `posit_ids`, some `unique_ids`",
+       " correspond to deactivated nodes and NAs were produced"
+diff --git a/R/net.mod.simnet.R b/R/net.mod.simnet.R
+index 8889e16d..c9a5bc95 100644
+--- a/R/net.mod.simnet.R
++++ b/R/net.mod.simnet.R
+@@ -311,10 +311,8 @@ resim_nets <- function(dat, at) {
+   anyActive <- ifelse(length(idsActive) > 0, TRUE, FALSE)
+   if (dat$param$groups == 2) {
+     group <- get_attr(dat, "group")
+-    groupids.1 <- which(group == 1)
+-    groupids.2 <- which(group == 2)
+-    nActiveG1 <- length(intersect(groupids.1, idsActive))
+-    nActiveG2 <- length(intersect(groupids.2, idsActive))
++    nActiveG1 <- sum(active == 1 & group == 1, na.rm = TRUE)
++    nActiveG2 <- sum(active == 1 & group == 2, na.rm = TRUE)
+     anyActive <- ifelse(nActiveG1 > 0 & nActiveG2 > 0, TRUE, FALSE)
+   }
+ 
+diff --git a/tests/testthat/test-posit-ids.R b/tests/testthat/test-posit-ids.R
+new file mode 100644
+index 00000000..49a8379c
+--- /dev/null
++++ b/tests/testthat/test-posit-ids.R
+@@ -0,0 +1,48 @@
++context("Unique ID lookup")
++
++test_that("get_posit_ids gives what match() gives", {
++  dat <- create_dat_object(control = list(nsteps = 10))
++  dat <- append_core_attr(dat, at = 1, n.new = 5000)
++  set.seed(1)
++  departed_ids <- sort(sample.int(5000L, 1000L))
++  dat <- delete_attr(dat, departed_ids)
++  all_unique_ids <- get_attr(dat, "unique_id")
++  expect_type(all_unique_ids, "integer")
++
++  id_sets <- list(
++    few = sample(all_unique_ids, 20),
++    many = sample(all_unique_ids, 3000),
++    all = rev(all_unique_ids),
++    departed = c(sample(all_unique_ids, 10), departed_ids[1:5]),
++    out_of_range = c(0L, -3L, 6000L, all_unique_ids[c(1, 4000)]),
++    repeated = rep(all_unique_ids[c(7, 7, 300)], 2),
++    none = integer(0),
++    missing = c(all_unique_ids[3], NA, all_unique_ids[9]),
++    not_whole = c(all_unique_ids[5] + 0.5, all_unique_ids[5], Inf, -Inf)
++  )
++  for (set_name in names(id_sets)) {
++    unique_ids <- id_sets[[set_name]]
++    expect_identical(suppressWarnings(get_posit_ids(dat, unique_ids)),
++                     match(unique_ids, all_unique_ids), info = set_name)
++    expect_identical(
++      suppressWarnings(get_posit_ids(dat, as.numeric(unique_ids))),
++      match(unique_ids, all_unique_ids), info = set_name
++    )
++  }
++})
++
++test_that("get_posit_ids and is_active_unique_ids after departures", {
++  dat <- create_dat_object(control = list(nsteps = 10))
++  dat <- append_core_attr(dat, at = 1, n.new = 500)
++  dat <- delete_attr(dat, c(21:30, 400:420))
++  dat <- append_core_attr(dat, at = 2, n.new = 100)
++  all_unique_ids <- get_attr(dat, "unique_id")
++
++  expect_warning(
++    posit_ids <- get_posit_ids(dat, c(19L, 25L, 410L, 421L)),
++    "deactivated"
++  )
++  expect_identical(posit_ids, c(19L, NA, NA, match(421L, all_unique_ids)))
++  expect_identical(is_active_unique_ids(dat, c(19L, 25L, 410L, 421L)),
++                   c(TRUE, FALSE, FALSE, TRUE))
++})

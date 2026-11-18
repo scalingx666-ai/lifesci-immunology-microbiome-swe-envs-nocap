@@ -1,0 +1,1341 @@
+diff --git a/docs/moving-pictures/empress-tree.qzv b/docs/moving-pictures/empress-tree.qzv
+index bb14e9f8b..2716a9775 100644
+Binary files a/docs/moving-pictures/empress-tree.qzv and b/docs/moving-pictures/empress-tree.qzv differ
+diff --git a/empress/_plot.py b/empress/_plot.py
+index d7c46ee04..823c57f71 100644
+--- a/empress/_plot.py
++++ b/empress/_plot.py
+@@ -15,7 +15,7 @@
+ 
+ from jinja2 import Environment, FileSystemLoader
+ from bp import parse_newick, to_skbio_treenode
+-from empress import tools
++from empress import tools, taxonomy_utils
+ import pandas as pd
+ from empress.tree import Tree
+ from shutil import copytree
+@@ -36,7 +36,6 @@ def plot(
+ 
+     # 1. Convert inputs to the formats we want
+ 
+-    # TODO: do not ignore the feature metadata when specified by the user
+     if feature_metadata is not None:
+         feature_metadata = feature_metadata.to_dataframe()
+ 
+@@ -48,7 +47,6 @@ def plot(
+     with open(tree_file) as file:
+         t = parse_newick(file.readline())
+     empress_tree = Tree.from_tree(to_skbio_treenode(t))
+-    tools.name_internal_nodes(empress_tree)
+ 
+     # 2. Now that we've converted/read/etc. all of the four input sources,
+     # ensure that the samples and features they describe "match up" sanely.
+@@ -59,17 +57,24 @@ def plot(
+     # to tools.match_inputs() and keep using the transposed table for the rest
+     # of this visualizer.
+ 
+-    feature_table, sample_metadata = tools.match_inputs(
++    feature_table, sample_metadata, feature_metadata = tools.match_inputs(
+         empress_tree, feature_table.T, sample_metadata, feature_metadata,
+         ignore_missing_samples, filter_missing_features
+     )
+ 
++    if feature_metadata is not None:
++        feature_metadata = taxonomy_utils.split_taxonomy(feature_metadata)
++
+     # TODO: Add a check for empty samples/features in the table? Filtering this
+     # sorta stuff out would help speed things up (and would be good to report
+     # to the user on via warnings).
+ 
+     # 3. Go forward with creating the Empress visualization!
+ 
++    # Name internal nodes *after* doing input matching, so that we don't get
++    # things mixed up
++    tools.name_internal_nodes(empress_tree)
++
+     # extract balance parenthesis
+     bp_tree = list(t.B)
+ 
+@@ -137,6 +142,14 @@ def plot(
+     sample_data_type = {k: 'n' if pd.api.types.is_numeric_dtype(v) else 'o'
+                         for k, v in sample_data_type.items()}
+ 
++    # Convert feature metadata, similarly to how we handle sample metadata
++    if feature_metadata is not None:
++        feature_metadata_json = feature_metadata.to_dict(orient='index')
++        feature_metadata_columns = list(feature_metadata.columns)
++    else:
++        feature_metadata_json = {}
++        feature_metadata_columns = []
++
+     # create a mapping of observation ids and the samples that contain them
+     obs_data = {}
+     feature_table = (feature_table > 0)
+@@ -151,6 +164,8 @@ def plot(
+         'names_to_keys': names_to_keys,
+         'sample_data': sample_data,
+         'sample_data_type': sample_data_type,
++        'feature_metadata': feature_metadata_json,
++        'feature_metadata_columns': feature_metadata_columns,
+         'obs_data': obs_data,
+         'names': names,
+         'layout_to_coordsuffix': layout_to_coordsuffix,
+diff --git a/empress/plugin_setup.py b/empress/plugin_setup.py
+index cde5244a4..44c3bd399 100644
+--- a/empress/plugin_setup.py
++++ b/empress/plugin_setup.py
+@@ -58,8 +58,8 @@
+             'be automatically filtered out of the visualization.'
+         ),
+         'feature_metadata': (
+-            'Feature metadata. Not currently used for anything, but will '
+-            'be soon.'
++            'Feature metadata. Can be used to color tips in the tree by their '
++            'unique values for feature metadata fields.'
+         ),
+         # Parameter descriptions adapted from q2-emperor's
+         # --p-ignore-missing-samples flag.
+diff --git a/empress/support_files/css/empress.css b/empress/support_files/css/empress.css
+index 71565a7e0..b0e1672cc 100644
+--- a/empress/support_files/css/empress.css
++++ b/empress/support_files/css/empress.css
+@@ -899,3 +899,12 @@ button.close:hover {
+ #hover-table-notes {
+   font-size: xx-small;
+ }
++
++/* Somewhere else in the CSS adjusts line height and justify-content,
++ * so we reset these here.
++ */
++.side-panel-notes {
++  font-size: small;
++  line-height: normal !important;
++  justify-content: start !important;
++}
+diff --git a/empress/support_files/js/empress.js b/empress/support_files/js/empress.js
+index bd94e32e9..60182f7eb 100644
+--- a/empress/support_files/js/empress.js
++++ b/empress/support_files/js/empress.js
+@@ -1,11 +1,12 @@
+ define([
++    "underscore",
+     "Camera",
+     "Drawer",
+     "Colorer",
+     "VectorOps",
+     "CanvasEvents",
+     "util",
+-], function (Camera, Drawer, Colorer, VectorOps, CanvasEvents, util) {
++], function (_, Camera, Drawer, Colorer, VectorOps, CanvasEvents, util) {
+     // The index position of the color array
+     const RED = 0;
+     const GREEN = 1;
+@@ -36,6 +37,8 @@ define([
+         layoutToCoordSuffix,
+         defaultLayout,
+         biom,
++        featureMetadataColumns,
++        featureMetadata,
+         canvas
+     ) {
+         /**
+@@ -99,6 +102,22 @@ define([
+          */
+         this._biom = biom;
+ 
++        /**
++         * @type{Array}
++         * Feature metadata column names.
++         * @private
++         */
++        this._featureMetadataColumns = featureMetadataColumns;
++
++        /**
++         * @type{Object}
++         * Feature metadata: keys are tree node IDs, and values are objects
++         * mapping feature metadata column names to the metadata value for that
++         * feature.
++         * @private
++         */
++        this._featureMetadata = featureMetadata;
++
+         /**
+          * @type{Object}
+          * As described above, maps layout names to node coordinate suffixes
+@@ -515,8 +534,7 @@ define([
+         var coords = [];
+         this._drawer.loadSampleThickBuf([]);
+ 
+-        // define theses variables so jslint does not complain
+-        var x1, y1, x2, y2, corners;
++        var corners;
+ 
+         // In the corner case where the root node (located at index tree.size)
+         // has an assigned color, thicken the root's drawn vertical line when
+@@ -617,18 +635,22 @@ define([
+                 }
+                 // Thicken the actual "node" portion, extending from the center
+                 // of the layout
+-                x1 = this._treeData[node].xc0;
+-                y1 = this._treeData[node].yc0;
+-                x2 = this.getX(this._treeData[node]);
+-                y2 = this.getY(this._treeData[node]);
+-                corners = VectorOps.computeBoxCorners(x1, y1, x2, y2, amount);
++                corners = VectorOps.computeBoxCorners(
++                    this._treeData[node].xc0,
++                    this._treeData[node].yc0,
++                    this.getX(this._treeData[node]),
++                    this.getY(this._treeData[node]),
++                    amount
++                );
+                 this._addTriangleCoords(coords, corners, color);
+             } else {
+-                x1 = this.getX(this._treeData[parent]);
+-                y1 = this.getY(this._treeData[parent]);
+-                x2 = this.getX(this._treeData[node]);
+-                y2 = this.getY(this._treeData[node]);
+-                corners = VectorOps.computeBoxCorners(x1, y1, x2, y2, amount);
++                corners = VectorOps.computeBoxCorners(
++                    this.getX(this._treeData[parent]),
++                    this.getY(this._treeData[parent]),
++                    this.getX(this._treeData[node]),
++                    this.getY(this._treeData[node]),
++                    amount
++                );
+                 this._addTriangleCoords(coords, corners, color);
+             }
+         }
+@@ -716,6 +738,71 @@ define([
+         return keyInfo;
+     };
+ 
++    /**
++     * Color the tree based on a feature metadata column
++     *
++     * @param {String} cat The feature metadata column to color nodes by
++     * @param {String} color - the color map to use
++     *
++     * @return {Object} Maps unique values in this f. metadata column to colors
++     */
++    Empress.prototype.colorByFeatureMetadata = function (cat, color) {
++        var tree = this._tree;
++        // 1. produce a mapping of unique values in this feature metadata
++        //    column to an array of the feature(s) with each value
++        var uniqueValueToFeatures = {};
++        _.mapObject(this._featureMetadata, function (fmRow, featureID) {
++            // This is loosely based on how BIOMTable.getObsBy() works.
++            var fmVal = fmRow[cat];
++            if (_.has(uniqueValueToFeatures, fmVal)) {
++                uniqueValueToFeatures[fmVal].push(featureID);
++            } else {
++                uniqueValueToFeatures[fmVal] = [featureID];
++            }
++        });
++
++        var sortedUniqueValues = util.naturalSort(
++            Object.keys(uniqueValueToFeatures)
++        );
++        console.log(uniqueValueToFeatures);
++        // shared by the following for loop
++        var i, j, uniqueVal;
++
++        // convert observation IDs to _treeData keys
++        for (i = 0; i < sortedUniqueValues.length; i++) {
++            uniqueVal = sortedUniqueValues[i];
++            uniqueValueToFeatures[uniqueVal] = this._namesToKeys(
++                uniqueValueToFeatures[uniqueVal]
++            );
++        }
++
++        // assign colors to unique values
++        var colorer = new Colorer(color, sortedUniqueValues);
++        // colors for drawing the tree
++        var cm = colorer.getMapRGB();
++        // colors for the legend
++        var keyInfo = colorer.getMapHex();
++
++        // color internal nodes if their children all have same fm val
++        // this is adapted from _projectObservations() below
++        for (var ii = 1; ii < this._tree.size; ii++) {
++            var parent = tree.postorder(tree.parent(tree.postorderselect(ii)));
++
++            for (var jj = 0; jj < sortedUniqueValues.length; jj++) {
++                uniqueVal = sortedUniqueValues[jj];
++                if (uniqueValueToFeatures[uniqueVal].has(ii)) {
++                    uniqueValueToFeatures[uniqueVal].add(parent);
++                }
++            }
++        }
++        var obs = util.keepUniqueKeys(uniqueValueToFeatures);
++
++        // color tree
++        this._colorTree(obs, cm);
++
++        return keyInfo;
++    };
++
+     /**
+      * Finds the branches that are unique to each category in obs
+      *
+@@ -734,7 +821,7 @@ define([
+             var node = i;
+             var parent = tree.postorder(tree.parent(tree.postorderselect(i)));
+ 
+-            for (j = 0; j < categories.length; j++) {
++            for (var j = 0; j < categories.length; j++) {
+                 category = categories[j];
+                 if (obs[category].has(node)) {
+                     this._treeData[node].inSample = true;
+@@ -896,5 +983,14 @@ define([
+         return this._biom.getGradientStep(cat, grad, traj);
+     };
+ 
++    /**
++     * Returns an array of feature metadata column names.
++     *
++     * @return {Array}
++     */
++    Empress.prototype.getFeatureMetadataCategories = function () {
++        return this._featureMetadataColumns;
++    };
++
+     return Empress;
+ });
+diff --git a/empress/support_files/js/side-panel-handler.js b/empress/support_files/js/side-panel-handler.js
+index 64a65dc6e..34195132f 100644
+--- a/empress/support_files/js/side-panel-handler.js
++++ b/empress/support_files/js/side-panel-handler.js
+@@ -41,6 +41,14 @@ define(["Colorer"], function (Colorer) {
+         this.sLineWidth = document.getElementById("sample-line-width");
+         this.sUpdateBtn = document.getElementById("sample-update");
+ 
++        // feature metadata GUI components
++        this.fChk = document.getElementById("feature-chk");
++        this.fSel = document.getElementById("feature-options");
++        this.fAddOpts = document.getElementById("feature-add");
++        this.fColor = document.getElementById("feature-color");
++        this.fLineWidth = document.getElementById("feature-line-width");
++        this.fUpdateBtn = document.getElementById("feature-update");
++
+         // layout GUI components
+         this.layoutDiv = document.getElementById("layout-div");
+ 
+@@ -88,7 +96,21 @@ define(["Colorer"], function (Colorer) {
+     };
+ 
+     /**
+-     * Sets the components of the samples panel back to there default value
++     * Analogue to SidePanel.__samplePanelReset() for feature coloring
++     */
++    SidePanel.prototype.__featurePanelReset = function () {
++        // set color map back to default
++        this.fColor.value = "discrete-coloring-qiime";
++
++        // set default branch length back to 1
++        this.fLineWidth.value = 1;
++
++        // hide update button
++        this.fUpdateBtn.classList.add("hidden");
++    };
++
++    /**
++     * Sets the components of the samples panel back to their default value
+      * and hides the additional options
+      */
+     SidePanel.prototype.__samplePanelClose = function () {
+@@ -113,9 +135,33 @@ define(["Colorer"], function (Colorer) {
+     };
+ 
+     /**
+-     * Updates/redraws the tree
++     * Analogue to SidePanel.__samplePanelClose() for feature coloring
++     */
++    SidePanel.prototype.__featurePanelClose = function () {
++        // disable sample check box
++        this.fChk.checked = false;
++
++        // disable the sample category select
++        this.fSel.disabled = true;
++
++        // hide the additional options
++        this.fAddOpts.classList.add("hidden");
++
++        // reset panel
++        this.__featurePanelReset();
++
++        //reset tree
++        this.empress.resetTree();
++        this.empress.drawTree();
++
++        // clear legends
++        this.legend.clearAllLegends();
++    };
++
++    /**
++     * Updates/redraws the tree for sample coloring
+      */
+-    SidePanel.prototype._updateSample = function () {
++    SidePanel.prototype._updateSampleColoring = function () {
+         this.empress.resetTree();
+ 
+         // clear legends
+@@ -134,6 +180,29 @@ define(["Colorer"], function (Colorer) {
+         this.sUpdateBtn.classList.add("hidden");
+     };
+ 
++    /**
++     * Updates/redraws the tree for feature coloring
++     */
++    SidePanel.prototype._updateFeatureColoring = function () {
++        this.empress.resetTree();
++
++        // clear legends
++        this.legend.clearAllLegends();
++
++        // color tree
++        this._colorFeatureTree();
++
++        var lWidth = this.fLineWidth.value;
++        // TODO analogue of this but for feature metadata
++        // if (lWidth !== 1) {
++        //     this.empress.thickenSameSampleLines(lWidth - 1);
++        // }
++        this.empress.drawTree();
++
++        // hide update button
++        this.fUpdateBtn.classList.add("hidden");
++    };
++
+     /**
+      * Colors the tree
+      */
+@@ -146,6 +215,16 @@ define(["Colorer"], function (Colorer) {
+         this.legend.addColorKey(colBy, keyInfo, "node", false);
+     };
+ 
++    /**
++     * Analogue of _colorSampleTree()
++     */
++    SidePanel.prototype._colorFeatureTree = function () {
++        var colBy = this.fSel.value;
++        var col = this.fColor.value;
++        var keyInfo = this.empress.colorByFeatureMetadata(colBy, col);
++        this.legend.addColorKey(colBy, keyInfo, "node", false);
++    };
++
+     /**
+      * Redraws the tree with a different layout.
+      */
+@@ -265,7 +344,54 @@ define(["Colorer"], function (Colorer) {
+         };
+ 
+         this.sUpdateBtn.onclick = function () {
+-            sp._updateSample();
++            sp._updateSampleColoring();
++        };
++    };
++
++    /**
++     * Initializes feature metadata coloring components
++     */
++    SidePanel.prototype.addFeatureTab = function () {
++        var sp = this;
++
++        var i, opt;
++        // add feature metadata categories / "columns"
++        var selOpts = this.empress.getFeatureMetadataCategories();
++        for (i = 0; i < selOpts.length; i++) {
++            opt = document.createElement("option");
++            opt.value = selOpts[i];
++            opt.innerHTML = selOpts[i];
++            this.fSel.appendChild(opt);
++        }
++
++        // The color map selector
++        Colorer.addColorsToSelect(this.fColor);
++
++        // toggle the sample/color map selectors
++        this.fChk.onclick = function () {
++            if (sp.fChk.checked) {
++                sp.fSel.disabled = false;
++                sp.fAddOpts.classList.remove("hidden");
++                sp.fUpdateBtn.classList.remove("hidden");
++            } else {
++                sp.__featurePanelClose();
++            }
++        };
++
++        this.fSel.onchange = function () {
++            sp.fUpdateBtn.classList.remove("hidden");
++        };
++
++        this.fColor.onchange = function () {
++            sp.fUpdateBtn.classList.remove("hidden");
++        };
++
++        this.fLineWidth.onchange = function () {
++            sp.fUpdateBtn.classList.remove("hidden");
++        };
++
++        this.fUpdateBtn.onclick = function () {
++            sp._updateFeatureColoring();
+         };
+     };
+ 
+diff --git a/empress/support_files/templates/animate-panel.html b/empress/support_files/templates/animate-panel.html
+index 4f7e12606..ac04655ab 100644
+--- a/empress/support_files/templates/animate-panel.html
++++ b/empress/support_files/templates/animate-panel.html
+@@ -1,6 +1,11 @@
+ <!-- animate Options -->
+ <button class="side-header collapsible">Animation</button>
+ <div class="side-content control hidden">
++  <p class="side-panel-notes">
++    Color nodes in the tree that are unique to certain groups of samples
++    (specified by the trajectory) at different timepoints throughout a
++    gradient.
++  </p>
+   <p>
+     <label for="animate-color-select">Choose Color Map</label>
+     <label class="select-container">
+diff --git a/empress/support_files/templates/empress-template.html b/empress/support_files/templates/empress-template.html
+index 5b239b5a7..cb79d415b 100644
+--- a/empress/support_files/templates/empress-template.html
++++ b/empress/support_files/templates/empress-template.html
+@@ -117,6 +117,8 @@ <h1 id="hover-table-node-id"></h1>
+             {{ layout_to_coordsuffix | tojson }},
+             '{{ default_layout }}',
+             biom,
++            {{ feature_metadata_columns }},
++            {{ feature_metadata | tojson }},
+             canvas
+         );
+         empress.initialize();
+@@ -129,6 +131,10 @@ <h1 id="hover-table-node-id"></h1>
+         var sPanel = new SidePanel(document.getElementById('side-panel'),
+                                    empress, legend);
+         sPanel.addSampleTab();
++        if ({{ feature_metadata_columns }}.length > 0) {
++            sPanel.addFeatureTab();
++            document.getElementById("fmOpenButton").classList.remove("hidden");
++        }
+         sPanel.addLayoutTab();
+ 
+         // create animator state machine
+diff --git a/empress/support_files/templates/side-panel.html b/empress/support_files/templates/side-panel.html
+index 3e15d0241..485d53d64 100644
+--- a/empress/support_files/templates/side-panel.html
++++ b/empress/support_files/templates/side-panel.html
+@@ -10,8 +10,11 @@
+ </div>
+ 
+ <!-- Sample Coloring Options -->
+-<button class="side-header collapsible">Sample Coloring</button>
++<button class="side-header collapsible">Sample Metadata Coloring</button>
+ <div class="side-content control hidden">
++  <p class="side-panel-notes">
++    Color nodes in the tree that are unique to certain groups of samples.
++  </p>
+   <p>
+     <label for="sample-chk">Color by...</label>
+     <input id="sample-chk" type="checkbox">
+@@ -42,10 +45,47 @@
+   </p>
+ </div>
+ 
++<!-- Feature Metadata Coloring Options -->
++<button id="fmOpenButton" class="side-header collapsible hidden">Feature
++    Metadata Coloring</button>
++<div class="side-content control hidden">
++  <p class="side-panel-notes">
++    Color nodes in the tree based on feature metadata: for example,
++    taxonomic annotations.
++  </p>
++  <p>
++    <label for="feature-chk">Color by...</label>
++    <input id="feature-chk" type="checkbox">
++    <label class="select-container">
++      <select id="feature-options"  disabled="true"></select>
++    </label>
++  </p>
++  <p class="hidden">
++    <div id="feature-add" class="hidden">
++      <p>
++        <label for="feature-color">Choose Color Map</label>
++        <label class="select-container">
++          <select id="feature-color"></select>
++        </label>
++      </p>
++      <p>
++        <label for="feature-line-width">Line Width</label>
++        <input id="feature-line-width" type="number" value="1">
++      </p>
++      <p>
++        <button id="feature-update" class="hidden">Update</button>
++      </p>
++    </div>
++  </p>
++</div>
++
+ <!-- Layout options; shamelessly copied from above.
+      Stuff will be added to the #layout-div element below when
+      SidePanel.addLayoutTab() is called :)
+ -->
+ <button class="side-header collapsible">Layout</button>
+ <div class="side-content control hidden" id="layout-div">
++  <p class="side-panel-notes">
++    Change how the tree is drawn.
++  </p>
+ </div>
+diff --git a/empress/taxonomy_utils.py b/empress/taxonomy_utils.py
+new file mode 100644
+index 000000000..7dd2eb016
+--- /dev/null
++++ b/empress/taxonomy_utils.py
+@@ -0,0 +1,151 @@
++import warnings
++import pandas as pd
++
++
++class TaxonomyError(Exception):
++    pass
++
++
++class TaxonomyWarning(Warning):
++    pass
++
++
++def split_taxonomy(feature_metadata):
++    """ Attempts to find a taxonomy column and split it into taxonomic levels.
++
++    If one of the columns in the feature metadata DataFrame (ignoring case)
++    is named "Taxon" or "Taxonomy", this will return a new DataFrame where
++    the column in question is removed and replaced with S + 1 new columns,
++    where S is the maximum number of semicolons present in any feature's
++    taxonomy.
++
++    Basically, this lets us convert taxonomy annotations to an easier-to-work-
++    with format; instead of having a single column for taxonomy, we'll have one
++    column per taxonomy level. This will make life easier.
++
++    Parameters
++    ----------
++    feature_metadata : pd.DataFrame
++       DataFrame describing feature metadata.
++
++    Returns
++    -------
++    taxsplit_feature_metadata : pd.DataFrame
++        A version of the input feature metadata split as described above. (If
++        none of the columns in the feature metadata were identified as being
++        taxonomy columns, this DataFrame is identical to the input DataFrame.)
++        The new "Level" columns will be placed at the start of the returned
++        DataFrame's columns.
++
++    Raises
++    ------
++    TaxonomyError
++        If any of the following conditions are met:
++            1. Multiple possible "taxonomy columns" are present in the input
++               DataFrame: for example, both a "Taxon" and "Taxonomy" column are
++               present, or both a "taxon" and "Taxon" column are present.
++            2. A taxonomy column is present in the input DataFrame, and there
++               is already at least one column in the DataFrame that starts with
++               "Level".
++    """
++    # The entries in this tuple should only be lowercase
++    VALID_TAXONOMY_COLUMN_NAMES = ("taxon", "taxonomy")
++    lowercase_col_names = [str(c).lower() for c in feature_metadata.columns]
++
++    # See if there is a "taxonomy column", and do some related validation on
++    # column names
++    invalid_level_columns_present = False
++    tax_col_index = None
++    tax_col_name = None
++    for col, i in zip(lowercase_col_names, range(len(lowercase_col_names))):
++        if col in VALID_TAXONOMY_COLUMN_NAMES:
++            if tax_col_index is None:
++                tax_col_index = i
++                # ("col" has already been set to lowercase)
++                tax_col_name = feature_metadata.columns[i]
++            else:
++                # Error condition 1 -- multiple possible "taxonomy columns" :(
++                raise TaxonomyError(
++                    (
++                        "Multiple columns in the feature metadata have one of "
++                        "the following names (case insensitive): {}. At most "
++                        "one feature metadata column can have a name from "
++                        "that list."
++                    ).format(VALID_TAXONOMY_COLUMN_NAMES)
++                )
++        if col.startswith("level"):
++            # This will be a problem *if* there's a taxonomy column, but if
++            # there isn't it's not a problem. (So we wait until after we've
++            # seen all of the feature metadata columns to raise an error about
++            # this.)
++            invalid_level_columns_present = True
++
++    if tax_col_index is not None:
++        if invalid_level_columns_present:
++            # Error condition 2 -- there is at least one "Level" column already
++            # in the feature metadata, which will make distinguishing these
++            # column(s) from the columns we were going to add from feature
++            # metadata difficult.
++            raise TaxonomyError(
++                "The feature metadata contains a taxonomy column, but also "
++                "already contains column(s) starting with the text 'Level' "
++                "(case insensitive)."
++            )
++
++        max_sc_count = 0
++
++        def find_max_semicolon_count(fm_row):
++            # We need to be able to update max_sc_count as we go through each
++            # row, and Python gets angry if we don't explicitly declare it as
++            # "nonlocal" before referencing it here. See
++            # https://stackoverflow.com/a/46018922/10730311
++            nonlocal max_sc_count
++            row_sc_count = fm_row.loc[tax_col_name].count(";")
++            max_sc_count = max(max_sc_count, row_sc_count)
++
++        # Figure out maximum number of semicolons in any feature (this works
++        # on a per-row basis even though axis="columns", because each call
++        # to validate_semicolon_count() gets a Series of columns which is
++        # technically a row I guess)
++        feature_metadata.apply(find_max_semicolon_count, axis="columns")
++
++        if max_sc_count == 0:
++            # We allow this in the case of single-rank taxonomies (e.g. just
++            # kingdoms, for some reason). Can change this to an error if
++            # desired.
++            warnings.warn(
++                (
++                    "None of the taxonomy values in the feature metadata "
++                    "contain a semicolon (;). Please make sure your taxonomy "
++                    'is formatted so that "levels" are separated by '
++                    "semicolons."
++                ),
++                TaxonomyWarning
++            )
++
++        # OK, actually do splitting now (taking into account max_sc_count)
++        def split_taxonomy_col(fm_row):
++            levels = [r.strip() for r in fm_row.loc[tax_col_name].split(";")]
++            # If this row's taxonomy has less levels than the max number of
++            # levels, pad it out with empty strings.
++            if len(levels) < max_sc_count + 1:
++                num_missing_levels = (max_sc_count + 1) - len(levels)
++                levels += ["Unspecified"] * num_missing_levels
++            return levels
++
++        # Our use of result_type="expand" means that tax_levels will be a
++        # DataFrame with the same index as feature_metadata but with one column
++        # for each taxonomic level (in order -- Kingdom, Phylum, etc.)
++        tax_levels = feature_metadata.apply(
++            split_taxonomy_col, axis="columns", result_type="expand"
++        )
++        # Assign human-friendly column names: Level 1, Level 2, ...
++        tax_levels.columns = [
++            "Level {}".format(i) for i in range(1, len(tax_levels.columns) + 1)
++        ]
++        fm_no_tax = feature_metadata.drop(columns=tax_col_name)
++        # Finally, join the f.m. with the tax. levels DF by the index.
++        return pd.concat([tax_levels, fm_no_tax], axis="columns")
++    else:
++        # No taxonomy column found, so no need to modify the DataFrame
++        return feature_metadata
+diff --git a/empress/tools.py b/empress/tools.py
+index 696df1360..6a719b9fb 100644
+--- a/empress/tools.py
++++ b/empress/tools.py
+@@ -64,15 +64,17 @@ def match_inputs(
+         The tree to be visualized.
+     table: pd.DataFrame
+         Representation of the feature table. The index should describe feature
+-        IDs; the columns should describe sample IDs.
++        IDs; the columns should describe sample IDs. (It's expected that
++        feature IDs in the table only describe tips in the tree, not internal
++        nodes.)
+     sample_metadata: pd.DataFrame
+         Sample metadata. The index should describe sample IDs; the columns
+         should describe different sample metadata fields' names.
+     feature_metadata: pd.DataFrame or None
+         Feature metadata. If this is passed, the index should describe feature
+         IDs and the columns should describe different feature metadata fields'
+-        names. NOTE: THIS CURRENTLY IS NOT CHECKED, BUT IT SHOULD BE IN THE
+-        FUTURE WHEN #130 IS ADDRESSED.
++        names. (Feature IDs here can describe tips or internal nodes in the
++        tree.)
+     ignore_missing_samples: bool
+         If True, pads missing samples (i.e. samples in the table but not the
+         metadata) with placeholder metadata. If False, raises a
+@@ -89,8 +91,10 @@ def match_inputs(
+ 
+     Returns
+     -------
+-    (table, sample_metadata): (pd.DataFrame, pd.DataFrame)
+-        Versions of the input table and sample metadata filtered such that:
++    (table, sample_metadata, feature_metadata): (pd.DataFrame, pd.DataFrame,
++                                                 pd.DataFrame or None)
++        Versions of the input table, sample metadata, and feature metadata
++        filtered such that:
+             -The table only contains features also present as tips in the tree.
+             -The sample metadata only contains samples also present in the
+              table.
+@@ -98,6 +102,9 @@ def match_inputs(
+              have all of their sample metadata values set to "This sample has
+              no metadata". (This will only be done if ignore_missing_samples is
+              True; otherwise, this situation will trigger an error. See below.)
++            -The feature metadata, if it was passed, only contains features
++             also present as tips or internal nodes in the tree. (If the
++             feature metadata wasn't passed, this will just return None.)
+ 
+     Raises
+     ------
+@@ -109,6 +116,8 @@ def match_inputs(
+             3. No samples are shared between the sample metadata and table.
+             4. There are samples present in the table but not in the sample
+                metadata, AND ignore_missing_samples is False.
++            5. The feature metadata was passed, but no features present in it
++               are also present as tips or internal nodes in the tree.
+ 
+     References
+     ----------
+@@ -216,4 +225,19 @@ def match_inputs(
+     # sample_metadata.shape[0] and sf_sample_metadata.shape[0]. However, the
+     # presence of such "dropped samples" is a common occurrence in 16S studies,
+     # so we currently don't do that for the sake of avoiding alarm fatigue.
+-    return ff_table, sf_sample_metadata
++
++    # If the feature metadata was passed, filter it so that it only contains
++    # features present as tips / internal nodes in the tree
++    if feature_metadata is not None:
++        all_tree_node_names = set([n.name for n in tree.postorder()])
++        fm_ids = set(feature_metadata.index)
++        fm_and_tree_features = fm_ids & all_tree_node_names
++        feature_metadata = feature_metadata.loc[fm_and_tree_features]
++        if len(feature_metadata.index) == 0:
++            # Error condition 5
++            raise DataMatchingError(
++                "No features in the feature metadata are present in the tree, "
++                "either as tips or as internal nodes."
++            )
++
++    return ff_table, sf_sample_metadata, feature_metadata
+diff --git a/empress/tree.py b/empress/tree.py
+index 61cd5486c..eb3872d59 100644
+--- a/empress/tree.py
++++ b/empress/tree.py
+@@ -359,8 +359,8 @@ def layout_circular(self, width, height):
+                 prev_clangle += anglepernode
+             else:
+                 # Center internal nodes at an angle above their children
+-                n.clangle = sum([c.clangle for c in n.children])\
+-                    / len(n.children)
++                n.clangle = \
++                    sum([c.clangle for c in n.children]) / len(n.children)
+ 
+         max_clradius = 0
+         self.clradius = 0
+diff --git a/tests/python/test_taxonomy_utils.py b/tests/python/test_taxonomy_utils.py
+new file mode 100644
+index 000000000..26437452e
+--- /dev/null
++++ b/tests/python/test_taxonomy_utils.py
+@@ -0,0 +1,241 @@
++# ----------------------------------------------------------------------------
++# Copyright (c) 2018--, empress development team.
++#
++# Distributed under the terms of the Modified BSD License.
++#
++# ----------------------------------------------------------------------------
++import unittest
++import pandas as pd
++from pandas.testing import assert_frame_equal, assert_series_equal
++import empress.taxonomy_utils as tax_utils
++
++
++class TestTaxonomyUtils(unittest.TestCase):
++
++    def setUp(self):
++        self.feature_metadata = pd.DataFrame(
++            {
++                "Taxonomy": [
++                    (
++                        "k__Bacteria; p__Bacteroidetes; c__Bacteroidia; "
++                        "o__Bacteroidales; f__Bacteroidaceae; g__Bacteroides; "
++                        "s__"
++                    ),
++                    (
++                        "k__Bacteria; p__Proteobacteria; "
++                        "c__Gammaproteobacteria; o__Pasteurellales; "
++                        "f__Pasteurellaceae; g__; s__"
++                    ),
++                    (
++                        "k__Bacteria; p__Bacteroidetes; c__Bacteroidia; "
++                        "o__Bacteroidales; f__Bacteroidaceae; g__Bacteroides; "
++                        "s__uniformis"
++                    ),
++                    "k__Bacteria; p__Firmicutes; c__Bacilli"
++                ],
++                "Confidence": [0.95, 0.8, 0, 1]
++            },
++            index=["f1", "f2", "f3", "f4"]
++        )
++
++    def test_split_taxonomy_no_tax_column(self):
++        fm2 = self.feature_metadata.copy()
++        fm2.columns = ["asdf", "ghjkl"]
++        fm3 = tax_utils.split_taxonomy(fm2)
++        assert_frame_equal(fm2, fm3)
++
++    def test_split_taxonomy_multiple_tax_columns(self):
++        bad_fm = self.feature_metadata.copy()
++        bad_fm.columns = ["Taxonomy", "taxon"]
++        # As with above, parentheses mess up regexes -- raw strings fix that
++        with self.assertRaisesRegex(
++            tax_utils.TaxonomyError,
++            (
++                "Multiple columns in the feature metadata have one of the "
++                r"following names \(case insensitive\): "
++                r"\('taxon', 'taxonomy'\). At most one feature metadata "
++                "column can have a name from that list."
++            )
++        ):
++            tax_utils.split_taxonomy(bad_fm)
++
++    def test_split_taxonomy_invalid_level_column(self):
++        bad_fm = self.feature_metadata.copy()
++        bad_fm.columns = ["Taxonomy", "Level 20"]
++        with self.assertRaisesRegex(
++            tax_utils.TaxonomyError,
++            (
++                "The feature metadata contains a taxonomy column, but also "
++                r"already contains column\(s\) starting with the text 'Level' "
++                r"\(case insensitive\)."
++            )
++        ):
++            tax_utils.split_taxonomy(bad_fm)
++
++    def test_split_taxonomy_level_column_but_no_taxonomy_column(self):
++        meh_fm = self.feature_metadata.copy()
++        meh_fm.columns = ["I'm ambivalent!", "Level 20"]
++        meh_fm2 = tax_utils.split_taxonomy(meh_fm)
++        assert_frame_equal(meh_fm, meh_fm2)
++
++    def test_split_taxonomy_basic_case(self):
++        initial_fm = self.feature_metadata.copy()
++        split_fm = tax_utils.split_taxonomy(initial_fm)
++
++        # First off, check that initial_fm was NOT modified: the input DF
++        # should remain untouched
++        assert_frame_equal(self.feature_metadata, initial_fm)
++
++        # Next, let's verify that split_fm looks how we expect it to look.
++        # ...First, by checking the columns -- should indicate that the
++        # correct number of taxonomic levels were identified
++        self.assertCountEqual(split_fm.columns, [
++            "Level 1", "Level 2", "Level 3", "Level 4", "Level 5", "Level 6",
++            "Level 7", "Confidence"
++        ])
++        # ...Next, check the index -- no features should've been dropped (that
++        # isn't even a thing that this function does, but let's be safe :P)
++        self.assertCountEqual(split_fm.index, ["f1", "f2", "f3", "f4"])
++
++        # Now, let's check each row individually. This is kinda inelegant.
++        assert_series_equal(
++            split_fm.loc["f1"],
++            pd.Series({
++                "Level 1": "k__Bacteria",
++                "Level 2": "p__Bacteroidetes",
++                "Level 3": "c__Bacteroidia",
++                "Level 4": "o__Bacteroidales",
++                "Level 5": "f__Bacteroidaceae",
++                "Level 6": "g__Bacteroides",
++                "Level 7": "s__",
++                "Confidence": 0.95
++            }, name="f1")
++        )
++        assert_series_equal(
++            split_fm.loc["f2"],
++            pd.Series({
++                "Level 1": "k__Bacteria",
++                "Level 2": "p__Proteobacteria",
++                "Level 3": "c__Gammaproteobacteria",
++                "Level 4": "o__Pasteurellales",
++                "Level 5": "f__Pasteurellaceae",
++                "Level 6": "g__",
++                "Level 7": "s__",
++                "Confidence": 0.8
++            }, name="f2")
++        )
++        assert_series_equal(
++            split_fm.loc["f3"],
++            pd.Series({
++                "Level 1": "k__Bacteria",
++                "Level 2": "p__Bacteroidetes",
++                "Level 3": "c__Bacteroidia",
++                "Level 4": "o__Bacteroidales",
++                "Level 5": "f__Bacteroidaceae",
++                "Level 6": "g__Bacteroides",
++                "Level 7": "s__uniformis",
++                "Confidence": 0
++            }, name="f3")
++        )
++        assert_series_equal(
++            split_fm.loc["f4"],
++            pd.Series({
++                "Level 1": "k__Bacteria",
++                "Level 2": "p__Firmicutes",
++                "Level 3": "c__Bacilli",
++                "Level 4": "Unspecified",
++                "Level 5": "Unspecified",
++                "Level 6": "Unspecified",
++                "Level 7": "Unspecified",
++                "Confidence": 1
++            }, name="f4")
++        )
++
++    def test_split_taxonomy_rows_with_no_semicolons(self):
++        funky_fm = self.feature_metadata.copy()
++        funky_fm.loc["f1", "Taxonomy"] = "birds aren't real"
++        funky_fm.loc["f2", "Taxonomy"] = "theyve been drones"
++        funky_fm.loc["f3", "Taxonomy"] = "all along :O"
++        split_fm = tax_utils.split_taxonomy(funky_fm)
++
++        # Notice that f4's taxonomy is still there -- so each feature will have
++        # 3 levels
++        self.assertCountEqual(split_fm.columns, [
++            "Level 1", "Level 2", "Level 3", "Confidence"
++        ])
++
++        # Check each row individually
++        assert_series_equal(
++            split_fm.loc["f1"],
++            pd.Series({
++                "Level 1": "birds aren't real",
++                "Level 2": "Unspecified",
++                "Level 3": "Unspecified",
++                "Confidence": 0.95
++            }, name="f1")
++        )
++        assert_series_equal(
++            split_fm.loc["f2"],
++            pd.Series({
++                "Level 1": "theyve been drones",
++                "Level 2": "Unspecified",
++                "Level 3": "Unspecified",
++                "Confidence": 0.8
++            }, name="f2")
++        )
++        assert_series_equal(
++            split_fm.loc["f3"],
++            pd.Series({
++                "Level 1": "all along :O",
++                "Level 2": "Unspecified",
++                "Level 3": "Unspecified",
++                "Confidence": 0
++            }, name="f3")
++        )
++        assert_series_equal(
++            split_fm.loc["f4"],
++            pd.Series({
++                "Level 1": "k__Bacteria",
++                "Level 2": "p__Firmicutes",
++                "Level 3": "c__Bacilli",
++                "Confidence": 1
++            }, name="f4")
++        )
++
++    def test_split_taxonomy_all_rows_no_semicolons(self):
++        funky_fm = self.feature_metadata.copy()
++        funky_fm.loc["f1", "Taxonomy"] = "Bacteria"
++        funky_fm.loc["f2", "Taxonomy"] = "Archaea"
++        funky_fm.loc["f3", "Taxonomy"] = "Bacteria"
++        funky_fm.loc["f4", "Taxonomy"] = "Viruses"
++        with self.assertWarnsRegex(
++            tax_utils.TaxonomyWarning,
++            (
++                "None of the taxonomy values in the feature metadata "
++                r"contain a semicolon \(;\). Please make sure your taxonomy "
++                'is formatted so that "levels" are separated by semicolons.'
++            )
++        ):
++            split_fm = tax_utils.split_taxonomy(funky_fm)
++
++        self.assertCountEqual(split_fm.columns, ["Level 1", "Confidence"])
++        assert_series_equal(
++            split_fm.loc["f1"],
++            pd.Series({"Level 1": "Bacteria", "Confidence": 0.95}, name="f1")
++        )
++        assert_series_equal(
++            split_fm.loc["f2"],
++            pd.Series({"Level 1": "Archaea", "Confidence": 0.8}, name="f2")
++        )
++        assert_series_equal(
++            split_fm.loc["f3"],
++            pd.Series({"Level 1": "Bacteria", "Confidence": 0}, name="f3")
++        )
++        assert_series_equal(
++            split_fm.loc["f4"],
++            pd.Series({"Level 1": "Viruses", "Confidence": 1}, name="f4")
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/python/test_tools.py b/tests/python/test_tools.py
+index d1cfdf4e7..7810fbfdf 100644
+--- a/tests/python/test_tools.py
++++ b/tests/python/test_tools.py
+@@ -39,8 +39,31 @@ def setUp(self):
+             },
+             index=list(self.table.columns)[:]
+         )
+-        # TODO Also test matching feature metadata, when that's supported
+-        self.feature_metadata = None
++        # (These are some Greengenes taxonomy annotations I took from the
++        # moving pictures taxonomy.qza file. I made up the confidences.)
++        self.feature_metadata = pd.DataFrame(
++            {
++                "Taxonomy": [
++                    (
++                        "k__Bacteria; p__Bacteroidetes; c__Bacteroidia; "
++                        "o__Bacteroidales; f__Bacteroidaceae; g__Bacteroides; "
++                        "s__"
++                    ),
++                    (
++                        "k__Bacteria; p__Proteobacteria; "
++                        "c__Gammaproteobacteria; o__Pasteurellales; "
++                        "f__Pasteurellaceae; g__; s__"
++                    ),
++                    (
++                        "k__Bacteria; p__Bacteroidetes; c__Bacteroidia; "
++                        "o__Bacteroidales; f__Bacteroidaceae; g__Bacteroides; "
++                        "s__uniformis"
++                    )
++                ],
++                "Confidence": [0.95, 0.8, 0]
++            },
++            index=["e", "h", "a"]
++        )
+ 
+     def test_name_internal_nodes(self):
+         t = Tree.from_tree(self.tree)
+@@ -52,27 +75,27 @@ def test_name_internal_nodes(self):
+ 
+     def test_match_inputs_nothing_dropped(self):
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+-        filtered_table, filtered_sample_metadata = tools.match_inputs(
++        filtered_table, filtered_sample_metadata, feat_md = tools.match_inputs(
+             t, self.table, self.sample_metadata
+         )
+         assert_frame_equal(filtered_table, self.table)
+         assert_frame_equal(filtered_sample_metadata, self.sample_metadata)
++        # We didn't pass in any feature metadata, so we shouldn't get any out
++        self.assertIsNone(feat_md)
+ 
+     def test_match_inputs_only_1_feature_in_table(self):
+         # This is technically allowed (so long as this 1 feature is a tree tip)
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         tiny_table = self.table.loc[["a"]]
+-        filtered_tiny_table, filtered_sample_metadata = tools.match_inputs(
++        filtered_tiny_table, filtered_sample_metadata, fm = tools.match_inputs(
+             t, tiny_table, self.sample_metadata
+         )
+         assert_frame_equal(filtered_tiny_table, tiny_table)
+         assert_frame_equal(filtered_sample_metadata, self.sample_metadata)
++        self.assertIsNone(fm)
+ 
+     def test_match_inputs_no_tips_in_table(self):
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_table = self.table.copy()
+         bad_table.index = range(len(self.table.index))
+         with self.assertRaisesRegex(
+@@ -93,7 +116,6 @@ def test_match_inputs_no_tips_in_table(self):
+ 
+     def test_match_inputs_no_shared_samples(self):
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_sample_metadata = self.sample_metadata.copy()
+         bad_sample_metadata.index = ["lol", "nothing", "here", "matches"]
+         with self.assertRaisesRegex(
+@@ -115,7 +137,6 @@ def test_match_inputs_no_shared_samples(self):
+ 
+     def test_match_inputs_filter_missing_features_error(self):
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_table = self.table.copy()
+         # Replace one of the tip IDs in the table with an internal node ID,
+         # instead. This isn't ok.
+@@ -131,7 +152,6 @@ def test_match_inputs_filter_missing_features_override(self):
+         """Checks that --p-filter-missing-features works as expected."""
+         # The inputs are the same as with the above test
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_table = self.table.copy()
+         bad_table.index = ["a", "b", "e", "g"]
+         out_table = None
+@@ -146,7 +166,7 @@ def test_match_inputs_filter_missing_features_override(self):
+                 "visualization."
+             )
+         ):
+-            out_table, out_sm = tools.match_inputs(
++            out_table, out_sm, fm = tools.match_inputs(
+                 t, bad_table, self.sample_metadata,
+                 filter_missing_features=True
+             )
+@@ -162,7 +182,6 @@ def test_match_inputs_filter_missing_features_override(self):
+ 
+     def test_match_inputs_ignore_missing_samples_error(self):
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_table = self.table.copy()
+         # Replace one of the sample IDs in the table with some junk
+         bad_table.columns = ["Sample1", "Sample2", "Whatever", "Sample4"]
+@@ -177,7 +196,6 @@ def test_match_inputs_ignore_missing_samples_override(self):
+         """Checks that --p-ignore-missing-samples works as expected."""
+         # These inputs are the same as with the above test
+         t = Tree.from_tree(self.tree)
+-        tools.name_internal_nodes(t)
+         bad_table = self.table.copy()
+         # Replace one of the sample IDs in the table with some junk
+         bad_table.columns = ["Sample1", "Sample2", "Whatever", "Sample4"]
+@@ -194,7 +212,7 @@ def test_match_inputs_ignore_missing_samples_override(self):
+             tools.match_inputs(
+                 t, bad_table, self.sample_metadata, ignore_missing_samples=True
+             )
+-            out_table, out_sm = tools.match_inputs(
++            out_table, out_sm, fm = tools.match_inputs(
+                 t, bad_table, self.sample_metadata, ignore_missing_samples=True
+             )
+ 
+@@ -225,6 +243,47 @@ def test_match_inputs_ignore_missing_samples_override(self):
+             check_dtype=False
+         )
+ 
++    def test_match_inputs_feature_metadata_nothing_dropped(self):
++        t = Tree.from_tree(self.tree)
++        f_table, f_sample_metadata, f_feature_metadata = tools.match_inputs(
++            t, self.table, self.sample_metadata, self.feature_metadata
++        )
++        assert_frame_equal(f_table, self.table)
++        assert_frame_equal(f_sample_metadata, self.sample_metadata)
++        # Check that no filtering had to be done (the feature metadata might be
++        # out of order compared to the original since we called .loc[] on it,
++        # hence our use of check_like=True, but the actual data should be the
++        # same)
++        assert_frame_equal(
++            f_feature_metadata, self.feature_metadata, check_like=True
++        )
++
++    def test_match_inputs_feature_metadata_no_features_in_tree(self):
++        t = Tree.from_tree(self.tree)
++        bad_fm = self.feature_metadata.copy()
++        bad_fm.index = range(len(self.feature_metadata.index))
++        with self.assertRaisesRegex(
++            tools.DataMatchingError,
++            (
++                "No features in the feature metadata are present in the tree, "
++                "either as tips or as internal nodes."
++            )
++        ):
++            tools.match_inputs(t, self.table, self.sample_metadata, bad_fm)
++
++    def test_match_inputs_feature_metadata_some_features_dropped(self):
++        t = Tree.from_tree(self.tree)
++        # Manipulate bad_fm so that only the "e" feature should get preserved
++        # (since it's actually in the tree, while "asdf" and "hjkl" aren't)
++        bad_fm = self.feature_metadata.copy()
++        bad_fm.index = ["e", "asdf", "hjkl"]
++        f_table, f_sample_metadata, f_bad_fm = tools.match_inputs(
++            t, self.table, self.sample_metadata, bad_fm
++        )
++        assert_frame_equal(f_table, self.table)
++        assert_frame_equal(f_sample_metadata, self.sample_metadata)
++        assert_frame_equal(self.feature_metadata.loc[["e"]], f_bad_fm)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/python/test_tree.py b/tests/python/test_tree.py
+index 4b7e6309a..9b9a55e13 100644
+--- a/tests/python/test_tree.py
++++ b/tests/python/test_tree.py
+@@ -156,28 +156,28 @@ def test_rectangular_layout(self):
+                            (0.0, 0.0)]       # i (root)
+         self.check_coords(t, "xr", "yr", expected_coords)
+ 
+-        # Check that lowestchildyr and highestchildyr attributes were set
++        # Check that lowest_child_yr and highest_child_yr attributes were set
+         # properly. We do this by iterating over tree.non_tips(), which (like
+         # check_coords()) also uses a post-order traversal.
+         # (Note that the "coordinates" in this list of 2-tuples are ordered as
+         # (lowest child y-coordinate, highest child y-coordinate). Computing
+         # these from the list above should be pretty simple.)
+-        expected_lowesthighestchildyr = [(-296.875, -171.875),  # f
+-                                         (-234.375,  -46.875),  # g
+-                                         (78.125,    203.125),  # h
+-                                         (-140.625,  140.625)]  # i
++        expected_lowesthighest_child_yr = [(-296.875, -171.875),  # f
++                                           (-234.375,  -46.875),  # g
++                                           (78.125,    203.125),  # h
++                                           (-140.625,  140.625)]  # i
+         for i, node in enumerate(t.non_tips()):
+-            l, h = expected_lowesthighestchildyr[i]
+-            self.assertTrue(hasattr(node, "lowestchildyr"))
+-            self.assertTrue(hasattr(node, "highestchildyr"))
+-            self.assertAlmostEqual(node.lowestchildyr, l, places=5)
+-            self.assertAlmostEqual(node.highestchildyr, h, places=5)
++            l, h = expected_lowesthighest_child_yr[i]
++            self.assertTrue(hasattr(node, "lowest_child_yr"))
++            self.assertTrue(hasattr(node, "highest_child_yr"))
++            self.assertAlmostEqual(node.lowest_child_yr, l, places=5)
++            self.assertAlmostEqual(node.highest_child_yr, h, places=5)
+ 
+         # ... And also check that tip nodes *don't* have these attributes,
+         # since tips don't have children.
+         for node in t.tips():
+-            self.assertFalse(hasattr(node, "lowestchildyr"))
+-            self.assertFalse(hasattr(node, "highestchildyr"))
++            self.assertFalse(hasattr(node, "lowest_child_yr"))
++            self.assertFalse(hasattr(node, "highest_child_yr"))
+ 
+     def check_basic_tree_rect_layout(self, t):
+         """Checks that the Empress tree for "((b:2)a:1)root:100;" has a correct
+@@ -187,8 +187,8 @@ def check_basic_tree_rect_layout(self, t):
+         expected_coords = [(100, 0.0), (100 / 3.0, 0.0), (0.0, 0.0)]
+         self.check_coords(t, "xr", "yr", expected_coords)
+         for node in t.non_tips():
+-            self.assertEqual(node.lowestchildyr, 0)
+-            self.assertEqual(node.highestchildyr, 0)
++            self.assertEqual(node.lowest_child_yr, 0)
++            self.assertEqual(node.highest_child_yr, 0)
+ 
+     def test_straightline_tree_rect_layout(self):
+         """Checks that all nodes are drawn as expected even when there aren't
+@@ -203,8 +203,8 @@ def test_straightline_tree_rect_layout(self):
+         expected_coords = [(100, 0.0), (100 / 3.0, 0.0), (0.0, 0.0)]
+         self.check_coords(t, "xr", "yr", expected_coords)
+         for node in t.non_tips():
+-            self.assertEqual(node.lowestchildyr, 0)
+-            self.assertEqual(node.highestchildyr, 0)
++            self.assertEqual(node.lowest_child_yr, 0)
++            self.assertEqual(node.highest_child_yr, 0)
+         self.check_basic_tree_rect_layout(t)
+ 
+     def test_missing_root_length_tree_rect_layout(self):
+@@ -217,8 +217,8 @@ def test_missing_root_length_tree_rect_layout(self):
+         expected_coords = [(100, 0.0), (100 / 3.0, 0.0), (0.0, 0.0)]
+         self.check_coords(t, "xr", "yr", expected_coords)
+         for node in t.non_tips():
+-            self.assertEqual(node.lowestchildyr, 0)
+-            self.assertEqual(node.highestchildyr, 0)
++            self.assertEqual(node.lowest_child_yr, 0)
++            self.assertEqual(node.highest_child_yr, 0)
+         self.check_basic_tree_rect_layout(t)
+ 
+ 

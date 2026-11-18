@@ -1,0 +1,171 @@
+diff --git a/README.md b/README.md
+index c86a8b87..baf3f0ec 100644
+--- a/README.md
++++ b/README.md
+@@ -37,6 +37,7 @@ Please post questions and issues related to GTDB-Tk on the Issues section of the
+ * GTDB-Tk v**INSERT_VERSION** has been released (**we recommend all users update to this version**)
+     * Updated the `gtdb_to_ncbi_majority_vote.py` script for translating taxonomy.
+     * Added the `--pplacer_cpus` argument to specify the number of pplacer threads when running `classify` and `classify_wf` (#195).
++    * The `--debug` flag in `align` outputs aligned markers to disk before trimming.
+ 
+ **Note (Dec 12, 2019)**:
+ * GTDB-Tk v1.0.2 has been released
+diff --git a/bin/gtdbtk b/bin/gtdbtk
+index 662355e2..55312dcc 100755
+--- a/bin/gtdbtk
++++ b/bin/gtdbtk
+@@ -144,7 +144,9 @@ if __name__ == '__main__':
+     optional_denovo_wf.add_argument('--cpus', default=1, type=int,
+                                     help='number of CPUs to use')
+     optional_denovo_wf.add_argument('--force', action='store_const', const=True, default=False,
+-                                    help='continue processing if an error occurrs on a single genome')
++                                    help='continue processing if an error occurs on a single genome')
++    optional_denovo_wf.add_argument('--debug', action="store_true",
++                                    help='create intermediate files for debugging purposes')
+     optional_denovo_wf.add_argument('-h', '--help', action="help",
+                                     help="show help message")
+ 
+@@ -253,11 +255,12 @@ if __name__ == '__main__':
+                                 help='minimum percentage of taxa required to retain column (inclusive bound)')
+     optional_align.add_argument('--rnd_seed', type=int, default=None,
+                                 help='random seed to use for selecting columns')
+-
+     optional_align.add_argument('--prefix', required=False, default='gtdbtk',
+                                 help='desired prefix for output files')
+     optional_align.add_argument('--cpus', default=1, type=int,
+                                 help='number of CPUs to use')
++    optional_align.add_argument('--debug', action="store_true",
++                                help='create intermediate files for debugging purposes')
+     optional_align.add_argument('-h', '--help', action="help",
+                                 help="show help message")
+ 
+@@ -317,7 +320,7 @@ if __name__ == '__main__':
+     optional_classify.add_argument('-r', '--recalculate_red', action='store_true',
+                                    help='recalculate RED values based on the reference tree and all added user genomes')
+ 
+-    optional_classify.add_argument('-d', '--debug', action="store_true",
++    optional_classify.add_argument('--debug', action="store_true",
+                                    help='create intermediate files for debugging purposes')
+     optional_classify.add_argument('-h', '--help', action="help",
+                                    help="show help message")
+diff --git a/gtdbtk/config/output.py b/gtdbtk/config/output.py
+index c193e55e..1a107fe1 100644
+--- a/gtdbtk/config/output.py
++++ b/gtdbtk/config/output.py
+@@ -31,6 +31,7 @@
+ PATH_AR122_USER_MSA = join(DIR_ALIGN, '{prefix}.ar122.user_msa.fasta')
+ PATH_BAC120_MARKER_INFO = join(DIR_ALIGN_INTERMEDIATE, '{prefix}.bac120.marker_info.tsv')
+ PATH_AR122_MARKER_INFO = join(DIR_ALIGN_INTERMEDIATE, '{prefix}.ar122.marker_info.tsv')
++DIR_ALIGN_MARKERS = join(DIR_ALIGN_INTERMEDIATE, 'markers')
+ 
+ # Command: classify
+ DIR_CLASSIFY = 'classify'
+diff --git a/gtdbtk/external/hmm_aligner.py b/gtdbtk/external/hmm_aligner.py
+index 31177d46..e7168694 100644
+--- a/gtdbtk/external/hmm_aligner.py
++++ b/gtdbtk/external/hmm_aligner.py
+@@ -283,11 +283,10 @@ def _run_multi_align(self, db_genome_id, path, marker_set_id):
+ 
+         # we concatenate the aligned markers together and associate them with
+         # the genome.
++        seq = ""
+         for gid, markids in result_aligns.items():
+-            seq = ""
+             for markid in sorted(markids.keys()):
+                 seq = seq + markids.get(markid)
+-
+         return seq
+ 
+     def _run_align(self, marker_dict, genome):
+diff --git a/gtdbtk/main.py b/gtdbtk/main.py
+index e58b76e7..69c1529f 100644
+--- a/gtdbtk/main.py
++++ b/gtdbtk/main.py
+@@ -259,7 +259,7 @@ def align(self, options):
+         if not hasattr(options, 'outgroup_taxon'):
+             options.outgroup_taxon = None
+ 
+-        markers = Markers(options.cpus)
++        markers = Markers(options.cpus, options.debug)
+         markers.align(options.identify_dir,
+                       options.skip_gtdb_refs,
+                       options.taxa_filter,
+diff --git a/gtdbtk/markers.py b/gtdbtk/markers.py
+index f76293e7..8406005b 100644
+--- a/gtdbtk/markers.py
++++ b/gtdbtk/markers.py
+@@ -23,6 +23,7 @@
+ import numpy as np
+ 
+ import gtdbtk.config.config as Config
++from gtdbtk.biolib_lite.common import make_sure_path_exists
+ from gtdbtk.biolib_lite.execute import check_dependencies
+ from gtdbtk.biolib_lite.seq_io import read_fasta
+ from gtdbtk.biolib_lite.taxonomy import Taxonomy
+@@ -39,13 +40,14 @@
+ class Markers(object):
+     """Identify and align marker genes."""
+ 
+-    def __init__(self, cpus=1):
++    def __init__(self, cpus=1, debug=False):
+         """Initialize."""
+ 
+         self.logger = logging.getLogger('timestamp')
+         self.warnings = logging.getLogger('warnings')
+ 
+         self.cpus = cpus
++        self.debug = debug
+ 
+         self.genome_file_suffix = GENOME_FILE_SUFFIX
+         self.protein_file_suffix = PROTEIN_FILE_SUFFIX
+@@ -548,6 +550,10 @@ def align(self,
+             user_msa = hmm_aligner.align_marker_set(cur_genome_files,
+                                                     marker_set_id)
+ 
++            # Write the individual marker alignments to disk
++            if self.debug:
++                self._write_individual_markers(user_msa, marker_set_id, marker_info_file, out_dir, prefix)
++
+             # filter columns without sufficient representation across taxa
+             if skip_trimming:
+                 self.logger.info(
+@@ -656,3 +662,39 @@ def align(self,
+                 self.logger.error(
+                     'There was an error determining the marker set.')
+                 raise GenomeMarkerSetUnknown
++
++    def _write_individual_markers(self, user_msa, marker_set_id, marker_list, out_dir, prefix):
++        marker_dir = join(out_dir, DIR_ALIGN_MARKERS)
++        make_sure_path_exists(marker_dir)
++
++        markers, total_msa_len = self._parse_marker_info_file(marker_list)
++        marker_to_msa = dict()
++        offset = 0
++        for marker_id, marker_desc, marker_len in sorted(markers, key=lambda x: x[0]):
++            path_msa = os.path.join(marker_dir, f'{prefix}.{marker_set_id}.{marker_id}.faa')
++            marker_to_msa[path_msa] = defaultdict(str)
++            for gid, msa in user_msa.items():
++                marker_to_msa[path_msa][gid] += msa[offset: marker_len + offset]
++            offset += marker_len
++
++        if total_msa_len != offset:
++            self.logger.warning('Internal error: the total MSA length is not equal to the offset.')
++        for path_marker, gid_dict in marker_to_msa.items():
++            with open(path_marker, 'w') as fh:
++                for genome_id, genome_msa in gid_dict.items():
++                    fh.write(f'>{genome_id}\n{genome_msa}\n')
++        self.logger.debug(f'Successfully written all markers to: {marker_dir}')
++
++    def _parse_marker_info_file(self, path):
++        total_msa_len = 0
++        markers = list()
++        with open(path, 'r') as fh:
++            fh.readline()
++            for line in fh.readlines():
++                list_info = line.split("\t")
++                marker_id = list_info[0]
++                marker_name = '%s: %s' % (list_info[1], list_info[2])
++                marker_len = int(list_info[3])
++                markers.append((marker_id, marker_name, marker_len))
++                total_msa_len += marker_len
++        return markers, total_msa_len

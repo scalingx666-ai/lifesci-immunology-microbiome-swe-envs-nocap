@@ -1,0 +1,516 @@
+diff --git a/qiita_db/analysis.py b/qiita_db/analysis.py
+index 876bdd46f..c7e44855f 100644
+--- a/qiita_db/analysis.py
++++ b/qiita_db/analysis.py
+@@ -127,7 +127,8 @@ def get_by_status(cls, status):
+ 
+     @classmethod
+     def create(cls, owner, name, description, from_default=False,
+-               merge_duplicated_sample_ids=False, categories=None):
++               merge_duplicated_sample_ids=False, categories=None,
++               reservation=None):
+         """Creates a new analysis on the database
+ 
+         Parameters
+@@ -147,6 +148,8 @@ def create(cls, owner, name, description, from_default=False,
+             the artifact id
+         categories : list of str, optional
+             If not None, use _only_ these categories for the metaanalysis
++        reservation : str
++            The slurm reservation to asign to the analysis
+ 
+         Returns
+         -------
+@@ -187,6 +190,8 @@ def create(cls, owner, name, description, from_default=False,
+             qdb.sql_connection.TRN.add(sql, args, many=True)
+ 
+             instance = cls(a_id)
++            if reservation is not None:
++                instance.slurm_reservation = reservation
+ 
+             # Once the analysis is created, we can create the mapping file and
+             # the initial set of artifacts
+@@ -1198,12 +1203,11 @@ def slurm_reservation(self):
+         """
+         slurm_reservation = self._slurm_reservation()
+ 
+-        if slurm_reservation:
+-            slurm_reservation = slurm_reservation[0]
+-            cmd = f"scontrol show reservations {slurm_reservation}"
++        if slurm_reservation and slurm_reservation[0] != '':
++            cmd = f"scontrol show reservations {slurm_reservation[0]}"
+             p_out, p_err, rv = qdb.processing_job._system_call(cmd)
+-            if rv == 0:
+-                return slurm_reservation
++            if rv == 0 and p_out != 'No reservations in the system\n':
++                return slurm_reservation[0]
+ 
+         return None
+ 
+diff --git a/qiita_db/handlers/tests/test_processing_job.py b/qiita_db/handlers/tests/test_processing_job.py
+index aa854d2a5..09e4d39ce 100644
+--- a/qiita_db/handlers/tests/test_processing_job.py
++++ b/qiita_db/handlers/tests/test_processing_job.py
+@@ -234,9 +234,9 @@ def test_post_job_success(self):
+         # additionally we can test that job.print_trace is correct
+         self.assertEqual(job.trace, [
+             f'{job.id} [Not Available]: Validate | '
+-            '-p qiita -N 1 -n 1 --mem 90gb --time 150:00:00 --nice 10000',
++            '-p qiita -N 1 -n 1 --mem 90gb --time 150:00:00 --nice=10000',
+             f'  {cj.id} [{cj.external_id}] | '
+-            '-p qiita -N 1 -n 1 --mem 16gb --time 10:00:00 --nice 10000'])
++            '-p qiita -N 1 -n 1 --mem 16gb --time 10:00:00 --nice=10000'])
+ 
+     def test_post_job_success_with_archive(self):
+         pt = npt.assert_warns(
+diff --git a/qiita_db/processing_job.py b/qiita_db/processing_job.py
+index a89f75083..8ac900cc3 100644
+--- a/qiita_db/processing_job.py
++++ b/qiita_db/processing_job.py
+@@ -419,8 +419,15 @@ def resource_allocation_info(self):
+                 if v['artifacts'] is not None:
+                     an_element = list(v['artifacts'].keys())[0]
+                     name = v['artifacts'][an_element]['artifact_type']
+-                ia = ProcessingJob(params['job_id']).input_artifacts
+-                if ia:
++                # for analysis we have two options, either use the
++                # input_artifacts or use the parameter 'analysis' of the job
++                # to complete
++                job = ProcessingJob(params['job_id'])
++                params = job.parameters.values
++                ia = job.input_artifacts
++                if 'analysis' in params and params['analysis'] is not None:
++                    analysis = qdb.analysis.Analysis(params['analysis'])
++                elif ia:
+                     analysis = ia[0].analysis
+             elif self.command.name == 'release_validators':
+                 jtype = 'RELEASE_VALIDATORS_RESOURCE_PARAM'
+@@ -440,8 +447,13 @@ def resource_allocation_info(self):
+                 # assume anything else is a command
+                 jtype = 'RESOURCE_PARAMS_COMMAND'
+                 name = self.command.name
++                # for analysis we have two options, either use the
++                # input_artifacts or use the parameter 'analysis' of self
++                params = self.parameters.values
+                 ia = self.input_artifacts
+-                if ia:
++                if 'analysis' in params and params['analysis'] is not None:
++                    analysis = qdb.analysis.Analysis(params['analysis'])
++                elif ia:
+                     analysis = ia[0].analysis
+ 
+             # first, query for resources matching name and type
+diff --git a/qiita_db/support_files/patches/89.sql b/qiita_db/support_files/patches/89.sql
+index 8647d9b16..d5b0892cb 100644
+--- a/qiita_db/support_files/patches/89.sql
++++ b/qiita_db/support_files/patches/89.sql
+@@ -1,8 +1,8 @@
+ -- Nov 1, 2023
+ -- add creation_job_id to qiita.prep_template
+ ALTER TABLE qiita.analysis ADD slurm_reservation VARCHAR DEFAULT '' NOT NULL;
+-ALTER TABLE qiita.user_level ADD slurm_parameters VARCHAR DEFAULT '--nice 10000' NOT NULL;
++ALTER TABLE qiita.user_level ADD slurm_parameters VARCHAR DEFAULT '--nice=10000' NOT NULL;
+ 
+-UPDATE qiita.user_level SET slurm_parameters = '--nice 5000' WHERE name = 'admin';
++UPDATE qiita.user_level SET slurm_parameters = '--nice=5000' WHERE name = 'admin';
+ 
+ UPDATE qiita.user_level SET slurm_parameters = '' WHERE name = 'wet-lab admin';
+diff --git a/qiita_db/test/test_processing_job.py b/qiita_db/test/test_processing_job.py
+index c9c7a3a5e..b3b8be2c6 100644
+--- a/qiita_db/test/test_processing_job.py
++++ b/qiita_db/test/test_processing_job.py
+@@ -554,7 +554,7 @@ def test_complete_success(self):
+         self.assertEqual(validator.parameters.values['artifact_type'], 'BIOM')
+         self.assertEqual(
+             validator.resource_allocation_info,
+-            '-p qiita -N 1 -n 1 --mem 90gb --time 150:00:00 --nice 10000')
++            '-p qiita -N 1 -n 1 --mem 90gb --time 150:00:00 --nice=10000')
+         self.assertEqual(validator.shape, (27, 53, None))
+         # Test the output artifact is going to be named based on the
+         # input parameters
+@@ -793,7 +793,7 @@ def test_shape_special_cases(self):
+         current_allocation = pj.resource_allocation_info
+         self.assertEqual(current_allocation,
+                          '-p qiita -N 1 -n 1 --mem 120gb --time 80:00:00 '
+-                         '--nice 10000')
++                         '--nice=10000')
+ 
+         # now, let's update that job allocation and make sure that things
+         # work as expected
+@@ -801,29 +801,29 @@ def test_shape_special_cases(self):
+             # (resource allocation, specific allocation)
+             # 1. tests that nlog works
+             ('-p qiita -N 1 -n 1 --mem nlog({samples})*100 --time {columns}',
+-             '-p qiita -N 1 -n 1 --mem 329B --time 0:00:53 --nice 10000'),
++             '-p qiita -N 1 -n 1 --mem 329B --time 0:00:53 --nice=10000'),
+             # 2. days in time works fine
+             ('-p qiita -N 1 -n 1 --mem 10g --time {columns}*10000',
+-             '-p qiita -N 1 -n 1 --mem 10g --time 6-3:13:20 --nice 10000'),
++             '-p qiita -N 1 -n 1 --mem 10g --time 6-3:13:20 --nice=10000'),
+             ('-p qiita -N 1 -n 1 --mem 20g --time {columns}*1631',
+-             '-p qiita -N 1 -n 1 --mem 20g --time 1-0:00:43 --nice 10000'),
++             '-p qiita -N 1 -n 1 --mem 20g --time 1-0:00:43 --nice=10000'),
+             # 3. conditionals work
+             ('-p qiita -N 1 -n 1 --mem 10g --time {columns}*1631 '
+              'if {columns}*1631 < 86400 else 86400',
+-             '-p qiita -N 1 -n 1 --mem 10g --time 1-0:00:00 --nice 10000'),
++             '-p qiita -N 1 -n 1 --mem 10g --time 1-0:00:00 --nice=10000'),
+             ('-p qiita -N 1 -n 1 --mem 10g --time {columns}*1631 '
+              'if {columns}*1631 > 86400 else 86400',
+-             '-p qiita -N 1 -n 1 --mem 10g --time 1-0:00:43 --nice 10000'),
++             '-p qiita -N 1 -n 1 --mem 10g --time 1-0:00:43 --nice=10000'),
+             # --qos=qiita_prio
+             ('-p qiita -N 1 -n 1 --mem 10g --time 1:00:00 --qos=qiita_prio',
+              '-p qiita -N 1 -n 1 --mem 10g --time 1:00:00 --qos=qiita_prio '
+-             '--nice 10000'),
++             '--nice=10000'),
+             # all the combinations
+             ('-p qiita -N 1 -n 1 --mem nlog({samples})*100000 --time '
+              '{columns}*1631 if {columns}*1631 > 86400 else 86400 '
+              '--qos=qiita_prio',
+              '-p qiita -N 1 -n 1 --mem 322K --time 1-0:00:43 '
+-             '--qos=qiita_prio --nice 10000'),
++             '--qos=qiita_prio --nice=10000'),
+         ]
+         for ra, sra in tests:
+             sql = ("UPDATE qiita.processing_job_resource_allocation "
+@@ -842,17 +842,17 @@ def test_get_resource_allocation_info(self):
+         jids = {
+             # Split libraries FASTQ
+             '6d368e16-2242-4cf8-87b4-a5dc40bb890b':
+-                '-p qiita -N 1 -n 1 --mem 120gb --time 80:00:00 --nice 10000',
++                '-p qiita -N 1 -n 1 --mem 120gb --time 80:00:00 --nice=10000',
+             # Pick closed-reference OTUs
+             '80bf25f3-5f1d-4e10-9369-315e4244f6d5':
+-                '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice 10000',
++                '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice=10000',
+             # Single Rarefaction / Analysis
+             '8a7a8461-e8a1-4b4e-a428-1bc2f4d3ebd0':
+                 '-p qiita -N 1 -n 5 --mem-per-cpu 8gb --time 168:00:00 '
+-                '--nice 10000',
++                '--nice=10000',
+             # Split libraries
+             'bcc7ebcd-39c1-43e4-af2d-822e3589f14d':
+-                '-p qiita -N 1 -n 1 --mem 60gb --time 25:00:00 --nice 10000'}
++                '-p qiita -N 1 -n 1 --mem 60gb --time 25:00:00 --nice=10000'}
+ 
+         for jid, allocation in jids.items():
+             job = qdb.processing_job.ProcessingJob(jid)
+@@ -877,27 +877,27 @@ def _set_allocation(memory):
+         _set_allocation('{samples}*1000')
+         self.assertEqual(
+             job_not_changed.resource_allocation_info,
+-            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice 10000')
++            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice=10000')
+         self.assertEqual(job_changed.resource_allocation_info,
+-                         '-p qiita --mem 26K --nice 10000')
++                         '-p qiita --mem 26K --nice=10000')
+ 
+         # a little more complex ((samples+columns)*1000000)+4000000
+         #                       ((   27  +  31   )*1000000)+4000000 ~ 62000000
+         _set_allocation('(({samples}+{columns})*1000000)+4000000')
+         self.assertEqual(
+             job_not_changed.resource_allocation_info,
+-            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice 10000')
++            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice=10000')
+         self.assertEqual(job_changed.resource_allocation_info,
+-                         '-p qiita --mem 80M --nice 10000')
++                         '-p qiita --mem 80M --nice=10000')
+ 
+         # now something real input_size+(2*1e+9)
+         #                        116   +(2*1e+9) ~ 2000000116
+         _set_allocation('{input_size}+(2*1e+9)')
+         self.assertEqual(
+             job_not_changed.resource_allocation_info,
+-            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice 10000')
++            '-p qiita -N 1 -n 5 --mem 120gb --time 130:00:00 --nice=10000')
+         self.assertEqual(job_changed.resource_allocation_info,
+-                         '-p qiita --mem 2G --nice 10000')
++                         '-p qiita --mem 2G --nice=10000')
+ 
+         # restore allocation
+         sql = ("UPDATE qiita.processing_job_resource_allocation "
+diff --git a/qiita_db/test/test_user.py b/qiita_db/test/test_user.py
+index 1a07ee225..6978e3dba 100644
+--- a/qiita_db/test/test_user.py
++++ b/qiita_db/test/test_user.py
+@@ -515,9 +515,9 @@ def test_update_email(self):
+ 
+     def test_slurm_parameters(self):
+         self.assertEqual(qdb.user.User('shared@foo.bar').slurm_parameters,
+-                         '--nice 10000')
++                         '--nice=10000')
+         self.assertEqual(qdb.user.User('admin@foo.bar').slurm_parameters,
+-                         '--nice 5000')
++                         '--nice=5000')
+ 
+ 
+ @qiita_test_checker()
+diff --git a/qiita_pet/handlers/analysis_handlers/__init__.py b/qiita_pet/handlers/analysis_handlers/__init__.py
+index 868abfa1b..a45105643 100644
+--- a/qiita_pet/handlers/analysis_handlers/__init__.py
++++ b/qiita_pet/handlers/analysis_handlers/__init__.py
+@@ -7,13 +7,13 @@
+ # -----------------------------------------------------------------------------
+ 
+ from .util import check_analysis_access
+-from .base_handlers import (CreateAnalysisHandler, AnalysisDescriptionHandler,
++from .base_handlers import (CreateAnalysisHandler, AnalysisHandler,
+                             AnalysisGraphHandler, AnalysisJobsHandler)
+ from .listing_handlers import (ListAnalysesHandler, AnalysisSummaryAJAX,
+                                SelectedSamplesHandler)
+ from .sharing_handlers import ShareAnalysisAJAX
+ 
+-__all__ = ['CreateAnalysisHandler', 'AnalysisDescriptionHandler',
++__all__ = ['CreateAnalysisHandler', 'AnalysisHandler',
+            'AnalysisGraphHandler', 'AnalysisJobsHandler',
+            'ListAnalysesHandler', 'AnalysisSummaryAJAX',
+            'SelectedSamplesHandler', 'check_analysis_access',
+diff --git a/qiita_pet/handlers/analysis_handlers/base_handlers.py b/qiita_pet/handlers/analysis_handlers/base_handlers.py
+index 782d24f27..bc3de16d0 100644
+--- a/qiita_pet/handlers/analysis_handlers/base_handlers.py
++++ b/qiita_pet/handlers/analysis_handlers/base_handlers.py
+@@ -27,6 +27,7 @@ def post(self):
+         desc = self.get_argument('description')
+         mdsi = self.get_argument('merge_duplicated_sample_ids', False)
+         metadata = self.request.arguments.get('analysis-metadata', None)
++        reservation = self.get_argument('reservation', None)
+         # we need to change from bytes to strings
+         if metadata is not None:
+             metadata = [m.decode('utf-8') for m in metadata]
+@@ -35,7 +36,7 @@ def post(self):
+             mdsi = True
+         analysis = Analysis.create(
+             self.current_user, name, desc, merge_duplicated_sample_ids=mdsi,
+-            from_default=True, categories=metadata)
++            from_default=True, categories=metadata, reservation=reservation)
+ 
+         self.redirect(u"%s/analysis/description/%s/"
+                       % (qiita_config.portal_dir, analysis.id))
+@@ -86,10 +87,11 @@ def analysis_description_handler_get_request(analysis_id, user):
+             'analysis_mapping_id': analysis.mapping_file,
+             'alert_type': alert_type,
+             'artifacts': artifacts,
++            'analysis_reservation': analysis._slurm_reservation()[0],
+             'alert_msg': alert_msg}
+ 
+ 
+-class AnalysisDescriptionHandler(BaseHandler):
++class AnalysisHandler(BaseHandler):
+     @authenticated
+     @execute_as_transaction
+     def get(self, analysis_id):
+@@ -119,6 +121,26 @@ def post(self, analysis_id):
+ 
+         self.render("analysis_description.html", **res)
+ 
++    @authenticated
++    @execute_as_transaction
++    def patch(self, analysis_id):
++        """Patches a analysis
++
++        Follows the JSON PATCH specification:
++        https://tools.ietf.org/html/rfc6902
++        """
++        req_op = self.get_argument('op')
++        req_path = self.get_argument('path')
++        req_value = self.get_argument('value', None)
++
++        if req_op == 'replace' and req_path == 'reservation':
++            Analysis(analysis_id).slurm_reservation = req_value
++            response = {'status': 'success', 'message': ''}
++        else:
++            response = {'status': 'error', 'message': 'Not implemented'}
++
++        self.write(response)
++
+ 
+ def analyisis_graph_handler_get_request(analysis_id, user):
+     """Returns the graph information of the analysis
+diff --git a/qiita_pet/handlers/analysis_handlers/tests/test_base_handlers.py b/qiita_pet/handlers/analysis_handlers/tests/test_base_handlers.py
+index a72c3c848..735c6db1d 100644
+--- a/qiita_pet/handlers/analysis_handlers/tests/test_base_handlers.py
++++ b/qiita_pet/handlers/analysis_handlers/tests/test_base_handlers.py
+@@ -56,8 +56,8 @@ def test_analysis_description_handler_get_request(self):
+                                   'libraries FASTQ', 'QIIME v1.9.1'), [
+                             '1.SKB7.640196', '1.SKB8.640193', '1.SKD8.640184',
+                             '1.SKM4.640180', '1.SKM9.640192'], {'1'})},
++               'analysis_reservation': '',
+                'alert_msg': ''}
+-
+         self.assertEqual(obs, exp)
+ 
+         r_client.set('analysis_1', dumps({'job_id': 'job_id'}))
+@@ -85,7 +85,8 @@ def test_analysis_description_handler_get_request(self):
+                                   'libraries FASTQ', 'QIIME v1.9.1'), [
+                             '1.SKB7.640196', '1.SKB8.640193', '1.SKD8.640184',
+                             '1.SKM4.640180', '1.SKM9.640192'], {'1'})},
+-               'alert_msg': 'An artifact is being deleted from this analysis'}
++               'alert_msg': 'An artifact is being deleted from this analysis',
++               'analysis_reservation': ''}
+         self.assertEqual(obs, exp)
+ 
+         r_client.set('job_id', dumps(
+@@ -115,7 +116,8 @@ def test_analysis_description_handler_get_request(self):
+                                   'libraries FASTQ', 'QIIME v1.9.1'), [
+                             '1.SKB7.640196', '1.SKB8.640193', '1.SKD8.640184',
+                             '1.SKM4.640180', '1.SKM9.640192'], {'1'})},
+-               'alert_msg': 'Error deleting artifact'}
++               'alert_msg': 'Error deleting artifact',
++               'analysis_reservation': ''}
+         self.assertEqual(obs, exp)
+ 
+     def test_analyisis_graph_handler_get_request(self):
+@@ -199,6 +201,25 @@ def test_get_analysis_jobs_handler(self):
+         exp = {job_id: {'status': 'queued', 'step': None, 'error': ""}}
+         self.assertEqual(obs, exp)
+ 
++    def test_patch(self):
++        # first let's check that the reservation is not set
++        analysis = Analysis(1)
++        self.assertEqual(analysis._slurm_reservation(), [''])
++
++        # now, let's change it to something different
++        reservation = 'my-reservation'
++        arguments = {
++            'op': 'replace', 'path': 'reservation', 'value': reservation}
++        self.patch(f'/analysis/description/{analysis.id}/', data=arguments)
++        self.assertEqual(analysis._slurm_reservation(), [reservation])
++
++        # then bring it back
++        reservation = ''
++        arguments = {
++            'op': 'replace', 'path': 'reservation', 'value': reservation}
++        self.patch(f'/analysis/description/{analysis.id}/', data=arguments)
++        self.assertEqual(analysis._slurm_reservation(), [reservation])
++
+ 
+ class TestAnalysisGraphHandler(TestHandlerBase):
+     def test_get_analysis_graph_handler(self):
+diff --git a/qiita_pet/templates/analysis_description.html b/qiita_pet/templates/analysis_description.html
+index e3e966869..2c2baad25 100644
+--- a/qiita_pet/templates/analysis_description.html
++++ b/qiita_pet/templates/analysis_description.html
+@@ -5,6 +5,31 @@
+ <script type="text/javascript" src="{% raw qiita_config.portal_dir %}/static/js/sharing.js"></script>
+ 
+ <script type="text/javascript">
++  /*
++   * update_analysis_reservation will update the analysis resevation
++   *
++   * @param analysis_id: The id of the analysis to update
++   * @param reservation: The reservation
++   *
++   */
++
++  function update_analysis_reservation(analysis_id, reservation) {
++    $.ajax({
++      url: '{% raw qiita_config.portal_dir %}/analysis/description/{{analysis_id}}/',
++      type: 'PATCH',
++      data: {'op': 'replace', 'path': 'reservation', 'value': reservation},
++      success: function(data) {
++        $('#analysis-reservation-modal-view').modal('hide');
++        if(data.status == 'error') {
++          bootstrapAlert(data.message, "danger");
++        } else {
++          $('#reservation').val(reservation);
++          $('#analysis-reservation-modal-data').text("Reservation: " + reservation);
++        }
++      }
++    });
++
++  }
+ 
+   $(document).ready(function(){
+     // Create the processing network view object
+@@ -51,6 +76,9 @@ <h2>
+         {% if not analysis_is_public %}
+           <a class="btn btn-default" onclick="if (confirm('Are you sure you want to make this analysis public? Note that this will not allow you to delete your analysis later.')) { $('#make-public').submit(); }"><span class="glyphicon glyphicon-globe"></span> Make analysis public</a>
+         {% end %}
++        <a class="btn btn-default" data-toggle="modal" data-target="#analysis-reservation-modal-view"><span class="glyphicon glyphicon-pencil" name="analysis-reservation-modal-data" id="analysis-reservation-modal-data"> Reservation: {% raw analysis_reservation %}</span></a>
++
++
+       </small>
+     </h2>
+     <a class="btn btn-info" data-toggle="modal" data-target="#share-analysis-modal-view" onclick="modify_sharing({{analysis_id}});"><span class=" glyphicon glyphicon-share"></span></a> Shared with: <span id="shared_html_{{analysis_id}}"></span>
+@@ -123,4 +151,26 @@ <h4 class="modal-title" id="myModalLabel">Modify Sharing Settings</h4>
+   </div>
+ </div>
+ 
++<!-- Modal used to change reservation -->
++<div class="modal fade" id="analysis-reservation-modal-view" tabindex="-1" role="dialog" aria-labelledby="myModalLabel" aria-hidden="true">
++ <div class="modal-dialog">
++   <div class="modal-content">
++     <div class="modal-header">
++       <button type="button" class="close" data-dismiss="modal" aria-hidden="true">&times;</button>
++       <h4 class="modal-title" id="myModalLabel">Modify Reservation Setting</h4>
++     </div>
++       <div class="modal-body">
++         <div>
++           <div class="form-group">
++             <label for="shares-select">Reservation (optional)</label>
++             <input type="text" class="form-control" id="reservation" name="reservation" value="{{ analysis_reservation }}" placeholder="Reservation (optional)">
++             <button id="update-reservation-btn" class="btn btn-default" onclick="update_analysis_reservation({{analysis_id}}, $('#reservation').val());">Update</button>
++           </div>
++         </div>
++       </div>
++       <div class="modal-footer"></div>
++   </div>
++ </div>
++</div>
++
+ {% end %}
+diff --git a/qiita_pet/templates/analysis_selected.html b/qiita_pet/templates/analysis_selected.html
+index 5cc5da4ce..99f2aa860 100644
+--- a/qiita_pet/templates/analysis_selected.html
++++ b/qiita_pet/templates/analysis_selected.html
+@@ -270,6 +270,10 @@ <h4 class="modal-title" id="myModalLabel">Create new analysis</h4>
+                   <label for="description">Metadata selected <small>(to update use the main page)</small></label>
+                   <select name="analysis-metadata" id="analysis-metadata" class="analysis-metadata" multiple disabled></select>
+                 </div>
++                <div class="form-group">
++                  <label for="description">Reservation (optional)</label>
++                  <input type="text" class="form-control" id="reservation" name="reservation" placeholder="Reservation (optional)">
++                </div>
+               </div>
+             </div>
+             <div class="modal-footer">
+diff --git a/qiita_pet/webserver.py b/qiita_pet/webserver.py
+index dbb695395..84d71431a 100644
+--- a/qiita_pet/webserver.py
++++ b/qiita_pet/webserver.py
+@@ -28,7 +28,7 @@
+     AdminProcessingJob, AJAXAdminProcessingJobListing, SampleValidation)
+ from qiita_pet.handlers.analysis_handlers import (
+     ListAnalysesHandler, AnalysisSummaryAJAX, SelectedSamplesHandler,
+-    AnalysisDescriptionHandler, AnalysisGraphHandler, CreateAnalysisHandler,
++    AnalysisHandler, AnalysisGraphHandler, CreateAnalysisHandler,
+     AnalysisJobsHandler, ShareAnalysisAJAX)
+ from qiita_pet.handlers.study_handlers import (
+     StudyIndexHandler, StudyBaseInfoAJAX, SampleTemplateHandler,
+@@ -123,7 +123,7 @@ def __init__(self):
+             (r"/analysis/selected/socket/", SelectedSocketHandler),
+             (r"/analysis/description/(.*)/graph/", AnalysisGraphHandler),
+             (r"/analysis/description/(.*)/jobs/", AnalysisJobsHandler),
+-            (r"/analysis/description/(.*)/", AnalysisDescriptionHandler),
++            (r"/analysis/description/(.*)/", AnalysisHandler),
+             (r"/analysis/sharing/", ShareAnalysisAJAX),
+             (r"/artifact/samples/", ArtifactGetSamples),
+             (r"/artifact/info/", ArtifactGetInfo),
+diff --git a/qiita_ware/test/test_private_plugin.py b/qiita_ware/test/test_private_plugin.py
+index a26dd5268..79df8c9dc 100644
+--- a/qiita_ware/test/test_private_plugin.py
++++ b/qiita_ware/test/test_private_plugin.py
+@@ -395,10 +395,10 @@ def _set_allocation(memory):
+         self.assertEqual(job.shape, (4, None, 1256812))
+         self.assertEqual(
+             job.resource_allocation_info,
+-            '-p qiita -N 1 -n 1 --mem 16gb --time 10:00:00 --nice 10000')
++            '-p qiita -N 1 -n 1 --mem 16gb --time 10:00:00 --nice=10000')
+         _set_allocation('{samples}*1000')
+         self.assertEqual(job.resource_allocation_info,
+-                         '-p qiita --mem 4K --nice 10000')
++                         '-p qiita --mem 4K --nice=10000')
+         _set_allocation('{columns}*1000')
+         self.assertEqual(job.resource_allocation_info, 'Not valid')
+         self.assertEqual(job.status, 'error')

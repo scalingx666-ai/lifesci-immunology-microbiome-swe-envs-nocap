@@ -1,0 +1,237 @@
+diff --git a/metagraph/docs/source/quick_start.rst b/metagraph/docs/source/quick_start.rst
+index 1acdc0153c..1db5760b0f 100644
+--- a/metagraph/docs/source/quick_start.rst
++++ b/metagraph/docs/source/quick_start.rst
+@@ -862,7 +862,8 @@ Move an annotation to another graph with the same k-mers
+ """"""""""""""""""""""""""""""""""""""""""""""""""""""""
+ A ``brwt`` or ``row_diff_brwt`` annotation can be moved to another graph with the same k-mers, such as an SSHash graph built from the unitigs of a succinct graph.
+ This avoids annotating the new graph again from the input sequences.
+-Both graphs must be in ``basic`` mode.
++Both graphs must be in ``basic`` mode, or the old graph in ``primary`` mode and the new one an SSHash graph built with ``--mode primary``.
++In the second case, build the SSHash graph from the contigs of the old graph (``transform --to-fasta``), so that both store every k-mer in the same orientation.
+ Pass the graph that the annotation was built for with ``--remap-graph`` and the new graph with ``-i``::
+ 
+     metagraph transform_anno -v -p 36 --remap-graph graph.dbg -i graph.sshashdbg \
+diff --git a/metagraph/integration_tests/test_remap_anno.py b/metagraph/integration_tests/test_remap_anno.py
+index 0f96e0cecc..3831b49564 100644
+--- a/metagraph/integration_tests/test_remap_anno.py
++++ b/metagraph/integration_tests/test_remap_anno.py
+@@ -4,6 +4,7 @@
+ from subprocess import PIPE
+ from tempfile import TemporaryDirectory
+ import glob
++import gzip
+ import os
+ from base import PROTEIN_MODE, TestingBase, METAGRAPH, MMAP_FLAG
+ 
+@@ -39,6 +40,8 @@ def setUpClass(cls):
+         cls.partial_target = cls.tempdir.name + '/partial.sshashdbg'
+         cls._build_sshash(cls.partial_input, cls.partial_target)
+ 
++        cls.primary_source, cls.primary_target, cls.flipped_target = cls._build_primary_graphs()
++
+     @staticmethod
+     def _build_sshash(input, output):
+         # SSHash needs each k-mer once, so build it from the unitigs of a succinct graph.
+@@ -51,6 +54,32 @@ def _build_sshash(input, output):
+             f'{METAGRAPH} build -p {NUM_THREADS} --mode basic --graph sshash'
+             f' -k {K} -o {output} {prefix}_unitigs.fasta.gz', 'Build command', shell=True)
+ 
++    @classmethod
++    def _build_primary_graphs(cls):
++        """A primary succinct graph, an SSHash graph built from its contigs, and an
++        SSHash graph built from the reverse complements of those contigs."""
++        prefix = cls.tempdir.name + '/primary'
++        cls._build_graph(INPUT, prefix + '.dbg', K, 'succinct', 'primary')
++        # The contigs of the primary graph spell every k-mer as the graph stores it.
++        cls._run_command(
++            f'{METAGRAPH} transform -p {NUM_THREADS} --to-fasta'
++            f' -o {prefix}_contigs {prefix}.dbg', 'Transform command', shell=True)
++        contigs = prefix + '_contigs.fasta.gz'
++        cls._run_command(
++            f'{METAGRAPH} build -p {NUM_THREADS} --mode primary --graph sshash'
++            f' -k {K} -o {prefix}.sshashdbg {contigs}', 'Build command', shell=True)
++
++        complement = str.maketrans('ACGT', 'TGCA')
++        flipped = prefix + '_flipped.fa'
++        with gzip.open(contigs, 'rt') as f, open(flipped, 'w') as out:
++            for line in f:
++                line = line.strip()
++                out.write((line if line.startswith('>') else line.translate(complement)[::-1]) + '\n')
++        cls._run_command(
++            f'{METAGRAPH} build -p {NUM_THREADS} --mode primary --graph sshash'
++            f' -k {K} -o {prefix}_flipped.sshashdbg {flipped}', 'Build command', shell=True)
++        return prefix + '.dbg', prefix + '.sshashdbg', prefix + '_flipped.sshashdbg'
++
+     def _query(self, graph, anno, mode):
+         res = subprocess.run(
+             f'{METAGRAPH} query --query-mode {mode} -i {graph} -a {anno} {INPUT}' + MMAP_FLAG,
+@@ -58,11 +87,11 @@ def _query(self, graph, anno, mode):
+         self.assertEqual(res.returncode, 0, res.stderr.decode())
+         return sorted(res.stdout.decode().splitlines())
+ 
+-    def _remap(self, anno, out, target, anno_type=None, in_memory=False):
++    def _remap(self, anno, out, target, anno_type=None, in_memory=False, source=None):
+         anno_type_flag = f' --anno-type {anno_type}' if anno_type else ''
+         in_memory_flag = ' --disk-swap ""' if in_memory else ''
+         return subprocess.run(
+-            f'{METAGRAPH} transform_anno -p {NUM_THREADS} --remap-graph {self.source}'
++            f'{METAGRAPH} transform_anno -p {NUM_THREADS} --remap-graph {source or self.source}'
+             f' -i {target}{anno_type_flag}{in_memory_flag} -o {out} {anno}',
+             shell=True, stdout=PIPE, stderr=PIPE)
+ 
+@@ -169,6 +198,39 @@ def test_remap_rejects_conversion(self, anno_repr, anno_type):
+         self.assertIn('--anno-type' if anno_repr == 'row_diff_brwt' else 'can convert only',
+                       res.stderr.decode() + res.stdout.decode())
+ 
++    @parameterized.expand(['brwt', 'row_diff_brwt'])
++    def test_remap_primary_to_sshash(self, anno_repr):
++        source, target = self.primary_source, self.primary_target
++        prefix = f'{self.tempdir.name}/primary_{anno_repr}'
++        self._annotate_graph(INPUT, source, prefix, anno_repr, num_threads=NUM_THREADS)
++        anno = prefix + anno_file_extension[anno_repr]
++        out = prefix + '_remapped'
++        out_anno = out + anno_file_extension[anno_repr]
++
++        res = self._remap(anno, out, target, source=source)
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++
++        # The SSHash graph also has a node, and so a row, for every reverse complement.
++        stats = self._get_stats(f'-a {out_anno}')
++        self.assertEqual(stats['objects'], self._get_stats(target)['nodes (k)'])
++        for mode in ['labels', 'matches', 'signature']:
++            expected = self._query(source, anno, mode)
++            self.assertEqual(len(expected), 100)
++            self.assertTrue(all(line.split('\t')[-1] for line in expected))
++            self.assertEqual(expected, self._query(target, out_anno, mode))
++
++        res = self._remap(anno, prefix + '_flipped', self.flipped_target, source=source)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('other orientation', res.stderr.decode() + res.stdout.decode())
++
++    def test_remap_rejects_mixed_modes(self):
++        prefix = f'{self.tempdir.name}/mixed'
++        self._annotate_graph(INPUT, self.source, prefix, 'brwt', num_threads=NUM_THREADS)
++        res = self._remap(prefix + anno_file_extension['brwt'], prefix + '_remapped',
++                          self.primary_target)
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('basic mode', res.stderr.decode() + res.stdout.decode())
++
+     def test_remap_rejects_different_kmers(self):
+         prefix = f'{self.tempdir.name}/mismatch'
+         self._annotate_graph(INPUT, self.source, prefix, 'row_diff_brwt',
+diff --git a/metagraph/src/annotation/annotation_remap.cpp b/metagraph/src/annotation/annotation_remap.cpp
+index 8708e84bd6..311d9ef659 100644
+--- a/metagraph/src/annotation/annotation_remap.cpp
++++ b/metagraph/src/annotation/annotation_remap.cpp
+@@ -15,6 +15,7 @@
+ #include "common/logger.hpp"
+ #include "common/threads/threading.hpp"
+ #include "common/vectors/vector_algorithm.hpp"
++#include "graph/representation/hash/dbg_sshash.hpp"
+ #include "graph/representation/succinct/dbg_succinct.hpp"
+ 
+ 
+@@ -29,6 +30,18 @@ static uint64_t width_for(uint64_t max_value) {
+     return max_value ? sdsl::bits::hi(max_value) + 1 : 1;
+ }
+ 
++// A canonical SSHash graph has a node for every stored k-mer and one more for its
++// reverse complement.
++static bool is_canonical_sshash(const DeBruijnGraph &graph) {
++    return graph.get_mode() == DeBruijnGraph::CANONICAL
++            && dynamic_cast<const graph::DBGSSHash *>(&graph);
++}
++
++// The number of k-mers that `graph` stores.
++static uint64_t num_stored_kmers(const DeBruijnGraph &graph) {
++    return is_canonical_sshash(graph) ? graph.num_nodes() / 2 : graph.num_nodes();
++}
++
+ // Walk `source`, look every k-mer up in `target`, and pass each matched pair to
+ // store(source_row, target_node). Throws if the graphs have different k-mers.
+ template <class Store>
+@@ -36,9 +49,11 @@ static void match_rows(const DeBruijnGraph &source,
+                        const DeBruijnGraph &target,
+                        size_t num_threads,
+                        const Store &store) {
+-    if (source.get_mode() != DeBruijnGraph::BASIC
+-            || target.get_mode() != DeBruijnGraph::BASIC)
+-        throw std::invalid_argument("Row remapping supports only graphs in basic mode");
++    if (!(source.get_mode() == DeBruijnGraph::BASIC && target.get_mode() == DeBruijnGraph::BASIC)
++            && !(source.get_mode() == DeBruijnGraph::PRIMARY && is_canonical_sshash(target))) {
++        throw std::invalid_argument("Row remapping supports two graphs in basic mode, or a"
++                                    " primary graph and an SSHash graph built in primary mode");
++    }
+ 
+     if (source.get_k() != target.get_k())
+         throw std::invalid_argument("Row remapping needs graphs with the same k");
+@@ -48,6 +63,11 @@ static void match_rows(const DeBruijnGraph &source,
+     std::atomic<uint64_t> num_mapped(0);
+     std::atomic<uint64_t> num_missing(0);
+     std::atomic<uint64_t> num_repeated(0);
++    // A target node above num_kmers is the reverse complement of a stored k-mer.
++    // Row-diff successors survive only if both graphs store a k-mer in the same
++    // orientation, which holds for a target built from the contigs of the source.
++    const uint64_t num_kmers = num_stored_kmers(target);
++    std::atomic<uint64_t> num_flipped(0);
+ 
+     source.call_sequences([&](const std::string &sequence, const std::vector<node_index> &path) {
+         uint64_t mapped = 0;
+@@ -60,6 +80,10 @@ static void match_rows(const DeBruijnGraph &source,
+                 ++missing;
+                 return;
+             }
++            if (target_node > num_kmers) {
++                ++num_flipped;
++                return;
++            }
+             if (fetch_and_set_bit(found.data(), target_node - 1, true,
+                                   std::memory_order_relaxed)) {
+                 ++repeated;
+@@ -73,12 +97,19 @@ static void match_rows(const DeBruijnGraph &source,
+         num_repeated += repeated;
+     }, num_threads);
+ 
+-    if (num_missing || num_repeated || num_mapped != target.num_nodes()) {
++    if (num_flipped) {
++        throw std::runtime_error(fmt::format(
++            "The target graph stores {} k-mers in the other orientation than the source"
++            " graph. Build the target graph from the contigs of the source graph",
++            num_flipped.load()));
++    }
++
++    if (num_missing || num_repeated || num_mapped != num_kmers) {
+         throw std::runtime_error(fmt::format(
+             "The graphs have different k-mers: {} source k-mers are missing from the"
+             " target graph, {} target nodes were matched more than once, and {} of"
+             " {} target nodes were matched",
+-            num_missing.load(), num_repeated.load(), num_mapped.load(), target.num_nodes()));
++            num_missing.load(), num_repeated.load(), num_mapped.load(), num_kmers));
+     }
+ 
+     logger->trace("Matched {} of {} source rows to target rows",
+@@ -261,7 +292,7 @@ static bool check_row_map(const DeBruijnGraph &source,
+                 matches = false;
+         }
+     }
+-    return matches && num_kept == target.num_nodes() && max_target_row <= target.max_index();
++    return matches && num_kept == num_stored_kmers(target) && max_target_row <= target.max_index();
+ }
+ 
+ bool check_row_map(const DeBruijnGraph &source,
+diff --git a/metagraph/src/annotation/annotation_remap.hpp b/metagraph/src/annotation/annotation_remap.hpp
+index d6838882e8..a8b54d2de8 100644
+--- a/metagraph/src/annotation/annotation_remap.hpp
++++ b/metagraph/src/annotation/annotation_remap.hpp
+@@ -21,7 +21,9 @@ class MultiLabelAnnotation;
+ 
+ /**
+  * Match the annotation rows of `source` to the rows of `target` by k-mer.
+- * Both graphs must be in BASIC mode and contain the same k-mers. Source nodes
++ * Both graphs must contain the same k-mers. Either both are in BASIC mode, or
++ * `source` is in PRIMARY mode and `target` is an SSHash graph built in PRIMARY
++ * mode that stores every k-mer in the same orientation. Source nodes
+  * that do not represent a k-mer, such as the dummy nodes of a succinct graph,
+  * are dropped.
+  *

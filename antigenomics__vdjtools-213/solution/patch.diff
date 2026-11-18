@@ -1,0 +1,90 @@
+diff --git a/python/vdjtools/signature/corpus.py b/python/vdjtools/signature/corpus.py
+index 3045bd89..61079147 100644
+--- a/python/vdjtools/signature/corpus.py
++++ b/python/vdjtools/signature/corpus.py
+@@ -290,7 +290,7 @@ def save(self, path: "str | Path") -> Path:
+         # writer change, and the point of the hash is that a file in someone else's environment
+         # can be proved to be the one fitted here.
+         np.savez_compressed(path, **arrays)
+-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
++        digest = _file_sha256(path)
+         meta = {**self.meta, "sig": self.sig, "name": self.name,
+                 "n_rows": {loc: f.n_rows for loc, f in self.fits.items()},
+                 "k": self.k,
+@@ -1032,6 +1032,15 @@ def corpora_index(res_dir: Path) -> dict:
+     return json.loads(p.read_text())
+ 
+ 
++def _file_sha256(path: Path) -> str:
++    """Hash large artifacts with bounded scratch memory, including on Python 3.10."""
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
+ def _download(url: str, dest: Path, sha256: "str | None", nbytes: "int | None") -> Path:
+     """Fetch one file into ``dest``, verifying its digest before it is visible under that name.
+ 
+@@ -1050,7 +1059,7 @@ def _download(url: str, dest: Path, sha256: "str | None", nbytes: "int | None")
+             with urllib.request.urlopen(url, timeout=60) as r:
+                 shutil.copyfileobj(r, f)
+             f.close()
+-            got = hashlib.sha256(tmp.read_bytes()).hexdigest()
++            got = _file_sha256(tmp)
+             if sha256 and got != sha256:
+                 raise OSError(f"{url} hashed {got[:12]}, the shipped index expects {sha256[:12]}; refusing "
+                               "to cache it. Either the release asset was replaced or the download truncated.")
+@@ -1085,7 +1094,7 @@ def fetch_artifact(name: str, *, sig: str, res_dir: Path, repo: str, quiet: bool
+         part = entry.get(ext, {})
+         target = cache / f"{sig}_{name}.{ext}"
+         if target.exists() and (not part.get("sha256")
+-                                or hashlib.sha256(target.read_bytes()).hexdigest()
++                                or _file_sha256(target)
+                                 == part["sha256"]):
+             continue
+         url = f"{base}/{sig}_{name}.{ext}"
+diff --git a/tests/python/test_signature.py b/tests/python/test_signature.py
+index a95f3d65..3ccbb7ee 100644
+--- a/tests/python/test_signature.py
++++ b/tests/python/test_signature.py
+@@ -784,3 +784,38 @@ def fail(url, **kw):
+         C._download("test://artifact", target, None, None)
+     assert target.read_bytes() == b"existing"
+     assert not list(tmp_path.glob("*.part"))
++
++
++def test_corpus_file_digests_do_not_materialize_whole_artifacts(tmp_path, monkeypatch):
++    import hashlib
++    import json
++
++    payload = b'corpus digest regression\n' * 100000
++    source = tmp_path / 'served'
++    source.mkdir()
++    (source / 'vsig_demo.npz').write_bytes(payload)
++    (source / 'vsig_demo.json').write_bytes(b'{}')
++    res = tmp_path / 'resources'
++    res.mkdir()
++    (res / C.CORPORA_INDEX).write_text(json.dumps({'demo': {
++        ext: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
++        for ext, data in [('npz', payload), ('json', b'{}')]
++    }}))
++    monkeypatch.setenv('VDJTOOLS_CORPUS_DIR', str(tmp_path / 'cache'))
++
++    def no_full_read(path):
++        raise AssertionError('digest must not allocate one buffer the size of the artifact')
++
++    monkeypatch.setattr(pathlib.Path, 'read_bytes', no_full_read)
++    saved = C.Corpus('vsig', 'empty', {}, {}).save(tmp_path / 'empty.npz')
++    with saved.open('rb') as stream:
++        expected = hashlib.sha256(stream.read()).hexdigest()
++    assert json.loads(saved.with_suffix('.json').read_text())['content_sha256'] == expected
++    downloaded = C.fetch_artifact('demo', sig='vsig', res_dir=res, repo='x/y',
++                                  base_url=source.as_uri(), quiet=True)
++    # A valid cached artifact is verified again without downloading its now-corrupt source.
++    (source / 'vsig_demo.npz').write_bytes(b'corrupt')
++    assert C.fetch_artifact('demo', sig='vsig', res_dir=res, repo='x/y',
++                            base_url=source.as_uri(), quiet=True) == downloaded
++    with downloaded.open('rb') as stream:
++        assert hashlib.sha256(stream.read()).hexdigest() == hashlib.sha256(payload).hexdigest()

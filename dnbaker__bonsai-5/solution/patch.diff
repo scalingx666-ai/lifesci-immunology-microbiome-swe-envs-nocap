@@ -1,0 +1,1801 @@
+diff --git a/Makefile b/Makefile
+index d15560e7..596e472a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -8,7 +8,7 @@ WARNINGS=-Wall -Wextra -Wno-char-subscripts \
+ DBG:= # -DNDEBUG # -fno-inline
+ OPT:= -O3 -funroll-loops -ffast-math \
+ 	  -fopenmp \
+-      -pipe -fno-strict-aliasing -march=native -mpclmul # -DNOT_MEMORY_HOG
++      -pipe -fno-strict-aliasing -march=native -mpclmul
+ OS:=$(shell uname)
+ ifeq ($(OS),Darwin)
+ 	OPT := $(OPT) -Wa,-q
+diff --git a/lib/bitmap.h b/lib/bitmap.h
+index 7ba2c78e..51b00048 100644
+--- a/lib/bitmap.h
++++ b/lib/bitmap.h
+@@ -113,6 +113,7 @@ class bitmap_t {
+         return tmp;
+     }
+ 
++    bitmap_t(){}
+     bitmap_t(const kgset_t &set) {
+         const auto tmp(fill(set));
+         unsigned bitsum;
+@@ -130,6 +131,8 @@ class bitmap_t {
+         LOG_DEBUG("Keeping %zu of %zu kmers for bit patterns which are not exactly compressed by the taxonomy heuristic.\n",
+                   n_passed, total);
+     }
++    bitmap_t(bitmap_t &&other)            = default;
++    bitmap_t &operator=(bitmap_t &&other) = default;
+ 
+     count::Counter<std::vector<std::uint64_t>> to_counter();
+ };
+diff --git a/lib/encoder.cpp b/lib/encoder.cpp
+new file mode 100644
+index 00000000..d108f25f
+--- /dev/null
++++ b/lib/encoder.cpp
+@@ -0,0 +1,12 @@
++#include <encoder.h>
++
++namespace emp {
++
++template std::size_t estimate_cardinality<lex_score>(const std::vector<std::string> &paths,
++                                                     unsigned k, uint16_t w, spvec_t spaces,
++                                                     void *data, int num_threads, std::size_t np);
++template std::size_t estimate_cardinality<hash_score>(const std::vector<std::string> &paths,
++                                                     unsigned k, uint16_t w, spvec_t spaces,
++                                                     void *data, int num_threads, std::size_t np);
++
++}
+diff --git a/lib/encoder.h b/lib/encoder.h
+index 44abf390..4bc7eb58 100644
+--- a/lib/encoder.h
++++ b/lib/encoder.h
+@@ -15,6 +15,8 @@
+ #include "qmap.h"
+ #include "spacer.h"
+ #include "util.h"
++#include "klib/kthread.h"
++#include <mutex>
+ 
+ 
+ namespace emp {
+@@ -74,9 +76,7 @@ class Encoder {
+     }
+     elscore_t max_in_queue_manual() {
+         elscore_t t1{BF, BF};
+-        for(auto &i: qmap_) {
+-            if(i.first < t1) t1 = i.first;
+-        }
++        for(auto &i: qmap_) if(i.first < t1) t1 = i.first;
+         return t1;
+     }
+     Encoder(char *s, std::size_t l, const Spacer &sp, void *data=nullptr):
+@@ -117,7 +117,6 @@ class Encoder {
+             new_kmer |= cstr_lut[s_[start]];
+         }
+         new_kmer = canonical_representation(new_kmer, sp_.k_) ^ XOR_MASK;
+-        //LOG_DEBUG("Kmer about to be classified: %s.\n", sp_.to_string(new_kmer).data());
+         return new_kmer;
+     }
+     // When we encode kmers, we XOR it with this XOR_MASK for good key dispersion
+@@ -158,11 +157,7 @@ khash_t(all) *hashcount_lmers(const std::string &path, const Spacer &space,
+     std::uint64_t min;
+     while(kseq_read(ks) >= 0) {
+         enc.assign(ks);
+-        while(enc.has_next_kmer()) {
+-            if((min = enc.next_minimizer()) != BF) {
+-                kh_put(all, ret, min, &khr);
+-            }
+-        }
++        while(enc.has_next_kmer()) if((min = enc.next_minimizer()) != BF) kh_put(all, ret, min, &khr);
+     }
+     kseq_destroy(ks);
+     gzclose(fp);
+@@ -178,23 +173,12 @@ hll::hll_t hllcount_lmers(const std::string &path, const Spacer &space,
+     kseq_t *ks(kseq_init(fp));
+     hll::hll_t ret(np);
+     std::uint64_t min;
+-    //std::fprintf(stderr, "About to start loop. gzfp %p, ksfp %p.\n", (void *)fp, (void *)ks);
+     while(kseq_read(ks) >= 0) {
+         enc.assign(ks);
+-        //std::fprintf(stderr, "Assignd to kseq. name: %s.\n", ks->name.s);
+-        while(enc.has_next_kmer()) {
+-        //std::fprintf(stderr, "Has!: %s.\n", ks->name.s);
+-            if((min = enc.next_minimizer()) != BF) {
+-                //std::fprintf(stderr, "kmer encoded: %s.\n", space.to_string(min).data());
+-                ret.add(wang_hash(min));
+-            }
+-        }
++        while(enc.has_next_kmer()) if((min = enc.next_minimizer()) != BF) ret.add(wang_hash(min));
+     }
+-    //std::fprintf(stderr, "Cleaning up!\n");
+     kseq_destroy(ks);
+     gzclose(fp);
+-    //std::fprintf(stderr, "Estimated: %lf with %zu.\n", ret.report(), np);
+-    //std::fprintf(stderr, "Exiting!\n");
+     return ret;
+ }
+ 
+@@ -241,86 +225,44 @@ std::size_t count_cardinality(const std::vector<std::string> paths,
+     // Get values from the rest of these threads.
+     for(auto &f: futures) if(f.valid()) hashes.push_back(f.get());
+     // Combine them all for a final count
+-    for(auto i(hashes.begin() + 1), end = hashes.end(); i != end; ++i) {
+-        kset_union(hashes[0], *i);
+-    }
++    for(auto i(hashes.begin() + 1), end = hashes.end(); i != end; ++i) kset_union(hashes[0], *i);
+     std::size_t ret(hashes[0]->n_occupied);
+-    for(auto i: hashes) kh_destroy(all, i);
++    for(auto i: hashes) khash_destroy(i);
+     return ret;
+ }
+ 
++struct est_helper {
++    const Spacer                   &sp_;
++    const std::vector<std::string> &paths_;
++    std::mutex                     &m_;
++    const std::size_t               np_;
++    void                           *data_;
++    hll::hll_t                     &master_;
++};
++
++template<std::uint64_t (*score)(std::uint64_t, void *)=lex_score>
++void est_helper_fn(void *data_, long index, int tid) {
++    est_helper &h(*(est_helper *)(data_));
++    hll::hll_t hll(hllcount_lmers<score>(h.paths_[index], h.sp_, h.np_, h.data_));
++    {
++        std::unique_lock<std::mutex> lock(h.m_);
++        h.master_ += hll; // Could be sped up by recursive algorithm that breaks the data up into sets of two and sets of those and so on.
++    }
++}
++
+ template<std::uint64_t (*score)(std::uint64_t, void *)=lex_score>
+ std::size_t estimate_cardinality(const std::vector<std::string> &paths,
+                                  unsigned k, uint16_t w, spvec_t spaces,
+-                                 void *data=nullptr, int num_threads=-1, std::size_t np=23, const int high_memory=0) {
++                                 void *data=nullptr, int num_threads=-1, std::size_t np=23) {
+     // Default to using all available threads.
+     if(num_threads < 0) {
+         num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+     }
+     const Spacer space(k, w, spaces);
+-    std::size_t submitted(0), completed(0), todo(paths.size());
+-    std::vector<std::future<hll::hll_t>> futures;
+-    std::vector<hll::hll_t> hlls;
+-    // Submit the first set of jobs
+-    for(std::size_t i(0); i < (unsigned)num_threads && i < todo; ++i) {
+-        futures.emplace_back(std::async(
+-          std::launch::async, hllcount_lmers<score>, paths[i], space, np, data));
+-        ++submitted;
+-    }
+-    hll::hll_t master(np * (!high_memory));
+-    LOG_DEBUG("About to start daemon.\n");
+-    // Daemon -- check the status of currently running jobs, submit new ones when available.
+-    while(submitted < todo) {
+-        static const int max_retries = 10;
+-        for(auto f(futures.begin()); f != futures.end(); ++f) {
+-            if(submitted == todo) break;
+-            if(is_ready(*f)) {
+-                if(high_memory) hlls.push_back(f->get());
+-                else            master += f->get();
+-                futures.erase(f);
+-#if !NDEBUG
+-                master.sum();
+-                LOG_DEBUG("Latest estimate: %lf\n", master.report());
+-#endif
+-                int success(0), tries(0);
+-                while(!success) {
+-                    try {
+-                    futures.emplace_back(std::async(
+-                      std::launch::async, hllcount_lmers<score>, paths[submitted],
+-                      space, np, data));
+-                    success = 1;
+-                    ++submitted;
+-                    ++completed;
+-                    } catch(std::system_error &se) {
+-                      LOG_DEBUG("System error: resource temporarily available. Retry #%i\n", ++tries);
+-                      sleep(5);
+-                      if(tries >= max_retries) {LOG_EXIT("Exceeded maximum retries\n"); throw;}
+-                    }
+-                }
+-                break; // Iterators are invalid. Start again.
+-            }
+-        }
+-    }
+-    // Get values from the rest of these threads.
+-    // Combine them all for a final count
+-    // Note: This could be parallelized by dividing into subsets, summing those subsets,
+-    // and then summing those sums. In practice, this is already obscenely fast.
+-    if(high_memory) {
+-        for(auto &f: futures) if(f.valid()) hlls.push_back(f.get());
+-        for(auto i(hlls.begin() + 1), end = hlls.end(); i != end; ++i) hlls[0] += *i;
+-        if(hlls.size() != todo) throw "a party!";
+-        hlls[0].sum();
+-        return (std::size_t)hlls[0].report();
+-    }
+-    for(auto f(std::begin(futures)); f != std::end(futures); ++f) {
+-        if(f->valid()) {
+-            hll::hll_t tmp(std::move(f->get()));
+-            master += tmp;
+-            master.sum();
+-            LOG_DEBUG("Latest estimate: %lf\n", master.report());
+-        }
+-    }
+-    master.sum();
++    hll::hll_t master(np);
++    std::mutex m;
++    est_helper helper{space, paths, m, np, data, master};
++    kt_for(num_threads, &est_helper_fn<score>, &helper, paths.size());
+     return (std::size_t)master.report();
+ }
+ 
+diff --git a/lib/feature_min.cpp b/lib/feature_min.cpp
+index e68cf063..43837c96 100644
+--- a/lib/feature_min.cpp
++++ b/lib/feature_min.cpp
+@@ -31,23 +31,16 @@ khash_t(c) *make_depth_hash(khash_t(c) *lca_map, khash_t(p) *tax_map) {
+ #define _DBP(h)
+ #endif
+ 
+-void update_minimized_map(khash_t(all) *set, khash_t(64) *full_map, khash_t(c) *ret, int mode) {
+-    _DBP(set);
+-    _DBP(full_map);
+-    _DBP(ret);
+-    int khr;
+-    khiter_t kif, kir;
+-    if(!mode) LOG_EXIT("Mode %i in score scheme is not good.\n");
++void update_minimized_map(khash_t(all) *set, khash_t(64) *full_map, khash_t(c) *ret) {
++    khiter_t kif;
+     LOG_DEBUG("Size of set: %zu\n", kh_size(set));
+     for(khiter_t ki(0); ki != kh_end(set); ++ki) {
+-        if(!kh_exist(set, ki) ||
+-               kh_get(c, ret, kh_key(set, ki)) != kh_end(ret))
++        if(!kh_exist(set, ki) || kh_get(c, ret, kh_key(set, ki)) != kh_end(ret))
+             continue;
+             // If the key is already in the main map, what's the problem?
+         if(unlikely((kif = kh_get(64, full_map, kh_key(set, ki))) == kh_end(full_map)))
+             LOG_EXIT("Missing kmer from database... Check for matching spacer and kmer size.\n");
+-        kir = kh_put(c, ret, kh_key(full_map, kif), &khr);
+-        kh_val(ret, kir) = kh_val(full_map, kif);
++        kh_set(c, ret, kh_key(full_map, kif), kh_val(full_map, kif));
+         if(unlikely(kh_size(ret) % 1000000 == 0)) LOG_INFO("Final hash size %zu\n", kh_size(ret));
+     }
+     return;
+@@ -79,15 +72,10 @@ void update_td_map(khash_t(64) *kc, khash_t(all) *set, khash_t(p) *tax, tax_t ta
+             if((k2 = kh_get(64, kc, kh_key(set, ki))) == kh_end(kc)) {
+                 k2 = kh_put(64, kc, kh_key(set, ki), &khr);
+                 kh_val(kc, k2) = TDencode(node_depth(tax, kh_val(kc, ki)), kh_val(kc, ki));
+-#if !NDEBUG
+                 if(unlikely(kh_size(kc) % 1000000 == 0)) LOG_INFO("Final hash size %zu\n", kh_size(kc));
+-#endif
+             } else if(kh_val(kc, k2) != taxid) {
+-                val = lca(tax, taxid, kh_val(kc, k2));
+-                if(val == (tax_t)-1) {
+-                    kh_val(kc, k2) = 1;
+-                    LOG_WARNING("Missing taxid %u. Setting lca to tree root\n", taxid);
+-                } else kh_val(kc, k2) = TDencode(node_depth(tax, val), val);
++                do val = lca(tax, taxid, kh_val(kc, k2));
++                while(!kh_try_set(64, kc, k2, val == (tax_t)-1 ? 1: TDencode(node_depth(tax, val), val)));
+             }
+         }
+     }
+@@ -107,14 +95,27 @@ void update_lca_map(khash_t(c) *kc, khash_t(all) *set, khash_t(p) *tax, tax_t ta
+                 kh_val(kc, k2) = taxid;
+                 if(unlikely(kh_size(kc) % 1000000 == 0)) LOG_INFO("Final hash size %zu\n", kh_size(kc));
+             } else if(kh_val(kc, k2) != taxid) {
+-                if(unlikely((val = lca(tax, taxid, kh_val(kc, k2))) == UINT32_C(-1))) {
+-                    kh_val(kc, k2) = 1;
+-                    LOG_WARNING("Missing taxid %u. Setting lca \n", taxid);
+-                } else kh_val(kc, k2) = val;
++                do val = lca(tax, taxid, kh_val(kc, k2));
++                while(!kh_try_set(c, kc, k2, val));
++                if(kh_val(kc, k2) == UINT32_C(-1)) kh_val(kc, k2) = 1, LOG_WARNING("Missing taxid %u. Setting lca \n", taxid);
+             }
+         }
+     }
+     LOG_DEBUG("After updating with set of size %zu, total set current size is %zu.\n", kh_size(set), kh_size(kc));
+ }
+ 
++void update_feature_counter(khash_t(64) *kc, khash_t(all) *set, khash_t(p) *tax, const tax_t taxid) {
++    // TODO: make this threadsafe.
++    int khr;
++    khint_t k2;
++    for(khiter_t ki(kh_begin(set)); ki != kh_end(set); ++ki) {
++        if(kh_exist(set, ki)) {
++           if((k2 = kh_get(64, kc, kh_key(set, ki))) == kh_end(kc)) {
++                k2 = kh_put(64, kc, kh_key(set, ki), &khr);
++                kh_val(kc, k2) = FMencode(1, node_depth(tax, taxid));
++            } else while(!kh_try_set(64, kc, k2, FMencode(FMcount(kh_val(kc, k2)), lca(tax, taxid, kh_val(kc, k2)))));
++        }
++    }
++}
++
+ } //namespace emp
+diff --git a/lib/feature_min.h b/lib/feature_min.h
+index 18babd6c..9743ec54 100644
+--- a/lib/feature_min.h
++++ b/lib/feature_min.h
+@@ -5,6 +5,7 @@
+ #include "spacer.h"
+ #include "khash64.h"
+ #include "util.h"
++#include "klib/kthread.h"
+ 
+ #include <set>
+ 
+@@ -35,19 +36,7 @@ int fill_set_seq(kseq_t *ks, const Spacer &sp, khash_t(all) *ret);
+ void update_lca_map(khash_t(c) *kc, khash_t(all) *set, khash_t(p) *tax, tax_t taxid);
+ void update_td_map(khash_t(64) *kc, khash_t(all) *set, khash_t(p) *tax, tax_t taxid);
+ khash_t(64) *make_taxdepth_hash(khash_t(c) *kc, khash_t(p) *tax);
+-
+-inline void update_feature_counter(khash_t(64) *kc, khash_t(p) *tax, khash_t(all) *set, const tax_t taxid) {
+-    int khr;
+-    khint_t k2;
+-    for(khiter_t ki(kh_begin(set)); ki != kh_end(set); ++ki) {
+-        if(kh_exist(set, ki)) {
+-           if((k2 = kh_get(64, kc, kh_key(set, ki))) == kh_end(kc)) {
+-                k2 = kh_put(64, kc, kh_key(set, ki), &khr);
+-                kh_val(kc, k2) = FMencode(1, node_depth(tax, taxid));
+-            } else kh_val(kc, k2) = FMencode(FMcount(kh_val(kc, k2)), lca(tax, taxid, kh_val(kc, k2)));
+-        }
+-    }
+-}
++void update_feature_counter(khash_t(64) *kc, khash_t(all) *set, khash_t(p) *tax, const tax_t taxid);
+ 
+ 
+ // Return value: whether or not additional sequences were present and added.
+@@ -103,9 +92,10 @@ std::size_t fill_set_genome(const char *path, const Spacer &sp, khash_t(all) *re
+ 
+ template<std::uint64_t (*score)(std::uint64_t, void *), class Container>
+ std::size_t fill_set_genome_container(Container container, const Spacer &sp, khash_t(all) *ret, void *data) {
++    std::size_t sz(0);
+     for(std::string &str: container)
+-        fill_set_genome<score>(str.data(), sp, ret, 0, data);
+-    return 0;
++        sz += fill_set_genome<score>(str.data(), sp, ret, 0, data);
++    return sz;
+ }
+ 
+ template<std::uint64_t (*score)(std::uint64_t, void *)>
+@@ -115,266 +105,145 @@ khash_t(64) *ftct_map(std::vector<std::string> &fns, khash_t(p) *tax_map,
+     return feature_count_map<score>(fns, tax_map, seq2tax_path, sp, num_threads, start_size);
+ }
+ 
+-void update_minimized_map(khash_t(all) *set, khash_t(64) *full_map, khash_t(c) *ret, int mode);
+-
+-template<std::uint64_t (*score)(std::uint64_t, void *)>
+-khash_t(c) *minimized_map(std::vector<std::string> fns,
+-                          khash_t(64) *full_map,
+-                          const Spacer &sp, int num_threads, std::size_t start_size=1<<16, int mode=score_scheme::LEX) {
+-    std::size_t submitted(0), completed(0), todo(fns.size());
+-    std::vector<khash_t(all) *> counters(todo, nullptr);
+-    khash_t(c) *ret(kh_init(c));
+-    kh_resize(c, ret, start_size);
+-    std::vector<std::future<std::size_t>> futures;
+-    //for(auto &i: fns) fprintf(stderr, "Filename: %s\n", i.data());
++void update_minimized_map(khash_t(all) *set, khash_t(64) *full_map, khash_t(c) *ret);
+ 
+-    if(num_threads < 0) num_threads = 16;
+ 
+-    LOG_DEBUG("Number of items to do: %zu\n", todo);
++template<typename T>
++struct helper {
++    const Spacer                   &sp_;
++    const std::vector<std::string> &fns_;
++    T                              *ret_;
++    khash_t(name)                  *name_hash_;
++    khash_t(p)                     *tax_map_;
++    std::vector<khash_t(all) *>     hashes_;
++    void                           *data_;
++};
++using lca_helper = helper<khash_t(c)>;
++using td_helper  = helper<khash_t(64)>;
+ 
+-    for(std::size_t i(0); i < todo; ++i) counters[i] = kh_init(all), kh_resize(all, counters[i], start_size);
++template<std::uint64_t (*score)(std::uint64_t, void *)>
++void fct_for_helper(void *data_, long index, int tid) {
++    LOG_DEBUG("Helper with index %ld and tid %i starting\n", index, tid);
++    td_helper &tdh(*(td_helper *)data_);
++    khash_t(all) *h(tdh.hashes_[tid]);
++    khash_t(64) *ret(tdh.ret_);
++    if(kh_size(h)) kh_clear(all, h);
++    fill_set_genome<score>(tdh.fns_[index].data(), tdh.sp_, h, index, nullptr);
++    tax_t taxid(get_taxid(tdh.fns_[index].data(), tdh.name_hash_));
++    if(taxid == UINT32_C(-1)) {
++        LOG_WARNING("Taxid for %s not listed in summary.txt. Not including.", tdh.fns_[index].data());
++    } else update_feature_counter(ret, h, tdh.tax_map_, taxid);
++}
+ 
+-    // Submit the first set of jobs
+-    for(int i(0), e(std::min(num_threads, (int)todo)); i < e; ++i) {
+-        futures.emplace_back(std::async(
+-          std::launch::async, fill_set_genome<score>, fns.at(i).data(), sp, counters[i], i, (void *)full_map));
+-        ++submitted;
+-    }
++template<std::uint64_t (*score)(std::uint64_t, void *)>
++void td_for_helper(void *data_, long index, int tid) {
++    LOG_DEBUG("Helper with index %ld and tid %i starting\n", index, tid);
++    td_helper &tdh(*(td_helper *)data_);
++    khash_t(all) *h(tdh.hashes_[tid]);
++    khash_t(64) *ret(tdh.ret_);
++    if(kh_size(h)) kh_clear(all, h);
++    fill_set_genome<score>(tdh.fns_[index].data(), tdh.sp_, h, index, nullptr);
++    tax_t taxid(get_taxid(tdh.fns_[index].data(), tdh.name_hash_));
++    if(taxid == UINT32_C(-1)) {
++        LOG_WARNING("Taxid for %s not listed in summary.txt. Not including.", tdh.fns_[index].data());
++    } else update_td_map(ret, h, tdh.tax_map_, taxid);
++}
+ 
+-    // Daemon -- check the status of currently running jobs, submit new ones when available.
+-    while(submitted < todo) {
+-        //LOG_DEBUG("Submitted %zu, todo %zu\n", submitted, todo);
+-        for(auto f(futures.begin()), fend(futures.end()); f != fend; ++f) {
+-            if(is_ready(*f)) {
+-                const std::size_t index(f->get());
+-                futures.erase(f);
+-                futures.emplace_back(std::async(
+-                     std::launch::async, fill_set_genome<score>, fns[submitted].data(),
+-                     sp, counters[submitted], submitted, (void *)full_map));
+-                LOG_INFO("Submitted for %zu. Updating map for %zu. Total completed/all: %zu/%zu. Current size: %zu\n",
+-                         submitted, index, completed, todo, kh_size(ret));
+-                ++submitted, ++completed;
+-                update_minimized_map(counters[index], full_map, ret, mode);
+-                kh_destroy(all, counters[index]); // Destroy set once we're done with it.
+-                break;
+-            }
+-        }
+-    }
++template<std::uint64_t (*score)(std::uint64_t, void *)>
++void lca_for_helper(void *data_, long index, int tid) {
++    LOG_DEBUG("Helper with index %ld and tid %i starting\n", index, tid);
++    lca_helper &lh(*(lca_helper *)data_);
++    khash_t(all) *h(lh.hashes_[tid]);
++    khash_t(c) *ret(lh.ret_);
++    if(kh_size(h)) kh_clear(all, h);
++    fill_set_genome<score>(lh.fns_[index].data(), lh.sp_, h, index, nullptr);
++    tax_t taxid(get_taxid(lh.fns_[index].data(), lh.name_hash_));
++    if(taxid == UINT32_C(-1)) {
++        LOG_WARNING("Taxid for %s not listed in summary.txt. Not including.", lh.fns_[index].data());
++    } else update_lca_map(ret, h, lh.tax_map_, taxid);
++}
+ 
+-    // Join
+-    for(auto &f: futures) if(f.valid()) {
+-        const std::size_t index(f.get());
+-        update_minimized_map(counters[index], full_map, ret, mode);
+-        kh_destroy(all, counters[index]);
+-        ++completed;
+-        LOG_DEBUG("Number left to do: %zu\n", todo - completed);
+-    }
+-    LOG_DEBUG("Finished minimized map building! Subbed %zu, completed %zu.\n", submitted, completed);
++template<std::uint64_t (*score)(std::uint64_t, void *)>
++void min_for_helper(void *data_, long index, int tid) {
++    LOG_DEBUG("Helper with index %ld and tid %i starting\n", index, tid);
++    lca_helper &lh(*(lca_helper *)data_);
++    khash_t(all) *h(lh.hashes_[tid]);
++    khash_t(c) *ret(lh.ret_);
++    if(kh_size(h)) kh_clear(all, h);
++    fill_set_genome<score>(lh.fns_[index].data(), lh.sp_, h, index, (khash_t(64) *)lh.data_);
++    update_minimized_map(h, (khash_t(64) *)lh.data_, ret);
++}
+ 
+-    // Clean up
+-    LOG_DEBUG("Cleaned up after LCA map building!\n")
++template<std::uint64_t (*score)(std::uint64_t, void *)>
++khash_t(c) *minimized_map(std::vector<std::string> fns,
++                          khash_t(64) *full_map,
++                          const Spacer &sp, int num_threads, std::size_t start_size) {
++    khash_t(c) *ret(kh_init(c));
++    kh_resize(c, ret, start_size);
++    std::vector<khash_t(all) *> counters;
++    counters.reserve(num_threads);
++    for(std::size_t i(0), end(fns.size()); i != end; ++i) counters.emplace_back(kh_init(all));
++    lca_helper lh{sp, fns, ret, nullptr, nullptr, counters, (void *)full_map};
++    kt_for(num_threads, &min_for_helper<score>, (void *)&lh, fns.size());
++    for(auto c: counters) khash_destroy(c);
++    LOG_DEBUG("Cleaned up after minimized map building! Size: %zu\n", kh_size(ret));
+     return ret;
+ }
+ 
++
+ template<std::uint64_t (*score)(std::uint64_t, void *)>
+ khash_t(64) *taxdepth_map(std::vector<std::string> &fns, khash_t(p) *tax_map,
+                           const char *seq2tax_path, const Spacer &sp,
+-                          int num_threads, std::size_t start_size=1<<10) {
+-    std::size_t submitted(0), completed(0), todo(fns.size());
+-    std::vector<khash_t(all) *> counters(todo, nullptr);
++                          int num_threads, std::size_t start_size) {
+     khash_t(64) *ret(kh_init(64));
+     kh_resize(64, ret, start_size);
+     khash_t(name) *name_hash(build_name_hash(seq2tax_path));
+-    std::vector<std::future<std::size_t>> futures;
+-
+-    for(std::size_t i(0), end(fns.size()); i != end; ++i) counters[i] = kh_init(all);
+-
+-    // Submit the first set of jobs
+-    std::set<std::size_t> subbed, used;
+-    for(int i(0), e(std::min(num_threads, (int)todo)); i < e; ++i) {
+-        LOG_DEBUG("Launching thread to read from file %s.\n", fns[i].data());
+-        futures.emplace_back(std::async(
+-          std::launch::async, fill_set_genome<score>, fns[i].data(), sp, counters[i], i, nullptr));
+-        //LOG_DEBUG("Submitted for %zu.\n", submitted);
+-        subbed.insert(submitted);
+-        ++submitted;
+-    }
+-
+-    // Daemon -- check the status of currently running jobs, submit new ones when available.
+-    while(submitted < todo) {
+-        LOG_DEBUG("Submitted %zu, todo %zu\n", submitted, todo);
+-        for(auto &f: futures) {
+-            if(is_ready(f)) {
+-                if(submitted == todo) break;
+-                const std::size_t index(f.get());
+-                if(used.find(index) != used.end()) continue;
+-                used.insert(index);
+-                if(subbed.find(submitted) != subbed.end()) throw "a party!";
+-                LOG_DEBUG("Launching thread to read from file %s.\n", fns[submitted].data());
+-                f = std::async(
+-                  std::launch::async, fill_set_genome<score>, fns[submitted].data(),
+-                  sp, counters[submitted], submitted, nullptr);
+-                subbed.insert(submitted);
+-                LOG_INFO("Submitted for %zu. Updating map for %zu. Total completed/all: %zu/%zu. Total size: %zu.\n",
+-                         submitted, index, completed, todo, kh_size(ret));
+-                ++submitted, ++completed;
+-                const tax_t taxid(get_taxid(fns[index].data(), name_hash));
+-                LOG_DEBUG("Just fetched taxid from file %s %u.\n", fns[index].data(), taxid);
+-                update_td_map(ret, counters[index], tax_map, taxid);
+-                kh_destroy(all, counters[index]); // Destroy set once we're done with it.
+-            }
+-        }
+-    }
+-
+-    // Join
+-    for(auto &f: futures) if(f.valid()) {
+-        const std::size_t index(f.get());
+-        if(used.find(index) != used.end()) continue;
+-        used.insert(index);
+-        update_td_map(ret, counters[index], tax_map, get_taxid(fns[index].data(), name_hash));
+-        kh_destroy(all, counters[index]);
+-        ++completed;
+-        LOG_DEBUG("Number left to do: %zu\n", todo - completed);
+-    }
+-    LOG_DEBUG("Finished LCA map building! Subbed %zu, completed %zu, size of futures %zu.\n", submitted, completed, used.size());
+-#if !NDEBUG
+-    for(std::size_t i(0); i < todo; ++i) assert(used.find(i) != used.end());
+-#endif
+-
+-    // Clean up
++    std::vector<khash_t(all) *> counters;
++    counters.reserve(num_threads);
++    for(std::size_t i(0), end(fns.size()); i != end; ++i) counters.emplace_back(kh_init(all));
++    td_helper th{sp, fns, ret, name_hash, tax_map, counters, nullptr};
++    kt_for(num_threads, &td_for_helper<score>, (void *)&th, fns.size());
+     destroy_name_hash(name_hash);
+-    LOG_DEBUG("Cleaned up after LCA map building!\n")
++    for(auto c: counters) khash_destroy(c);
++    LOG_DEBUG("Cleaned up after taxdepth map building!\n");
+     return ret;
+ }
+ 
++
+ template<std::uint64_t (*score)(std::uint64_t, void *)>
+ khash_t(c) *lca_map(const std::vector<std::string> &fns, khash_t(p) *tax_map,
+                     const char *seq2tax_path,
+-                    const Spacer &sp, int num_threads, std::size_t start_size=1<<10) {
+-    std::size_t submitted(0), completed(0), todo(fns.size());
+-    std::vector<khash_t(all) *> counters;
++                    const Spacer &sp, int num_threads, std::size_t start_size) {
+     khash_t(c) *ret(kh_init(c));
+     kh_resize(c, ret, start_size);
+-    counters.reserve(todo);
+     khash_t(name) *name_hash(build_name_hash(seq2tax_path));
+-    std::vector<std::future<std::size_t>> futures;
+-
++    std::vector<khash_t(all) *> counters;
++    counters.reserve(num_threads);
+     for(std::size_t i(0), end(fns.size()); i != end; ++i) counters.emplace_back(kh_init(all));
+-
+-
+-    // TODO: rewrite this using kt_for and use __sync_bool_compare_and_swap to update, eliminating the terrible threadscaling.
+-
+-    // Submit the first set of jobs
+-    std::set<std::size_t> subbed, used;
+-    for(int i(0), e(std::min(num_threads, (int)todo)); i < e; ++i) {
+-        LOG_DEBUG("Launching thread to read from file %s.\n", fns[i].data());
+-        futures.emplace_back(std::async(
+-          std::launch::async, fill_set_genome<score>, fns[i].data(), sp, counters[i], i, nullptr));
+-        subbed.insert(submitted);
+-        ++submitted;
+-    }
+-
+-    // Daemon -- check the status of currently running jobs, submit new ones when available.
+-    while(submitted < todo) {
+-        LOG_DEBUG("Submitted %zu, todo %zu\n", submitted, todo);
+-        tax_t taxid;
+-        for(auto &f: futures) {
+-            if(is_ready(f)) {
+-                if(submitted == todo) break;
+-                const std::size_t index(f.get());
+-                if(used.find(index) != used.end()) continue;
+-                used.insert(index);
+-                if(subbed.find(submitted) != subbed.end()) throw "a party!";
+-                LOG_DEBUG("Launching thread to read from file %s.\n", fns[submitted].data());
+-                f = std::async(
+-                  std::launch::async, fill_set_genome<score>, fns[submitted].data(),
+-                  sp, counters[submitted], submitted, nullptr);
+-                subbed.insert(submitted);
+-                LOG_INFO("Submitted for %zu. Updating map for %zu. Total completed/all: %zu/%zu. Total size: %zu\n",
+-                         submitted, index, completed, todo, kh_size(ret));
+-                ++submitted, ++completed;
+-                if((taxid = get_taxid(fns[index].data(), name_hash)) == UINT32_C(-1)) {
+-                    LOG_WARNING("Taxid for %s not listed in summary.txt. Not including.\n", fns[index].data());
+-                } else update_lca_map(ret, counters[index], tax_map, taxid);
+-                kh_destroy(all, counters[index]); // Destroy set once we're done with it.
+-            }
+-        }
+-    }
+-
+-    // Join
+-    for(auto &f: futures) if(f.valid()) {
+-        const std::size_t index(f.get());
+-        if(used.find(index) != used.end()) continue;
+-        used.insert(index);
+-        tax_t taxid(get_taxid(fns[index].data(), name_hash));
+-        if(taxid == UINT32_C(-1)) {
+-            LOG_WARNING("Taxid for %s not listed in summary.txt. Not including.", fns[index].data());
+-        } else update_lca_map(ret, counters[index], tax_map, taxid);
+-        kh_destroy(all, counters[index]);
+-        ++completed;
+-        LOG_DEBUG("Number left to do: %zu\n", todo - completed);
+-    }
+-    LOG_DEBUG("Finished LCA map building! Subbed %zu, completed %zu, size of futures %zu.\n", submitted, completed, used.size());
+-
+-    // Clean up
++    lca_helper lh{sp, fns, ret, name_hash, tax_map, counters, nullptr};
++    kt_for(num_threads, &lca_for_helper<score>, (void *)&lh, fns.size());
+     destroy_name_hash(name_hash);
+-    LOG_DEBUG("Cleaned up after LCA map building!\n");
++    for(auto c: counters) khash_destroy(c);
++    LOG_DEBUG("Cleaned up after LCA map building! Size: %zu\n", kh_size(ret));
+     return ret;
+ }
+ 
++
+ template <std::uint64_t (*score)(std::uint64_t, void *)>
+-khash_t(64) *feature_count_map(std::vector<std::string> fns, khash_t(p) *tax_map, const char *seq2tax_path, const Spacer &sp, int num_threads, std::size_t start_size) {
+-    // Update this to include tax ids in the hash map.
+-    std::size_t submitted(0), completed(0), todo(fns.size());
+-    std::vector<khash_t(all) *> counters(todo, nullptr);
++khash_t(64) *feature_count_map(std::vector<std::string> fns, khash_t(p) *tax_map,
++                               const char *seq2tax_path,
++                               const Spacer &sp, int num_threads, std::size_t start_size) {
++    // TODO: make scale better.
+     khash_t(64) *ret(kh_init(64));
+     kh_resize(64, ret, start_size);
+     khash_t(name) *name_hash(build_name_hash(seq2tax_path));
+-    for(std::size_t i(0), end(fns.size()); i != end; ++i) counters[i] = kh_init(all);
+-    std::vector<std::future<std::size_t>> futures;
+-    fprintf(stderr, "Will use tax_map (%p) and seq2tax_map (%s) to assign "
+-                    "feature-minimized values to all kmers.\n", (void *)tax_map, seq2tax_path);
+-
+-    // Submit the first set of jobs
+-    std::set<std::size_t> used;
+-    for(std::size_t i(0); i < (unsigned)num_threads && i < todo; ++i) {
+-        futures.emplace_back(std::async(
+-          std::launch::async, fill_set_genome<score>, fns[i].data(), sp, counters[i], i, nullptr));
+-        LOG_DEBUG("Submitted for %zu.\n", submitted);
+-        ++submitted;
+-    }
+-
+-    // Daemon -- check the status of currently running jobs, submit new ones when available.
+-    while(submitted < todo) {
+-        for(auto &f: futures) {
+-            if(is_ready(f)) {
+-                const std::size_t index(f.get());
+-                if(submitted == todo) break;
+-                if(used.find(index) != used.end()) continue;
+-                used.insert(index);
+-                LOG_DEBUG("Submitted for %zu.\n", submitted);
+-                f = std::async(
+-                  std::launch::async, fill_set_genome<score>, fns[submitted].data(),
+-                  sp, counters[submitted], submitted, nullptr);
+-                ++submitted, ++completed;
+-                const tax_t taxid(get_taxid(fns[index].data(), name_hash));
+-                update_feature_counter(ret, tax_map, counters[index], taxid);
+-                kh_destroy(all, counters[index]); // Destroy set once we're done with it.
+-            }
+-        }
+-    }
+-
+-    // Join
+-    for(auto &f: futures) if(f.valid()) {
+-        const std::size_t index(f.get());
+-        const tax_t taxid(get_taxid(fns[index].data(), name_hash));
+-        update_feature_counter(ret, tax_map, counters[index], taxid);
+-        kh_destroy(all, counters[index]);
+-        ++completed;
+-    }
+-
+-    // Clean up
+-    kh_destroy(name, name_hash);
++    std::vector<khash_t(all) *> counters;
++    counters.reserve(num_threads);
++    for(std::size_t i(0), end(fns.size()); i != end; ++i) counters.emplace_back(kh_init(all));
++    td_helper th{sp, fns, ret, name_hash, tax_map, counters, nullptr};
++    kt_for(num_threads, &fct_for_helper<score>, (void *)&th, fns.size());
++    for(auto c: counters) khash_destroy(c);
++    destroy_name_hash(name_hash);
+     return ret;
+ }
+ 
+diff --git a/lib/hash.h b/lib/hash.h
+index fbfb4e53..7e5996b7 100644
+--- a/lib/hash.h
++++ b/lib/hash.h
+@@ -9,7 +9,7 @@ namespace emp {
+ // This is our core 64-bit hash.
+ // It has a 1-1 mapping from any one 64-bit integer to another
+ // and can be inverted with irving_inv_hash.
+-INLINE std::uint64_t wang_hash(std::uint64_t key) {
++constexpr INLINE std::uint64_t wang_hash(std::uint64_t key) {
+   key = (~key) + (key << 21); // key = (key << 21) - key - 1;
+   key = key ^ (key >> 24);
+   key = (key + (key << 3)) + (key << 8); // key * 265
+@@ -19,6 +19,19 @@ INLINE std::uint64_t wang_hash(std::uint64_t key) {
+   key = key + (key << 31);
+   return key;
+ }
++struct wang_hash_struct {
++    constexpr std::uint64_t operator()(std::uint64_t key) {return wang_hash(key);}
++};
++template<typename T>
++struct ptr_wang_hash_struct {
++    template<typename = typename std::enable_if<std::is_pointer<T>::value || sizeof(T) == 8>::type>
++    constexpr std::uint64_t operator()(T key) {return wang_hash(reinterpret_cast<std::uint64_t>(key));}
++};
++
++template<typename T>
++struct idt_struct {
++    constexpr T operator()(const T key) {return key;}
++};
+ 
+ // Geoffrey Irving
+ // https://naml.us/blog/tag/thomas-wang
+@@ -69,14 +82,13 @@ static INLINE int X31_hash_string(const char *s)
+ 
+ // SBDM http://www.cse.yorku.ca/~oz/sdbm.bun/. Mirrored https://github.com/davidar/sdbm.
+ // Slightly modified.
+-// This is a 32-bit unsigned hash functionf or strings.
+-#define DUFF
++// This is a 32-bit unsigned hash function for strings.
+ static INLINE unsigned
+ dbm_hash(register const char *str, register std::size_t len)
+ {
+     register unsigned n = 0;
+ 
+-#define HASHC  (n = *str++ + 65599 * n)
++#define HASHC  (n = *str++ + (n << 16) + (n << 6) - n)
+ #ifdef DUFF
+     if(len) {
+ 
+@@ -92,16 +104,15 @@ dbm_hash(register const char *str, register std::size_t len)
+         }
+     }
+ #else
+-    while (len--) n = *str++ + 65599 * n;
++    while (len--) HASHC;
+ #endif
+     return n;
+ }
+-#undef DUFF
+ #undef HASHC
+ static INLINE unsigned dbm_hash(register const char *str)
+ {
+-    register unsigned n = 0;
+-    while(*str) n = *str++ + ((n << 16) + (n << 6) - n);
++    register unsigned n = *str;
++    if(n) for(++str; *str; n = *str++ + ((n << 16) + (n << 6) - n));
+     return n;
+ }
+ 
+diff --git a/lib/khash64.h b/lib/khash64.h
+index fa8e4259..9137c6c0 100644
+--- a/lib/khash64.h
++++ b/lib/khash64.h
+@@ -61,7 +61,7 @@ int main() {
+ 
+   2011-12-29 (0.2.7):
+ 
+-    * Minor code clean up; no actual effect.
++	* Minor code clean up; no actual effect.
+ 
+   2011-09-16 (0.2.6):
+ 
+@@ -80,11 +80,11 @@ int main() {
+ 
+   2011-02-14 (0.2.5):
+ 
+-    * Allow to declare global functions.
++	* Allow to declare global functions.
+ 
+   2009-09-26 (0.2.4):
+ 
+-    * Improve portability
++	* Improve portability
+ 
+   2008-09-19 (0.2.3):
+ 
+@@ -129,6 +129,12 @@ int main() {
+ #include <string.h>
+ #include <limits.h>
+ #include <stdint.h>
++#include <mutex>
++#include <shared_mutex>
++
++#if __cplusplus < 201402L || __GNUC__ < 6
++#define shared_mutex shared_timed_mutex
++#endif
+ 
+ /* compiler specific configuration */
+ 
+@@ -213,6 +219,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 		khint32_t *flags; \
+ 		khkey_t *keys; \
+ 		khval_t *vals; \
++		mutable std::shared_mutex m;  \
+ 	} kh_##name##_t;
+ 
+ // TODO: Add a mutex around kh_resize to be safe in resizing.
+@@ -232,6 +239,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 	}																	\
+ 	SCOPE void kh_destroy_##name(kh_##name##_t *h)						\
+ 	{																	\
++		std::unique_lock<std::shared_mutex>(h->m);					  \
+ 		if (h) {														\
+ 			kfree((void *)h->keys); kfree(h->flags);					\
+ 			kfree((void *)h->vals);										\
+@@ -240,6 +248,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 	}																	\
+ 	SCOPE void kh_clear_##name(kh_##name##_t *h)						\
+ 	{																	\
++		std::unique_lock<std::shared_mutex>(h->m);										 \
+ 		if (h && h->flags) {											\
+ 			memset(h->flags, 0xaa, __ac_fsize(h->n_buckets) * sizeof(khint32_t)); \
+ 			h->size = h->n_occupied = 0;								\
+@@ -247,6 +256,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 	}																	\
+ 	SCOPE khint_t kh_get_##name(const kh_##name##_t *h, khkey_t key) 	\
+ 	{																	\
++		std::shared_lock<std::shared_mutex>(h->m);					  \
+ 		if (h->n_buckets) {												\
+ 			khint_t k, i, last, mask, step = 0; \
+ 			mask = h->n_buckets - 1;									\
+@@ -268,6 +278,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 			if (new_n_buckets < 4) new_n_buckets = 4;					\
+ 			if (h->size >= (khint_t)(new_n_buckets * __ac_HASH_UPPER + 0.5)) j = 0;	/* requested size is too small */ \
+ 			else { /* hash table size to be changed (shrink or expand); rehash */ \
++				std::unique_lock<std::shared_mutex>(h->m);				  \
+ 				new_flags = (khint32_t*)kmalloc(__ac_fsize(new_n_buckets) * sizeof(khint32_t));	\
+ 				if (!new_flags) return -1;								\
+ 				memset(new_flags, 0xaa, __ac_fsize(new_n_buckets) * sizeof(khint32_t)); \
+@@ -284,6 +295,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 			}															\
+ 		}																\
+ 		if (j) { /* rehashing is needed */								\
++			std::unique_lock<std::shared_mutex>(h->m);				  \
+ 			for (j = 0; j != h->n_buckets; ++j) {						\
+ 				if (__ac_iseither(h->flags, j) == 0) {					\
+ 					khkey_t key = h->keys[j];							\
+@@ -334,6 +346,7 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 				*ret = -1; return h->n_buckets;							\
+ 			}															\
+ 		} /* TODO: to implement automatically shrinking; resize() already support shrinking */ \
++		std::unique_lock<std::shared_mutex>(h->m);					  \
+ 		{																\
+ 			khint_t k, i, site, last, mask = h->n_buckets - 1, step = 0; \
+ 			x = site = h->n_buckets; k = __hash_func(key); i = k & mask; \
+@@ -366,12 +379,31 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ 	}																	\
+ 	SCOPE void kh_del_##name(kh_##name##_t *h, khint_t x)				\
+ 	{																	\
++		std::unique_lock<std::shared_mutex>(h->m);					   \
+ 		if (x != h->n_buckets && !__ac_iseither(h->flags, x)) {			\
+ 			__ac_set_isdel_true(h->flags, x);							\
+ 			--h->size;													\
+ 		}																\
++	}\
++	SCOPE bool kh_try_set_##name(kh_##name##_t *h, const khint_t ki, const khval_t val)\
++	{\
++		std::shared_lock<std::shared_mutex>(h->m);					  \
++		const khval_t old(kh_val(h, ki));\
++		return __sync_bool_compare_and_swap(h->vals + ki, old, val);			  \
++	}\
++	SCOPE void kh_set_##name(kh_##name##_t *h, khkey_t key, const khval_t val)	\
++	{\
++		std::shared_lock<std::shared_mutex>(h->m);					  \
++		khint_t ki;\
++		int khr;\
++		if((ki = kh_get_##name(h, key)) == kh_end(h)) kh_put_##name(h, key, &khr);\
++		const khval_t old(kh_val(h, ki));\
++		while(!__sync_bool_compare_and_swap(h->vals + ki, old, val))\
++			if(h->keys[ki] != key) ki = kh_get_##name(h, key);\
+ 	}
+ 
++
++
+ #define KHASH_DECLARE(name, khkey_t, khval_t)		 					\
+ 	__KHASH_TYPE(name, khkey_t, khval_t) 								\
+ 	__KHASH_PROTOTYPES(name, khkey_t, khval_t)
+@@ -386,29 +418,29 @@ kh_inline std::uint64_t __ac_Wang64_hash(std::uint64_t key) {
+ /* --- BEGIN OF HASH FUNCTIONS --- */
+ 
+ /*! @function
+-  @abstract     Integer hash function
++  @abstract	 Integer hash function
+   @param  key   The integer [khint32_t]
+-  @return       The hash value [khint_t]
++  @return	   The hash value [khint_t]
+  */
+ #define kh_int_hash_func(key) (khint32_t)(key)
+ /*! @function
+-  @abstract     Integer comparison function
++  @abstract	 Integer comparison function
+  */
+ #define kh_int_hash_equal(a, b) ((a) == (b))
+ /*! @function
+-  @abstract     64-bit integer hash function
++  @abstract	 64-bit integer hash function
+   @param  key   The integer [khint64_t]
+-  @return       The hash value [khint_t]
++  @return	   The hash value [khint_t]
+  */
+ #define kh_int64_hash_func(key) (khint32_t)((key)>>33^(key)^(key)<<11)
+ /*! @function
+-  @abstract     64-bit integer comparison function
++  @abstract	 64-bit integer comparison function
+  */
+ #define kh_int64_hash_equal(a, b) ((a) == (b))
+ /*! @function
+-  @abstract     const char* hash function
+-  @param  s     Pointer to a null terminated string
+-  @return       The hash value
++  @abstract	 const char* hash function
++  @param  s	 Pointer to a null terminated string
++  @return	   The hash value
+  */
+ static kh_inline khint_t __ac_X31_hash_string(const char *s)
+ {
+@@ -417,25 +449,25 @@ static kh_inline khint_t __ac_X31_hash_string(const char *s)
+ 	return h;
+ }
+ /*! @function
+-  @abstract     Another interface to const char* hash function
++  @abstract	 Another interface to const char* hash function
+   @param  key   Pointer to a null terminated string [const char*]
+-  @return       The hash value [khint_t]
++  @return	   The hash value [khint_t]
+  */
+ #define kh_str_hash_func(key) __ac_X31_hash_string(key)
+ /*! @function
+-  @abstract     Const char* comparison function
++  @abstract	 Const char* comparison function
+  */
+ #define kh_str_hash_equal(a, b) (strcmp(a, b) == 0)
+ 
+ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ {
+-    key += ~(key << 15);
+-    key ^=  (key >> 10);
+-    key +=  (key << 3);
+-    key ^=  (key >> 6);
+-    key += ~(key << 11);
+-    key ^=  (key >> 16);
+-    return key;
++	key += ~(key << 15);
++	key ^=  (key >> 10);
++	key +=  (key << 3);
++	key ^=  (key >> 6);
++	key += ~(key << 11);
++	key ^=  (key >> 16);
++	return key;
+ }
+ #define kh_int_hash_func2(k) __ac_Wang_hash((khint_t)key)
+ 
+@@ -450,125 +482,128 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ #define khash_t(name) kh_##name##_t
+ 
+ /*! @function
+-  @abstract     Initiate a hash table.
++  @abstract	 Initiate a hash table.
+   @param  name  Name of the hash table [symbol]
+-  @return       Pointer to the hash table [khash_t(name)*]
++  @return	   Pointer to the hash table [khash_t(name)*]
+  */
+ #define kh_init(name) kh_init_##name()
+ 
+ /*! @function
+-  @abstract     Destroy a hash table.
++  @abstract	 Destroy a hash table.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  h	 Pointer to the hash table [khash_t(name)*]
+  */
+ #define kh_destroy(name, h) kh_destroy_##name(h)
+ 
+ /*! @function
+-  @abstract     Reset a hash table without deallocating memory.
++  @abstract	 Reset a hash table without deallocating memory.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  h	 Pointer to the hash table [khash_t(name)*]
+  */
+ #define kh_clear(name, h) kh_clear_##name(h)
+ 
+ /*! @function
+-  @abstract     Resize a hash table.
++  @abstract	 Resize a hash table.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  s     New size [khint_t]
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  s	 New size [khint_t]
+  */
+ #define kh_resize(name, h, s) kh_resize_##name(h, s)
+ 
+ /*! @function
+-  @abstract     Insert a key to the hash table.
++  @abstract	 Insert a key to the hash table.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  k     Key [type of keys]
+-  @param  r     Extra return code: -1 if the operation failed;
+-                0 if the key is present in the hash table;
+-                1 if the bucket is empty (never used); 2 if the element in
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  k	 Key [type of keys]
++  @param  r	 Extra return code: -1 if the operation failed;
++				0 if the key is present in the hash table;
++				1 if the bucket is empty (never used); 2 if the element in
+ 				the bucket has been deleted [int*]
+-  @return       Iterator to the inserted element [khint_t]
++  @return	   Iterator to the inserted element [khint_t]
+  */
+ #define kh_put(name, h, k, r) kh_put_##name(h, k, r)
+ 
+ /*! @function
+-  @abstract     Retrieve a key from the hash table.
++  @abstract	 Retrieve a key from the hash table.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  k     Key [type of keys]
+-  @return       Iterator to the found element, or kh_end(h) if the element is absent [khint_t]
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  k	 Key [type of keys]
++  @return	   Iterator to the found element, or kh_end(h) if the element is absent [khint_t]
+  */
+ #define kh_get(name, h, k) kh_get_##name(h, k)
+ 
+ /*! @function
+-  @abstract     Remove a key from the hash table.
++  @abstract	 Remove a key from the hash table.
+   @param  name  Name of the hash table [symbol]
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  k     Iterator to the element to be deleted [khint_t]
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  k	 Iterator to the element to be deleted [khint_t]
+  */
+ #define kh_del(name, h, k) kh_del_##name(h, k)
+ 
++#define kh_set(name, h, k, v) kh_set_##name(h, k, v)
++#define kh_try_set(name, h, i, v) kh_try_set_##name(h, i, v)
++
+ /*! @function
+-  @abstract     Test whether a bucket contains data.
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  x     Iterator to the bucket [khint_t]
+-  @return       1 if containing data; 0 otherwise [int]
++  @abstract	 Test whether a bucket contains data.
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  x	 Iterator to the bucket [khint_t]
++  @return	   1 if containing data; 0 otherwise [int]
+  */
+ #define kh_exist(h, x) (!__ac_iseither((h)->flags, (x)))
+ 
+ /*! @function
+-  @abstract     Get key given an iterator
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  x     Iterator to the bucket [khint_t]
+-  @return       Key [type of keys]
++  @abstract	 Get key given an iterator
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  x	 Iterator to the bucket [khint_t]
++  @return	   Key [type of keys]
+  */
+ #define kh_key(h, x) ((h)->keys[x])
+ 
+ /*! @function
+-  @abstract     Get value given an iterator
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @param  x     Iterator to the bucket [khint_t]
+-  @return       Value [type of values]
++  @abstract	 Get value given an iterator
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @param  x	 Iterator to the bucket [khint_t]
++  @return	   Value [type of values]
+   @discussion   For hash sets, calling this results in segfault.
+  */
+ #define kh_val(h, x) ((h)->vals[x])
+ 
+ /*! @function
+-  @abstract     Alias of kh_val()
++  @abstract	 Alias of kh_val()
+  */
+ #define kh_value(h, x) ((h)->vals[x])
+ 
+ /*! @function
+-  @abstract     Get the start iterator
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @return       The start iterator [khint_t]
++  @abstract	 Get the start iterator
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @return	   The start iterator [khint_t]
+  */
+ #define kh_begin(h) (khint_t)(0)
+ 
+ /*! @function
+-  @abstract     Get the end iterator
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @return       The end iterator [khint_t]
++  @abstract	 Get the end iterator
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @return	   The end iterator [khint_t]
+  */
+ #define kh_end(h) ((h)->n_buckets)
+ 
+ /*! @function
+-  @abstract     Get the number of elements in the hash table
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @return       Number of elements in the hash table [khint_t]
++  @abstract	 Get the number of elements in the hash table
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @return	   Number of elements in the hash table [khint_t]
+  */
+ #define kh_size(h) ((h)->size)
+ 
+ /*! @function
+-  @abstract     Get the number of buckets in the hash table
+-  @param  h     Pointer to the hash table [khash_t(name)*]
+-  @return       Number of buckets in the hash table [khint_t]
++  @abstract	 Get the number of buckets in the hash table
++  @param  h	 Pointer to the hash table [khash_t(name)*]
++  @return	   Number of buckets in the hash table [khint_t]
+  */
+ #define kh_n_buckets(h) ((h)->n_buckets)
+ 
+ /*! @function
+-  @abstract     Iterate over the entries in the hash table
+-  @param  h     Pointer to the hash table [khash_t(name)*]
++  @abstract	 Iterate over the entries in the hash table
++  @param  h	 Pointer to the hash table [khash_t(name)*]
+   @param  kvar  Variable to which key will be assigned
+   @param  vvar  Variable to which value will be assigned
+   @param  code  Block of code to execute
+@@ -582,8 +617,8 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ 	} }
+ 
+ /*! @function
+-  @abstract     Iterate over the values in the hash table
+-  @param  h     Pointer to the hash table [khash_t(name)*]
++  @abstract	 Iterate over the values in the hash table
++  @param  h	 Pointer to the hash table [khash_t(name)*]
+   @param  vvar  Variable to which value will be assigned
+   @param  code  Block of code to execute
+  */
+@@ -597,14 +632,14 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ /* More conenient interfaces */
+ 
+ /*! @function
+-  @abstract     Instantiate a hash set containing integer keys
++  @abstract	 Instantiate a hash set containing integer keys
+   @param  name  Name of the hash table [symbol]
+  */
+ #define KHASH_SET_INIT_INT(name)										\
+ 	KHASH_INIT(name, khint32_t, char, 0, kh_int_hash_func, kh_int_hash_equal)
+ 
+ /*! @function
+-  @abstract     Instantiate a hash map containing integer keys
++  @abstract	 Instantiate a hash map containing integer keys
+   @param  name  Name of the hash table [symbol]
+   @param  khval_t  Type of values [type]
+  */
+@@ -612,14 +647,14 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ 	KHASH_INIT(name, khint32_t, khval_t, 1, kh_int_hash_func, kh_int_hash_equal)
+ 
+ /*! @function
+-  @abstract     Instantiate a hash map containing 64-bit integer keys
++  @abstract	 Instantiate a hash map containing 64-bit integer keys
+   @param  name  Name of the hash table [symbol]
+  */
+ #define KHASH_SET_INIT_INT64(name)										\
+ 	KHASH_INIT(name, khint64_t, char, 0, __ac_Wang64_hash, kh_int64_hash_equal)
+ 
+ /*! @function
+-  @abstract     Instantiate a hash map containing 64-bit integer keys
++  @abstract	 Instantiate a hash map containing 64-bit integer keys
+   @param  name  Name of the hash table [symbol]
+   @param  khval_t  Type of values [type]
+  */
+@@ -631,66 +666,66 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
+ #ifdef __cplusplus
+ template<std::size_t nbits>
+ struct khkey_t {
+-    __attribute__((packed)) std::uint64_t key_:nbits;
+-    static const std::uint64_t max = (1ull << nbits) - 1;
+-
+-    kh_inline std::uint64_t operator=(std::uint64_t other) {
+-        return key_ = other;
+-    }
+-    kh_inline bool operator<=(std::uint64_t other) {
+-        return key_ <= other;
+-    }
+-    kh_inline bool operator>=(std::uint64_t other) {
+-        return key_ >= other;
+-    }
+-    kh_inline bool operator==(std::uint64_t other) {
+-        return key_ == other;
+-    }
+-    kh_inline std::uint64_t operator+=(std::uint64_t other) {
+-        return key_ += other;
+-    }
+-    kh_inline std::uint64_t operator-=(std::uint64_t other) {
+-        return key_ -= other;
+-    }
+-    kh_inline std::uint64_t operator-(std::uint64_t other) {
+-        return key_ - other;
+-    }
+-    kh_inline std::uint64_t operator+(std::uint64_t other) {
+-        return key_ + other;
+-    }
+-    kh_inline std::uint64_t operator=(khkey_t<nbits> other) {
+-        return key_ = other.key_;
+-    }
+-    kh_inline bool operator<=(khkey_t<nbits> other) {
+-        return key_ <= other.key_;
+-    }
+-    kh_inline bool operator>=(khkey_t<nbits> other) {
+-        return key_ >= other.key_;
+-    }
+-    kh_inline bool operator==(khkey_t<nbits> other) {
+-        return key_ == other.key_;
+-    }
+-    kh_inline std::uint64_t operator+=(khkey_t<nbits> other) {
+-        return key_ += other.key_;
+-    }
+-    kh_inline std::uint64_t operator-=(khkey_t<nbits> other) {
+-        return key_ -= other.key_;
+-    }
+-    kh_inline std::uint64_t operator-(khkey_t<nbits> other) {
+-        return key_ - other.key_;
+-    }
+-    kh_inline std::uint64_t operator+(khkey_t<nbits> other) {
+-        return key_ + other.key_;
+-    }
+-    kh_inline std::uint64_t operator++() {
+-        return ++key_;
+-    }
+-    kh_inline std::uint64_t operator--() {
+-        return --key_;
+-    }
+-    kh_inline operator std::uint64_t() {
+-        return (std::uint64_t)key_;
+-    }
++	__attribute__((packed)) std::uint64_t key_:nbits;
++	static const std::uint64_t max = (1ull << nbits) - 1;
++
++	kh_inline std::uint64_t operator=(std::uint64_t other) {
++		return key_ = other;
++	}
++	kh_inline bool operator<=(std::uint64_t other) {
++		return key_ <= other;
++	}
++	kh_inline bool operator>=(std::uint64_t other) {
++		return key_ >= other;
++	}
++	kh_inline bool operator==(std::uint64_t other) {
++		return key_ == other;
++	}
++	kh_inline std::uint64_t operator+=(std::uint64_t other) {
++		return key_ += other;
++	}
++	kh_inline std::uint64_t operator-=(std::uint64_t other) {
++		return key_ -= other;
++	}
++	kh_inline std::uint64_t operator-(std::uint64_t other) {
++		return key_ - other;
++	}
++	kh_inline std::uint64_t operator+(std::uint64_t other) {
++		return key_ + other;
++	}
++	kh_inline std::uint64_t operator=(khkey_t<nbits> other) {
++		return key_ = other.key_;
++	}
++	kh_inline bool operator<=(khkey_t<nbits> other) {
++		return key_ <= other.key_;
++	}
++	kh_inline bool operator>=(khkey_t<nbits> other) {
++		return key_ >= other.key_;
++	}
++	kh_inline bool operator==(khkey_t<nbits> other) {
++		return key_ == other.key_;
++	}
++	kh_inline std::uint64_t operator+=(khkey_t<nbits> other) {
++		return key_ += other.key_;
++	}
++	kh_inline std::uint64_t operator-=(khkey_t<nbits> other) {
++		return key_ -= other.key_;
++	}
++	kh_inline std::uint64_t operator-(khkey_t<nbits> other) {
++		return key_ - other.key_;
++	}
++	kh_inline std::uint64_t operator+(khkey_t<nbits> other) {
++		return key_ + other.key_;
++	}
++	kh_inline std::uint64_t operator++() {
++		return ++key_;
++	}
++	kh_inline std::uint64_t operator--() {
++		return --key_;
++	}
++	kh_inline operator std::uint64_t() {
++		return (std::uint64_t)key_;
++	}
+ };
+ 
+ typedef khkey_t<4> khkey_2_t;
+@@ -724,7 +759,7 @@ typedef khkey_t<58> khkey_29_t;
+ typedef khkey_t<60> khkey_30_t;
+ typedef khkey_t<62> khkey_31_t;
+ /*! @function
+-  @abstract     Instantiate a hash map containing 64-bit integer keys
++  @abstract	 Instantiate a hash map containing 64-bit integer keys
+   @param  name  Name of the hash table [symbol]
+   @param  khval_t  Type of values [type]
+ */
+@@ -732,14 +767,14 @@ typedef khkey_t<62> khkey_31_t;
+ 
+ typedef const char *kh_cstr_t;
+ /*! @function
+-  @abstract     Instantiate a hash map containing const char* keys
++  @abstract	 Instantiate a hash map containing const char* keys
+   @param  name  Name of the hash table [symbol]
+  */
+ #define KHASH_SET_INIT_STR(name)										\
+ 	KHASH_INIT(name, kh_cstr_t, char, 0, kh_str_hash_func, kh_str_hash_equal)
+ 
+ /*! @function
+-  @abstract     Instantiate a hash map containing const char* keys
++  @abstract	 Instantiate a hash map containing const char* keys
+   @param  name  Name of the hash table [symbol]
+   @param  khval_t  Type of values [type]
+  */
+diff --git a/lib/khpp.cpp b/lib/khpp.cpp
+new file mode 100644
+index 00000000..9c9aaf40
+--- /dev/null
++++ b/lib/khpp.cpp
+@@ -0,0 +1,14 @@
++#include "lib/khpp.h"
++namespace emp {
++namespace kh {
++
++template struct khpp_t<std::uint64_t, std::uint64_t, emp::wang_hash_struct>;
++using kh64_t = khpp_t<std::uint64_t, std::uint64_t, emp::wang_hash_struct>;
++template struct khpp_t<std::uint64_t, std::uint64_t, emp::idt_struct<std::uint64_t>>;
++
++void f() {
++    khpp_t<std::uint64_t, std::uint64_t, emp::idt_struct<std::uint64_t>> map;
++}
++
++}
++}
+diff --git a/lib/khpp.h b/lib/khpp.h
+new file mode 100644
+index 00000000..cdb5af26
+--- /dev/null
++++ b/lib/khpp.h
+@@ -0,0 +1,191 @@
++#ifndef KHPP_H__
++#define KHPP_H__
++#include "lib/khash64.h"
++#include "lib/hash.h"
++
++namespace emp {
++namespace kh {
++
++template<typename khkey_t, typename khval_t, typename hash_func=std::hash<khkey_t>, class hash_equal=std::equal_to<khkey_t>, bool is_map=true>
++struct khpp_t {
++    using index_type = std::uint64_t;
++    index_type n_buckets, size, n_occupied, upper_bound;
++    khint32_t *flags;
++    khkey_t *keys;
++    khval_t *vals;
++    mutable std::shared_mutex m;
++    hash_equal he;
++    hash_func hf;
++    static constexpr double HASH_UPPER = 0.77;
++    khpp_t(): n_buckets(0), size(0), n_occupied(0), upper_bound(0), flags(0), keys(0), vals(0) {
++    }
++    ~khpp_t() {
++        free(flags);
++        free(vals);
++        free(keys);
++    }
++    void clear() {
++        std::unique_lock<std::shared_mutex>(m);
++        if (flags) {
++            memset(flags, 0xaa, __ac_fsize(n_buckets) * sizeof(khint32_t));
++            size = n_occupied = 0;
++        }
++    }
++    index_type iget(khkey_t &key)
++    {
++        std::shared_lock<std::shared_mutex>(m);
++        if (n_buckets) {
++            index_type k, i, last, mask, step = 0;
++            mask = n_buckets - 1;
++            k = hf(key); i = k & mask;
++            last = i;
++            while (!__ac_isempty(flags, i) && (__ac_isdel(flags, i) || !he(keys[i], key))) {
++                i = (i + (++step)) & mask;
++                if (i == last) return n_buckets;
++            }
++            return __ac_iseither(flags, i)? n_buckets : i;
++        }
++        return 0;
++    }
++    index_type iput(khkey_t &key, int *ret)
++    {
++        index_type x;
++        if (n_occupied >= upper_bound) { /* update the hash table */
++            if (n_buckets > (size<<1)) {
++                if (resize(n_buckets - 1) < 0) { /* clear "deleted" elements */
++                    *ret = -1; return n_buckets;
++                }
++            } else if (resize(n_buckets + 1) < 0) { /* expand the hash table */
++                *ret = -1; return n_buckets;
++            }
++        } /* TODO: to implement automatically shrinking; resize() already support shrinking */
++        std::unique_lock<std::shared_mutex>(m);
++        {
++            index_type k, i, site, last, mask = n_buckets - 1, step = 0;
++            x = site = n_buckets; k = hf(key); i = k & mask;
++            if (__ac_isempty(flags, i)) x = i; /* for speed up */
++            else {
++                last = i;
++                while (!__ac_isempty(flags, i) && (__ac_isdel(flags, i) || !he(keys[i], key))) {
++                    if (__ac_isdel(flags, i)) site = i;
++                    i = (i + (++step)) & mask;
++                    if (i == last) { x = site; break; }
++                }
++                if (x == n_buckets) {
++                    if (__ac_isempty(flags, i) && site != n_buckets) x = site;
++                    else x = i;
++                }
++            }
++        }
++        if (__ac_isempty(flags, x)) { /* not present at all */
++            keys[x] = key;
++            __ac_set_isboth_false(flags, x);
++            ++size; ++n_occupied;
++            *ret = 1;
++        } else if (__ac_isdel(flags, x)) { /* deleted */
++            keys[x] = key;
++            __ac_set_isboth_false(flags, x);
++            ++size;
++            *ret = 2;
++        } else *ret = 0; /* Don't touch keys[x] if present and not deleted */
++        return x;
++    }
++    index_type nb() const {return n_buckets;}
++    khval_t &operator[](khkey_t &key) {
++        std::shared_lock<std::shared_mutex>(m);
++        index_type ki(iget(key));
++        int khr;
++        if(ki == nb()) ki = iput(key, &khr);
++        return vals[ki];
++    }
++    void del(index_type x)
++    {
++        std::unique_lock<std::shared_mutex>(m);
++        if (x != n_buckets && !__ac_iseither(flags, x)) {
++            __ac_set_isdel_true(flags, x);
++            --size;
++        }
++    }
++    int resize(index_type new_n_buckets)
++    { /* This function uses 0.25*n_buckets bytes of working space instead of [sizeof(key_t+val_t)+.25]*n_buckets. */
++        khint32_t *new_flags = 0;
++        index_type j = 1;
++        {
++            kroundup64(new_n_buckets);
++            if (new_n_buckets < 4) new_n_buckets = 4;
++            if (size >= (index_type)(new_n_buckets * HASH_UPPER + 0.5)) j = 0;    /* requested size is too small */
++            else { /* hash table size to be changed (shrink or expand); rehash */
++                std::unique_lock<std::shared_mutex>(m);
++                new_flags = (khint32_t*)kmalloc(__ac_fsize(new_n_buckets) * sizeof(khint32_t));
++                if (!new_flags) return -1;
++                memset(new_flags, 0xaa, __ac_fsize(new_n_buckets) * sizeof(khint32_t));
++                if (n_buckets < new_n_buckets) {    /* expand */
++                    khkey_t *new_keys = (khkey_t*)krealloc((void *)keys, new_n_buckets * sizeof(khkey_t));
++                    if (!new_keys) { kfree(new_flags); return -1; }
++                    keys = new_keys;
++                    if (is_map) {
++                        khval_t *new_vals = (khval_t*)krealloc((void *)vals, new_n_buckets * sizeof(khval_t));
++                        if (!new_vals) { kfree(new_flags); return -1; }
++                        vals = new_vals;
++                    }
++                } /* otherwise shrink */
++            }
++        }
++        if (j) { /* rehashing is needed */
++            std::unique_lock<std::shared_mutex>(m);
++            for (j = 0; j != n_buckets; ++j) {
++                if (__ac_iseither(flags, j) == 0) {
++                    khkey_t key = keys[j];
++                    khval_t val;
++                    index_type new_mask;
++                    new_mask = new_n_buckets - 1;
++                    if (is_map) val = vals[j];
++                    __ac_set_isdel_true(flags, j);
++                    while (1) { /* kick-out process; sort of like in Cuckoo hashing */
++                        index_type k, i, step = 0;
++                        k = hf(key);
++                        i = k & new_mask;
++                        while (!__ac_isempty(new_flags, i)) i = (i + (++step)) & new_mask;
++                        __ac_set_isempty_false(new_flags, i);
++                        if (i < n_buckets && __ac_iseither(flags, i) == 0) { /* kick out the existing element */
++                            { khkey_t tmp = keys[i]; keys[i] = key; key = tmp; }
++                            if (is_map) { khval_t tmp = vals[i]; vals[i] = val; val = tmp; }
++                            __ac_set_isdel_true(flags, i); /* mark it as deleted in the old hash table */
++                        } else { /* write the element and jump out of the loop */
++                            keys[i] = key;
++                            if (is_map) vals[i] = val;
++                            break;
++                        }
++                    }
++                }
++            }
++            if (n_buckets > new_n_buckets) { /* shrink the hash table */
++                keys = (khkey_t*)krealloc((void *)keys, new_n_buckets * sizeof(khkey_t));
++                if (is_map) vals = (khval_t*)krealloc((void *)vals, new_n_buckets * sizeof(khval_t));
++            }
++            kfree(flags); /* free the working space */
++            flags = new_flags;
++            n_buckets = new_n_buckets;
++            n_occupied = size;
++            upper_bound = (index_type)(n_buckets * HASH_UPPER + 0.5);
++        }
++        return 0;
++    }
++    bool try_set(const index_type ki, const khval_t &val)
++    {
++        std::shared_lock<std::shared_mutex>(m);
++        return __sync_bool_compare_and_swap(vals + ki, vals[ki], val);
++    }
++    void set(khkey_t &key, const khval_t &val)
++    {
++        khiter_t ki;
++        int khr;
++        if((ki = iget(key)) == nb()) ki = iput(key, &khr);
++        while(!try_set(ki, val));
++    }
++
++};
++
++}
++}
++#endif
+diff --git a/lib/util.cpp b/lib/util.cpp
+index 8d8ef45a..69bd6c48 100644
+--- a/lib/util.cpp
++++ b/lib/util.cpp
+@@ -213,7 +213,7 @@ tax_t get_taxid(const char *fn, khash_t(name) *name_hash) {
+ 
+ 
+ 
+-std::unordered_map<tax_t, std::forward_list<std::string>> tax2genome_map(khash_t(name) *name_map, const std::vector<std::string> &paths) {
++std::unordered_map<tax_t, strlist> tax2genome_map(khash_t(name) *name_map, const std::vector<std::string> &paths) {
+     tax_t taxid;
+     std::unordered_map<tax_t, std::forward_list<std::string>> ret;
+     ret.reserve(paths.size());
+diff --git a/lib/util.h b/lib/util.h
+index 8b453370..761eea1c 100644
+--- a/lib/util.h
++++ b/lib/util.h
+@@ -52,6 +52,7 @@ KHASH_MAP_INIT_INT64(c, tax_t)
+ KHASH_MAP_INIT_INT64(64, std::uint64_t)
+ KHASH_MAP_INIT_INT(p, tax_t)
+ KHASH_MAP_INIT_STR(name, tax_t)
++using strlist = std::forward_list<std::string>;
+ 
+ std::string rand_string(std::size_t n);
+ std::size_t count_lines(const char *fn) noexcept;
+@@ -157,7 +158,7 @@ void kset_union(khash_t(all) *a, khash_t(all) *b) noexcept;
+ 
+ tax_t lca(khash_t(p) *map, tax_t a, tax_t b) noexcept;
+ unsigned node_depth(khash_t(p) *map, tax_t a) noexcept;
+-std::unordered_map<tax_t, std::forward_list<std::string>> tax2genome_map(khash_t(name) *name_map, const std::vector<std::string> &paths);
++std::unordered_map<tax_t, strlist> tax2genome_map(khash_t(name) *name_map, const std::vector<std::string> &paths);
+ INLINE tax_t get_parent(khash_t(p) *taxmap, tax_t key) noexcept {
+     // Returns maximum value if not found.
+     khiter_t ki;
+diff --git a/src/emp.cpp b/src/emp.cpp
+index e7e740e0..6ac715fc 100644
+--- a/src/emp.cpp
++++ b/src/emp.cpp
+@@ -5,6 +5,8 @@
+ #include "lib/tree_climber.h"
+ #include "lib/bitmap.h"
+ #include "lib/tx.h"
++#include "lib/khpp.h"
++#include <functional>
+ 
+ using namespace emp;
+ 
+@@ -78,7 +80,7 @@ std::vector<std::string> get_paths(const char *path) {
+ }
+ 
+ int phase2_main(int argc, char *argv[]) {
+-    int c, mode(score_scheme::LEX), wsz(-1), num_threads(-1), use_hll(0), k(31);
++    int c, mode(score_scheme::LEX), wsz(-1), num_threads(-1), k(31);
+     std::size_t start_size(1<<16);
+     std::string spacing, tax_path, seq2taxpath, paths_file;
+     // TODO: update documentation for tax_path and seq2taxpath options.
+@@ -103,7 +105,6 @@ int phase2_main(int argc, char *argv[]) {
+             case 'w': wsz = atoi(optarg); break;
+             case 'T': tax_path = optarg; break;
+             case 'M': seq2taxpath = optarg; break;
+-            case 'H': use_hll = 1; break;
+             case 'F': paths_file = optarg; break;
+         }
+     }
+@@ -120,6 +121,7 @@ int phase2_main(int argc, char *argv[]) {
+ #else
+         // Force using hll so that we can use __sync_bool_compare_and_swap to parallelize.
+         std::size_t hash_size(estimate_cardinality<lex_score>(inpaths, k, k, sp.s_, nullptr, num_threads, 24));
++        LOG_DEBUG("Estimated cardinality: %zu\n", hash_size);
+ #endif
+         LOG_DEBUG("Parent map bulding from %s\n", argv[optind]);
+         khash_t(p) *taxmap(build_parent_map(argv[optind]));
+@@ -132,7 +134,7 @@ int phase2_main(int argc, char *argv[]) {
+     Spacer sp(k, wsz, phase1_map.s_);
+     Database<khash_t(c)>  phase2_map(phase1_map);
+     khash_t(p) *taxmap(tax_path.empty() ? nullptr: build_parent_map(tax_path.data()));
+-    phase2_map.db_ = minimized_map<hash_score>(inpaths, phase1_map.db_, sp, num_threads, start_size, mode);
++    phase2_map.db_ = minimized_map<hash_score>(inpaths, phase1_map.db_, sp, num_threads, start_size);
+     // Write minimized map
+     phase2_map.write(argv[optind + 1]);
+     if(taxmap) kh_destroy(p, taxmap);
+@@ -144,8 +146,14 @@ int hll_main(int argc, char *argv[]) {
+     int c, wsz(-1), k(31), num_threads(-1), sketch_size(24);
+     std::string spacing;
+     if(argc < 2) {
+-        usage:
+-        LOG_EXIT("NotImplementedError: Add usage, pls.");
++        usage: LOG_EXIT("Usage: %s <opts> <paths>\nFlags:"
++                        "-k:\tkmer length (Default: 31. Max: 31)\n"
++                        "-w:\twindow size (Default: -1)  Must be -1 (ignored) or >= kmer length.\n"
++                        "-s:\tspacing (default: none). format: <value>x<times>,<value>x<times>,...\n"
++                        "   \tOmitting x<times> indicates 1 occurrence of spacing <value>\n"
++                        "-S:\tsketch size (default: 24). (Allocates 2 << [param] bytes of memory per HyperLogLog.\n"
++                        "-p:\tnumber of threads.\n"
++                        , argv[0]);
+     }
+     while((c = getopt(argc, argv, "w:s:S:p:k:tfh?")) >= 0) {
+         switch(c) {
+@@ -240,18 +248,12 @@ void metatree_usage(char *arg) {
+     std::exit(EXIT_FAILURE);
+ }
+ 
+-typedef std::tuple<int, std::vector<std::uint64_t>, std::uint64_t> indvec_t;
++typedef std::tuple<std::uint64_t, int, std::vector<std::uint64_t>> indvec_t;
++using vecptr_t = std::uint64_t;
++
++template struct kh::khpp_t<std::vector<std::uint64_t> *, std::uint64_t, ptr_wang_hash_struct<std::vector<std::uint64_t> *>>;
++using pkh_t = kh::khpp_t<std::vector<std::uint64_t> *, std::uint64_t, ptr_wang_hash_struct<std::vector<std::uint64_t> *>>;
+ 
+-struct indgt {
+-    inline bool operator()(const indvec_t &a, const indvec_t &b) {
+-        using std::get;
+-        if(get<2>(a) !=get<2>(b)) return get<2>(a) > get<2>(b);
+-        if(get<0>(a) != get<0>(b)) return get<0>(a) > get<0>(b);
+-        for(unsigned i(0); i < get<1>(a).size(); ++i)
+-            if(get<1>(a)[i] != get<1>(b)[i]) return get<1>(a)[i] > get<1>(b)[i];
+-        return 0; // Identical, never happens.
+-    }
+-};
+ 
+ 
+ int metatree_main(int argc, char *argv[]) {
+@@ -296,8 +298,8 @@ int metatree_main(int argc, char *argv[]) {
+     if(to_fetch.empty()) LOG_EXIT("No binary files to grab from.\n");
+     LOG_DEBUG("Fetched! Making tx2g\n");
+     std::size_t ind(0);
+-    std::set<indvec_t, indgt> vec_scores;
+-    std::unordered_map<tax_t, std::forward_list<std::string>> tx2g(tax2genome_map(name_hash, inpaths));
++    std::set<indvec_t, std::greater<indvec_t>> vec_scores;
++    std::unordered_map<tax_t, strlist> tx2g(tax2genome_map(name_hash, inpaths));
+     LOG_DEBUG("Made! Printing\n");
+     for(auto &kv: tx2g)
+         for(auto &path: kv.second)
+@@ -307,6 +309,7 @@ int metatree_main(int argc, char *argv[]) {
+     for(int i(0), e(offsets.size() - 1); i < e; ++i) {
+         LOG_DEBUG("Doing set %i of %i\n", i, e);
+         ind = offsets[i];
++        const tax_t parent_tax(get_parent(taxmap, nodes[ind]));
+         std::set<tax_t> taxids(nodes.begin() + ind, nodes.begin() + offsets[i + 1]);
+         std::unordered_map<tax_t, std::forward_list<std::string>> range_map;
+         std::vector<std::forward_list<std::string>> list_vec;
+@@ -314,24 +317,31 @@ int metatree_main(int argc, char *argv[]) {
+             if(taxids.find(pair.first) == taxids.end()) continue;
+             range_map.emplace(pair.first, pair.second);
+         }
++        if(range_map.empty()) {
++            LOG_INFO("No genomes to process for taxids who are descendents of %u\n", parent_tax);
++            taxes.emplace_back();
++            tax_paths.emplace_back();
++            continue;
++        }
+         for(auto &pair: range_map) list_vec.push_back(pair.second); // Potentially expensive copy.
+         // Handle sets of genomes which all match a taxonomy.
+-        const tax_t parent_tax(get_parent(taxmap, nodes[ind]));
+         std::string parent_path(folder);
+         if(!parent_path.empty()) parent_path += '/';
+         parent_path += std::to_string(parent_tax) + ".kmers.bin";
+         khash_t(all) *acceptable(tree::load_binary_kmerset(parent_path.data()));
+-        kgset_t kgs(range_map, sp, num_threads, acceptable);
+-        bitmap_t bitmap(kgs);
++        bitmap_t bitmap;
++        {
++            kgset_t kgs(range_map, sp, num_threads, acceptable);
++            bitmap = kgs;
++            taxes.emplace_back(std::move(kgs.get_taxes()));
++        }
+         count::Counter<std::vector<std::uint64_t>> counts(bitmap.to_counter());
+         adjmap_t fwd_adj(counts);
+         adjmap_t rev_adj(counts, true);
+         for(auto &c: counts) {
+-            vec_scores.emplace(std::make_tuple(i, c.first,
+-                                               score_node_addn(c.first, fwd_adj, counts, range_map.size())));
++            vec_scores.emplace(score_node_addn(c.first, fwd_adj, counts, range_map.size()), i, c.first);
+         }
+         kh_destroy(all, acceptable);
+-        taxes.emplace_back(std::move(kgs.get_taxes()));
+         tax_paths.emplace_back(std::move(list_vec));
+     }
+     for(std::size_t i(0), e(taxes.size()); i < e; ++i) {
+@@ -359,17 +369,14 @@ int hist_main(int argc, char *argv[]) {
+     if(argc > 2) ofp = std::fopen(argv[2], "w");
+     for(khiter_t ki(0); ki != kh_end(map); ++ki) if(kh_exist(map, ki)) counter.add(kh_val(map, ki));
+     auto &cmap(counter.get_map());
+-    struct elcount {
+-        tax_t el; std::uint32_t count;
+-        elcount(tax_t el, std::size_t count): el(el), count(count) {}
+-    } __attribute__((packed));
++    using elcount = std::pair<tax_t, std::uint32_t>;
+     std::vector<elcount> structs;
+     for(auto& i: cmap) structs.emplace_back(i.first, i.second);
+     std::sort(std::begin(structs), std::end(structs), [] (elcount &a, elcount &b) {
+-        return a.count < b.count;
++        return a.second < b.second;
+     });
+     std::fputs("Name\tCount\n", ofp);
+-    for(auto &i: structs) std::fprintf(ofp, "%u\t%u\n", i.el, i.count);
++    for(auto &i: structs) std::fprintf(ofp, "%u\t%u\n", i.first, i.second);
+     if(ofp != stdout) std::fclose(ofp);
+     return EXIT_SUCCESS;
+ }

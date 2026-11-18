@@ -1,0 +1,335 @@
+diff --git a/docs/src/compute.md b/docs/src/compute.md
+index cbee0b47..284235d7 100644
+--- a/docs/src/compute.md
++++ b/docs/src/compute.md
+@@ -33,6 +33,19 @@ The `cholmod`, `accelerate`, and `pardiso` solvers perform batched direct solves
+ Threading in these modes parallelizes the postprocessing step (current map
+ accumulation and output writing).
+ 
++## Convergence Checks
++
++Every linear solve, whichever solver produced it, is accepted only if its true
++relative residual `‖Gv − b‖ / ‖b‖` is below `residual_tolerance` (by default
++`1e-4` in double precision and `1e-3` in single). For `cg+amg` there is a subtlety: Krylov's stopping test is on the
++*preconditioned* residual, and when the multigrid preconditioner is a poor fit
++for a particular component the two norms can disagree — CG reports success
++while the true residual is still too large. Circuitscape then tightens the
++Krylov tolerance and retries (up to three attempts) before failing, so a single
++awkward component does not abort a long run. The retry is logged as a warning;
++if you see many of them, the grid probably has extreme resistance contrasts
++worth examining.
++
+ ## Default Solvers: CG+AMG and CHOLMOD
+ 
+ Circuitscape ships with two solvers that work out of the box with no additional
+diff --git a/docs/src/options.md b/docs/src/options.md
+index ef0aae61..d6b406e6 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -89,6 +89,7 @@ All Circuitscape configuration is done through an `.ini` file. Below is a comple
+ | `precision` | String | `Double` | Floating-point precision. Values: `Double`, `Single`. CHOLMOD and Pardiso require double precision. |
+ | `use_64bit_indexing` | Boolean | `True` | If `True`, use 64-bit integer indexing. Required for very large grids. |
+ | `cholmod_batch_size` | Integer | `1000` | Number of pairs to solve simultaneously when using CHOLMOD in pairwise mode. |
++| `residual_tolerance` | Float | `auto` | Every linear solve is accepted only if its true relative residual `‖Gv − b‖ / ‖b‖` is below this. `auto` means `1e-4` in double precision and `1e-3` in single. With `cg+amg`, a solve that stops short is retried with tighter Krylov tolerances before the run is aborted. |
+ | `parallelize` | Boolean | `False` | If `True`, run iterations in parallel using Julia threads. Start Julia with `julia -t N` for N threads. |
+ 
+ | `low_memory_mode` | Boolean | `False` | Circuitscape 4 option, not implemented in Circuitscape.jl. Setting it to `True` is an error so that it cannot be relied on silently. |
+diff --git a/ext/CircuitscapeAppleAccelerateExt.jl b/ext/CircuitscapeAppleAccelerateExt.jl
+index a618f13a..1ae5550f 100644
+--- a/ext/CircuitscapeAppleAccelerateExt.jl
++++ b/ext/CircuitscapeAppleAccelerateExt.jl
+@@ -12,11 +12,11 @@ function construct_cholesky_factor(matrix, ::AccelerateSolver)
+     factor
+ end
+ 
+-function solve_linear_system(factor::AppleAccelerate.AAFactorization, matrix, rhs)
++function solve_linear_system(factor::AppleAccelerate.AAFactorization, matrix, rhs; tol = 1e-4)
+     lhs = factor \ rhs
+     for col = 1:size(rhs, 2)
+         residual = norm(matrix * lhs[:, col] .- rhs[:, col]) / norm(rhs[:, col])
+-        residual < 1e-4 || error("Apple Accelerate solver residual $residual exceeds tolerance 1e-4 for column $col")
++        residual < tol || error("Apple Accelerate solver residual $residual exceeds tolerance $tol for column $col")
+     end
+     lhs
+ end
+diff --git a/ext/CircuitscapePardisoExt.jl b/ext/CircuitscapePardisoExt.jl
+index c68a4449..000e026c 100644
+--- a/ext/CircuitscapePardisoExt.jl
++++ b/ext/CircuitscapePardisoExt.jl
+@@ -31,14 +31,14 @@ end
+ construct_cholesky_factor(matrix, ::PardisoSolver) =
+     PardisoFactorize()
+ 
+-function solve_linear_system(factor::PardisoFactorize, matrix, rhs)
++function solve_linear_system(factor::PardisoFactorize, matrix, rhs; tol = 1e-4)
+     lhs = similar(rhs)
+     mat = sparse(10eps(eltype(matrix)) * I, size(matrix)...) + matrix
+     x = zeros(eltype(matrix), size(matrix, 1))
+     for i = 1:size(lhs, 2)
+         factor(x, mat, rhs[:, i])
+         residual = norm(mat * x .- rhs[:, i]) / norm(rhs[:, i])
+-        residual < 1e-4 || error("Pardiso solver residual $residual exceeds tolerance 1e-4 for column $i")
++        residual < tol || error("Pardiso solver residual $residual exceeds tolerance $tol for column $i")
+         lhs[:, i] .= x
+     end
+     lhs
+diff --git a/src/config.jl b/src/config.jl
+index 3c457a71..08edd646 100644
+--- a/src/config.jl
++++ b/src/config.jl
+@@ -27,6 +27,7 @@ Base.@kwdef struct CSConfig
+     precision::Precision = pr_double
+     use_64bit_indexing::Bool = true
+     cholmod_batch_size::Int = 1000
++    residual_tolerance::Float64 = 0.0   # 0 = automatic: 1e-4 double, 1e-3 single
+     low_memory_mode::Bool = false
+     preemptive_memory_release::Bool = false
+     use_variable_source_strengths::Bool = false
+@@ -93,6 +94,9 @@ function _parse_precision(s)
+     s in DOUBLE ? pr_double : _bad_value("precision", s, ["single", "double"])
+ end
+ 
++_parse_tolerance(s) = s in ("auto", "Auto", "AUTO", "None", "") ? 0.0 : parse(Float64, s)
++_tolerance_str(v) = v > 0 ? string(v) : "auto"
++
+ function _parse_log_level(s)
+     # Circuitscape 4 accepted Python's level names; keep reading them.
+     l = lowercase(s)
+@@ -139,6 +143,7 @@ function CSConfig(dict::Dict{String,String})
+         precision = _parse_precision(get(dict, "precision", "Double")),
+         use_64bit_indexing = _parse_bool(dict, "use_64bit_indexing", "true"),
+         cholmod_batch_size = parse(Int, get(dict, "cholmod_batch_size", "1000")),
++        residual_tolerance = _parse_tolerance(get(dict, "residual_tolerance", "auto")),
+         low_memory_mode = _parse_bool(dict, "low_memory_mode"),
+         preemptive_memory_release = _parse_bool(dict, "preemptive_memory_release"),
+         use_variable_source_strengths = _parse_bool(dict, "use_variable_source_strengths"),
+@@ -286,6 +291,7 @@ function Base.Dict{String,String}(cfg::CSConfig)
+     a["precision"] = _precision_str(cfg.precision)
+     a["use_64bit_indexing"] = _bool_str(cfg.use_64bit_indexing)
+     a["cholmod_batch_size"] = string(cfg.cholmod_batch_size)
++    a["residual_tolerance"] = _tolerance_str(cfg.residual_tolerance)
+     a["low_memory_mode"] = _bool_str(cfg.low_memory_mode)
+     a["preemptive_memory_release"] = _bool_str(cfg.preemptive_memory_release)
+     a["use_variable_source_strengths"] = _bool_str(cfg.use_variable_source_strengths)
+@@ -380,6 +386,7 @@ function init_config()
+     a["log_file"] = "None"
+     a["log_level"] = "INFO"
+     a["cholmod_batch_size"] = "1000"
++    a["residual_tolerance"] = "auto"
+     a["use_64bit_indexing"] = "true"
+     a["write_as_tif"] = "false"
+     a["suppress_messages"] = "false"
+@@ -437,6 +444,7 @@ function write_config(cfg::CSConfig)
+ 
+         [Calculation options]
+         solver = $(_solver_str(cfg.solver))
++        residual_tolerance = $(_tolerance_str(cfg.residual_tolerance))
+ 
+         [Output options]
+         write_cum_cur_map_only = $(cfg.write_cum_cur_map_only)
+diff --git a/src/consts.jl b/src/consts.jl
+index d1345cab..157793a4 100644
+--- a/src/consts.jl
++++ b/src/consts.jl
+@@ -39,9 +39,12 @@ const FILE_HDR_INCL_PAIRS = "mode"
+ # Constants for logging
+ const DEBUG = ["DEBUG", "debug", "Debug"]
+ 
+-# Constants for tolerance when checking matrix norms
++# Default acceptance thresholds for the true relative residual of a linear
++# solve, by precision. 1e-4 in double was settled on in #406; 1e-4 is at the
++# edge of what Float32 can reach, hence 1e-3 in single. Override per run with
++# `residual_tolerance` in the INI.
+ const TOL_SINGLE = 1e-3
+-const TOL_DOUBLE = 1e-5
++const TOL_DOUBLE = 1e-4
+ 
+ # Sentinel value for invalid/unreachable resistance entries in shortcut mode
+ const RESISTANCE_INVALID = -777
+diff --git a/src/core.jl b/src/core.jl
+index d44d677f..7d7bba4a 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -234,7 +234,7 @@ function solve(prob::GraphProblem{T,V}, ::AMGSolver, flags, cfg, log)::Matrix{T}
+                 current[comp_j] = 1
+ 
+                 log && haskey(pair_numbers, (src_node, dst_node)) && @debug("Solving pair $(pair_numbers[(src_node, dst_node)]) of $num_pairs")
+-                voltages = @timeit local_timer "solve linear system" solve_linear_system(matrix, current, local_P)
++                voltages = @timeit local_timer "solve linear system" solve_linear_system(matrix, current, local_P; tol = residual_tolerance(cfg, T))
+ 
+                 voltages .= voltages .- voltages[comp_i]
+                 resistance = voltages[comp_j] - voltages[comp_i]
+@@ -471,7 +471,7 @@ function solve(prob::GraphProblem{T,V}, solver::Union{CholmodSolver, PardisoSolv
+                 rhs[node.cc_idx[2], col] = 1
+             end
+ 
+-            lhs = solve_linear_system(factor, matrix, rhs)
++            lhs = solve_linear_system(factor, matrix, rhs; tol = residual_tolerance(cfg, T))
+ 
+             # Normalisation step
+             for (col, batch_pos) in enumerate(batch_range)
+@@ -644,21 +644,57 @@ function sum_off_diag(G, i)
+      sum
+  end
+ 
++"""
++    residual_tolerance(cfg, T)
++
++Largest acceptable true relative residual `‖Gv − b‖ / ‖b‖` for a solve in
++precision `T`. `cfg.residual_tolerance` when the user set one; otherwise
++`1e-4` in double and `1e-3` in single, since Float32 round-off puts `1e-4`
++at the edge of what CG can reach (the fixed `1e-4` gate broke every single
++precision run).
++"""
++residual_tolerance(cfg, ::Type{T}) where {T} =
++    cfg.residual_tolerance > 0 ? cfg.residual_tolerance :
++    T === Float32 ? TOL_SINGLE : TOL_DOUBLE
++
++"""
++    solve_linear_system(G, curr, M; tol)
++
++Preconditioned CG. Krylov's stopping test is on the *preconditioned* residual
++`sqrt(r' M⁻¹ r)`, while the result is accepted on the true 2-norm relative
++residual. When the AMG preconditioner is a poor fit for a component the two
++diverge: CG reports success in its own norm while the true residual is still
++above `tol` (issue #470). Rather than abort a multi-hour job on one such
++solve, tighten the stopping tolerances and retry; solves that pass first time
++are unaffected.
++"""
+ function solve_linear_system(
+             G::SparseMatrixCSC{T,V},
+-            curr::Vector{T}, M)::Vector{T} where {T,V}
+-    v, stats = Krylov.cg(G, curr, M=M, ldiv=true, rtol=T(1e-6), itmax=100_000)
+-    residual = norm(G*v .- curr) / norm(curr)
+-    residual < 1e-4 || error("CG solver did not converge: relative residual $residual exceeds tolerance 1e-4")
+-    v
++            curr::Vector{T}, M; tol = TOL_DOUBLE)::Vector{T} where {T,V}
++    # Krylov's own default for atol; in Float32 it is ~3e-4 and is what
++    # actually stops CG, so it has to be tightened along with rtol.
++    atol = sqrt(eps(T))
++    rtol = T === Float32 ? T(1e-5) : T(1e-6)
++    local v, stats, residual
++    for attempt in 1:3
++        v, stats = Krylov.cg(G, curr, M=M, ldiv=true, atol=atol, rtol=rtol, itmax=100_000)
++        residual = norm(G*v .- curr) / norm(curr)
++        residual < tol && return v
++        attempt < 3 && @warn("CG stopped after $(stats.niter) iterations ($(stats.status)) " *
++                             "but the relative residual $residual exceeds $tol; " *
++                             "retrying with rtol = $(rtol / 100)")
++        atol /= 100
++        rtol /= 100
++    end
++    error("CG solver did not converge: relative residual $residual exceeds tolerance $tol " *
++          "after 3 attempts (last rtol = $(rtol * 100), $(stats.niter) iterations, $(stats.status))")
+ end
+ 
+-
+-function solve_linear_system(factor::SuiteSparse.CHOLMOD.Factor, matrix, rhs)
++function solve_linear_system(factor::SuiteSparse.CHOLMOD.Factor, matrix, rhs; tol = TOL_DOUBLE)
+     lhs = factor \ rhs
+     for col = 1:size(rhs, 2)
+         residual = norm(matrix*lhs[:,col] .- rhs[:,col]) / norm(rhs[:,col])
+-        residual < 1e-4 || error("CHOLMOD solver residual $residual exceeds tolerance 1e-4 for column $col")
++        residual < tol || error("CHOLMOD solver residual $residual exceeds tolerance $tol for column $col")
+     end
+     lhs
+ end
+diff --git a/src/raster/advanced.jl b/src/raster/advanced.jl
+index 8e1d5b6f..14a9943b 100644
+--- a/src/raster/advanced.jl
++++ b/src/raster/advanced.jl
+@@ -295,7 +295,7 @@ function multiple_solver(cfg, solver, a::SparseMatrixCSC{T,V}, sources, grounds,
+     deleteat!(r, dst_del)
+     asolve = asolve[r, r]
+ 
+-    volt = multiple_solve(solver, asolve, sources)
++    volt = multiple_solve(cfg, solver, asolve, sources)
+ 
+     # Replace the inf with 0
+     voltages = zeros(eltype(a), length(volt) + length(infgrounds))
+@@ -312,37 +312,29 @@ function multiple_solver(cfg, solver, a::SparseMatrixCSC{T,V}, sources, grounds,
+     voltages
+ end
+ 
+-function multiple_solve(s::AMGSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
++function multiple_solve(cfg, s::AMGSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
+     # Pin the coarse solver and smoothers for the same reason as in core.jl:
+     # CG needs a symmetric positive definite preconditioner.
+     M = aspreconditioner(smoothed_aggregation(matrix;
+                                               coarse_solver = AlgebraicMultigrid.Pinv,
+                                               presmoother = AlgebraicMultigrid.GaussSeidel(),
+                                               postsmoother = AlgebraicMultigrid.GaussSeidel()))
+-    volt = solve_linear_system(matrix, sources, M)
+-    @assert (norm(matrix*volt .- sources) / norm(sources)) < 1e-4
+-    volt
++    solve_linear_system(matrix, sources, M; tol = residual_tolerance(cfg, T))
+ end
+ 
+-function multiple_solve(s::CholmodSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
++function multiple_solve(cfg, s::CholmodSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
+     factor = construct_cholesky_factor(matrix, s)
+-    volt = solve_linear_system(factor, matrix, sources)
+-    @assert (norm(matrix*volt .- sources) / norm(sources)) < 1e-4
+-    volt
++    solve_linear_system(factor, matrix, sources; tol = residual_tolerance(cfg, T))
+ end
+ 
+-function multiple_solve(s::PardisoSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
++function multiple_solve(cfg, s::PardisoSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
+     factor = construct_cholesky_factor(matrix, s)
+-    volt = solve_linear_system(factor, matrix, sources)
+-    @assert (norm(matrix*volt .- sources) / norm(sources)) < 1e-4
+-    volt
++    solve_linear_system(factor, matrix, sources; tol = residual_tolerance(cfg, T))
+ end
+ 
+-function multiple_solve(s::AccelerateSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
++function multiple_solve(cfg, s::AccelerateSolver, matrix::SparseMatrixCSC{T,V}, sources::Vector{T}) where {T,V}
+     factor = construct_cholesky_factor(matrix, s)
+-    volt = solve_linear_system(factor, matrix, sources)
+-    @assert (norm(matrix*volt .- sources) / norm(sources)) < 1e-4
+-    volt
++    solve_linear_system(factor, matrix, sources; tol = residual_tolerance(cfg, T))
+ end
+ 
+ struct FullGraph{T,V}
+diff --git a/test/internal.jl b/test/internal.jl
+index 16e8b0a2..66d3dbf5 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -1,5 +1,6 @@
+ import Circuitscape: construct_node_map, compute_omniscape_current
+ using Circuitscape
++import LinearAlgebra
+ 
+ # Omniscape moving window solve test 
+ # just checking syntax, other tests should be sufficient to ensure correctness.
+@@ -332,3 +333,28 @@ end
+     @test all(ota_cum[i, j] == 0 for (i, j) in focal)
+     @test any(ota_cum .> 0)
+ end
++
++# Issue 470: the residual gate is configurable, and an unreachable tolerance
++# fails with the retry history rather than a bare threshold.
++@testset "Residual tolerance (#470)" begin
++    d = Circuitscape.init_config(); d["scenario"] = "pairwise"
++    cfg = Circuitscape.CSConfig(d)
++    @test cfg.residual_tolerance == 0.0
++    @test Circuitscape.residual_tolerance(cfg, Float64) == 1e-4
++    @test Circuitscape.residual_tolerance(cfg, Float32) == 1e-3
++    d["residual_tolerance"] = "1e-6"
++    cfg = Circuitscape.CSConfig(d)
++    @test Circuitscape.residual_tolerance(cfg, Float64) == 1e-6
++    @test Circuitscape.residual_tolerance(cfg, Float32) == 1e-6
++    @test Dict{String,String}(cfg)["residual_tolerance"] == "1.0e-6"
++
++    G = model_problem(4)
++    G.nzval .+= eps(Float64) * LinearAlgebra.norm(G.nzval)
++    M = Circuitscape.aspreconditioner(Circuitscape.smoothed_aggregation(G))
++    b = zeros(16); b[1] = -1; b[16] = 1
++    v = Circuitscape.solve_linear_system(G, b, M)
++    @test LinearAlgebra.norm(G * v .- b) / LinearAlgebra.norm(b) < 1e-4
++    err = try Circuitscape.solve_linear_system(G, b, M; tol = 0.0); nothing catch e; e end
++    @test err isa ErrorException
++    @test occursin("after 3 attempts", err.msg)
++end

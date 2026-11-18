@@ -1,0 +1,483 @@
+diff --git a/NAMESPACE b/NAMESPACE
+index 5af7eb3d..5c2c51b2 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -173,6 +173,7 @@ importFrom(igraph,graph_from_data_frame)
+ importFrom(jsonlite,read_json)
+ importFrom(magrittr,"%<>%")
+ importFrom(magrittr,"%>%")
++importFrom(magrittr,extract2)
+ importFrom(magrittr,set_attr)
+ importFrom(methods,as)
+ importFrom(parallel,detectCores)
+diff --git a/R/align_lineage.R b/R/align_lineage.R
+index 28f12213..e89c6aff 100644
+--- a/R/align_lineage.R
++++ b/R/align_lineage.R
+@@ -45,21 +45,12 @@ repAlignLineage <- function(.data) {
+     "Please download it from here: https://github.com/rcedgar/muscle/releases/latest\n",
+     "or install it with your system package manager (such as apt or dnf)."
+   ))
+-  if (inherits(.data, "list")) {
+-    .validate_repertoires_data(.data)
+-    .data %<>%
+-      lapply(function(sample_data) {
+-        sample_data %>%
+-          as_tibble() %>%
+-          align_single_df()
+-      })
+-    return(.data)
+-  } else {
+-    .data %<>%
+-      as_tibble() %>%
+-      align_single_df()
+-    return(.data)
+-  }
++  .data %<>%
++    apply_to_sample_or_list(
++      align_single_df,
++      .min.lineage.sequences = .min.lineage.sequences
++    )
++  return(.data)
+ }
+ 
+ align_single_df <- function(data) {
+diff --git a/R/distance.R b/R/distance.R
+index bb0b956a..960e602b 100644
+--- a/R/distance.R
++++ b/R/distance.R
+@@ -11,7 +11,7 @@
+ #' @usage
+ #'
+ #' seqDist(.data, .col = 'CDR3.nt', .method = 'hamming',
+-#'  .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, ...)
++#'  .group_by = c("V.first", "J.first"), .group_by_seqLength = TRUE, ...)
+ #'
+ #' @param .data The data to be processed. Can be \link{data.frame},
+ #' \link{data.table}, or a list of these objects.
+@@ -22,7 +22,7 @@
+ #'
+ #' @param .method Character value or user-defined function.
+ #'
+-#' @param .group_by Character vector of column names to group sequence by. Default value is c("V.name", "J.name"). Pass NA for no grouping options
++#' @param .group_by Character vector of column names to group sequence by. Default value is c("V.first", "J.first"). Columns "V.first" and "J.first" containing first genes without allele suffixes are calculated automatically from "V.name" and "J.name" if absent in the data. Pass NA for no grouping options.
+ #'
+ #' @param .group_by_seqLength If TRUE  - add grouping by sequence length of .col argument
+ #'
+@@ -66,12 +66,27 @@
+ #' seqDist(immdata$data[1:2], .method = f, .group_by_seqLength = FALSE)
+ #' @export seqDist
+ 
+-seqDist <- function(.data, .col = "CDR3.nt", .method = "hamming", .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, ...) {
++seqDist <- function(.data, .col = "CDR3.nt", .method = "hamming", .group_by = c("V.first", "J.first"), .group_by_seqLength = TRUE, ...) {
+   .validate_repertoires_data(.data)
+-  first_sample <- .data[[1]]
+   gr_by_is_na <- all(is.na(.group_by))
++  # prepare columns with 1st V and J genes if they are used, but not yet calculated
++  if ("V.first" %in% .group_by) {
++    .data %<>% apply_to_sample_or_list(
++      add_column_with_first_gene,
++      .original_colname = "V.name",
++      .target_colname = "V.first"
++    )
++  }
++  if ("J.first" %in% .group_by) {
++    .data %<>% apply_to_sample_or_list(
++      add_column_with_first_gene,
++      .original_colname = "J.name",
++      .target_colname = "J.first"
++    )
++  }
+   # Since seqDist works with any columns of string type, classic .col values are not suported
+   if (.col %in% c("aa", "nt", "v", "j", "aa+v")) stop("Please, provide full column name")
++  first_sample <- .data[[1]]
+   if (!all(.group_by %in% colnames(first_sample)) && !gr_by_is_na) {
+     stop("Expected column(s): ", paste0(.group_by, collapse = ", "), "; some of them are missing in data!")
+   }
+diff --git a/R/germline.R b/R/germline.R
+index 67217c47..67eb1465 100644
+--- a/R/germline.R
++++ b/R/germline.R
+@@ -7,11 +7,11 @@
+ #'
+ #' @concept germline
+ #'
+-#' @aliases repGermline germline_single_df take_first_allele generate_germline_sequence merge_reference_sequences validate_genes_edges validate_chains_length
++#' @aliases repGermline germline_single_df generate_germline_sequence merge_reference_sequences validate_genes_edges validate_chains_length
+ #'
+ #' @importFrom stringr str_sub str_length str_replace fixed
+ #' @importFrom purrr imap
+-#' @importFrom magrittr %>% %<>%
++#' @importFrom magrittr %>% %<>% extract2
+ #' @importFrom tidyr drop_na
+ #' @importFrom dplyr rowwise
+ 
+@@ -33,6 +33,9 @@
+ #' "OncorhynchusMykiss", "OrnithorhynchusAnatinus", "OryctolagusCuniculus", "RattusNorvegicus",
+ #' "SusScrofa".
+ #'
++#' @param min_nuc_outside_cdr3 This parameter sets how many nucleotides should have V or J chain
++#' outside of CDR3 to be considered good for further alignment.
++#'
+ #' @return
+ #'
+ #' Data with added columns V.first.allele, J.first.allele (with first alleles of V and J genes),
+@@ -47,34 +50,33 @@
+ #'   top(2000) %>% # reduce the dataset to save time on examples
+ #'   repGermline()
+ #' @export repGermline
+-repGermline <- function(.data, species = "HomoSapiens") {
+-  if (inherits(.data, "list")) {
+-    .validate_repertoires_data(.data)
+-    .data %<>%
+-      purrr::imap(function(sample_data, sample_name) {
+-        sample_data %>%
+-          as_tibble() %>%
+-          germline_single_df(species, sample_name)
+-      })
+-    return(.data)
+-  } else {
+-    .data %<>%
+-      as_tibble() %>%
+-      germline_single_df(species)
+-    return(.data)
+-  }
++repGermline <- function(.data, species = "HomoSapiens", min_nuc_outside_cdr3 = 5) {
++  .data %<>%
++    apply_to_sample_or_list(
++      germline_single_df,
++      .with_names = TRUE,
++      species = species,
++      min_nuc_outside_cdr3 = min_nuc_outside_cdr3
++    )
++  return(.data)
+ }
+ 
+-germline_single_df <- function(data, species, sample_name = NA) {
++germline_single_df <- function(data, species, min_nuc_outside_cdr3, sample_name = NA) {
+   data %<>%
+     validate_genes_edges(sample_name) %>%
+-    rowwise() %>%
+-    mutate(V.first.allele = take_first_allele(V.name)) %>%
++    add_column_with_first_gene(
++      "V.name",
++      "V.first.allele",
++      .with_allele = TRUE
++    ) %>%
+     merge_reference_sequences("V", species, sample_name) %>%
+-    rowwise() %>%
+-    mutate(J.first.allele = take_first_allele(J.name)) %>%
++    add_column_with_first_gene(
++      "J.name",
++      "J.first.allele",
++      .with_allele = TRUE
++    ) %>%
+     merge_reference_sequences("J", species, sample_name) %>%
+-    validate_chains_length(sample_name) %>%
++    validate_chains_length(min_nuc_outside_cdr3, sample_name) %>%
+     rowwise() %>%
+     mutate(Germline.sequence = generate_germline_sequence(
+       Sequence, V.sequence, J.sequence, V.end, CDR3.start, CDR3.end, J.start, sample_name
+@@ -83,17 +85,6 @@ germline_single_df <- function(data, species, sample_name = NA) {
+   return(data)
+ }
+ 
+-take_first_allele <- function(string) {
+-  string %<>%
+-    # first allele is substring until first ',' or '(' in string taken from column with gene names
+-    strsplit(",|\\(") %>%
+-    unlist() %>%
+-    extract2(1) %>%
+-    # MiXCR uses *00 for unknown alleles; replace *00 to *01 to find them in reference
+-    stringr::str_replace(stringr::fixed("*00"), "*01")
+-  return(string)
+-}
+-
+ generate_germline_sequence <- function(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start, sample_name) {
+   if (any(is.na(c(seq, v_ref, j_ref, v_end, cdr3_start, cdr3_end, j_start))) || (seq == "")) {
+     warning(
+@@ -233,27 +224,22 @@ validate_genes_edges <- function(data, sample_name) {
+   return(data)
+ }
+ 
+-# min_nuc_outside_cdr3 parameter sets how many nucleotides should have V or J chain
+-# outside of CDR3 to be considered good for further alignment
+-validate_chains_length <- function(data, sample_name, min_nuc_outside_cdr3 = 5) {
+-  too_short_v_chains_num <- data %>%
+-    rowwise() %>%
+-    mutate(Too.short.V = min(V.end, as.numeric(CDR3.start)) < min_nuc_outside_cdr3) %>%
+-    pull(Too.short.V) %>%
+-    sum()
+-  too_short_j_chains_num <- data %>%
+-    rowwise() %>%
+-    mutate(
+-      Too.short.J =
+-        stringr::str_length(Sequence) + 1 - max(J.start, as.numeric(CDR3.end)) < min_nuc_outside_cdr3
+-    ) %>%
+-    pull(Too.short.J) %>%
+-    sum()
++validate_chains_length <- function(data, min_nuc_outside_cdr3, sample_name) {
++  old_length_v <- nrow(data)
++  data %<>% filter(pmin(V.end, as.numeric(CDR3.start)) >= min_nuc_outside_cdr3)
++  dropped_v <- old_length_v - nrow(data)
++  old_length_j <- nrow(data)
++  if (nrow(data) > 0) {
++    data %<>%
++      filter(stringr::str_length(Sequence) + 1 - pmax(J.start, as.numeric(CDR3.end)) >=
++        min_nuc_outside_cdr3)
++  }
++  dropped_j <- old_length_j - nrow(data)
++
+   warning_prefix <- paste0(
+-    too_short_v_chains_num,
+     " clonotype(s) ",
+     optional_sample("in sample ", sample_name, " "),
+-    "have too short part of "
++    "were dropped because they have too short part of "
+   )
+   warning_suffix <- paste0(
+     " chain that doesn't intersect with CDR3!\n",
+@@ -261,11 +247,18 @@ validate_chains_length <- function(data, sample_name, min_nuc_outside_cdr3 = 5)
+     min_nuc_outside_cdr3,
+     " are considered too short."
+   )
+-  if (too_short_v_chains_num > 0) {
+-    warning(warning_prefix, "V", warning_suffix)
++  if (dropped_v > 0) {
++    warning(dropped_v, warning_prefix, "V", warning_suffix)
++  }
++  if (dropped_j > 0) {
++    warning(dropped_j, warning_prefix, "J", warning_suffix)
+   }
+-  if (too_short_j_chains_num > 0) {
+-    warning(warning_prefix, "J", warning_suffix)
++  if (nrow(data) == 0) {
++    stop(
++      "Sample ",
++      optional_sample("", sample_name, " "),
++      "dataframe is empty after dropping sequences with too short V and J chains!"
++    )
+   }
+   return(data)
+ }
+diff --git a/R/tools.R b/R/tools.R
+index 20ba637e..f691549b 100644
+--- a/R/tools.R
++++ b/R/tools.R
+@@ -150,7 +150,6 @@ add_pb <- function(.pb, .value = 1) {
+ #' @concept utility_private
+ #'
+ #' @param x Character vector of length 1.
+-#' @param .verbose If TRUE then print any issues or wanings.
+ #'
+ #' @return
+ #' A string with the column name.
+@@ -158,7 +157,7 @@ add_pb <- function(.pb, .value = 1) {
+ #' @section Developer Examples:
+ #' immunarch:::.quant_column_choice("count")
+ #' immunarch:::.quant_column_choice("freq")
+-.quant_column_choice <- function(x, .verbose = TRUE) {
++.quant_column_choice <- function(x) {
+   x <- switch(x[1],
+     count = IMMCOL$count,
+     Count = IMMCOL$count,
+@@ -252,7 +251,7 @@ check_group_names <- function(.meta, .by) {
+     names_to_check <- names(.by)
+   }
+ 
+-  for (i in 1:length(names_to_check)) {
++  for (i in seq_along(names_to_check)) {
+     if (!(names_to_check[i] %in% colnames(.meta))) {
+       message("Check failed: '", names_to_check[i], "' not in the metadata table!")
+       return(FALSE)
+@@ -282,7 +281,7 @@ group_from_metadata <- function(.by, .metadata, .sep = "; ") {
+   if (length(.by) == 1) {
+     collect(select(.metadata, .by))[[1]]
+   } else {
+-    do.call(paste, c(list(sep = .sep), lapply(1:length(.by), function(i) {
++    do.call(paste, c(list(sep = .sep), lapply(seq_along(.by), function(i) {
+       collect(select(.metadata, .by[i]))[[1]]
+     })))
+   }
+@@ -370,7 +369,7 @@ rename_column <- function(.data, .old, .new) {
+ apply_symm <- function(.datalist, .fun, ..., .diag = NA, .verbose = TRUE) {
+   res <- matrix(0, length(.datalist), length(.datalist))
+   if (.verbose) pb <- set_pb(length(.datalist)^2 / 2 + length(.datalist) / 2)
+-  for (i in 1:length(.datalist)) {
++  for (i in seq_along(.datalist)) {
+     for (j in i:length(.datalist)) {
+       if (i == j && is.na(.diag)) {
+         res[i, j] <- NA
+@@ -389,8 +388,8 @@ apply_symm <- function(.datalist, .fun, ..., .diag = NA, .verbose = TRUE) {
+ apply_asymm <- function(.datalist, .fun, ..., .diag = NA, .verbose = TRUE) {
+   res <- matrix(0, length(.datalist), length(.datalist))
+   if (.verbose) pb <- set_pb(length(.datalist)^2)
+-  for (i in 1:length(.datalist)) {
+-    for (j in 1:length(.datalist)) {
++  for (i in seq_along(.datalist)) {
++    for (j in seq_along(.datalist)) {
+       if (i == j && is.na(.diag)) {
+         res[i, j] <- NA
+       } else {
+@@ -483,17 +482,51 @@ as_numeric_or_fail <- function(.string) {
+   return(result)
+ }
+ 
+-all_bcr_columns_present <- function(.data) {
+-  expected_columns <- c(
+-    IMMCOL$order,
+-    IMMCOL_EXT$bestv, IMMCOL_EXT$bestj, IMMCOL_EXT$cdr3s, IMMCOL_EXT$cdr3e, IMMCOL_EXT$c
+-  )
+-  return(all(expected_columns %in% colnames(.data)))
++# apply function to .data if it's a single sample or to each sample if .data is a list of samples
++apply_to_sample_or_list <- function(.data, .function, .with_names = FALSE, ...) {
++  if (inherits(.data, "list")) {
++    .validate_repertoires_data(.data)
++    if (.with_names) {
++      .data %<>%
++        purrr::imap(function(sample_data, sample_name) {
++          sample_data %>%
++            as_tibble() %>%
++            .function(..., sample_name = sample_name)
++        })
++    } else {
++      .data %<>%
++        lapply(function(sample_data) {
++          sample_data %>%
++            as_tibble() %>%
++            .function(...)
++        })
++    }
++    return(.data)
++  } else {
++    .data %<>%
++      as_tibble() %>%
++      .function(...)
++    return(.data)
++  }
++}
++
++# return TRUE if target column doesn't exist, otherwise FALSE; stop if original column doesn't exist
++validate_columns <- function(.data, .original_colname, .target_colname) {
++  if (!(.original_colname %in% colnames(.data))) {
++    stop(
++      "Trying to get data from missing column ",
++      .original_colname,
++      ", available columns: ",
++      colnames(.data)
++    )
++  }
++  # FALSE return value means that the column was previously added and no need to add it again
++  return(!(.target_colname %in% colnames(.data)))
+ }
+ 
+ # get genes from original column, remove alleles and write to target column
+ add_column_without_alleles <- function(.data, .original_colname, .target_colname) {
+-  if (.original_colname %in% colnames(.data)) {
++  if (validate_columns(.data, .original_colname, .target_colname)) {
+     .data[[.target_colname]] <- gsub(
+       ", ", ",",
+       .data[[.original_colname]]
+@@ -515,13 +548,34 @@ add_column_without_alleles <- function(.data, .original_colname, .target_colname
+       "[*][[:digit:]]*", "",
+       .data[[.target_colname]]
+     )
+-  } else {
+-    stop(paste0(
+-      "Trying to remove alleles from missing column ", .original_colname,
+-      ", available columns: ", colnames(.data)
+-    ))
+   }
+-  .data
++  return(.data)
++}
++
++add_column_with_first_gene <- function(.data, .original_colname, .target_colname, .with_allele = FALSE) {
++  if (validate_columns(.data, .original_colname, .target_colname)) {
++    .data[[.target_colname]] <- .data[[.original_colname]] %>% sapply(
++      function(genes_string) {
++        if (.with_allele) {
++          genes_string %<>%
++            # first allele is substring until first ',' or '(' in string taken from column with gene names
++            strsplit(",|\\(") %>%
++            unlist() %>%
++            magrittr::extract2(1) %>%
++            # MiXCR uses *00 for unknown alleles; replace *00 to *01 to find them in reference
++            stringr::str_replace(stringr::fixed("*00"), "*01")
++        } else {
++          genes_string %<>%
++            # first gene is substring until first ',', '(' or '*'
++            strsplit(",|\\(|\\*") %>%
++            unlist() %>%
++            magrittr::extract2(1)
++        }
++        return(genes_string)
++      }
++    )
++  }
++  return(.data)
+ }
+ 
+ # used to add sample name to error/warning messages when sample name is available
+diff --git a/man/dot-quant_column_choice.Rd b/man/dot-quant_column_choice.Rd
+index e7a7972e..5831881b 100644
+--- a/man/dot-quant_column_choice.Rd
++++ b/man/dot-quant_column_choice.Rd
+@@ -4,12 +4,10 @@
+ \alias{.quant_column_choice}
+ \title{Get a column's name using the input alias}
+ \usage{
+-.quant_column_choice(x, .verbose = TRUE)
++.quant_column_choice(x)
+ }
+ \arguments{
+ \item{x}{Character vector of length 1.}
+-
+-\item{.verbose}{If TRUE then print any issues or wanings.}
+ }
+ \value{
+ A string with the column name.
+diff --git a/man/repGermline.Rd b/man/repGermline.Rd
+index 6e49d503..abce8895 100644
+--- a/man/repGermline.Rd
++++ b/man/repGermline.Rd
+@@ -3,7 +3,6 @@
+ \name{repGermline}
+ \alias{repGermline}
+ \alias{germline_single_df}
+-\alias{take_first_allele}
+ \alias{generate_germline_sequence}
+ \alias{merge_reference_sequences}
+ \alias{validate_genes_edges}
+@@ -29,6 +28,9 @@ It must have columns in the immunarch compatible format \link{immunarch_data_for
+ "MusMusculusCastaneus", "MusMusculusMolossinus", "MusMusculusMusculus", "MusSpretus",
+ "OncorhynchusMykiss", "OrnithorhynchusAnatinus", "OryctolagusCuniculus", "RattusNorvegicus",
+ "SusScrofa".}
++
++\item{min_nuc_outside_cdr3}{This parameter sets how many nucleotides should have V or J chain
++outside of CDR3 to be considered good for further alignment.}
+ }
+ \value{
+ Data with added columns V.first.allele, J.first.allele (with first alleles of V and J genes),
+diff --git a/man/seqDist.Rd b/man/seqDist.Rd
+index 650bb09a..749f2e4c 100644
+--- a/man/seqDist.Rd
++++ b/man/seqDist.Rd
+@@ -5,7 +5,7 @@
+ \title{Function for computing distance for sequences}
+ \usage{
+ seqDist(.data, .col = 'CDR3.nt', .method = 'hamming',
+- .group_by = c("V.name", "J.name"), .group_by_seqLength = TRUE, ...)
++ .group_by = c("V.first", "J.first"), .group_by_seqLength = TRUE, ...)
+ }
+ \arguments{
+ \item{.data}{The data to be processed. Can be \link{data.frame},
+@@ -17,7 +17,7 @@ Every object must have columns in the immunarch compatible format \link{immunarc
+ 
+ \item{.method}{Character value or user-defined function.}
+ 
+-\item{.group_by}{Character vector of column names to group sequence by. Default value is c("V.name", "J.name"). Pass NA for no grouping options}
++\item{.group_by}{Character vector of column names to group sequence by. Default value is c("V.first", "J.first"). Columns "V.first" and "J.first" containing first genes without allele suffixes are calculated automatically from "V.name" and "J.name" if absent in the data. Pass NA for no grouping options.}
+ 
+ \item{.group_by_seqLength}{If TRUE  - add grouping by sequence length of .col argument}
+ 

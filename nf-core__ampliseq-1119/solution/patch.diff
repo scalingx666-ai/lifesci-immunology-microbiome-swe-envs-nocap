@@ -1,0 +1,112 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bd293bf25..4a8ded7e1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,12 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## nf-core/ampliseq version 3.1.0dev - [YYYY-MM-DD]
++
++### `Fixed`
++
++- [#1119](https://github.com/nf-core/ampliseq/pull/1119) - DADA2 `addSpecies` no longer runs out of memory with the SILVA 144 database: SILVA 144 is classified in chunks of 2000 ASVs instead of 10000. A database can set its own chunk size with `chunksize` in `conf/ref_databases.config`; `--dada_assign_chunksize` overrides it (by @erikrikarddaniel)
++
+ ## nf-core/ampliseq version 3.0.0 - [2026-10-09]
+ 
+ ### `Added`
+diff --git a/conf/ref_databases.config b/conf/ref_databases.config
+index 0a5f4047f..74ff05301 100644
+--- a/conf/ref_databases.config
++++ b/conf/ref_databases.config
+@@ -5,8 +5,9 @@
+  * Defines sources and files for reference databases
+  * Please also reflect all changes in 'nextflow_schema.json'
+  * Each entry requires as a minimum: title, file, citation, fmtscript, dbversion
+- * Optional entries are: taxlevels, shfile
++ * Optional entries are: taxlevels, shfile, license, tree_qza, pplace, derep, chunksize
+  * taxlevels default in "dada2_taxonomy.nf" and "dada2_addspecies.nf": "Kingdom,Phylum,Class,Order,Family,Genus,Species"
++ * chunksize default: 10000 ASVs per DADA2 classification task, overridden by --dada_assign_chunksize
+  */
+ 
+ params {
+@@ -336,6 +337,7 @@ params {
+             fmtscript = "taxref_reformat_standard.sh"
+             dbversion = "SILVA v144 (DOI: 10.82364/144/SSU/Ref-NR99/DADA2/species, 10.82364/144/SSU/Ref/DADA2/species)"
+             taxlevels = "Domain,Kingdom,Phylum,Class,Order,Family,Genus,Species"
++            chunksize = 2000
+         }
+         'silva=144' {
+             title = "Silva 144 prokaryotic SSU"
+@@ -344,6 +346,7 @@ params {
+             fmtscript = "taxref_reformat_standard.sh"
+             dbversion = "SILVA v144 (DOI: 10.82364/144/SSU/Ref-NR99/DADA2/species, 10.82364/144/SSU/Ref/DADA2/species)"
+             taxlevels = "Domain,Kingdom,Phylum,Class,Order,Family,Genus,Species"
++            chunksize = 2000
+         }
+         'silva=138.2' {
+             title = "Silva 138.2 prokaryotic SSU"
+diff --git a/main.nf b/main.nf
+index 471a96749..704da0630 100644
+--- a/main.nf
++++ b/main.nf
+@@ -139,7 +139,7 @@ params {
+     consolidate_taxonomies: String = 'first'
+     dada_addspecies_allowmultiple: Boolean
+     dada_taxonomy_rc: Boolean
+-    dada_assign_chunksize: Integer = 10000
++    dada_assign_chunksize: Integer?
+     pplace_sheet: Path?
+     pplace_tree: Path?
+     pplace_aln: Path?
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index a1cda928a..b2785307f 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -498,9 +498,8 @@
+                 },
+                 "dada_assign_chunksize": {
+                     "type": "integer",
+-                    "help_text": "Chunks for DADA2's assignTaxonomy and addSpecies can speed up the process and lower required memory.",
+-                    "description": "ASV fasta will be subset into chunks of this size for classification",
+-                    "default": 10000
++                    "help_text": "Chunks for DADA2's assignTaxonomy and addSpecies can speed up the process and lower required memory. Without this parameter, a database specific chunk size is used if the database defines one (`chunksize` in `conf/ref_databases.config`), otherwise 10000.",
++                    "description": "ASV fasta will be subset into chunks of this size for classification"
+                 },
+                 "pplace_sheet": {
+                     "type": "string",
+diff --git a/subworkflows/local/dada2_taxonomy_wf/main.nf b/subworkflows/local/dada2_taxonomy_wf/main.nf
+index 7b7045fd5..906d0d020 100644
+--- a/subworkflows/local/dada2_taxonomy_wf/main.nf
++++ b/subworkflows/local/dada2_taxonomy_wf/main.nf
+@@ -65,8 +65,16 @@ workflow DADA2_TAXONOMY_WF {
+         ASV_tax_name = "ASV_ITS_tax"
+     }
+ 
+-    //split sequences into chunks (shared across every listed database)
+-    ch_fasta_chunks = ch_fasta.splitFasta( by: val_dada_assign_chunksize, file: true )
++    //chunk size: --dada_assign_chunksize, else the database's own `chunksize`, else 10000
++    def chunksizes = val_dada_ref_taxonomy_list.collectEntries { db_key ->
++        [ (db_key): val_dada_assign_chunksize ?: params.dada_ref_databases[db_key]?.chunksize ?: 10000 ]
++    }
++
++    //split sequences into chunks, once per distinct chunk size
++    ch_fasta_chunks = channel.empty()
++    chunksizes.values().toList().unique().each { chunksize ->
++        ch_fasta_chunks = ch_fasta_chunks.mix( ch_fasta.splitFasta( by: chunksize, file: true ).map { fasta -> [ chunksize, fasta ] } )
++    }
+ 
+     //per-database outfile suffix + taxlevels, derived once per listed database. db_key is "user" for
+     //--dada_ref_tax_custom (not a real dada_ref_databases key), so the lookup must be null-safe.
+@@ -81,8 +89,9 @@ workflow DADA2_TAXONOMY_WF {
+     //DADA2 assignTaxonomy -- one task per (database x fasta chunk)
+     DADA2_TAXONOMY (
+         ch_assigntax_taxlevels
+-            .combine( ch_fasta_chunks )
+-            .map { db_key, db, outfile, taxlevels, fasta -> [ db_key, fasta, db, outfile, taxlevels ] }
++            .map { db_key, db, outfile, taxlevels -> [ chunksizes[db_key], db_key, db, outfile, taxlevels ] }
++            .combine( ch_fasta_chunks, by: 0 )
++            .map { _chunksize, db_key, db, outfile, taxlevels, fasta -> [ db_key, fasta, db, outfile, taxlevels ] }
+     )
+ 
+     // collect all DADA2_TAXONOMY.out.tsv chunks into one file per database

@@ -1,0 +1,254 @@
+diff --git a/covasim/parameters.py b/covasim/parameters.py
+index f05f657d6..b95067b7b 100644
+--- a/covasim/parameters.py
++++ b/covasim/parameters.py
+@@ -34,6 +34,10 @@ def make_pars(set_prognoses=False, prog_by_age=True, use_layers=False, **kwargs)
+     pars['n_days']     = 60 # Number of days of run, if end_day isn't used
+     pars['rand_seed']  = 1 # Random seed, if None, don't reset
+     pars['verbose']    = 1 # Whether or not to display information during the run -- options are 0 (silent), 1 (default), 2 (everything)
++    pars['resample']   = 0 # Enable dynamic resampling
++    pars['resample_max_pop'] = 100000 # Maximum real population for resampling
++    pars['resample_threshold'] = 0.95 # Fraction susceptible population that will trigger resampling
++    pars['resample_factor'] = 2 # Factor by which we multiply population
+ 
+     # Disease transmission parameters
+     pars['n_imports']    = 0 # Average daily number of imported cases (actual number is drawn from Poisson distribution)
+diff --git a/covasim/person.py b/covasim/person.py
+index c3725f5dd..32e35e4af 100644
+--- a/covasim/person.py
++++ b/covasim/person.py
+@@ -58,7 +58,7 @@ def __init__(self, pars, uid, age, sex, contacts):
+         self.infected = [] #: Record the UIDs of all people this person infected
+         self.infected_by = None #: Store the UID of the person who caused the infection. If None but person is infected, then it was an externally seeded infection
+ 
+-        # Set prognoses
++         # Set prognoses
+         prognoses = pars['prognoses']
+         idx = np.argmax(prognoses['age_cutoffs'] > self.age)  # Index of the age bin to use
+         self.symp_prob   = pars['rel_symp_prob']   * prognoses['symp_probs'][idx]
+@@ -70,6 +70,43 @@ def __init__(self, pars, uid, age, sex, contacts):
+         return
+ 
+ 
++    def make_susceptible(self):
++        """
++        Make person susceptible. This is used during dynamic resampling
++        """
++        # Define state
++        self.susceptible    = True
++        self.exposed        = False
++        self.infectious     = False
++        self.symptomatic    = False
++        self.severe         = False
++        self.critical       = False
++        self.diagnosed      = False
++        self.recovered      = False
++        self.dead           = False
++        self.known_contact  = False # Keep track of whether each person is a contact of a known positive
++
++        # Keep track of dates
++        self.date_exposed      = None
++        self.date_infectious   = None
++        self.date_symptomatic  = None
++        self.date_severe       = None
++        self.date_critical     = None
++        self.date_diagnosed    = None
++        self.date_recovered    = None
++        self.date_died         = None
++
++        # Keep track of durations
++        self.dur_exp2inf  = None # Duration from exposure to infectiousness
++        self.dur_inf2sym  = None # Duration from infectiousness to symptoms
++        self.dur_sym2sev  = None # Duration from symptoms to severe symptoms
++        self.dur_sev2crit = None # Duration from symptoms to severe symptoms
++        self.dur_disease  = None # Total duration of disease, from date of exposure to date of recovery or death
++
++        self.infected = [] #: Record the UIDs of all people this person infected
++        self.infected_by = None #: Store the UID of the person who caused the infection. If None but person is infected, then it was an externally seeded infection
++
++
+     # Methods to make events occur (infection and diagnosis)
+     def infect(self, t, bed_constraint=None, source=None):
+         """
+@@ -270,5 +307,3 @@ def check_diagnosed(self, t):
+             return 1
+         else:
+             return 0
+-
+-
+diff --git a/covasim/population.py b/covasim/population.py
+index e70830f8b..efc8e9a2a 100644
+--- a/covasim/population.py
++++ b/covasim/population.py
+@@ -175,7 +175,10 @@ def make_randpop(sim, age_data=None, sex_ratio=0.5):
+ def make_synthpop(sim):
+     ''' Make a population using synthpops, including contacts '''
+     import synthpops as sp # Optional import
+-    population = sp.make_population(n=sim['pop_size'])
++    if sim['resample']:  # pop size will differ from actual pop if we're using resampling
++        population = sp.make_population(n=sim['resample_max_pop'])
++    else:
++        population = sp.make_population(n=sim['pop_size'])
+     uids, ages, sexes, contacts = [], [], [], []
+     for uid,person in population.items():
+         uids.append(uid)
+diff --git a/covasim/sim.py b/covasim/sim.py
+index 726f23126..03cb42e29 100644
+--- a/covasim/sim.py
++++ b/covasim/sim.py
+@@ -52,7 +52,16 @@ def __init__(self, pars=None, datafile=None, datacols=None, popfile=None, filena
+         self.load_data(datafile, datacols) # Load the data, if provided
+         self.load_population(popfile)      # Load the population, if provided
+         self.update_pars(pars)             # Update the parameters, if provided
+-        return
++
++        # if resampling is enabled, make 100k(default) pop size
++        if self["resample"] and self["pop_size"] > self["resample_max_pop"]:
++
++            self.max_n = self["pop_size"]
++            self["pop_size"] = self["resample_max_pop"]
++
++        # dynamic resampling
++        self.resampe_threshold = self["resample_threshold"]  # Fraction of total pop that isn't susceptible when we trigger scaling
++        self.resample_factor = self["resample_factor"]  # Factor by which we will rescale population
+ 
+ 
+     def update_pars(self, pars=None, create=False):
+@@ -239,7 +248,7 @@ def init_people(self, verbose=None, id_len=None, **kwargs):
+         return
+ 
+ 
+-    def next(self, verbose=0):
++    def next(self, scale, verbose=0):
+         '''
+         Step simulation forward in time
+ 
+@@ -381,25 +390,44 @@ def next(self, verbose=0):
+             self =self['interv_func'](self)
+ 
+         # Update counts for this time step: stocks
+-        self.results['n_susceptible'][t]  = n_susceptible
+-        self.results['n_exposed'][t]      = n_exposed
+-        self.results['n_infectious'][t]   = n_infectious # Tracks total number infectious at this timestep
+-        self.results['n_symptomatic'][t]  = n_symptomatic # Tracks total number symptomatic at this timestep
+-        self.results['n_severe'][t]       = n_severe # Tracks total number of severe cases at this timestep
+-        self.results['n_critical'][t]     = n_critical # Tracks total number of critical cases at this timestep
+-        self.results['n_diagnosed'][t]    = n_diagnosed # Tracks total number of diagnosed cases at this timestep
+-        self.results['bed_capacity'][t]   = n_severe/n_beds if n_beds>0 else None
++
++        self.results['n_susceptible'][t]  = n_susceptible * scale
++        self.results['n_exposed'][t]      = n_exposed * scale
++        self.results['n_infectious'][t]   = n_infectious * scale # Tracks total number infectious at this timestep
++        self.results['n_symptomatic'][t]  = n_symptomatic * scale # Tracks total number symptomatic at this timestep
++        self.results['n_severe'][t]       = n_severe * scale # Tracks total number of severe cases at this timestep
++        self.results['n_critical'][t]     = n_critical * scale # Tracks total number of critical cases at this timestep
++        self.results['n_diagnosed'][t]    = n_diagnosed * scale # Tracks total number of diagnosed cases at this timestep
++        self.results['bed_capacity'][t]   = (n_severe * scale)/n_beds if n_beds>0 else None
+ 
+         # Update counts for this time step: flows
+-        self.results['new_infections'][t]  = new_infections # New infections on this timestep
+-        self.results['new_recoveries'][t]  = new_recoveries # Tracks new recoveries on this timestep
+-        self.results['new_symptomatic'][t] = new_symptomatic
+-        self.results['new_severe'][t]      = new_severe
+-        self.results['new_critical'][t]    = new_critical
+-        self.results['new_deaths'][t]      = new_deaths
++        self.results['new_infections'][t]  = new_infections * scale # New infections on this timestep
++        self.results['new_recoveries'][t]  = new_recoveries * scale # Tracks new recoveries on this timestep
++        self.results['new_symptomatic'][t] = new_symptomatic * scale
++        self.results['new_severe'][t]      = new_severe * scale
++        self.results['new_critical'][t]    = new_critical * scale
++        self.results['new_deaths'][t]      = new_deaths * scale
++
+         self.t += 1
+ 
+-        return
++    def resample(self, current_scale):
++        # Check if max pop was already reached
++        if current_scale * self["pop_size"] >= self.max_n:
++            return current_scale
++        susceptible = list(self.people.filter_in('susceptible'))
++        # Check if we've reached point when we want to resample and we didn't reach max population
++        if (len(susceptible) / len(self.people)) < self.resampe_threshold:
++            # Check if we've reached max pop
++            if current_scale * self.resample_factor * self["pop_size"] > self.max_n:
++                # Calculate new resample_factor to get us close to maxumum population
++                self.resample_factor = self.max_n / (self["pop_size"] * current_scale)
++            # Pick random list of people to make susceptible again
++            new_susceptible = np.random.choice(list(self.people.keys()), size=round(len(self.people) / self.resample_factor))
++            for p in new_susceptible:
++                self.people[p].make_susceptible()
++            return current_scale * self.resample_factor
++        else:
++            return current_scale
+ 
+ 
+     def run(self, do_plot=False, verbose=None, **kwargs):
+@@ -417,6 +445,8 @@ def run(self, do_plot=False, verbose=None, **kwargs):
+ 
+         T = sc.tic()
+ 
++        self.scaling_vec = [1.0]
++
+         # Reset settings and results
+         if not self.initialized:
+             self.initialize()
+@@ -424,11 +454,15 @@ def run(self, do_plot=False, verbose=None, **kwargs):
+         if verbose is None:
+             verbose = self['verbose']
+ 
++        current_scale = 1.0
+         # Main simulation loop
+         for t in range(self.npts):
++            # Check if we need to rescale
++            if self["resample"]:
++                current_scale = self.resample(current_scale)
++            self.scaling_vec.append(current_scale)
+ 
+-            # This does all the work!
+-            self.next(verbose=verbose)
++            self.next(verbose=verbose, scale=current_scale)
+ 
+             # Check if we were asked to stop
+             elapsed = sc.toc(T, output=True)
+@@ -720,4 +754,3 @@ def plot_result(self, key, fig_args=None, plot_args=None):
+         color = res.color
+         pl.plot(tvec, y, c=color, **plot_args)
+         return fig
+-
+diff --git a/tests/test_sim.py b/tests/test_sim.py
+index 55e41b418..15db113c5 100644
+--- a/tests/test_sim.py
++++ b/tests/test_sim.py
+@@ -108,7 +108,7 @@ def test_start_stop(): # If being run via pytest, turn off
+     sim2 = cv.Sim(pars)
+     sim2.initialize()
+     for n in range(sim2.npts):
+-        sim2.next(verbose=0)
++        sim2.next(verbose=0, scale=1.0)
+     sim2.finalize()
+ 
+     # Compare results
+@@ -118,6 +118,23 @@ def test_start_stop(): # If being run via pytest, turn off
+     return sim2
+ 
+ 
++def test_dynamic_resampling(): # If being run via pytest, turn off
++    sc.heading('Test dunamic resampling')
++
++    pars = pars = {
++        'n_days': 140,
++        'pop_size': 50000,
++        'resample': 1,
++        'resample_max_pop': 10000
++    }
++
++    # Create and run a basic simulation
++    sim = cv.Sim(pars)
++    sim.run(verbose=0)
++    assert sim.results['cum_infections'][-1] > 10000  # infections at the end of sim should be much more than internal pop
++    return sim
++
++
+ def test_sim_data(do_plot=False, do_show=False):
+     sc.heading('Data test')
+ 

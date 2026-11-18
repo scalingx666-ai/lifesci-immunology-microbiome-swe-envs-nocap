@@ -1,0 +1,524 @@
+diff --git a/docs/usage.md b/docs/usage.md
+index 35fc7588..b0bf3d07 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -183,11 +183,11 @@ Annotate called genes. You will need to specify what databases to annotate again
+ 
+ `--qc`
+ 
+-Run quality control options for DRAM workflow. The QC step collects rRNA and tRNA scans using Barrnap and tRNAscan-SE for the genome_states.tsv output as a baseline. Additional options for QC can be found in the Parameters API documentation or `--help`.
++Run quality control options for the DRAM workflow. With `--input_fasta`, QC scans for rRNA and tRNA using Barrnap and tRNAscan-SE. Without raw FASTA, QC can collect precomputed `--rrnas` and `--trnas` tables. It can also add `--bin_quality` and `--taxa` data to annotations produced by `--annotate` or supplied with `--annotations`. QC outputs remain under the `ANNOTATE` output directory.
+ 
+ `--summarize`
+ 
+-Distill out annotations from the topic toolkit default (set of predetermined distill topics). You can also specify additional ecosystem toolkits with `--sum_ecos [OPTIONS]` or custom distill sheets. See the Parameters API documentation for more details, or `--help`.
++Distill out annotations from the topic toolkit default (set of predetermined distill topics). You can also specify additional ecosystem toolkits with `--sum_ecos [OPTIONS]` or custom distill sheets. To summarize without running `--annotate`, provide an existing DRAM annotations TSV with `--annotations`. QC remains optional in either mode. See the Parameters API documentation for more details, or `--help`.
+ 
+ `--visualize`
+ 
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 7d1b1ade..0d00eb80 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -25,7 +25,7 @@
+                 },
+                 "qc": {
+                     "type": "boolean",
+-                    "description": "Run quality control steps such as collect rRNA and tRNA scans. See QC section for more options."
++                    "description": "Run quality control steps. With --input_fasta, DRAM scans for rRNA and tRNA; without FASTA, optional precomputed --rrnas and --trnas tables can be collected. QC can enrich generated or supplied annotations with bin quality and taxonomy."
+                 },
+                 "summarize": {
+                     "type": "boolean",
+@@ -284,19 +284,19 @@
+                     "type": "string",
+                     "format": "file-path",
+                     "exists": true,
+-                    "description": "Path to annotations tsv to distill. Required if running without annotate"
++                    "description": "Path to an annotations TSV for summarize, QC enrichment, visualization, or traits without running annotate."
+                 },
+                 "rrnas": {
+                     "type": "string",
+-                    "format": "file-path",
++                    "format": "directory-path",
+                     "exists": true,
+-                    "description": "Path to folder containing individual rRNA files generated with tRNAscan-SE. Can be used when running distill without call to add additional information."
++                    "description": "Path to a directory containing individual rRNA TSV files generated with Barrnap. Can be used by QC without raw FASTA input."
+                 },
+                 "trnas": {
+                     "type": "string",
+-                    "format": "file-path",
++                    "format": "directory-path",
+                     "exists": true,
+-                    "description": "Path to folder containging individual tRNA files generated with tRNAscan-SE. Can be used when running distill without call to add additional information."
++                    "description": "Path to a directory containing individual tRNA TSV files generated with tRNAscan-SE. Can be used by QC without raw FASTA input."
+                 },
+                 "distill_dummy_sheet": {
+                     "type": "string",
+diff --git a/subworkflows/local/annotate.nf b/subworkflows/local/annotate.nf
+index 0878dfb1..d921979e 100644
+--- a/subworkflows/local/annotate.nf
++++ b/subworkflows/local/annotate.nf
+@@ -1,43 +1,11 @@
+-include { RENAME_FASTA           } from "../../modules/local/rename/rename_fasta.nf"
+ include { RENAME_PROTEINS        } from "../../modules/local/rename/rename_proteins.nf"
+ include { RENAME_PROTEINS as RENAME_FNA       } from "../../modules/local/rename/rename_proteins.nf"
+ include { CALL                   } from "../../subworkflows/local/call.nf"
+-include { QC                     } from "../../subworkflows/local/qc.nf"
+ include { DB_SEARCH              } from "../../subworkflows/local/db_search.nf"
+ include { GENE_LOCS              } from "../../modules/local/annotate/gene_locs.nf"
+ include { GENERATE_GFF  } from "../../modules/local/add_and_combine/generate_gff.nf"
+ include { resourceBytes } from './utils_resource_classes.nf'
+-
+-def batchManifestToTuples(ch_renamed_batch) {
+-    ch_renamed_batch.flatMap { manifest, renamed_files ->
+-        def files = renamed_files instanceof List ? renamed_files : [renamed_files]
+-        def files_by_name = files.collectEntries { renamed_file ->
+-            [(renamed_file.getFileName().toString()): renamed_file]
+-        }
+-
+-        manifest.readLines()
+-            .findAll { line -> line }
+-            .collect { line ->
+-                def (name, relpath) = line.split('\t')
+-                def renamed_file = files_by_name[relpath]
+-                if (!renamed_file) {
+-                    error("Could not find renamed file `${relpath}` listed in ${manifest}")
+-                }
+-                tuple(name, renamed_file)
+-            }
+-    }
+-}
+-
+-def collectNamePathTuples(ch_name_path, check_size = false) {
+-    ch_name_path
+-        .collect(flat: false)
+-        .map { rows ->
+-            def names = rows.collect { tup -> tup[0] }
+-            def paths = rows.collect { tup -> tup[1] }
+-            tuple(names, paths)
+-        }
+-        .filter { names, _paths -> !check_size || names.size() > 0 }
+-}
++include { batchManifestToTuples; collectNamePathTuples } from './utils_channels.nf'
+ /*
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     SUBWORKFLOW TO ANNOTATE
+@@ -46,7 +14,7 @@ def collectNamePathTuples(ch_name_path, check_size = false) {
+ 
+ workflow ANNOTATE {
+     take:
+-    ch_fasta  // channel: [ val(input_fasta name), path(fasta) ]
++    ch_fasta  // channel: [ val(input_fasta name), path(fasta), val(logical bytes) ]
+     default_sheet // Path to dummy sheet
+     call     // boolean: whether gene calling flag is set
+     use_kegg
+@@ -70,37 +38,18 @@ workflow ANNOTATE {
+ 
+     main:
+     // n_fastas = 0
+-    ch_rrna_collected = default_sheet
+-    ch_trna_collected = default_sheet
+-    ch_trna_combined = default_sheet
+     ch_combined_annotations = default_sheet
+ 
+     ch_quast_stats = default_sheet
+-    ch_collected_fna = default_sheet
+     ch_gene_gff = channel.empty()
+     ch_filtered_fasta = channel.empty()
+     ch_called_genes = channel.empty()
+ 
+     if (call){
+-        // n_fastas = file("$params.input_fasta/${params.fasta_fmt}").size()
+-
+-        if(params.rename) {
+-            def ch_fasta_collected = collectNamePathTuples(ch_fasta)
+-
+-            RENAME_FASTA( ch_fasta_collected )
+-
+-            ch_fasta = batchManifestToTuples(RENAME_FASTA.out.renamed_batch)
+-        }
+-
+-        // This is the final input FASTA used by CALL and RNA scans. Carry its
+-        // size as immutable per-sample metadata instead of re-statting it.
+-        ch_fasta = ch_fasta.map { name, fasta -> tuple(name, fasta, resourceBytes(fasta)) }
+-
+         CALL( ch_fasta )
+         ch_quast_stats = CALL.out.ch_quast_stats
+         ch_gene_locs = CALL.out.ch_gene_locs
+         ch_called_proteins = CALL.out.ch_called_proteins
+-        ch_collected_fna = CALL.out.ch_collected_fna
+         ch_gene_gff = CALL.out.ch_gene_gff
+         ch_filtered_fasta = CALL.out.ch_filtered_fasta
+         ch_called_genes = CALL.out.ch_called_genes
+@@ -179,18 +128,7 @@ workflow ANNOTATE {
+         ch_combined_annotations = DB_SEARCH.out.ch_combined_annotations
+     }
+ 
+-    if (params.qc){
+-        QC( ch_fasta, default_sheet, ch_combined_annotations, ch_collected_fna, call )
+-        ch_rrna_collected = QC.out.ch_rrna_collected
+-        ch_trna_collected = QC.out.ch_trna_collected
+-        ch_trna_combined = QC.out.ch_trna_combined
+-        ch_combined_annotations = QC.out.ch_final_annots
+-    }
+-
+     emit:
+-    ch_rrna_collected
+-    ch_trna_collected
+-    ch_trna_combined
+     ch_combined_annotations
+     ch_quast_stats
+ 
+diff --git a/subworkflows/local/collect_rna.nf b/subworkflows/local/collect_rna.nf
+index 9acc7636..baf13cf8 100644
+--- a/subworkflows/local/collect_rna.nf
++++ b/subworkflows/local/collect_rna.nf
+@@ -28,15 +28,14 @@ workflow COLLECT_RNA {
+     take:
+     ch_fasta  // channel: [ val(input_fasta name), path(fasta), val(logical bytes) ]
+     default_sheet // Path to dummy sheet
+-    call          // boolean: whether gene calling flag is set
++    scan_input_fasta // boolean: whether raw FASTA input is available
+ 
+     main:
+ 
+     run_rrna_collect = false
+     run_trna_collect = false
+ 
+-    // If we didn't run call
+-    if (!call) {
++    if (!scan_input_fasta) {
+         if (params.rrnas) {
+             channel.fromPath("${params.rrnas}/*.tsv", checkIfExists: true)
+                 .ifEmpty { exit 1, "Cannot find individual rRNA files generated with barrnap at: ${params.rrnas}\nNB: Path needs to follow pattern: path/to/directory" }
+@@ -57,7 +56,7 @@ workflow COLLECT_RNA {
+         else {
+             log.warn("No tRNA files provided, skipping tRNA steps.")
+         }
+-    } else { // If we did run call then we need to generate the rrnas and trnas from the fastas
++    } else {
+         ch_fasta_by_resource = bucketFastaBatches(ch_fasta,
+             params.rna_batch_size as int,
+             batchMaxBytes(params.rna_batch_max_size))
+diff --git a/subworkflows/local/qc.nf b/subworkflows/local/qc.nf
+index 05605c66..55823837 100644
+--- a/subworkflows/local/qc.nf
++++ b/subworkflows/local/qc.nf
+@@ -13,12 +13,11 @@ workflow QC {
+     ch_fasta  // channel: [ val(input_fasta name), path(fasta), val(logical bytes) ]
+     default_sheet // Path to dummy sheet
+     ch_combined_annotations  // channel: [ path(combined_annotations_out) ]
+-    ch_collected_fna
+-    call                     // boolean: whether gene calling flag is set
++    scan_input_fasta         // boolean: whether raw FASTA input is available
+ 
+     main:
+ 
+-    COLLECT_RNA( ch_fasta, default_sheet, call )
++    COLLECT_RNA( ch_fasta, default_sheet, scan_input_fasta )
+     ch_rrna_collected = COLLECT_RNA.out.ch_rrna_collected
+     ch_trna_collected = COLLECT_RNA.out.ch_trna_collected
+     ch_trna_combined = COLLECT_RNA.out.ch_trna_combined
+@@ -41,7 +40,7 @@ workflow QC {
+         ch_updated_taxa_annots = ADD_TAXA.out.annots_taxa_out
+     }
+     else{
+-        ch_updated_taxa_annots = ch_combined_annotations
++        ch_updated_taxa_annots = ch_updated_annots
+     }
+ 
+     ch_final_annots = ch_updated_taxa_annots
+diff --git a/subworkflows/local/utils_channels.nf b/subworkflows/local/utils_channels.nf
+new file mode 100644
+index 00000000..51ed4a0b
+--- /dev/null
++++ b/subworkflows/local/utils_channels.nf
+@@ -0,0 +1,30 @@
++def batchManifestToTuples(ch_renamed_batch) {
++    ch_renamed_batch.flatMap { manifest, renamed_files ->
++        def files = renamed_files instanceof List ? renamed_files : [renamed_files]
++        def files_by_name = files.collectEntries { renamed_file ->
++            [(renamed_file.getFileName().toString()): renamed_file]
++        }
++
++        manifest.readLines()
++            .findAll { line -> line }
++            .collect { line ->
++                def (name, relpath) = line.split('\t')
++                def renamed_file = files_by_name[relpath]
++                if (!renamed_file) {
++                    error("Could not find renamed file `${relpath}` listed in ${manifest}")
++                }
++                tuple(name, renamed_file)
++            }
++    }
++}
++
++def collectNamePathTuples(ch_name_path, check_size = false) {
++    ch_name_path
++        .collect(flat: false)
++        .map { rows ->
++            def names = rows.collect { tup -> tup[0] }
++            def paths = rows.collect { tup -> tup[1] }
++            tuple(names, paths)
++        }
++        .filter { names, _paths -> !check_size || names.size() > 0 }
++}
+diff --git a/tests/data/owc/qc/bin_quality.tsv b/tests/data/owc/qc/bin_quality.tsv
+new file mode 100644
+index 00000000..fe5c18e9
+--- /dev/null
++++ b/tests/data/owc/qc/bin_quality.tsv
+@@ -0,0 +1,3 @@
++Name	Completeness	Contamination
++OWC_0000	98.5	1.2
++OWC_0001	91.0	2.5
+diff --git a/tests/data/owc/qc/rrnas/OWC_0000_processed_rrnas.tsv b/tests/data/owc/qc/rrnas/OWC_0000_processed_rrnas.tsv
+new file mode 100644
+index 00000000..da05d1e4
+--- /dev/null
++++ b/tests/data/owc/qc/rrnas/OWC_0000_processed_rrnas.tsv
+@@ -0,0 +1,2 @@
++input_fasta	query_id	type	begin	end	e-value	strand	note
++OWC_0000	OWC_0000_test_rRNA	rRNA	1	100	1e-20	+	Name=5S_rRNA;product=5S ribosomal RNA
+diff --git a/tests/data/owc/qc/trnas/OWC_0000_processed_trnas.tsv b/tests/data/owc/qc/trnas/OWC_0000_processed_trnas.tsv
+new file mode 100644
+index 00000000..68e724ec
+--- /dev/null
++++ b/tests/data/owc/qc/trnas/OWC_0000_processed_trnas.tsv
+@@ -0,0 +1,2 @@
++input_fasta	query_id	tRNA #	begin	end	type	codon	score	note	gene_id
++OWC_0000	OWC_0000_test_tRNA	1	1	75	Ala	TGC	75.0		Ala (TGC)
+diff --git a/tests/qc.nf.test b/tests/qc.nf.test
+new file mode 100644
+index 00000000..46039cb5
+--- /dev/null
++++ b/tests/qc.nf.test
+@@ -0,0 +1,47 @@
++nextflow_pipeline {
++
++    name "Test standalone QC"
++    script "../main.nf"
++    tag "pipeline"
++
++    test("Test QC with input FASTA") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++                annotate = false
++                summarize = false
++                qc = true
++                anno_dbs = ""
++            }
++        }
++
++        then {
++            assert workflow.success
++            assert path("${params.outdir}/ANNOTATE/raw_rrna_scan.tsv").exists()
++        }
++    }
++
++    test("Test QC with supplied RNA tables") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++                input_fasta = null
++                rename = false
++                annotate = false
++                summarize = false
++                qc = true
++                anno_dbs = ""
++                rrnas = "${projectDir}/tests/data/owc/qc/rrnas"
++                trnas = "${projectDir}/tests/data/owc/qc/trnas"
++            }
++        }
++
++        then {
++            assert workflow.success
++            assert path("${params.outdir}/ANNOTATE/raw_rrna_scan.tsv").exists()
++            assert path("${params.outdir}/ANNOTATE/raw_trna_scan.tsv").exists()
++        }
++    }
++}
+diff --git a/tests/summarize.nf.test b/tests/summarize.nf.test
+index 6a0f82bf..c59bfd61 100644
+--- a/tests/summarize.nf.test
++++ b/tests/summarize.nf.test
+@@ -39,4 +39,74 @@ nextflow_pipeline {
+             assert genome_stats_actual.columns["L50"] == genome_stats_expected.columns["L50"]
+         }
+     }
++
++    test("Test SUMMARIZE with supplied annotations") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++                input_fasta = null
++                rename = false
++                annotate = false
++                qc = false
++                summarize = true
++                anno_dbs = ""
++                annotations = "${projectDir}/tests/data/owc/annotation/dram1_informed_annotations.tsv"
++            }
++        }
++
++        then {
++            assert workflow.success
++            assert path("${params.outdir}/SUMMARIZE/summarized_genomes.tsv").exists()
++        }
++    }
++
++    test("Test SUMMARIZE with supplied annotations and QC tables") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++                input_fasta = null
++                rename = false
++                annotate = false
++                qc = true
++                summarize = true
++                anno_dbs = ""
++                annotations = "${projectDir}/tests/data/owc/annotation/dram1_informed_annotations.tsv"
++                rrnas = "${projectDir}/tests/data/owc/qc/rrnas"
++                trnas = "${projectDir}/tests/data/owc/qc/trnas"
++            }
++        }
++
++        then {
++            assert workflow.success
++            assert path("${params.outdir}/SUMMARIZE/summarized_genomes.tsv").exists()
++            assert path("${params.outdir}/ANNOTATE/raw_rrna_scan.tsv").exists()
++            assert path("${params.outdir}/ANNOTATE/raw_trna_scan.tsv").exists()
++        }
++    }
++
++    test("Test QC retains bin quality without taxonomy") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++                input_fasta = null
++                rename = false
++                annotate = false
++                qc = true
++                summarize = false
++                anno_dbs = ""
++                annotations = "${projectDir}/tests/data/owc/annotation/dram1_informed_annotations.tsv"
++                bin_quality = "${projectDir}/tests/data/owc/qc/bin_quality.tsv"
++            }
++        }
++
++        then {
++            assert workflow.success
++            def actual = path("${params.outdir}/ANNOTATE/raw-annotations.tsv").csv(sep: "\t")
++            assert actual.columns["Completeness"].every { it == 98.5 || it == 91.0 }
++            assert actual.columns["Contamination"].every { it == 1.2 || it == 2.5 }
++        }
++    }
+ }
+diff --git a/workflows/dram.nf b/workflows/dram.nf
+index 12419ad2..e244e439 100644
+--- a/workflows/dram.nf
++++ b/workflows/dram.nf
+@@ -19,9 +19,13 @@ include { FORMAT_KEGG_DB         } from "../modules/local/database/format_kegg_d
+ include { MMSEQS_GPU_DATABASE    } from "../modules/local/database/mmseqs_gpu_database.nf"
+ include { MERGE                  } from "../subworkflows/local/merge.nf"
+ include { ANNOTATE               } from "../subworkflows/local/annotate.nf"
++include { QC                     } from "../subworkflows/local/qc.nf"
+ include { ADD_ANNOTATIONS        } from "../modules/local/add_and_combine/add_annotations.nf"
+ include { SUMMARIZE              } from "../modules/local/distill/distill.nf"
+ include { DECOMPRESS_FASTA       } from "../modules/local/rename/decompress_fasta.nf"
++include { RENAME_FASTA           } from "../modules/local/rename/rename_fasta.nf"
++include { resourceBytes          } from '../subworkflows/local/utils_resource_classes.nf'
++include { batchManifestToTuples; collectNamePathTuples } from '../subworkflows/local/utils_channels.nf'
+ 
+ 
+ /*
+@@ -48,7 +52,7 @@ workflow DRAM {
+     // if annotate with raw fasta but no call, we can infer we need to call genes, so set call to true
+     // Also, if call is specified, set call to true
+     call = false
+-    if ((params.annotate && params.input_fasta != "") || params.call) {
++    if ((params.annotate && params.input_fasta) || params.call) {
+         call = true
+     }
+     visualize = false
+@@ -60,7 +64,7 @@ workflow DRAM {
+         traits = true
+     }
+ 
+-    if (params.input_fasta && (params.rename || call)) {
++    if (params.input_fasta && (params.rename || call || params.qc)) {
+         ch_fasta_raw = channel
+             .fromPath(file(params.input_fasta) / params.fasta_fmt, checkIfExists: true)
+                 .ifEmpty { exit 1, "Cannot find any fasta files matching: ${params.input_fasta}\nNB: Path needs to follow pattern: path/to/directory/" }
+@@ -80,6 +84,14 @@ workflow DRAM {
+ 
+         DECOMPRESS_FASTA( ch_fasta_branched.gz )
+         ch_fasta = DECOMPRESS_FASTA.out.decompressed_fasta.mix( ch_fasta_branched.plain )
++
++        if (params.rename) {
++            ch_fasta_collected = collectNamePathTuples(ch_fasta)
++            RENAME_FASTA( ch_fasta_collected )
++            ch_fasta = batchManifestToTuples(RENAME_FASTA.out.renamed_batch)
++        }
++
++        ch_fasta = ch_fasta.map { name, fasta -> tuple(name, fasta, resourceBytes(fasta)) }
+     }
+     viz_rules_system = params.viz_rules_system
+ 
+@@ -271,7 +283,7 @@ workflow DRAM {
+         // Pipeline steps
+         //
+ 
+-        if (params.input_fasta || params.input_genes) {
++        if (params.annotate || params.call) {
+ 
+             ANNOTATE (
+                 ch_fasta,
+@@ -298,13 +310,8 @@ workflow DRAM {
+             )
+         }
+ 
+-        if (params.annotate){ // If the user has specified --annotate, us the outputted annotations
++        if (params.annotate){ // If the user has specified --annotate, use the outputted annotations
+             ch_final_annots = ANNOTATE.out.ch_combined_annotations
+-            if( params.add_annotations ){
+-                ch_add_annots = file(params.add_annotations)
+-                ADD_ANNOTATIONS( ANNOTATE.out.ch_combined_annotations, ch_add_annots )
+-                ch_final_annots = ADD_ANNOTATIONS.out.combined_annots_out
+-            }
+         } else if (params.annotations) {
+             ch_final_annots = channel
+                 .fromPath(params.annotations, checkIfExists: true)
+@@ -313,10 +320,24 @@ workflow DRAM {
+             ch_final_annots = default_sheet
+         }
+ 
++        ch_trna_combined = default_sheet
++        if (params.qc) {
++            scan_input_fasta = params.input_fasta ? true : false
++            QC( ch_fasta, default_sheet, ch_final_annots, scan_input_fasta )
++            ch_final_annots = QC.out.ch_final_annots
++            ch_trna_combined = QC.out.ch_trna_combined
++        }
++
++        if (params.annotate && params.add_annotations) {
++            ch_add_annots = file(params.add_annotations)
++            ADD_ANNOTATIONS( ch_final_annots, ch_add_annots )
++            ch_final_annots = ADD_ANNOTATIONS.out.combined_annots_out
++        }
++
+         if (distill_flag) {
+             SUMMARIZE(
+                 ch_final_annots,
+-                ANNOTATE.out.ch_trna_combined,
++                ch_trna_combined,
+                 distill_topic,
+                 distill_ecosystem,
+                 distill_custom

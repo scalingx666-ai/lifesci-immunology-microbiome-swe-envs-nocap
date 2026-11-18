@@ -1,0 +1,384 @@
+diff --git a/metagraph/docs/source/quick_start.rst b/metagraph/docs/source/quick_start.rst
+index d2ec3e6f3b..f33d0421d7 100644
+--- a/metagraph/docs/source/quick_start.rst
++++ b/metagraph/docs/source/quick_start.rst
+@@ -542,6 +542,11 @@ Pass these files in an order that is consistent with the final transformed annot
+ During query, MetaGraph loads ``annotation.*.annodbg.seqs`` (where ``*`` is the final transformed annotation type)
+ automatically and reports sequence-based hits (header + local coordinate) instead of file-based coordinates.
+ 
++Each record is named by its whole header, so every header must be non-empty, valid UTF-8 and distinct within
++its file; the same header may appear in different files. A file that breaks this is refused, and no ``.seqs``
++file is written. ``--header-delimiter`` cannot be combined with ``--index-header-coords``.
++Earlier versions accepted repeated headers and merged consecutive records with the same header into one entry.
++
+ The ``--index-header-coords`` step is a one-shot run against the final merged annotation. If the annotation
+ was built in multiple chunks (multiple ``metagraph annotate`` invocations with disjoint FASTA subsets) or
+ with ``--separately``, run ``--index-header-coords`` once after all annotation/transform steps are complete,
+diff --git a/metagraph/integration_tests/test_annotate.py b/metagraph/integration_tests/test_annotate.py
+index 91a6f40ebc..4ee95bf593 100644
+--- a/metagraph/integration_tests/test_annotate.py
++++ b/metagraph/integration_tests/test_annotate.py
+@@ -420,6 +420,54 @@ def test_annotate_coordinates_hints_index_header_coords(self):
+         self.assertNotIn('To enable per-sequence coordinate reporting',
+                          res.stdout.decode())
+ 
++    def test_index_header_coords_requires_distinct_headers(self):
++        graph_input = f'{self.tempdir.name}/graph_input.fa'
++        with open(graph_input, 'w') as f:
++            f.write('>A\nGGCTTACGTAAGCATG\n>B\nCCTGGACGTACCTAGG\n')
++        res = subprocess.run([METAGRAPH, 'build', '-k', '5',
++                              '-o', f'{self.tempdir.name}/graph', graph_input],
++                             stdout=PIPE, stderr=PIPE)
++        self.assertEqual(res.returncode, 0)
++
++        def index(name, content, *flags):
++            fasta = f'{self.tempdir.name}/{name}.fa'
++            with open(fasta, 'w') as f:
++                f.write(content)
++            out = f'{self.tempdir.name}/{name}'
++            res = subprocess.run([METAGRAPH, 'annotate', '-i', f'{self.tempdir.name}/graph.dbg',
++                                  '--anno-filename', '--index-header-coords', *flags,
++                                  '-o', out, fasta],
++                                 stdout=PIPE, stderr=PIPE)
++            return res, os.path.exists(out + '.seqs')
++
++        # distinct headers
++        res, written = index('distinct', '>A\nGGCTTACGTAAGCATG\n>B\nCCTGGACGTACCTAGG\n')
++        self.assertEqual(res.returncode, 0, res.stderr.decode())
++        self.assertTrue(written)
++
++        # a repeated header, consecutive or not
++        for name, content in [
++            ('consecutive', '>A\nGGCTTACGTAAGCATG\n>A\nCCTGGACGTACCTAGG\n'),
++            ('apart', '>A\nGGCTTACGTAAGCATG\n>B\nCCTGGACGTACCTAGG\n>A\nGGCTTACGTA\n'),
++            ('short', '>A\nGGCTTACGTAAGCATG\n>A\nGGC\n'),
++        ]:
++            res, written = index(name, content)
++            self.assertNotEqual(res.returncode, 0, name)
++            self.assertIn('repeats record', res.stderr.decode() + res.stdout.decode())
++            self.assertFalse(written, name)
++
++        # an empty header
++        res, written = index('empty', '>\nGGCTTACGTAAGCATG\n')
++        self.assertNotEqual(res.returncode, 0)
++        self.assertFalse(written)
++
++        # the whole header names a record
++        res, written = index('delimiter', '>A|x\nGGCTTACGTAAGCATG\n>A|y\nCCTGGACGTACCTAGG\n',
++                             '--header-delimiter', '|')
++        self.assertNotEqual(res.returncode, 0)
++        self.assertIn('--header-delimiter', res.stderr.decode() + res.stdout.decode())
++        self.assertFalse(written)
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/metagraph/src/annotation/coord_to_header.cpp b/metagraph/src/annotation/coord_to_header.cpp
+index c48aef722e..272a374f54 100644
+--- a/metagraph/src/annotation/coord_to_header.cpp
++++ b/metagraph/src/annotation/coord_to_header.cpp
+@@ -1,5 +1,7 @@
+ #include "annotation/coord_to_header.hpp"
+ 
++#include <tsl/hopscotch_set.h>
++
+ #include "common/logger.hpp"
+ #include "common/serialization.hpp"
+ #include "common/utils/file_utils.hpp"
+@@ -13,6 +15,38 @@ namespace annot {
+ using Tuple = CoordToHeader::Tuple;
+ using mtg::common::logger;
+ 
++namespace {
++
++// a record index hashed and compared by the header it names (two types: the set derives from
++// both)
++struct HeaderOfRecordHash {
++    const std::vector<std::string> *headers;
++    size_t operator()(size_t i) const {
++        return std::hash<std::string_view>()((*headers)[i]);
++    }
++};
++
++struct HeaderOfRecordEqual {
++    const std::vector<std::string> *headers;
++    bool operator()(size_t a, size_t b) const {
++        return (*headers)[a] == (*headers)[b];
++    }
++};
++
++} // namespace
++
++void CoordToHeader::find_duplicate_headers(const std::vector<std::string> &headers,
++                                           const std::function<bool(size_t, size_t)> &callback) {
++    tsl::hopscotch_set<size_t, HeaderOfRecordHash, HeaderOfRecordEqual>
++            first(std::max<size_t>(headers.size(), 1),
++                  HeaderOfRecordHash { &headers }, HeaderOfRecordEqual { &headers });
++    for (size_t i = 0; i < headers.size(); ++i) {
++        auto [it, inserted] = first.insert(i);
++        if (!inserted && !callback(*it, i))
++            return;
++    }
++}
++
+ CoordToHeader::CoordToHeader(std::vector<std::vector<std::string>> &&headers,
+                              std::vector<std::vector<uint64_t>> &&num_kmers)
+       : headers_(std::move(headers)), coord_offsets_(num_kmers.size()) {
+diff --git a/metagraph/src/annotation/coord_to_header.hpp b/metagraph/src/annotation/coord_to_header.hpp
+index bda217de28..34c8a61d09 100644
+--- a/metagraph/src/annotation/coord_to_header.hpp
++++ b/metagraph/src/annotation/coord_to_header.hpp
+@@ -1,6 +1,7 @@
+ #ifndef __COORD_TO_HEADER_HPP__
+ #define __COORD_TO_HEADER_HPP__
+ 
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -77,6 +78,16 @@ class CoordToHeader {
+     // FASTA headers of the sequences in a column, indexed by seq_id.
+     const std::vector<std::string>& get_headers(Column column) const { return headers_[column]; }
+ 
++    /**
++     * The records of |headers| whose header repeats an earlier record's, in record order:
++     * |callback|(first, repeat) with the 0-based indices of the first occurrence and of the
++     * repeat, once per repeat, until the callback returns false. One pass with a hash set over
++     * the record indices (no header is copied), so a column of 33M headers is checked in O(n).
++     * `annotate --index-header-coords` refuses a column whose headers are not distinct.
++     */
++    static void find_duplicate_headers(const std::vector<std::string> &headers,
++                                       const std::function<bool(size_t, size_t)> &callback);
++
+     static constexpr auto kExtension = ".seqs";
+ 
+   private:
+diff --git a/metagraph/src/cli/annotate.cpp b/metagraph/src/cli/annotate.cpp
+index ea55f22d21..75eafde7cc 100644
+--- a/metagraph/src/cli/annotate.cpp
++++ b/metagraph/src/cli/annotate.cpp
+@@ -110,7 +110,7 @@ void call_annotations(const std::string &file,
+                     for (const auto &label
+                             : utils::split_string(fasta_anno_comment_delim != Config::UNINITIALIZED_STR
+                                                     ? utils::join_strings(
+-                                                        { read_stream->name.s, read_stream->comment.s },
++                                                        { read_stream->name.s, read_stream->comment.l ? read_stream->comment.s : "" },
+                                                         fasta_anno_comment_delim,
+                                                         true)
+                                                     : read_stream->name.s,
+@@ -200,7 +200,7 @@ void add_kmer_counts(const std::string &file,
+                 for (const auto &label
+                         : utils::split_string(fasta_anno_comment_delim != Config::UNINITIALIZED_STR
+                                                 ? utils::join_strings(
+-                                                    { read_stream->name.s, read_stream->comment.s },
++                                                    { read_stream->name.s, read_stream->comment.l ? read_stream->comment.s : "" },
+                                                     fasta_anno_comment_delim,
+                                                     true)
+                                                 : read_stream->name.s,
+@@ -250,6 +250,10 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+         std::vector<std::vector<uint64_t>> num_kmers(files.size());
+         #pragma omp parallel for num_threads(get_num_threads()) default(shared) schedule(dynamic)
+         for (size_t i = 0; i < files.size(); ++i) {
++            size_t calls = 0;
++            // the header of every record, and the records that have k-mers
++            std::vector<std::string> record_headers;
++            std::vector<size_t> stored;
+             call_annotations(
+                 files[i],
+                 config.refpath,
+@@ -264,16 +268,37 @@ void annotate_data(std::shared_ptr<graph::DeBruijnGraph> graph,
+                 config.fasta_header_delimiter,
+                 {}, // config.anno_labels
+                 [&](std::string sequence, auto labels, uint64_t) {
+-                    assert(labels.size() == 1 && "each sequence has a single label (header)");
+-                    if (sequence.size() >= k) {
+-                        if (headers[i].empty() || headers[i].back() != labels[0]) {
+-                            headers[i].push_back(labels[0]);
+-                            num_kmers[i].push_back(0);
+-                        }
+-                        num_kmers[i].back() += sequence.size() - k + 1;
++                    // A record's reverse complement shares its coordinates
++                    const size_t record = calls++ / (forward_and_reverse ? 2 : 1);
++                    if (labels.size() != 1 || labels[0].empty() || !utils::valid_utf8(labels[0])) {
++                        logger->error("Record {} in '{}' needs one non-empty UTF-8 header for "
++                                      "the record mapping; do not split it with --header-delimiter",
++                                      record + 1, files[i]);
++                        exit(1);
+                     }
++                    if (record == record_headers.size())
++                        record_headers.push_back(labels[0]);
++                    if (sequence.size() < k)
++                        return;
++                    if (stored.empty() || stored.back() != record) {
++                        stored.push_back(record);
++                        num_kmers[i].push_back(0);
++                    }
++                    num_kmers[i].back() += sequence.size() - k + 1;
+                 }
+             );
++            // Check every record, including those too short to have k-mers
++            annot::CoordToHeader::find_duplicate_headers(record_headers, [&](size_t first, size_t repeat) {
++                logger->error("Header of record {} in '{}' repeats record {}: record headers "
++                              "must be distinct within a file for the record mapping",
++                              repeat + 1, files[i], first + 1);
++                exit(1);
++                return false;
++            });
++            headers[i].reserve(stored.size());
++            for (size_t record : stored) {
++                headers[i].push_back(std::move(record_headers[record]));
++            }
+         }
+         annot::CoordToHeader headers_map(std::move(headers), std::move(num_kmers));
+         auto fname = utils::make_suffix(annotator_filename, annot::CoordToHeader::kExtension);
+@@ -467,6 +492,17 @@ int annotate_graph(Config *config) {
+     assert(config->infbase_annotators.size() <= 1);
+ 
+     if (config->index_header_coords) {
++        for (const auto &file : files) {
++            if (file_format(file) != "FASTA" && file_format(file) != "FASTQ") {
++                logger->error("--index-header-coords requires FASTA or FASTQ input: {}", file);
++                exit(1);
++            }
++        }
++        if (!config->fasta_header_delimiter.empty()) {
++            logger->error("--index-header-coords requires whole record headers; "
++                          "do not use --header-delimiter");
++            exit(1);
++        }
+         if (!config->filename_anno || config->annotate_sequence_headers || config->anno_labels.size()) {
+             logger->error("A CoordToHeader mapping (annotation with `--index-header-coords`) can "
+                           "only be constructed for annotated filenames (use flag `--anno-filename`)");
+diff --git a/metagraph/src/common/utils/string_utils.cpp b/metagraph/src/common/utils/string_utils.cpp
+index 02a5d5c9fb..16568eb408 100644
+--- a/metagraph/src/common/utils/string_utils.cpp
++++ b/metagraph/src/common/utils/string_utils.cpp
+@@ -8,6 +8,33 @@
+ 
+ namespace utils {
+ 
++bool valid_utf8(std::string_view s) {
++    size_t i = 0;
++    while (i < s.size()) {
++        const unsigned char c = s[i];
++        size_t n;
++        uint32_t cp;
++        if (c < 0x80) { i++; continue; }
++        if ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; }
++        else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; }
++        else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; }
++        else return false;
++        if (i + n >= s.size())
++            return false;
++        for (size_t j = 1; j <= n; ++j) {
++            const unsigned char d = s[i + j];
++            if ((d & 0xC0) != 0x80)
++                return false;
++            cp = (cp << 6) | (d & 0x3F);
++        }
++        if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000)
++                || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
++            return false;
++        i += n + 1;
++    }
++    return true;
++}
++
+ // Try to parse ka:f:[abundance] or km:f:[abundance] from header
+ // https://github.com/IndexThePlanet/Logan/blob/main/Unitigs.md
+ std::optional<uint64_t> parse_abundance(const std::string &comment) {
+diff --git a/metagraph/src/common/utils/string_utils.hpp b/metagraph/src/common/utils/string_utils.hpp
+index 1c63c9a88e..17ade6bc42 100644
+--- a/metagraph/src/common/utils/string_utils.hpp
++++ b/metagraph/src/common/utils/string_utils.hpp
+@@ -2,6 +2,7 @@
+ #define __STRING_UTILS_HPP__
+ 
+ #include <string>
++#include <string_view>
+ #include <deque>
+ #include <vector>
+ #include <cstdint>
+@@ -10,6 +11,9 @@
+ 
+ namespace utils {
+ 
++// well-formed UTF-8: no overlong forms, no surrogates, at most U+10FFFF
++bool valid_utf8(std::string_view s);
++
+ std::optional<uint64_t> parse_abundance(const std::string &comment);
+ 
+ std::string remove_suffix(const std::string &str, const std::string &suffix);
+diff --git a/metagraph/tests/annotation/test_coord_to_header.cpp b/metagraph/tests/annotation/test_coord_to_header.cpp
+index 43443e4987..8b748c6b22 100644
+--- a/metagraph/tests/annotation/test_coord_to_header.cpp
++++ b/metagraph/tests/annotation/test_coord_to_header.cpp
+@@ -194,6 +194,35 @@ TEST(CoordToHeader, SerializeLoadRoundTrip) {
+     }
+ }
+ 
++TEST(CoordToHeader, FindDuplicateHeadersNamesEveryRepeatAgainstTheFirst) {
++    // a column with one header twice, one three times, a repeat that is not consecutive
++    // and a header holding a byte that is not UTF-8 (a name, not a duplicate)
++    const std::vector<std::string> headers
++            = { "a", "b", "a", "c", "b", "b", std::string("d\xff", 2), "e" };
++    std::vector<std::pair<size_t, size_t>> repeats;
++    CoordToHeader::find_duplicate_headers(headers, [&](size_t first, size_t repeat) {
++        repeats.emplace_back(first, repeat);
++        return true;
++    });
++    EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{ { 0, 2 }, { 1, 4 }, { 1, 5 } }), repeats);
++
++    // the callback stops the scan
++    repeats.clear();
++    CoordToHeader::find_duplicate_headers(headers, [&](size_t first, size_t repeat) {
++        repeats.emplace_back(first, repeat);
++        return false;
++    });
++    EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{ { 0, 2 } }), repeats);
++
++    // distinct headers, an empty column: no repeat
++    size_t calls = 0;
++    CoordToHeader::find_duplicate_headers({ "x", "y", "" }, [&](size_t, size_t) {
++        return ++calls, true;
++    });
++    CoordToHeader::find_duplicate_headers({}, [&](size_t, size_t) { return ++calls, true; });
++    EXPECT_EQ(0u, calls);
++}
++
+ TEST(CoordToHeader, MapSingleCoordConsistentWithBatch) {
+     // Verify map_single_coord gives same results as map_to_local_coords
+     CoordToHeader cth(
+diff --git a/metagraph/tests/test_utils.cpp b/metagraph/tests/test_utils.cpp
+index 70976c07ad..a0bed18147 100644
+--- a/metagraph/tests/test_utils.cpp
++++ b/metagraph/tests/test_utils.cpp
+@@ -80,6 +80,28 @@ TEST(Utils, call_rows) {
+     ASSERT_EQ(7u, i);
+ }
+ 
++TEST(Utils, ValidUtf8) {
++    const std::vector<std::pair<std::string, bool>> cases = {
++        { "abc", true },
++        { "caf\xC3\xA9", true },
++        { "\xF0\x9F\x98\x80" "z", true },
++        { "bad\xEF\xBF\xBD", true },          // U+FFFD itself is valid
++        { "", true },
++        { "\xC0" "abc", false },                 // C0: never a lead byte
++        { "\xE9" "ab", false },                  // Latin-1: a lead without its tail
++        { "\xED\xA0\x80", false },              // a surrogate
++        { "\xE0\x80\x80", false },              // overlong
++        { "\xF4\x90\x80\x80", false },          // beyond U+10FFFF
++        { "\xF0\x9F\x98", false },              // truncated
++        { "\xE2\x82" "x", false },
++        { "bad\xFF", false },
++        { "\x80\x80", false },
++    };
++    for (const auto &[raw, valid] : cases) {
++        EXPECT_EQ(valid, utils::valid_utf8(raw)) << raw;
++    }
++}
++
+ TEST(Utils, TempFileInitialize) {
+     utils::TempFile tmp;
+ }

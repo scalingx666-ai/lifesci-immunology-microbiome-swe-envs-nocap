@@ -1,0 +1,206 @@
+diff --git a/.github/workflows/airflow.yml b/.github/workflows/airflow.yml
+index 85c8d23..4cd5580 100644
+--- a/.github/workflows/airflow.yml
++++ b/.github/workflows/airflow.yml
+@@ -55,5 +55,4 @@ jobs:
+           airflow test etl_$load upload_to_s3 2020-01-01;
+           airflow test etl_$load upload_to_snowflake 2020-01-01;
+           done
+-
+-           
+\ No newline at end of file
++        airflow test github_poll_trigger check_commits_jhu_covid-19 2020-03-27  
+\ No newline at end of file
+diff --git a/dags/covid_etl_dag.py b/dags/covid_etl_dag.py
+index ca2ca02..38522aa 100644
+--- a/dags/covid_etl_dag.py
++++ b/dags/covid_etl_dag.py
+@@ -44,7 +44,7 @@ def create_dag(dag_id, args):
+     dag = DAG(
+         dag_id=dag_id,
+         default_args=args,
+-        schedule_interval=schedules.get(basename,None),
++        schedule_interval=schedules["recurring"].get(basename,None),
+         dagrun_timeout=timedelta(minutes=60)
+     )
+ 
+@@ -95,7 +95,6 @@ def upload_to_snowflake(task_id):
+                 s3_file_name = os.path.basename(output_file)
+                 tablename = os.path.splitext(s3_file_name)[0].replace("-", "_")
+                 snowflake_stage = Variable.get("SNOWFLAKE_STAGE", default_var="COVID_PROD")
+-                print( f'using stage: "{snowflake_stage}"' )
+ 
+                 truncate_st = f'TRUNCATE TABLE {tablename}'
+                 insert_st = f'copy into {tablename} from @{snowflake_stage}/{s3_file_name} file_format = (type = "csv" field_delimiter = ","  FIELD_OPTIONALLY_ENCLOSED_BY=\'"\' skip_header = 1)'
+diff --git a/dags/github_poll_trigger.py b/dags/github_poll_trigger.py
+new file mode 100644
+index 0000000..846e6b3
+--- /dev/null
++++ b/dags/github_poll_trigger.py
+@@ -0,0 +1,74 @@
++import airflow
++from airflow import DAG
++from airflow.utils.dates import days_ago
++from airflow.operators.python_operator import BranchPythonOperator
++from airflow.operators.dagrun_operator import TriggerDagRunOperator
++from airflow.operators.dummy_operator import DummyOperator
++from airflow.configuration import conf
++import json
++import requests
++from datetime import datetime, timedelta
++
++DAGS_FOLDER = conf.get('core', 'dags_folder')
++
++with open( DAGS_FOLDER + "/../refresh_schedules.json", 'r') as f:
++    schedules = json.load(f)
++
++
++args = {
++    'owner': 'admin',
++    'start_date': '2020-03-18T12:00:00Z',
++    'catchup_by_default': False
++}
++
++def get_last_commit(ds, **kwargs):
++    since = kwargs.get('execution_date', None).strftime('%Y-%m-%dT%H:%M:%SZ')
++    name =kwargs.get('name')
++    url_template =kwargs.get('url')
++
++    url = url_template.format(since)
++
++    print("Loading data from " + url)
++
++    response = requests.get(url)
++    commits = response.json()
++
++    if len(commits) > 0:
++        print("We should run now.")
++        return f"trigger_{name.lower()}"
++    else:
++        return "stop"
++
++dag = DAG(
++    dag_id='github_poll_trigger',
++    default_args=args,
++    schedule_interval="@hourly"
++)
++
++
++with dag:
++    
++    stop_op = DummyOperator(task_id='stop', trigger_rule="all_done", dag=dag)
++    
++    start_op = DummyOperator(task_id='start', dag=dag)
++
++    for name,url in schedules["github"].items():
++
++        check_github_op = BranchPythonOperator (
++            task_id=f'check_commits_{name.lower()}',
++            python_callable=get_last_commit,
++            provide_context=True,
++            op_kwargs={"name": name, "url": url},
++            trigger_rule="all_done",
++            dag=dag,
++        )
++
++        trigger_etl_op = TriggerDagRunOperator(
++            task_id=f"trigger_{name.lower()}",
++            trigger_dag_id=f'etl_{name}',  
++            dag=dag
++        )
++
++        check_github_op >> trigger_etl_op
++        check_github_op >> stop_op
++        trigger_etl_op >> stop_op
+diff --git a/dags/jhu_github_poll.py b/dags/jhu_github_poll.py
+deleted file mode 100644
+index d43368e..0000000
+--- a/dags/jhu_github_poll.py
++++ /dev/null
+@@ -1,63 +0,0 @@
+-import airflow
+-from airflow import DAG
+-from airflow.utils.dates import days_ago
+-from airflow.operators.python_operator import BranchPythonOperator
+-from airflow.operators.dagrun_operator import TriggerDagRunOperator
+-from airflow.operators.dummy_operator import DummyOperator
+-
+-import requests
+-from datetime import datetime, timedelta
+-
+-args = {
+-    'owner': 'admin',
+-    'start_date': '2020-03-18T12:00:00Z',
+-    'catchup_by_default': False
+-}
+-
+-dag = DAG(
+-    dag_id='github_poller_jhu',
+-    default_args=args,
+-    schedule_interval="@hourly"
+-)
+-
+-# [START howto_operator_python]
+-
+-
+-def get_last_commit(ds, **kwargs):
+-    since = kwargs.get('execution_date', None).strftime('%Y-%m-%dT%H:%M:%SZ')
+-
+-    url = 'https://api.github.com/repos/CSSEGISandData/COVID-19/commits?since={}&path=csse_covid_19_data/csse_covid_19_time_series'.format(
+-        since)
+-
+-    print("Loading data from " + url)
+-
+-    response = requests.get(url)
+-    commits = response.json()
+-
+-    if len(commits) > 0:
+-        print("We should run now.")
+-        return "trigger_etl"
+-    else:
+-        return "stop"
+-
+-
+-check_github_op = BranchPythonOperator (
+-    task_id='check_if_commit_happened',
+-    python_callable=get_last_commit,
+-    provide_context=True,
+-    trigger_rule="all_done",
+-    dag=dag,
+-)
+-
+-trigger_etl_op = TriggerDagRunOperator(
+-    task_id="trigger_etl",
+-    trigger_dag_id="etl_JHU_COVID-19",  
+-    dag=dag
+-)
+-
+-stop_op = DummyOperator(task_id='stop', trigger_rule="all_done", dag=dag)
+-
+-
+-check_github_op >> trigger_etl_op
+-check_github_op >> stop_op
+-trigger_etl_op >> stop_op
+diff --git a/refresh_schedules.json b/refresh_schedules.json
+index cd666fa..4678661 100644
+--- a/refresh_schedules.json
++++ b/refresh_schedules.json
+@@ -1,6 +1,12 @@
+ {
+-  "CT_US_COVID_TESTS": "10 20 * * *",
+-  "WHO_SITUATION_REPORTS": "10 21 * * *",
+-  "PCM_DPS_COVID19": "40 17 * * *",
+-  "KFF_US": "@daily"
+-}
++  "recurring": {
++    "CT_US_COVID_TESTS": "10 20 * * *",
++    "WHO_SITUATION_REPORTS": "10 21 * * *",
++    "KFF_US": "@daily"
++  },
++  "github": {
++    "JHU_COVID-19": "https://api.github.com/repos/CSSEGISandData/COVID-19/commits?since={}&path=csse_covid_19_data/csse_covid_19_time_series",
++    "NYT_US_COVID": "https://api.github.com/repos/nytimes/covid-19-data/commits?since={}&path=",
++    "PCM_DPS_COVID19": "https://api.github.com/repos/pcm-dpc/COVID-19/commits?since={}path=dati-regioni" 
++  }
++}
+\ No newline at end of file

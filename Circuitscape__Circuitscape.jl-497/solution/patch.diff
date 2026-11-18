@@ -1,0 +1,125 @@
+diff --git a/src/core.jl b/src/core.jl
+index 562b82ac..4e4994f0 100644
+--- a/src/core.jl
++++ b/src/core.jl
+@@ -1,9 +1,12 @@
+ struct Cumulative{T,V}
+     cum_curr::Matrix{T}
+     max_curr::Matrix{T}
+-	cum_branch_curr::Vector{T}
+-	cum_node_curr::Vector{T}
+-	coords::Vector{Tuple{V,V}}
++    cum_branch_curr::Vector{T}
++    cum_node_curr::Vector{T}
++    coords::Vector{Tuple{V,V}}
++    # Edge (in either orientation) -> position in coords / cum_branch_curr,
++    # so accumulating a pair's branch currents is O(E), not O(E^2).
++    branch_index::Dict{Tuple{V,V},Int}
+     lock::ReentrantLock
+ end
+ 
+diff --git a/src/out.jl b/src/out.jl
+index 3eb5a91c..84d08b47 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -63,16 +63,18 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+ 		cum_branch_curr = output.cum.cum_branch_curr
+ 		cum_node_curr = output.cum.cum_node_curr
+ 
++        # Resolve every branch to its slot before taking the lock, so the
++        # critical section is just the adds.
++        bca = branch_currents_array
++        bidx = output.cum.branch_index
++        V = keytype(bidx).parameters[1]
++        slots = [bidx[(V(bca[i,1]), V(bca[i,2]))] for i in 1:size(bca, 1)]
++
+         lock(output.cum.lock) do
+         # Accumulate branch currents
+-		bca = branch_currents_array
+ 		cbc = cum_branch_curr
+-
+-		k = output.cum.coords
+-		@inbounds for i = 1:size(branch_currents_array, 1)
+-			idx = findfirst(isequal((Int(bca[i,1]), Int(bca[i,2]))), k)
+-			idx == nothing && (idx = findfirst(isequal((Int(bca[i,2]), Int(bca[i,1]))), k))
+-			cbc[idx] += bca[i,3]
++		@inbounds for i = 1:size(bca, 1)
++			cbc[slots[i]] += bca[i,3]
+ 		end
+ 
+ 
+diff --git a/src/utils.jl b/src/utils.jl
+index 0620b6a6..21999ac3 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -166,8 +166,8 @@ function initialize_cum_maps(cellmap::Matrix{T}, max = false) where T
+     cum_branch_curr = Vector{T}()
+     cum_node_curr = Vector{T}()
+ 
+-    Cumulative(cum_curr, max_curr,
+-			   cum_branch_curr, cum_node_curr, Vector{Tuple{Int,Int}}(), ReentrantLock())
++    Cumulative(cum_curr, max_curr, cum_branch_curr, cum_node_curr,
++               Vector{Tuple{Int,Int}}(), Dict{Tuple{Int,Int},Int}(), ReentrantLock())
+ end
+ 
+ function initialize_cum_vectors(coords::Tuple{Vector{V},Vector{V},Vector{T}}, num_nodes::Int64) where {T,V}
+@@ -177,9 +177,17 @@ function initialize_cum_vectors(coords::Tuple{Vector{V},Vector{V},Vector{T}}, nu
+ 	cum_branch_curr = zeros(T, length(_v))
+ 	cum_node_curr = zeros(T, num_nodes)
+ 
+-	pair_coords = map((x,y) -> (x,y), _i, _j)
+-    Cumulative(cum_curr, max_curr,
+-			   cum_branch_curr, cum_node_curr, pair_coords, ReentrantLock())
++    pair_coords = map((x,y) -> (x,y), _i, _j)
++    # First occurrence wins for a duplicated edge, as the linear scan it
++    # replaces did; both orientations map to the same slot.
++    branch_index = Dict{Tuple{V,V},Int}()
++    sizehint!(branch_index, 2 * length(pair_coords))
++    for (idx, (a, b)) in enumerate(pair_coords)
++        get!(branch_index, (a, b), idx)
++        get!(branch_index, (b, a), idx)
++    end
++    Cumulative(cum_curr, max_curr, cum_branch_curr, cum_node_curr,
++               pair_coords, branch_index, ReentrantLock())
+ end
+ 
+ # Function to calculate current for Omniscape moving window solves
+diff --git a/test/internal.jl b/test/internal.jl
+index f2e410d2..2bc9b9fb 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -514,3 +514,34 @@ end
+     @test hasmethod(Circuitscape.start, Tuple{})
+     @test_throws MethodError Circuitscape.start(1)
+ end
++
++# Network cumulative currents: the branch index must resolve either
++# orientation of an edge to one slot, keep the first slot for a duplicated
++# edge, and the accumulated result must not depend on how edges are listed.
++@testset "network cumulative branch index" begin
++    coords = ([1, 3, 2, 3, 4], [2, 2, 1, 4, 3], [1.0, 1.0, 1.0, 1.0, 1.0])  # (2,1) duplicates (1,2); (4,3) duplicates (3,4)
++    cum = Circuitscape.initialize_cum_vectors(coords, 4)
++    @test cum.branch_index[(1, 2)] == 1 && cum.branch_index[(2, 1)] == 1
++    @test cum.branch_index[(3, 2)] == 2 && cum.branch_index[(2, 3)] == 2
++    @test cum.branch_index[(3, 4)] == 4 && cum.branch_index[(4, 3)] == 4
++    @test length(cum.cum_branch_curr) == 5
++
++    # Path 1-2-3-4-5 with rows deliberately listed in mixed orientation. One
++    # focal pair, so the cumulative branch currents equal that pair's own.
++    dir = mktempdir()
++    write(joinpath(dir, "g.txt"), "2\t1\t1.0\n2\t3\t2.0\n4\t3\t1.0\n4\t5\t3.0\n")
++    write(joinpath(dir, "fp.txt"), "1\n5\n")
++    d = Circuitscape.init_config()
++    d["data_type"] = "network"; d["scenario"] = "pairwise"
++    d["habitat_file"] = joinpath(dir, "g.txt"); d["habitat_map_is_resistances"] = "True"
++    d["point_file"] = joinpath(dir, "fp.txt"); d["output_file"] = joinpath(dir, "o.out")
++    d["write_cur_maps"] = "True"
++    r = compute(d)
++    @test r[2, 3] ≈ 7.0   # series resistances 1 + 2 + 1 + 3
++    keyed(m) = Dict(minmax(Int(m[i, 1]), Int(m[i, 2])) => m[i, 3] for i in axes(m, 1))
++    pair = keyed(readdlm(joinpath(dir, "o_branch_currents_1_5.txt")))
++    cum = keyed(readdlm(joinpath(dir, "o_branch_currents_cum.txt")))
++    @test length(cum) == 4 && keys(cum) == keys(pair)
++    @test all(cum[k] ≈ pair[k] for k in keys(cum))
++    @test all(v ≈ 1.0 for v in values(cum))   # unit current through every series branch
++end

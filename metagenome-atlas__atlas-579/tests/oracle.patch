@@ -1,0 +1,305 @@
+diff --git a/atlas/template_config.yaml b/atlas/template_config.yaml
+index 06213a39..f782a5cd 100644
+--- a/atlas/template_config.yaml
++++ b/atlas/template_config.yaml
+@@ -177,16 +177,20 @@ DASTool:
+   search_engine: 'diamond'
+   score_threshold: 0.5              # Score threshold until selection algorithm will keep selecting bins [0..1].
+ 
+-# Acording to Parks et al. 2020 (GTDB)
+-genome_filter_criteria: "(Completeness-5*Contamination >50 )  & (Ambigious_bases <1e6) & (N50 > 5*1e3) & (N_scaffolds < 1e3)"
++
++genome_filter_criteria: "(Completeness-5*Contamination >50 ) & (Length >=50000) & (Ambigious_bases <1e6) & (N50 > 5*1e3) & (N_scaffolds < 1e3)"
+ 
+ 
+ genome_dereplication:
+-  ANI: 95                        ## Genome dreplication threshold
+-  overlap: 0.30                  # See more on https://wwood.github.io/galah/galah-cluster.html
+-  opt_parameters: ""
+-  quality_formula: "Parks2020_reduced" # completeness-5*contamination-5*num_contigs/100-5*num_ambiguous_bases/100000
+-  
++  ANI: 0.95                     ## Genome dreplication threshold 0.95 is more or less species
++  overlap: 0.2                  # See more on https://drep.readthedocs.io/en/latest/module_descriptions.html
++  greedy_clustering: "auto"     # Add options for greedy clustering 'auto' when using more than 5k bins
++  score:
++    completeness: 1
++    contamination: 5
++    N50: 0.5
++    length: 0
++    centrality: 1
+ 
+ rename_mags_contigs: true        #Rename contigs of representative MAGs
+ 
+diff --git a/atlas/workflow/config/default_config.yaml b/atlas/workflow/config/default_config.yaml
+index cd544d2c..8af89ee6 100644
+--- a/atlas/workflow/config/default_config.yaml
++++ b/atlas/workflow/config/default_config.yaml
+@@ -4,16 +4,19 @@ usejni: false
+ gene_annotations:
+   - eggNOG
+ 
+-genome_filter_criteria: "(Completeness-5*Contamination >50 )  & (Ambigious_bases <1e6) & (N50 > 5*1e3) & (N_scaffolds < 1e3)"
++genome_filter_criteria: "(Completeness-5*Contamination >50 ) & (Length >=50000) & (Ambigious_bases <1e6) & (N50 > 5*1e3) & (N_scaffolds < 1e3)"
+ exclude_unplacable_genomes: false
+ 
+ genome_dereplication:
+-  ANI: 97.5                        ## Genome dreplication threshold
+-  overlap: 0.5                  # See more on https://wwood.github.io/galah/galah-cluster.html
++  ANI: 0.95                        ## Genome dreplication threshold
++  overlap: 0.2                  # See more on https://drep.readthedocs.io/en/latest/module_descriptions.html
++  greedy_clustering: "auto"     # Add options for greedy clustering 'auto' when using more than 5k bins
+   opt_parameters: ""
+-  quality_formula: "Parks2020_reduced" # completeness-5*contamination-5*num_contigs/100-5*num_ambiguous_bases/100000
+-  
+-genome_min_completeness: 50
+-genome_max_contamination: 10
++  score:
++    completeness: 1
++    contamination: 5
++    N50: 0.5
++    length: 0
++    centrality: 1
+ 
+ genome_aligner: "minimap"
+\ No newline at end of file
+diff --git a/atlas/workflow/envs/dRep.yaml b/atlas/workflow/envs/dRep.yaml
+index fb3572da..66d886f0 100644
+--- a/atlas/workflow/envs/dRep.yaml
++++ b/atlas/workflow/envs/dRep.yaml
+@@ -4,9 +4,8 @@ channels:
+     - ruby-lang
+     - defaults
+ dependencies:
+-    - python=3.6
+-    - mummer>=3.22
++    - python>=3.8, <3.11
+     - mash>=2
+     - prodigal=2.6.3
+-    - fastani=1.32
+-    - drep=3.2
++    - fastani=1.33
++    - drep>=3.4 , <4
+diff --git a/atlas/workflow/rules/genomes.smk b/atlas/workflow/rules/genomes.smk
+index b484fb2e..aa14e927 100644
+--- a/atlas/workflow/rules/genomes.smk
++++ b/atlas/workflow/rules/genomes.smk
+@@ -127,45 +127,166 @@ rule filter_bins:
+         "../scripts/filter_genomes.py"
+ 
+ 
+-rule dereplication:
++def get_greedy_drep_Arguments(wildcards):
++    "Select greedy options of drep see: https://drep.readthedocs.io/en/latest/module_descriptions.html"
++
++    use_greedy = config["genome_dereplication"]["greedy_clustering"]
++    if (type(use_greedy) == str) and use_greedy.strip().lower() == "auto":
++
++        # count number of bins in file
++        bin_list = rules.filter_bins.output.paths
++
++        n_bins = 0
++        with open(bin_list) as f:
++            for line in f:
++                n_bins += 1
++
++        use_greedy = n_bins > 10e3
++
++        if use_greedy:
++
++            logger.warning(
++                f"You have {n_bins} to be dereplicated. I will use greedy algorithms with single linkage."
++            )
++
++    if use_greedy:
++
++        return " --multiround_primary_clustering --greedy_secondary_clustering "
++
++    else:
++
++        return ""
++
++
++def get_drep_ani(wildcards):
++    "Enshure that ani is [0.1]"
++    ani = config["genome_dereplication"]["ANI"]
++
++    if ani > 1:
++        logger.warning(
++            f"genome_dereplication - ANI is {ani} should be between 0 and 1, I correct this for you."
++        )
++
++        ani = ani / 100
++    return ani
++
++
++rule drep_compare:
+     input:
+         paths="genomes/all_bins/filtered_bins.txt",
++    output:
++        tables="genomes/Dereplication/data_tables/Cdb.csv",
++        bdb="genomes/Dereplication/data_tables/Bdb.csv",
++    threads: config["threads"]
++    log:
++        "logs/genomes/drep_compare.log",
++    conda:
++        "../envs/dRep.yaml"
++    params:
++        ANI=get_drep_ani,
++        overlap=config["genome_dereplication"]["overlap"],
++        greedy_options=get_greedy_drep_Arguments,
++        working_dir=lambda wc, output: Path(output[0]).parent.parent,
++    shell:
++        " rm -r {params.working_dir} 2> {log}"
++        ";"
++        " dRep compare "
++        " --genomes {input.paths} "
++        " --S_ani {params.ANI} "
++        " --S_algorithm fastANI "
++        " --cov_thresh {params.overlap} "
++        " --processors {threads} "
++        " {params.greedy_options} "
++        " {params.working_dir} "
++        " &>> {log} "
++
++
++rule dereplicate:
++    input:
++        rules.drep_compare.output,
+         quality="genomes/all_bins/filtered_quality.csv",
+     output:
+-        dir=temp(directory("genomes/dereplicated_genomes")),
+-        mapping_file=temp("genomes/clustering/allbins2genome_oldname.tsv"),
++        genomes=temp(directory("genomes/Dereplication/dereplicated_genomes")),
++        wdb="genomes/Dereplication/data_tables/Wdb.csv",
+     threads: config["threads"]
+     log:
+-        "logs/genomes/dereplication.log",
++        "logs/genomes/dereplicate.log",
+     conda:
+-        "../envs/galah.yaml"
++        "../envs/dRep.yaml"
+     params:
+-        ANI=config["genome_dereplication"]["ANI"],
+-        quality_formula=config["genome_dereplication"]["quality_formula"],
++        # no filtering
++        no_filer=" --length 100  --completeness 0 --contamination  100 ",
++        ANI=get_drep_ani,
++        overlap=config["genome_dereplication"]["overlap"],
++        completeness_weight=config["genome_dereplication"]["score"]["completeness"],
++        contamination_weight=config["genome_dereplication"]["score"]["contamination"],
++        #not in table
++        N50_weight=config["genome_dereplication"]["score"]["N50"],
++        size_weight=config["genome_dereplication"]["score"]["length"],
+         opt_parameters=config["genome_dereplication"]["opt_parameters"],
+-        min_overlap=config["genome_dereplication"]["overlap"],
++        working_dir=lambda wc, input: Path(input[0]).parent.parent,
+     shell:
+-        " galah cluster "
+-        " --genome-fasta-list {input.paths}"
+-        " --genome-info {input.quality} "
+-        " --ani {params.ANI} "
+-        " --min-aligned-fraction {params.min_overlap} "
++        " dRep dereplicate "
++        " {params.no_filer} "
++        " --genomeInfo {input.quality} "
++        " --S_ani {params.ANI} "
++        " --S_algorithm fastANI "
++        " --cov_thresh {params.overlap} "
++        " --completeness_weight {params.completeness_weight} "
++        " --contamination_weight {params.contamination_weight} "
++        " --N50_weight {params.N50_weight} "
++        " --size_weight {params.size_weight} "
++        " --processors {threads} "
++        " --run_tertiary_clustering "
+         " {params.opt_parameters} "
+-        " --quality-formula {params.quality_formula} "
+-        " --threads {threads} "
+-        " --output-representative-fasta-directory {output.dir} "
+-        " --output-cluster-definition {output.mapping_file} "
+-        " --precluster-method finch "
++        " {params.working_dir} "
+         " &> {log} "
+ 
+ 
++localrules:
++    parse_drep,
++
++
++rule parse_drep:
++    input:
++        cdb="genomes/Dereplication/data_tables/Cdb.csv",
++        bdb="genomes/Dereplication/data_tables/Bdb.csv",
++        wdb="genomes/Dereplication/data_tables/Wdb.csv",
++    output:
++        "genomes/clustering/allbins2genome_oldname.tsv",
++    run:
++        import pandas as pd
++
++
++        Cdb = pd.read_csv(input.cdb)
++        Cdb.set_index("genome", inplace=True)
++
++        Wdb = pd.read_csv(input.wdb)
++        Wdb.set_index("cluster", inplace=True)
++        genome2cluster = Cdb.secondary_cluster.map(Wdb.genome)
++
++
++        genome2cluster = genome2cluster.to_frame().reset_index()
++        genome2cluster.columns = ["Bin", "Rep"]
++
++        # map to full paths
++        file_paths = pd.read_csv(input.bdb, index_col=0).location
++        for col in genome2cluster:
++            genome2cluster[col + "_path"] = file_paths.loc[genome2cluster[col]].values
++
++        # expected output is inverted columns
++        genome2cluster[["Rep_path", "Bin_path"]].to_csv(
++            output[0], sep="\t", index=False, header=False
++        )
++
++
+ localrules:
+     rename_genomes,
+ 
+ 
+ checkpoint rename_genomes:
+     input:
+-        genomes="genomes/dereplicated_genomes",
++        genomes="genomes/Dereplication/dereplicated_genomes",
+         mapping_file="genomes/clustering/allbins2genome_oldname.tsv",
+         genome_quality=f"reports/genomic_bins_{config['final_binner']}.tsv",
+     output:
+diff --git a/atlas/workflow/scripts/filter_genomes.py b/atlas/workflow/scripts/filter_genomes.py
+index 39c09de8..0a2f775d 100644
+--- a/atlas/workflow/scripts/filter_genomes.py
++++ b/atlas/workflow/scripts/filter_genomes.py
+@@ -70,11 +70,13 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ 
+ 
+ # output quality for derepliation
+-D = Q
++D = Q.copy()
+ 
+ D.index.name = "genome"
+ 
+ D.columns = D.columns.str.lower()
++# fasta extension is needed even if otherwise stated https://github.com/MrOlm/drep/issues/169
++D.index += ".fasta"
+ D = D[["completeness", "contamination"]]
+ D.to_csv(snakemake.output.quality_for_derep)
+ 
+diff --git a/atlas/workflow/scripts/rename_genomes.py b/atlas/workflow/scripts/rename_genomes.py
+index c951d210..4147732c 100644
+--- a/atlas/workflow/scripts/rename_genomes.py
++++ b/atlas/workflow/scripts/rename_genomes.py
+@@ -51,6 +51,10 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ )
+ mapping.columns = ["Rep_path", "Bin_path"]
+ 
++assert (
++    mapping.Bin_path.is_unique
++), "The second column of {snakemake.input.mapping_file} should be unique"
++
+ # go from path to id
+ mapping[["Representative", "Bin"]] = mapping.applymap(
+     lambda x: os.path.basename(x).replace(".fasta", "")

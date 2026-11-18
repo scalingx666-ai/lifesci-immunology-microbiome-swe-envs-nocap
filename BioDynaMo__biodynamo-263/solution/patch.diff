@@ -1,0 +1,691 @@
+diff --git a/cmake/selection-libbiodynamo.xml b/cmake/selection-libbiodynamo.xml
+index 472a6d388..51dfc515a 100644
+--- a/cmake/selection-libbiodynamo.xml
++++ b/cmake/selection-libbiodynamo.xml
+@@ -131,5 +131,12 @@
+     <class name="bdm::neuroscience::SplitNeuriteElementEvent" />
+     <class name="bdm::neuroscience::NeuriteElement::MechanicalForcesFunctor" />
+     <class name="bdm::Spinlock" />
++    <class name="bdm::SharedData<std::vector<bdm::AgentUid>>" />
++    <class name="bdm::SharedData<uint64_t>" />
++    <class name="bdm::SharedData<bdm::MathArray<double,3>>" />
++    <class name="bdm::SharedData<bdm::MathArray<double,4>>" />
+   </selection>
++  <exclusion>
++    <class pattern="bdm::SharedData<*>::AlignedT" />
++  </exclusion>
+ </lcgdict>
+diff --git a/cmake/selection.xml b/cmake/selection.xml
+index 63de61404..d1d0c2641 100644
+--- a/cmake/selection.xml
++++ b/cmake/selection.xml
+@@ -92,7 +92,6 @@
+     <!-- list of biodynamo classes that should be ignored  -->
+     <class pattern="bdm::memory_manager_detail::*" />
+     <class pattern="std::vector<bdm::memory_manager_detail::*>" />
+-    <class pattern="bdm::SharedData*" />
+     <class name="bdm::MemoryManager" />
+     <class name="bdm::Operation" />
+     <class name="bdm::SoVisitor" />
+@@ -167,5 +166,10 @@
+     <class name="bdm::neuroscience::SideNeuriteExtensionEvent" />
+     <class name="bdm::neuroscience::SplitNeuriteElementEvent" />
+     <class name="bdm::neuroscience::NeuriteElement::MechanicalForcesFunctor" />
++    <class name="bdm::SharedData<std::vector<bdm::AgentUid>>" />
++    <class name="bdm::SharedData<uint64_t>" />
++    <class name="bdm::SharedData<bdm::MathArray<double,3>>" />
++    <class name="bdm::SharedData<bdm::MathArray<double,4>>" />
++    <class pattern="bdm::SharedData<*>::AlignedT" />
+   </exclusion>
+ </lcgdict>
+diff --git a/doc/user_guide/simulation_parameter_tutorial.md b/doc/user_guide/simulation_parameter_tutorial.md
+index 05d41ce6e..abaa1044a 100644
+--- a/doc/user_guide/simulation_parameter_tutorial.md
++++ b/doc/user_guide/simulation_parameter_tutorial.md
+@@ -161,8 +161,6 @@ Have a look at https://biodynamo.org/bioapi/ for more details about each paramet
+         "show_simulation_step": 0,
+         "simulation_max_displacement": 3,
+         "simulation_time_step": 0.01,
+-        "agent_uid_defragmentation_high_watermark": 0.9,
+-        "agent_uid_defragmentation_low_watermark": 0.5,
+         "statistics": false,
+         "thread_safety_mechanism": 1,
+         "use_bdm_mem_mgr": true,
+@@ -370,8 +368,6 @@ Parameters
+         "show_simulation_step": 0,
+         "simulation_max_displacement": 3,
+         "simulation_time_step": 1,
+-        "agent_uid_defragmentation_high_watermark": 0.9,
+-        "agent_uid_defragmentation_low_watermark": 0.5,
+         "statistics": true,
+         "thread_safety_mechanism": 1,
+         "use_bdm_mem_mgr": true,
+diff --git a/src/core/agent/agent_uid_generator.h b/src/core/agent/agent_uid_generator.h
+index c3d46ab1d..96c2dfd20 100644
+--- a/src/core/agent/agent_uid_generator.h
++++ b/src/core/agent/agent_uid_generator.h
+@@ -21,6 +21,7 @@
+ #include "core/agent/agent_handle.h"
+ #include "core/agent/agent_uid.h"
+ #include "core/container/agent_uid_map.h"
++#include "core/container/shared_data.h"
+ #include "core/scheduler.h"
+ #include "core/simulation.h"
+ #include "core/util/root.h"
+@@ -29,58 +30,41 @@
+ namespace bdm {
+ 
+ /// This class generates unique ids for agents.
+-/// All functions are  thread safe.
+ class AgentUidGenerator {
+  public:
+   AgentUidGenerator(const AgentUidGenerator&) = delete;
+-  AgentUidGenerator() : counter_(0) {}
++  AgentUidGenerator() : counter_(0), tinfo_(ThreadInfo::GetInstance()) {
++    Update();
++  }
+ 
+   /// Generates AgentUid with increasing index.
+-  /// In defragmentation mode it resuses index values from removed agents
+-  /// and sets the reused field to the current simulation step.
++  /// In defragmentation mode it reuses index values from removed agents
++  /// and increments the reused field.
++  /// Thread-safe.
+   AgentUid GenerateUid() {
+-    if (map_ != nullptr) {
+-      // defragmentation mode
+-      std::lock_guard<Spinlock> guard(lock_);
+-      // repeat check, another thread might have disabled defragmentation
+-      if (map_ != nullptr) {
+-        // find unused element in map
+-        while (search_index_ < map_->size() &&
+-               map_->GetReused(search_index_) !=
+-                   std::numeric_limits<typename AgentUid::Reused_t>::max()) {
+-          search_index_++;
+-        }
+-        if (search_index_ < map_->size()) {
+-          auto* scheduler = Simulation::GetActive()->GetScheduler();
+-          return AgentUid(search_index_++, static_cast<AgentUid::Reused_t>(
+-                                               scheduler->GetSimulatedSteps()));
+-        }
+-        // didn't find any empty slots -> disable defragmentation mode
+-        DisableDefragmentation();
+-      }
++    auto& old_uids = tl_uids_[tinfo_->GetMyThreadId()];
++    if (old_uids.size()) {
++      auto uid = old_uids.back();
++      old_uids.pop_back();
++      return AgentUid(uid.GetIndex(), uid.GetReused() + 1);
+     }
+     return AgentUid(counter_++);
+   }
+ 
+   // Returns the highest index that was used for an AgentUid
++  /// Thread-safe.
+   AgentUid::Index_t GetHighestIndex() const { return counter_; }
+ 
+-  void EnableDefragmentation(const AgentUidMap<AgentHandle>* map) {
+-    // check if already in defragmentation mode
+-    if (map_ == nullptr) {
+-      map_ = map;
+-      search_index_ = 0;
+-    }
+-  }
+-
+-  void DisableDefragmentation() {
+-    if (map_ != nullptr) {
+-      counter_ = static_cast<AgentUid::Index_t>(map_->size());
+-    }
+-    map_ = nullptr;
++  /// Adds AgentUid that can be reused after AgentUid::reused_ is incremented.
++  /// Thread-safe.
++  void ReuseAgentUid(const AgentUid& uid) {
++    tl_uids_[tinfo_->GetMyThreadId()].push_back(uid);
+   }
+ 
+-  bool IsInDefragmentationMode() const { return map_ != nullptr; }
++  /// Resizes internal data structures to the number of threads.
++  /// NB: If Update is called, calls to GenerateUid or ReuseAgentUid are not
++  /// allowed!
++  void Update() { tl_uids_.resize(tinfo_->GetMaxThreads()); }
+ 
+  private:
+   std::atomic<typename AgentUid::Index_t> counter_;  //!
+@@ -88,12 +72,10 @@ class AgentUidGenerator {
+   /// Therefore this additional helper variable is needed.
+   typename AgentUid::Index_t root_counter_;
+ 
+-  ///
+-  const AgentUidMap<AgentHandle>* map_ = nullptr;  //!
+-  /// Lock needed for defragmentation mode
+-  Spinlock lock_;  //!
+-  /// Current search position
+-  typename AgentUid::Index_t search_index_ = 0;  //!
++  /// Thread local vector of AgentUids that can be reused
++  SharedData<std::vector<AgentUid>> tl_uids_;
++  ThreadInfo* tinfo_ = nullptr;  //!
++
+   BDM_CLASS_DEF_NV(AgentUidGenerator, 1);
+ };
+ 
+diff --git a/src/core/container/shared_data.h b/src/core/container/shared_data.h
+index fbfbd189c..a40341555 100644
+--- a/src/core/container/shared_data.h
++++ b/src/core/container/shared_data.h
+@@ -19,6 +19,8 @@
+ #include <cstdint>
+ #include <vector>
+ 
++#include "core/util/root.h"
++
+ /// This is BioDynaMo's default cachline size. If you system has a different
+ /// cacheline size, consider changing the value accordingly. When BioDynaMo
+ /// moves to the C++17 standard, this choice will be automated. See :
+@@ -85,6 +87,8 @@ class SharedData {
+ 
+  private:
+   Data data_;
++
++  BDM_CLASS_DEF_NV(SharedData, 1)
+ };
+ 
+ }  // namespace bdm
+diff --git a/src/core/param/param.cc b/src/core/param/param.cc
+index bf8c2cc42..bdcecb7dc 100644
+--- a/src/core/param/param.cc
++++ b/src/core/param/param.cc
+@@ -341,12 +341,6 @@ void Param::AssignFromConfig(const std::shared_ptr<cpptoml::table>& config) {
+   BDM_ASSIGN_CONFIG_VALUE(detect_static_agents,
+                           "performance.detect_static_agents");
+   BDM_ASSIGN_CONFIG_VALUE(cache_neighbors, "performance.cache_neighbors");
+-  BDM_ASSIGN_CONFIG_VALUE(
+-      agent_uid_defragmentation_low_watermark,
+-      "performance.agent_uid_defragmentation_low_watermark");
+-  BDM_ASSIGN_CONFIG_VALUE(
+-      agent_uid_defragmentation_high_watermark,
+-      "performance.agent_uid_defragmentation_high_watermark");
+   BDM_ASSIGN_CONFIG_VALUE(use_bdm_mem_mgr, "performance.use_bdm_mem_mgr");
+   BDM_ASSIGN_CONFIG_VALUE(mem_mgr_aligned_pages_shift,
+                           "performance.mem_mgr_aligned_pages_shift");
+diff --git a/src/core/param/param.h b/src/core/param/param.h
+index ec844c8a1..918e086ce 100644
+--- a/src/core/param/param.h
++++ b/src/core/param/param.h
+@@ -476,24 +476,6 @@ struct Param {
+   ///     cache_neighbors = false
+   bool cache_neighbors = false;
+ 
+-  /// If the utilization in the AgentUidMap inside ResourceManager falls below
+-  /// this watermark, defragmentation will be turned on.\n
+-  /// Default value: `0.5`\n
+-  /// TOML config file:
+-  ///
+-  ///     [performance]
+-  ///     agent_uid_defragmentation_low_watermark = 0.5
+-  double agent_uid_defragmentation_low_watermark = 0.5;
+-
+-  /// If the utilization in the AgentUidMap inside ResourceManager rises above
+-  /// this watermark, defragmentation will be turned off.\n
+-  /// Default value: `0.9`\n
+-  /// TOML config file:
+-  ///
+-  ///     [performance]
+-  ///     agent_uid_defragmentation_high_watermark = 0.9
+-  double agent_uid_defragmentation_high_watermark = 0.9;
+-
+   /// Use the BioDynaMo memory manager.
+   /// Default value: `true`\n
+   /// TOML config file:
+diff --git a/src/core/resource_manager.cc b/src/core/resource_manager.cc
+index 79858e877..98c11f5cd 100644
+--- a/src/core/resource_manager.cc
++++ b/src/core/resource_manager.cc
+@@ -551,10 +551,13 @@ void ResourceManager::RemoveAgents(
+       start_del += lowest[nid];
+       end_del += lowest[nid];
+ 
++      auto* uid_generator = Simulation::GetActive()->GetAgentUidGenerator();
+       for (uint64_t i = start_del; i < end_del; ++i) {
+         Agent* agent = agents_[nid][i];
+-        assert(toberemoved.find(agent->GetUid()) != toberemoved.end());
+-        uid_ah_map_.Remove(agent->GetUid());
++        auto uid = agent->GetUid();
++        assert(toberemoved.find(uid) != toberemoved.end());
++        uid_ah_map_.Remove(uid);
++        uid_generator->ReuseAgentUid(uid);
+         if (type_index_) {
+           // TODO parallelize type_index removal
+ #pragma omp critical
+diff --git a/src/core/resource_manager.h b/src/core/resource_manager.h
+index ff7a0dc71..2ff101c6f 100644
+--- a/src/core/resource_manager.h
++++ b/src/core/resource_manager.h
+@@ -346,18 +346,7 @@ class ResourceManager {
+     }
+   }
+ 
+-  virtual void EndOfIteration() {
+-    // Check if SoUiD defragmentation should be turned on or off
+-    double utilization = static_cast<double>(GetNumAgents()) /
+-                         static_cast<double>(uid_ah_map_.size());
+-    auto* sim = Simulation::GetActive();
+-    auto* param = sim->GetParam();
+-    if (utilization < param->agent_uid_defragmentation_low_watermark) {
+-      sim->GetAgentUidGenerator()->EnableDefragmentation(&uid_ah_map_);
+-    } else if (utilization > param->agent_uid_defragmentation_high_watermark) {
+-      sim->GetAgentUidGenerator()->DisableDefragmentation();
+-    }
+-  }
++  virtual void EndOfIteration() {}
+ 
+   /// Adds `new_agents` to `agents_[numa_node]`. `offset` specifies
+   /// the index at which the first element is inserted. Agents are inserted
+@@ -416,6 +405,7 @@ class ResourceManager {
+       delete agent;
+       MarkEnvironmentOutOfSync();
+     }
++    Simulation::GetActive()->GetAgentUidGenerator()->ReuseAgentUid(uid);
+   }
+ 
+   // \param uids: one vector for each thread containing one vector for each numa
+diff --git a/src/core/scheduler.cc b/src/core/scheduler.cc
+index faa96a406..32c03a7ab 100644
+--- a/src/core/scheduler.cc
++++ b/src/core/scheduler.cc
+@@ -463,6 +463,9 @@ void Scheduler::Initialize(uint64_t steps) {
+     progress_bar_ = new ProgressBar(steps);
+   }
+ 
++  // Update the uid generator in case the number of threads has changed.
++  sim->GetAgentUidGenerator()->Update();
++
+   // We force-update the environment in this function because users may apply
+   // certain operations such as shifting them in space in between two Simulate()
+   // or SimulateUntil() calls. In contrast to adding or removing agents, such
+diff --git a/test/unit/core/agent/agent_uid_generator_test.cc b/test/unit/core/agent/agent_uid_generator_test.cc
+index 19b91a647..b044cbd2c 100644
+--- a/test/unit/core/agent/agent_uid_generator_test.cc
++++ b/test/unit/core/agent/agent_uid_generator_test.cc
+@@ -22,28 +22,25 @@
+ namespace bdm {
+ 
+ TEST(AgentUidGeneratorTest, NormalAndDefragmentationMode) {
+-  Simulation simulation(TEST_NAME);
+-  simulation.GetResourceManager()->AddAgent(new TestAgent(0));
+-
+   AgentUidGenerator generator;
+ 
+-  EXPECT_EQ(AgentUid(0), generator.GenerateUid());
+-  EXPECT_EQ(AgentUid(1), generator.GenerateUid());
+-  EXPECT_EQ(AgentUid(2), generator.GenerateUid());
+-
+-  // increment simulated time steps
+-  simulation.GetScheduler()->Simulate(1);
++  // Create num threads agent uids
++  auto* tinfo = ThreadInfo::GetInstance();
++  for (int i = 0; i < tinfo->GetMaxThreads(); ++i) {
++    EXPECT_EQ(AgentUid(i), generator.GenerateUid());
++  }
+ 
+-  // defragmentation mode
+-  AgentUidMap<AgentHandle> map(3);
+-  map.Insert(AgentUid(1), AgentHandle(123));
+-  // slots 0, and 2 are empty
++  // Reuse uids
++#pragma omp parallel for schedule(static, 1)
++  for (int i = 0; i < tinfo->GetMaxThreads(); ++i) {
++    generator.ReuseAgentUid(AgentUid(i));
++    EXPECT_EQ(AgentUid(i, 1), generator.GenerateUid());
++  }
+ 
+-  generator.EnableDefragmentation(&map);
+-  EXPECT_EQ(AgentUid(0, 1), generator.GenerateUid());
+-  EXPECT_EQ(AgentUid(2, 1), generator.GenerateUid());
+-  // no more empty slots -> generator should have switched back to normal mode
+-  EXPECT_EQ(AgentUid(3, 0), generator.GenerateUid());
++  // generate new uids
++  for (int i = 0; i < tinfo->GetMaxThreads(); ++i) {
++    EXPECT_EQ(AgentUid(i + tinfo->GetMaxThreads()), generator.GenerateUid());
++  }
+ }
+ 
+ #ifdef USE_DICT
+@@ -62,6 +59,37 @@ TEST_F(IOTest, AgentUidGenerator) {
+ 
+   delete restored;
+ }
++
++TEST_F(IOTest, AgentUidGeneratorWithReuse) {
++  AgentUidGenerator generator;
++
++  // Create num threads agent uids
++  auto* tinfo = ThreadInfo::GetInstance();
++  for (int i = 0; i < 2 * tinfo->GetMaxThreads(); ++i) {
++    EXPECT_EQ(AgentUid(i), generator.GenerateUid());
++  }
++
++  // Mark for reuse half of the uids
++#pragma omp parallel for schedule(static, 1)
++  for (int i = 0; i < tinfo->GetMaxThreads(); ++i) {
++    generator.ReuseAgentUid(AgentUid(i));
++  }
++
++  AgentUidGenerator* restored = nullptr;
++
++  BackupAndRestore(generator, &restored);
++
++  EXPECT_EQ(restored->GetHighestIndex(), 2u * tinfo->GetMaxThreads());
++
++  // Generate uids using the indices marked for reuse
++#pragma omp parallel for schedule(static, 1)
++  for (int i = 0; i < tinfo->GetMaxThreads(); ++i) {
++    EXPECT_EQ(AgentUid(i, 1), restored->GenerateUid());
++  }
++
++  delete restored;
++}
++
+ #endif  // USE_DICT
+ 
+ }  // namespace bdm
+diff --git a/test/unit/core/container/shared_data_test.cc b/test/unit/core/container/shared_data_test.cc
+index fac9e7a49..3316a264c 100644
+--- a/test/unit/core/container/shared_data_test.cc
++++ b/test/unit/core/container/shared_data_test.cc
+@@ -12,11 +12,14 @@
+ //
+ // -----------------------------------------------------------------------------
+ 
+-#include "core/container/shared_data.h"
++#include "unit/core/container/shared_data_test.h"
+ #include <gtest/gtest.h>
+ #include <vector>
++#include "core/container/shared_data.h"
++#include "unit/test_util/io_test.h"
+ 
+ namespace bdm {
++namespace shared_data_test {
+ 
+ // Test if resize and size method work correctly.
+ TEST(SharedDataTest, ReSize) {
+@@ -27,71 +30,13 @@ TEST(SharedDataTest, ReSize) {
+ }
+ 
+ // Test if shared data is occupying full cache lines.
+-TEST(SharedDataTest, CacheLineAlignment) {
+-  // Test standard data tyes int, float, double
+-  // Test alignment of int
+-  EXPECT_EQ(
+-      std::alignment_of<typename SharedData<int>::Data::value_type>::value,
+-      BDM_CACHE_LINE_SIZE);
+-  // Test alignment of float
+-  EXPECT_EQ(
+-      std::alignment_of<typename SharedData<float>::Data::value_type>::value,
+-      BDM_CACHE_LINE_SIZE);
+-  // Test alignment of double
+-  EXPECT_EQ(
+-      std::alignment_of<typename SharedData<double>::Data::value_type>::value,
+-      BDM_CACHE_LINE_SIZE);
+-  // Test size of vector components int
+-  EXPECT_EQ(sizeof(typename SharedData<int>::Data::value_type),
+-            BDM_CACHE_LINE_SIZE);
+-  // Test size of vector components float
+-  EXPECT_EQ(sizeof(typename SharedData<float>::Data::value_type),
+-            BDM_CACHE_LINE_SIZE);
+-  // Test size of vector components double
+-  EXPECT_EQ(sizeof(typename SharedData<double>::Data::value_type),
+-            BDM_CACHE_LINE_SIZE);
++TEST(SharedDataTest, CacheLineAlignment) { RunCacheLineAlignmentTest(); }
+ 
+-  // Test a chache line fully filled with doubles.
+-  // Test alignment of double[max_double], e.g. max cache line capacity
+-  EXPECT_EQ(
+-      std::alignment_of<
+-          typename SharedData<double[BDM_CACHE_LINE_SIZE /
+-                                     sizeof(double)]>::Data::value_type>::value,
+-      BDM_CACHE_LINE_SIZE);
+-  // Test size of vector components double[max_double], e.g. max cache line
+-  // capacity
+-  EXPECT_EQ(
+-      sizeof(typename SharedData<
+-             double[BDM_CACHE_LINE_SIZE / sizeof(double)]>::Data::value_type),
+-      BDM_CACHE_LINE_SIZE);
++#ifdef USE_DICT
+ 
+-  // Test some custom data structures
+-  // Test alignment of data that fills 1 cache line
+-  EXPECT_EQ(std::alignment_of<typename SharedData<
+-                char[BDM_CACHE_LINE_SIZE - 1]>::Data::value_type>::value,
+-            BDM_CACHE_LINE_SIZE);
+-  // Test alignment of data that fills 2 cache lines
+-  EXPECT_EQ(std::alignment_of<typename SharedData<
+-                char[BDM_CACHE_LINE_SIZE + 1]>::Data::value_type>::value,
+-            BDM_CACHE_LINE_SIZE);
+-  // Test alignment of data that fills 3 cache lines
+-  EXPECT_EQ(std::alignment_of<typename SharedData<
+-                char[2 * BDM_CACHE_LINE_SIZE + 1]>::Data::value_type>::value,
+-            BDM_CACHE_LINE_SIZE);
+-  // Test size of data that fills 1 cache line
+-  EXPECT_EQ(
+-      sizeof(
+-          typename SharedData<char[BDM_CACHE_LINE_SIZE - 1]>::Data::value_type),
+-      BDM_CACHE_LINE_SIZE);
+-  // Test size of data that fills 2 cache lines
+-  EXPECT_EQ(
+-      sizeof(
+-          typename SharedData<char[BDM_CACHE_LINE_SIZE + 1]>::Data::value_type),
+-      2 * BDM_CACHE_LINE_SIZE);
+-  // Test size of data that fills 3 cache lines
+-  EXPECT_EQ(sizeof(typename SharedData<
+-                   char[2 * BDM_CACHE_LINE_SIZE + 1]>::Data::value_type),
+-            3 * BDM_CACHE_LINE_SIZE);
+-}
++TEST_F(IOTest, SharedData) { RunIOTest(); }
++
++#endif  // USE_DICT
+ 
++}  // namespace shared_data_test
+ }  // namespace bdm
+diff --git a/test/unit/core/container/shared_data_test.h b/test/unit/core/container/shared_data_test.h
+new file mode 100644
+index 000000000..a7663eee2
+--- /dev/null
++++ b/test/unit/core/container/shared_data_test.h
+@@ -0,0 +1,116 @@
++// -----------------------------------------------------------------------------
++//
++// Copyright (C) 2021 CERN & University of Surrey for the benefit of the
++// BioDynaMo collaboration. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++//
++// See the LICENSE file distributed with this work for details.
++// See the NOTICE file distributed with this work for additional information
++// regarding copyright ownership.
++//
++// -----------------------------------------------------------------------------
++
++#ifndef UNIT_CORE_CONTAINER_SHARED_DATA_H_
++#define UNIT_CORE_CONTAINER_SHARED_DATA_H_
++
++#include <gtest/gtest.h>
++#include "core/container/shared_data.h"
++#include "unit/test_util/io_test.h"
++
++namespace bdm {
++namespace shared_data_test {
++
++inline void RunCacheLineAlignmentTest() {
++  // Test standard data types int, float, double
++  // Test alignment of int
++  EXPECT_EQ(
++      std::alignment_of<typename SharedData<int>::Data::value_type>::value,
++      BDM_CACHE_LINE_SIZE);
++  // Test alignment of float
++  EXPECT_EQ(
++      std::alignment_of<typename SharedData<float>::Data::value_type>::value,
++      BDM_CACHE_LINE_SIZE);
++  // Test alignment of double
++  EXPECT_EQ(
++      std::alignment_of<typename SharedData<double>::Data::value_type>::value,
++      BDM_CACHE_LINE_SIZE);
++  // Test size of vector components int
++  EXPECT_EQ(sizeof(typename SharedData<int>::Data::value_type),
++            BDM_CACHE_LINE_SIZE);
++  // Test size of vector components float
++  EXPECT_EQ(sizeof(typename SharedData<float>::Data::value_type),
++            BDM_CACHE_LINE_SIZE);
++  // Test size of vector components double
++  EXPECT_EQ(sizeof(typename SharedData<double>::Data::value_type),
++            BDM_CACHE_LINE_SIZE);
++
++  // Test a cache line fully filled with doubles.
++  // Test alignment of double[max_double], e.g. max cache line capacity
++  EXPECT_EQ(
++      std::alignment_of<
++          typename SharedData<double[BDM_CACHE_LINE_SIZE /
++                                     sizeof(double)]>::Data::value_type>::value,
++      BDM_CACHE_LINE_SIZE);
++  // Test size of vector components double[max_double], e.g. max cache line
++  // capacity
++  EXPECT_EQ(
++      sizeof(typename SharedData<
++             double[BDM_CACHE_LINE_SIZE / sizeof(double)]>::Data::value_type),
++      BDM_CACHE_LINE_SIZE);
++
++  // Test some custom data structures
++  // Test alignment of data that fills 1 cache line
++  EXPECT_EQ(std::alignment_of<typename SharedData<
++                char[BDM_CACHE_LINE_SIZE - 1]>::Data::value_type>::value,
++            BDM_CACHE_LINE_SIZE);
++  // Test alignment of data that fills 2 cache lines
++  EXPECT_EQ(std::alignment_of<typename SharedData<
++                char[BDM_CACHE_LINE_SIZE + 1]>::Data::value_type>::value,
++            BDM_CACHE_LINE_SIZE);
++  // Test alignment of data that fills 3 cache lines
++  EXPECT_EQ(std::alignment_of<typename SharedData<
++                char[2 * BDM_CACHE_LINE_SIZE + 1]>::Data::value_type>::value,
++            BDM_CACHE_LINE_SIZE);
++  // Test size of data that fills 1 cache line
++  EXPECT_EQ(
++      sizeof(
++          typename SharedData<char[BDM_CACHE_LINE_SIZE - 1]>::Data::value_type),
++      BDM_CACHE_LINE_SIZE);
++  // Test size of data that fills 2 cache lines
++  EXPECT_EQ(
++      sizeof(
++          typename SharedData<char[BDM_CACHE_LINE_SIZE + 1]>::Data::value_type),
++      2 * BDM_CACHE_LINE_SIZE);
++  // Test size of data that fills 3 cache lines
++  EXPECT_EQ(sizeof(typename SharedData<
++                   char[2 * BDM_CACHE_LINE_SIZE + 1]>::Data::value_type),
++            3 * BDM_CACHE_LINE_SIZE);
++}
++
++#ifdef USE_DICT
++
++inline void RunIOTest() {
++  SharedData<int> sd;
++  sd.resize(10);
++
++  for (uint64_t i = 0; i < sd.size(); ++i) {
++    sd[i] = 3 * i;
++  }
++
++  SharedData<int>* restored;
++  BackupAndRestore(sd, &restored);
++
++  ASSERT_EQ(10u, restored->size());
++  for (uint64_t i = 0; i < restored->size(); ++i) {
++    EXPECT_EQ(static_cast<int>(3 * i), (*restored)[i]);
++  }
++}
++
++#endif  // USE_DICT
++
++}  // namespace shared_data_test
++}  // namespace bdm
++
++#endif  // UNIT_CORE_CONTAINER_SHARED_DATA_H_
+diff --git a/test/unit/core/resource_manager_test.cc b/test/unit/core/resource_manager_test.cc
+index 4b7cad830..2c7b45464 100644
+--- a/test/unit/core/resource_manager_test.cc
++++ b/test/unit/core/resource_manager_test.cc
+@@ -197,52 +197,6 @@ TEST(ResourceManagerTest, DiffusionGrid) {
+   ASSERT_EQ(2, counter);
+ }
+ 
+-TEST(ResourceManagerTest, Defragmentation) {
+-  auto set_param = [](Param* param) {
+-    param->agent_uid_defragmentation_low_watermark = 0.3;
+-    param->agent_uid_defragmentation_high_watermark = 0.8;
+-  };
+-  Simulation simulation(TEST_NAME, set_param);
+-
+-  auto* rm = simulation.GetResourceManager();
+-  auto* agent_uid_generator = simulation.GetAgentUidGenerator();
+-
+-  // we don't know the how big the internal agent uid map is
+-  rm->AddAgent(new TestAgent());
+-  rm->EndOfIteration();
+-  EXPECT_TRUE(agent_uid_generator->IsInDefragmentationMode());
+-  // fill it to the max
+-  uint64_t cnt = 1;
+-  while (agent_uid_generator->IsInDefragmentationMode()) {
+-    rm->AddAgent(new TestAgent());
+-    cnt++;
+-  }
+-  // now we know how many agents are 100%
+-  rm->EndOfIteration();
+-  EXPECT_FALSE(agent_uid_generator->IsInDefragmentationMode());
+-
+-  // remove enough agents to drop below the low watermark
+-  uint64_t remove = std::ceil(cnt * 0.7) + 1;
+-  while (remove != 0) {
+-    remove--;
+-    rm->RemoveAgent(AgentUid(remove));
+-  }
+-  rm->EndOfIteration();
+-  EXPECT_TRUE(agent_uid_generator->IsInDefragmentationMode());
+-
+-  // add enough agents to exceed the high watermark
+-  uint64_t add = std::ceil(cnt * 0.5) + 1;
+-  while (add != 0) {
+-    add--;
+-    rm->AddAgent(new TestAgent());
+-  }
+-  rm->EndOfIteration();
+-  EXPECT_FALSE(agent_uid_generator->IsInDefragmentationMode());
+-  auto uid = agent_uid_generator->GenerateUid();
+-  EXPECT_GE(uid.GetIndex(), cnt);
+-  EXPECT_EQ(0u, uid.GetReused());
+-}
+-
+ // -----------------------------------------------------------------------------
+ struct DeleteFunctor : public Functor<void, Agent*, AgentHandle> {
+   std::vector<bool>& remove;
+diff --git a/test/unit/core/simulation_test.cc b/test/unit/core/simulation_test.cc
+index dedb60cd3..5d6e15037 100644
+--- a/test/unit/core/simulation_test.cc
++++ b/test/unit/core/simulation_test.cc
+@@ -80,8 +80,6 @@ class SimulationTest : public ::testing::Test {
+       "scheduling_batch_size = 123\n"
+       "detect_static_agents = true\n"
+       "cache_neighbors = true\n"
+-      "agent_uid_defragmentation_low_watermark = 0.123\n"
+-      "agent_uid_defragmentation_high_watermark = 0.456\n"
+       "use_bdm_mem_mgr = false\n"
+       "mem_mgr_aligned_pages_shift = 7\n"
+       "mem_mgr_growth_rate = 1.123\n"
+@@ -178,10 +176,6 @@ class SimulationTest : public ::testing::Test {
+     EXPECT_EQ(123u, param->scheduling_batch_size);
+     EXPECT_TRUE(param->detect_static_agents);
+     EXPECT_TRUE(param->cache_neighbors);
+-    EXPECT_NEAR(0.123, param->agent_uid_defragmentation_low_watermark,
+-                abs_error<double>::value);
+-    EXPECT_NEAR(0.456, param->agent_uid_defragmentation_high_watermark,
+-                abs_error<double>::value);
+     EXPECT_FALSE(param->use_bdm_mem_mgr);
+     EXPECT_EQ(7u, param->mem_mgr_aligned_pages_shift);
+     EXPECT_NEAR(1.123, param->mem_mgr_growth_rate, abs_error<double>::value);

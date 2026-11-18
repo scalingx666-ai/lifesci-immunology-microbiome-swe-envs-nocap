@@ -1,0 +1,657 @@
+diff --git a/ehrapy/preprocessing/_quality_control.py b/ehrapy/preprocessing/_quality_control.py
+index 1ccf01a65..30cae7b1d 100644
+--- a/ehrapy/preprocessing/_quality_control.py
++++ b/ehrapy/preprocessing/_quality_control.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import copy
++import warnings
+ from functools import singledispatch
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Literal
+@@ -10,7 +11,7 @@
+ import pandas as pd
+ import scipy.sparse as sp
+ from ehrdata._logger import logger
+-from ehrdata.io import to_pandas
++from scipy.stats import chi2, ttest_ind_from_stats
+ 
+ from ehrapy._compat import (
+     DaskArray,
+@@ -657,7 +658,10 @@ def mcar_test(
+ ) -> float | pd.DataFrame:
+     """Statistical hypothesis test for Missing Completely At Random (MCAR).
+ 
+-    The null hypothesis of the Little's test is that data is Missing Completely At Random (MCAR).
++    Performs Little's MCAR test or pairwise t-tests.
++
++    The null hypothesis of Little's test is that data is Missing Completely At Random (MCAR).
++    A small p-value suggests the data is not MCAR.
+ 
+     We advise to use Little’s MCAR test carefully.
+     Rejecting the null hypothesis may not always mean that data is not MCAR, nor is accepting the null hypothesis a guarantee that data is MCAR.
+@@ -666,15 +670,136 @@ def mcar_test(
+ 
+     Args:
+         edata: Central data object.
+-        method: Whether to perform a chi-square test on the entire dataset (“little”) or separate t-tests for every combination of variables (“ttest”).
+-        layer: Layer to apply the test to. Uses X matrix if set to `None`.
++        method: ``"little"`` for a global chi-square test or ``"ttest"`` for pairwise Welch t-tests across all variable combinations.
++        layer: Layer to apply the test to. Uses ``X`` if ``None``.
+ 
+     Returns:
+         A single p-value if the Little's test was applied or a Pandas DataFrame of the p-value of t-tests for each pair of features.
++
++    Examples:
++        >>> import ehrdata as ed
++        >>> import ehrapy as ep
++        >>> edata = ed.dt.ehrdata_blobs(
++        ...     n_observations=100, n_variables=5, missing_values=0.1, random_state=0, n_centers=1, base_timepoints=1
++        ... )
++        >>> ep.pp.mcar_test(edata)
++        0.327...
+     """
+-    df = ed.io.to_pandas(edata, layer=layer)
+-    from pyampute.exploration.mcar_statistical_tests import MCARTest
++    mtx = edata.X if layer is None else edata.layers[layer]
++
++    # float64 required: covariance estimation and linear solves need stable floating-point math
++    if mtx.dtype != np.float64:
++        logger.warning(
++            f"Data dtype is {mtx.dtype}, converting to float64 for MCAR test. This may temporarily increase memory usage."
++        )
++        mtx = mtx.astype(np.float64)
++
++    var_names = np.asarray(edata.var_names)
++    if method == "little":
++        return _little_mcar_test(mtx)
++    if method == "ttest":
++        return _mcar_t_tests(mtx, var_names)
++    raise ValueError(f"Unknown method {method!r}. Choose from 'little' or 'ttest'.")
++
++
++@singledispatch
++def _little_mcar_test(X) -> float:
++    _raise_array_type_not_implemented(_little_mcar_test, type(X))
++    raise TypeError(f"Unsupported input type: {type(X)!r}")
++
++
++@_little_mcar_test.register(np.ndarray)
++def _(X: np.ndarray) -> float:
++    # Implements equation (4) from:
++    # Li, C. (2013). Little's test of missing completely at random. Stata Journal, 13(4), 795-809.
++    # Freely accessible preprint: https://cpb-us-w2.wpmucdn.com/blog.nus.edu.sg/dist/4/6502/files/2018/06/mcartest-zlxtj7.pdf
++    # Original reference: Little, R.J.A. (1988). JASA 83(404), 1198-1202. https://doi.org/10.2307/2290157
++    n, p = X.shape
++    mask = np.isnan(X)
++
++    if not mask.any():
++        return 1.0
++
++    mu = np.nanmean(X, axis=0)
++
++    centered = X - mu
++    valid = ~mask
++    denom = valid.astype(np.float64).T @ valid.astype(np.float64)
++    np.fill_diagonal(denom, np.maximum(denom.diagonal(), 1))
++    cov_global = np.where(valid, centered, 0.0).T @ np.where(valid, centered, 0.0) / (denom - 1)
++    np.fill_diagonal(cov_global, np.maximum(cov_global.diagonal(), 1e-12))
++
++    patterns, inverse, counts = np.unique(mask, axis=0, return_inverse=True, return_counts=True)
++
++    d2 = 0.0
++    kj = 0
++    for j in range(len(patterns)):
++        obs_cols = ~patterns[j]
++        k = obs_cols.sum()
++        if k == 0:
++            continue
++        kj += k
+ 
+-    mt = MCARTest(method=method)
++        rows = inverse == j
++        X_sub = X[np.ix_(rows, obs_cols)]
++        delta = np.nanmean(X_sub, axis=0) - mu[obs_cols]
++        sigma_j = cov_global[np.ix_(obs_cols, obs_cols)]
++
++        try:
++            contribution = delta @ np.linalg.solve(sigma_j, delta)
++        except np.linalg.LinAlgError:
++            contribution = delta @ np.linalg.pinv(sigma_j) @ delta
++
++        d2 += counts[j] * contribution
++
++    df = kj - p
++    if df <= 0:
++        return 1.0
++
++    return float(chi2.sf(d2, df))
++
++
++@singledispatch
++def _mcar_t_tests(X, var_names: np.ndarray) -> pd.DataFrame:
++    _raise_array_type_not_implemented(_mcar_t_tests, type(X))
++    raise TypeError(f"Unsupported input type: {type(X)!r}")
++
++
++@_mcar_t_tests.register(np.ndarray)
++def _(X: np.ndarray, var_names: np.ndarray) -> pd.DataFrame:
++    _, m = X.shape
++    result = np.full((m, m), np.nan)
++
++    for i in range(m):
++        miss = np.isnan(X[:, i])
++        if miss.all() or (~miss).all():
++            continue
+ 
+-    return mt(df)
++        X_miss = X[miss]
++        X_pres = X[~miss]
++
++        n1 = (~np.isnan(X_miss)).sum(axis=0).astype(float)
++        n2 = (~np.isnan(X_pres)).sum(axis=0).astype(float)
++
++        # nanmean/nanstd are evaluated eagerly for all columns before the np.where guard
++        # filters out all-NaN or single-observation columns, causing spurious RuntimeWarnings.
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", RuntimeWarning)
++            mu1 = np.where(n1 > 0, np.nanmean(X_miss, axis=0), np.nan)
++            mu2 = np.where(n2 > 0, np.nanmean(X_pres, axis=0), np.nan)
++            # ddof=1 to match ttest_ind equal_var=False (Welch's t-test)
++            std1 = np.where(n1 > 1, np.nanstd(X_miss, axis=0, ddof=1), np.nan)
++            std2 = np.where(n2 > 1, np.nanstd(X_pres, axis=0, ddof=1), np.nan)
++
++        computable = (n1 >= 1) & (n2 >= 1)
++        result[i, computable] = ttest_ind_from_stats(
++            mu1[computable],
++            std1[computable],
++            n1[computable],
++            mu2[computable],
++            std2[computable],
++            n2[computable],
++            equal_var=False,
++        ).pvalue
++
++    return pd.DataFrame(result, index=var_names, columns=var_names)
+diff --git a/pyproject.toml b/pyproject.toml
+index 8e045f0c6..41081b25f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -56,7 +56,6 @@ dependencies = [
+     "missingno",
+     "thefuzz[speedup]",
+     "fhiry",
+-    "pyampute",
+     "tableone",
+     "fknni[faisscpu]>=1.3.0",
+     "filelock",
+diff --git a/tests/_scripts/generate_mcar_references.ipynb b/tests/_scripts/generate_mcar_references.ipynb
+new file mode 100644
+index 000000000..e46a0756f
+--- /dev/null
++++ b/tests/_scripts/generate_mcar_references.ipynb
+@@ -0,0 +1,302 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Generate MCAR reference files\n",
++    "\n",
++    "Runs `pyampute` on deterministic datasets generated with `ehrdata.dt.ehrdata_blobs`\n",
++    "and writes the expected p-values to the reference files that the MCAR tests read.\n"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 1,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import importlib.metadata\n",
++    "import json\n",
++    "from pathlib import Path\n",
++    "\n",
++    "import ehrdata as ed\n",
++    "import numpy as np\n",
++    "import pandas as pd\n",
++    "from pyampute.exploration.mcar_statistical_tests import MCARTest\n",
++    "\n",
++    "import ehrapy as ep\n",
++    "\n",
++    "for _name in (\"pyampute\", \"ehrapy\", \"ehrdata\"):\n",
++    "    print(f\"{_name} {importlib.metadata.version(_name)}\")"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 2,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# Parameters must match the constants in tests/preprocessing/test_quality_control.py\n",
++    "_BLOB_KWARGS = {\"n_centers\": 1, \"cluster_std\": 1.0, \"base_timepoints\": 1}\n",
++    "\n",
++    "_SCENARIOS_LITTLE = {\n",
++    "    \"mcar_small\": {\"n_obs\": 100, \"n_vars\": 10, \"missing_rate\": 0.10, \"seed\": 42},\n",
++    "    \"mar_small\": {\"n_obs\": 100, \"n_vars\": 10, \"missing_pct\": 0.10, \"seed\": 42},\n",
++    "    \"mcar_medium_high_missing\": {\"n_obs\": 900, \"n_vars\": 50, \"missing_rate\": 0.50, \"seed\": 7},\n",
++    "}\n",
++    "_SCENARIO_TTEST = {\"n_obs\": 200, \"n_vars\": 8, \"missing_pct\": 0.20, \"seed\": 99}"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 3,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "def _make_mcar_edata(*, n_obs, n_vars, missing_rate, seed):\n",
++    "    return ed.dt.ehrdata_blobs(\n",
++    "        n_observations=n_obs, n_variables=n_vars, missing_values=missing_rate, random_state=seed, **_BLOB_KWARGS\n",
++    "    )\n",
++    "\n",
++    "\n",
++    "def _make_mar_edata(*, n_obs, n_vars, missing_pct, seed):\n",
++    "    edata = ed.dt.ehrdata_blobs(\n",
++    "        n_observations=n_obs, n_variables=n_vars, missing_values=0.0, random_state=seed, **_BLOB_KWARGS\n",
++    "    )\n",
++    "    X = np.asarray(edata.X, dtype=float).copy()\n",
++    "    X[X[:, 0] < np.percentile(X[:, 0], missing_pct * 100), -1] = np.nan\n",
++    "    edata.X = X\n",
++    "    return edata\n",
++    "\n",
++    "\n",
++    "def _build_little_scenario(name):\n",
++    "    cfg = _SCENARIOS_LITTLE[name]\n",
++    "    return _make_mcar_edata(**cfg) if \"missing_rate\" in cfg else _make_mar_edata(**cfg)\n",
++    "\n",
++    "\n",
++    "def _to_df(edata):\n",
++    "    return pd.DataFrame(np.asarray(edata.X, dtype=float), columns=list(edata.var_names))"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 4,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "{'mcar_small': 0.8127459507579607, 'mar_small': 2.484164678229206e-05, 'mcar_medium_high_missing': 0.001045380246672778}\n"
++     ]
++    }
++   ],
++   "source": [
++    "out_dir = Path(\"../../tests/data/preprocessing/mcar_refs\")\n",
++    "out_dir.mkdir(parents=True, exist_ok=True)\n",
++    "\n",
++    "little = MCARTest(method=\"little\")\n",
++    "little_expected = {name: float(little(_to_df(_build_little_scenario(name)))) for name in _SCENARIOS_LITTLE}\n",
++    "\n",
++    "with (out_dir / \"little_expected.json\").open(\"w\", encoding=\"utf-8\") as f:\n",
++    "    json.dump(little_expected, f, indent=2, sort_keys=True)\n",
++    "\n",
++    "print(little_expected)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 5,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "/home/andreas/.local/share/hatch/env/virtual/ehrapy/Kw9Jk1rX/docs/lib64/python3.14/site-packages/pyampute/exploration/mcar_statistical_tests.py:146: SmallSampleWarning: One or more sample arguments is too small; all returned values will be NaN. See documentation for sample size requirements.\n",
++      "  mcar_matrix.loc[var, tvar] = ttest_ind(\n"
++     ]
++    },
++    {
++     "data": {
++      "text/html": [
++       "<div>\n",
++       "<style scoped>\n",
++       "    .dataframe tbody tr th:only-of-type {\n",
++       "        vertical-align: middle;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe tbody tr th {\n",
++       "        vertical-align: top;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe thead th {\n",
++       "        text-align: right;\n",
++       "    }\n",
++       "</style>\n",
++       "<table border=\"1\" class=\"dataframe\">\n",
++       "  <thead>\n",
++       "    <tr style=\"text-align: right;\">\n",
++       "      <th></th>\n",
++       "      <th>feature_0</th>\n",
++       "      <th>feature_1</th>\n",
++       "      <th>feature_2</th>\n",
++       "      <th>feature_3</th>\n",
++       "      <th>feature_4</th>\n",
++       "      <th>feature_5</th>\n",
++       "      <th>feature_6</th>\n",
++       "      <th>feature_7</th>\n",
++       "    </tr>\n",
++       "  </thead>\n",
++       "  <tbody>\n",
++       "    <tr>\n",
++       "      <th>feature_0</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_1</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_2</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_3</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_4</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_5</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_6</th>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>feature_7</th>\n",
++       "      <td>2.936954e-34</td>\n",
++       "      <td>0.34972</td>\n",
++       "      <td>0.966874</td>\n",
++       "      <td>0.941181</td>\n",
++       "      <td>0.961084</td>\n",
++       "      <td>0.578553</td>\n",
++       "      <td>0.433705</td>\n",
++       "      <td>NaN</td>\n",
++       "    </tr>\n",
++       "  </tbody>\n",
++       "</table>\n",
++       "</div>"
++      ],
++      "text/plain": [
++       "              feature_0  feature_1  feature_2  feature_3  feature_4  \\\n",
++       "feature_0           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_1           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_2           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_3           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_4           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_5           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_6           NaN        NaN        NaN        NaN        NaN   \n",
++       "feature_7  2.936954e-34    0.34972   0.966874   0.941181   0.961084   \n",
++       "\n",
++       "           feature_5  feature_6  feature_7  \n",
++       "feature_0        NaN        NaN        NaN  \n",
++       "feature_1        NaN        NaN        NaN  \n",
++       "feature_2        NaN        NaN        NaN  \n",
++       "feature_3        NaN        NaN        NaN  \n",
++       "feature_4        NaN        NaN        NaN  \n",
++       "feature_5        NaN        NaN        NaN  \n",
++       "feature_6        NaN        NaN        NaN  \n",
++       "feature_7   0.578553   0.433705        NaN  "
++      ]
++     },
++     "execution_count": null,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "ttest = MCARTest(method=\"ttest\")\n",
++    "ttest_result = ttest(_to_df(_make_mar_edata(**_SCENARIO_TTEST)))\n",
++    "ttest_result.to_csv(out_dir / \"ttest_mar_expected.csv\")\n",
++    "\n",
++    "ttest_result"
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "ehrapy (docs)",
++   "language": "python",
++   "name": "ehrapy-docs"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.14.4"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 4
++}
+diff --git a/tests/data/preprocessing/mcar_refs/little_expected.json b/tests/data/preprocessing/mcar_refs/little_expected.json
+new file mode 100644
+index 000000000..2ec11a05d
+--- /dev/null
++++ b/tests/data/preprocessing/mcar_refs/little_expected.json
+@@ -0,0 +1,5 @@
++{
++    "mar_small": 2.484164678229206e-5,
++    "mcar_medium_high_missing": 0.001045380246672778,
++    "mcar_small": 0.8127459507579607
++}
+diff --git a/tests/data/preprocessing/mcar_refs/ttest_mar_expected.csv b/tests/data/preprocessing/mcar_refs/ttest_mar_expected.csv
+new file mode 100644
+index 000000000..e86b07879
+--- /dev/null
++++ b/tests/data/preprocessing/mcar_refs/ttest_mar_expected.csv
+@@ -0,0 +1,9 @@
++,feature_0,feature_1,feature_2,feature_3,feature_4,feature_5,feature_6,feature_7
++feature_0,,,,,,,,
++feature_1,,,,,,,,
++feature_2,,,,,,,,
++feature_3,,,,,,,,
++feature_4,,,,,,,,
++feature_5,,,,,,,,
++feature_6,,,,,,,,
++feature_7,2.9369540420379227e-34,0.34972042692432337,0.9668742533864735,0.9411809036139718,0.9610836069627258,0.5785531523364957,0.4337050474286894,
+diff --git a/tests/preprocessing/test_quality_control.py b/tests/preprocessing/test_quality_control.py
+index 5a42a1eef..9968c32f9 100644
+--- a/tests/preprocessing/test_quality_control.py
++++ b/tests/preprocessing/test_quality_control.py
+@@ -1,4 +1,4 @@
+-from pathlib import Path
++import json
+ 
+ import ehrdata as ed
+ import numpy as np
+@@ -6,15 +6,45 @@
+ import pytest
+ from ehrdata.core.constants import DEFAULT_TEM_LAYER_NAME
+ from ehrdata.io import read_csv
++from scipy import sparse as sp
+ 
+ import ehrapy as ep
+ from ehrapy.preprocessing._encoding import encode
+ from ehrapy.preprocessing._quality_control import _compute_obs_metrics, _compute_var_metrics, mcar_test
+ from tests.conftest import ARRAY_TYPES_NONNUMERIC, TEST_DATA_PATH, as_dense_dask_array
+ 
+-CURRENT_DIR = Path(__file__).parent
+ _TEST_PATH_ENCODE = f"{TEST_DATA_PATH}/encode"
+ 
++_BLOB_KWARGS = {"n_centers": 1, "cluster_std": 1.0, "base_timepoints": 1}
++
++_SCENARIOS_LITTLE = {
++    "mcar_small": {"n_obs": 100, "n_vars": 10, "missing_rate": 0.10, "seed": 42},
++    "mar_small": {"n_obs": 100, "n_vars": 10, "missing_pct": 0.10, "seed": 42},
++    "mcar_medium_high_missing": {"n_obs": 900, "n_vars": 50, "missing_rate": 0.50, "seed": 7},
++}
++_SCENARIO_TTEST = {"n_obs": 200, "n_vars": 8, "missing_pct": 0.20, "seed": 99}
++
++
++def _make_mcar_edata(*, n_obs, n_vars, missing_rate, seed):
++    return ed.dt.ehrdata_blobs(
++        n_observations=n_obs, n_variables=n_vars, missing_values=missing_rate, random_state=seed, **_BLOB_KWARGS
++    )
++
++
++def _make_mar_edata(*, n_obs, n_vars, missing_pct, seed):
++    edata = ed.dt.ehrdata_blobs(
++        n_observations=n_obs, n_variables=n_vars, missing_values=0.0, random_state=seed, **_BLOB_KWARGS
++    )
++    X = np.asarray(edata.X, dtype=float).copy()
++    X[X[:, 0] < np.percentile(X[:, 0], missing_pct * 100), -1] = np.nan
++    edata.X = X
++    return edata
++
++
++def _build_little_scenario(name):
++    cfg = _SCENARIOS_LITTLE[name]
++    return _make_mcar_edata(**cfg) if "missing_rate" in cfg else _make_mar_edata(**cfg)
++
+ 
+ @pytest.mark.parametrize("array_type", ARRAY_TYPES_NONNUMERIC)
+ def test_qc_metrics_vanilla(array_type, missing_values_edata):
+@@ -438,26 +468,63 @@ def test_qc_lab_measurements_defaults_to_all_vars():
+     ],
+ )
+ def test_mcar_test_method_output_types(mar_edata, method, expected_output_type):
+-    """Tests if mcar_test returns the correct output type for different methods."""
+     output = mcar_test(mar_edata, method=method)
+-    assert isinstance(output, expected_output_type), (
+-        f"Output type for method '{method}' should be {expected_output_type}, got {type(output)} instead."
+-    )
+-
+-
+-def test_mcar_test_3D_edata(edata_blob_small):
+-    mcar_test(edata_blob_small, layer="layer_2")
+-    with pytest.raises(ValueError, match=r"only supports 2D data"):
+-        mcar_test(edata_blob_small, layer=DEFAULT_TEM_LAYER_NAME)
++    assert isinstance(output, expected_output_type)
+ 
+ 
+ def test_mar_data_identification(mar_edata):
+-    """Test that mcar_test correctly identifies data as not MCAR (i.e., MAR or NMAR)."""
+     p_value = mcar_test(mar_edata, method="little")
+-    assert p_value <= 0.05, "The test should significantly reject the MCAR hypothesis for MAR data."
++    assert p_value <= 0.05
+ 
+ 
+ def test_mcar_identification(mcar_edata):
+-    """Test that mcar_test correctly identifies data as MCAR."""
+     p_value = mcar_test(mcar_edata, method="little")
+-    assert p_value > 0.05, "The test should not significantly accept the MCAR hypothesis for MCAR data."
++    assert p_value > 0.05
++
++
++def test_mcar_test_ttest_detects_mar(mar_edata):
++    result = mcar_test(mar_edata, method="ttest")
++    assert result.shape == (mar_edata.n_vars, mar_edata.n_vars)
++    p_col0_given_miss9 = result.iloc[-1, 0]
++    assert not np.isnan(p_col0_given_miss9)
++    assert p_col0_given_miss9 < 0.05
++
++
++@pytest.fixture(params=list(_SCENARIOS_LITTLE))
++def little_scenario(request):
++    return request.param, _build_little_scenario(request.param)
++
++
++def test_mcar_test_little_matches_pyampute_reference(little_scenario):
++    name, edata = little_scenario
++    with (TEST_DATA_PATH / "preprocessing/mcar_refs/little_expected.json").open(encoding="utf-8") as f:
++        expected = json.load(f)[name]
++
++    observed = mcar_test(edata, method="little")
++    assert np.isclose(observed, expected, rtol=1e-2, atol=2e-3), (
++        f"Mismatch for {name}: observed={observed}, expected={expected}"
++    )
++
++
++def test_mcar_test_ttest_matches_pyampute_reference():
++    edata = _make_mar_edata(**_SCENARIO_TTEST)
++    expected = pd.read_csv(TEST_DATA_PATH / "preprocessing/mcar_refs/ttest_mar_expected.csv", index_col=0)
++    observed = mcar_test(edata, method="ttest")
++    expected = expected.reindex(index=observed.index, columns=observed.columns)
++
++    obs_vals = observed.to_numpy(dtype=float)
++    exp_vals = expected.to_numpy(dtype=float)
++    finite = np.isfinite(obs_vals) & np.isfinite(exp_vals)
++    nan_match = np.isnan(obs_vals) & np.isnan(exp_vals)
++
++    assert np.all(finite | nan_match), "NaN pattern mismatch vs pyampute reference"
++    assert np.allclose(obs_vals[finite], exp_vals[finite], rtol=1e-6, atol=1e-10)
++
++
++@pytest.mark.parametrize("method", ["little", "ttest"])
++@pytest.mark.parametrize("array_type", [sp.csr_array, as_dense_dask_array])
++def test_mcar_test_unsupported_array_type_raises(mar_edata, method, array_type):
++    edata = mar_edata.copy()
++    edata.X = array_type(edata.X)
++    with pytest.raises(NotImplementedError):
++        mcar_test(edata, method=method)

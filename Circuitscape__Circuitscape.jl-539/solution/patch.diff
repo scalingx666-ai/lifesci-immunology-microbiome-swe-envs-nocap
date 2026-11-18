@@ -1,0 +1,147 @@
+diff --git a/docs/src/migration.md b/docs/src/migration.md
+index 81dfa7b0..aae4a9ce 100644
+--- a/docs/src/migration.md
++++ b/docs/src/migration.md
+@@ -44,6 +44,9 @@ that can require action when upgrading.
+   Previously it injected 1 A (and Circuitscape 4.0.5 does the same when
+   variable source strengths are used), so current maps change wherever the
+   file excludes pairs.
++- **`compress_grids = True` gzips output grids.** ASCII maps are written as
++  `.asc.gz`, as in Circuitscape 4. Before, the option was accepted and
++  ignored, and maps were written as plain `.asc`.
+ 
+ Everything else in 6.0 is additive or internal; see the
+ [release notes](https://github.com/Circuitscape/Circuitscape.jl/releases) for
+diff --git a/docs/src/options.md b/docs/src/options.md
+index 99626609..0aca3896 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -81,7 +81,7 @@ Keys and option values are case-insensitive: `solver = CHOLMOD`, `Solver = cholm
+ | `set_null_currents_to_nodata` | Boolean | `False` | If `True`, cells that are NODATA in the resistance map (and so have no graph node) are written as NODATA in current maps instead of 0. |
+ | `set_null_voltages_to_nodata` | Boolean | `False` | If `True`, cells that are NODATA in the resistance map are written as NODATA in voltage maps instead of 0. |
+ | `set_focal_node_currents_to_zero` | Boolean | `False` | If `True`, the cells of the *active* focal nodes carry zero current in each raster current map: the two focal nodes of the pair in pairwise mode, every focal node in one-to-all and all-to-one. Cumulative and maximum maps then show only current that flows *through* a focal region while other pairs are active. Raster current maps only; network node currents and resistances are unaffected. |
+-| `compress_grids` | Boolean | `False` | Accepted for compatibility with Circuitscape 4. Output grids are currently written uncompressed; gzipped *input* grids (`.asc.gz`) are read. |
++| `compress_grids` | Boolean | `False` | If `True`, write ASCII output grids gzipped, as `.asc.gz`. GeoTIFF output (`write_as_tif = True`) is always compressed. Gzipped *input* grids (`.asc.gz`) are read either way. |
+ | `log_transform_maps` | Boolean | `False` | If `True`, log10-transform values in output current maps. Cells with zero current are set to NODATA. |
+ | `write_as_tif` | Boolean | `False` | If `True`, write current and voltage maps as GeoTIFF (LZW-compressed) instead of ESRI ASCII grids. Requires the optional GDAL support: `Pkg.add("ArchGDAL")`, then `using ArchGDAL` before running. |
+ 
+@@ -245,7 +245,7 @@ Set `write_cum_cur_map_only = True` to calculate current maps for each iteration
+ 
+ ### Compress Output Grids
+ 
+-Set `compress_grids = True` to compress output ASCII grids using gzip. This can be useful when many large maps will be written.
++Set `compress_grids = True` to compress output ASCII grids using gzip; each map is written as `<name>.asc.gz` instead of `<name>.asc`. This can be useful when many large maps will be written.
+ 
+ ### Log-Transform Current Maps
+ 
+diff --git a/src/out.jl b/src/out.jl
+index 97472caa..09b1d34d 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -409,7 +409,8 @@ function write_grid(cmap, name, cfg, hbmeta, cellmap = nothing;
+                  cmap,
+                  hbmeta.wkt,
+                  hbmeta.transform,
+-                 file_format)
++                 file_format;
++                 compress = cfg.compress_grids)
+ end
+ 
+ """
+@@ -553,21 +554,24 @@ function write_cum_maps(cum, hbmeta::RasterMeta, cellmap::Matrix, cfg)
+ end
+ 
+ """
+-    write_raster(fn_prefix, array, wkt, transform, file_format)
++    write_raster(fn_prefix, array, wkt, transform, file_format; compress = false)
+ 
+ Write a single-band raster. `.asc` is written natively with `writedlm` —
+ several times faster than the GDAL AAIGrid driver, and thread-safe, so it
+-takes no lock; `.tif` goes through GDAL under `IO_LOCK`.
++takes no lock; `.tif` goes through GDAL under `IO_LOCK`. With `compress`, an
++ASCII grid is gzipped to `.asc.gz`, as `compress_grids` did in Circuitscape 4;
++GeoTIFF output is always LZW-compressed.
+ """
+ function write_raster(fn_prefix::String,
+                       array::Matrix{T} where T <: Number,
+                       wkt::String,
+                       transform,
+-                      file_format::String)
++                      file_format::String;
++                      compress::Bool = false)
+     if file_format == "tif"
+         write_raster_gdal(fn_prefix, array, wkt, transform)
+     else
+-        write_asc(fn_prefix, array, wkt, transform)
++        write_asc(fn_prefix, array, wkt, transform; compress)
+     end
+ end
+ 
+@@ -584,10 +588,12 @@ function _asc_origin(transform, nrows)
+     0.0, 0.0, 1.0, 1.0
+ end
+ 
+-function write_asc(fn_prefix::String, array::AbstractMatrix, wkt::String, transform)
++function write_asc(fn_prefix::String, array::AbstractMatrix, wkt::String, transform;
++                   compress::Bool = false)
+     nrows, ncols = size(array)
+     xll, yll, dx, dy = _asc_origin(transform, nrows)
+-    open(fn_prefix * ".asc", "w") do io
++    path = fn_prefix * (compress ? ".asc.gz" : ".asc")
++    (compress ? GZip.open : open)(path, "w") do io
+         println(io, "ncols         ", ncols)
+         println(io, "nrows         ", nrows)
+         println(io, "xllcorner     ", xll)
+diff --git a/test/internal.jl b/test/internal.jl
+index 87eec16a..a4b9e0f7 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -1004,13 +1004,11 @@ end
+     @test occursin("dx", read(joinpath(dir, "e.asc"), String))
+     @test Circuitscape.read_raster(joinpath(dir, "e.asc"), Float64)[3] == tr2
+ 
+-    # Single-row grid and gzipped input
++    # Single-row grid, and a gzipped grid round trip with its projection
+     write(joinpath(dir, "one.asc"), "ncols 2\nnrows 1\nxllcorner 0\nyllcorner 0\ncellsize 1\n7 8\n")
+     @test Circuitscape.read_raster(joinpath(dir, "one.asc"), Float64)[1] == [7.0 8.0]
+-    Circuitscape.GZip.open(joinpath(dir, "z.asc.gz"), "w") do io
+-        write(io, read(joinpath(dir, "r.asc")))
+-    end
+-    @test Circuitscape.read_raster(joinpath(dir, "z.asc.gz"), Float64)[1] == a
++    Circuitscape.write_raster(joinpath(dir, "z"), a, "PROJCS[\"x\"]", tr, "asc"; compress = true)
++    @test Circuitscape.read_raster(joinpath(dir, "z.asc.gz"), Float64) == (a, "PROJCS[\"x\"]", tr)
+ 
+     # Bad headers are reported by file
+     write(joinpath(dir, "bad.asc"), "ncols 3\nnrows 3\nxllcorner 0\nyllcorner 0\ncellsize 1\n1 2 3\n4 5 6\n")
+@@ -1309,6 +1307,31 @@ end
+     @test !any(f -> startswith(f, "net") && occursin("currents", f), readdir(dir))
+ end
+ 
++# compress_grids writes every map gzipped (.asc.gz), as Circuitscape 4 did.
++# It used to be accepted and ignored.
++@testset "compress_grids" begin
++    dir = mktempdir()
++    hdr = "ncols 3\nnrows 3\nxllcorner 0\nyllcorner 0\ncellsize 1\n"
++    write(joinpath(dir, "cell.asc"), hdr * "1 1 1\n1 1 1\n1 1 1\n")
++    write(joinpath(dir, "pts.asc"), hdr * "1 0 0\n0 0 0\n0 0 2\n")
++    d = Circuitscape.init_config()
++    d["data_type"] = "raster"; d["scenario"] = "pairwise"
++    d["habitat_file"] = joinpath(dir, "cell.asc"); d["point_file"] = joinpath(dir, "pts.asc")
++    d["write_cur_maps"] = "True"; d["write_volt_maps"] = "True"
++    d["output_file"] = joinpath(dir, "plain.out")
++    r = compute(d)
++    d["output_file"] = joinpath(dir, "gz.out"); d["compress_grids"] = "True"
++    @test compute(d) == r
++    maps = filter(f -> startswith(f, "gz_") && occursin("map", f), readdir(dir))
++    @test !isempty(maps) && all(endswith(".asc.gz"), maps)
++    for f in maps
++        @test read(joinpath(dir, f), 2) == [0x1f, 0x8b]    # gzip, not plain text
++        plain = joinpath(dir, replace(f, "gz_" => "plain_", ".gz" => ""))
++        @test Circuitscape.read_raster(joinpath(dir, f), Float64)[1] ==
++              Circuitscape.read_raster(plain, Float64)[1]
++    end
++end
++
+ # 32-bit indices: chosen automatically when the problem fits, forced to
+ # 64-bit by use_64bit_indexing, and kept through the whole pipeline. The
+ # regularization used to promote a 32-bit matrix (and so the CHOLMOD factor)

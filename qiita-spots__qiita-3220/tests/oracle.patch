@@ -1,0 +1,268 @@
+diff --git a/qiita_core/util.py b/qiita_core/util.py
+index b5a30e436..2cc5b54ba 100644
+--- a/qiita_core/util.py
++++ b/qiita_core/util.py
+@@ -16,6 +16,9 @@
+ from qiita_db.environment_manager import reset_test_database
+ 
+ 
++REDIS_QIITA_GIT_SHA_KEY = 'qiita-git-sha'
++
++
+ def is_test_environment():
+     """Checks if Qiita is running in a test environment
+ 
+@@ -81,14 +84,7 @@ def wrapper(*args, **kwargs):
+     return wrapper
+ 
+ 
+-def get_qiita_version():
+-    """Returns the Qiita version and Git sha if present
+-
+-    Returns
+-    ------
+-    tuple (version, sha)
+-        The Qiita version and SHA. SHA can be an empty string.
+-    """
++def update_redis_qiita_sha_version():
+     # the actual repo is the abspath of the current file without
+     # qiita_core
+     git_repo_path = dirname(dirname(__file__))
+@@ -96,9 +92,25 @@ def get_qiita_version():
+     try:
+         repo = Repo(git_repo_path)
+         sha = repo.active_branch.commit.hexsha
++        repo.__del__()
+     except (InvalidGitRepositoryError, TypeError):
+         sha = ''
+ 
++    r_client.set(REDIS_QIITA_GIT_SHA_KEY, sha)
++
++
++def get_qiita_version():
++    """Returns the Qiita version and Git sha if present
++
++    Returns
++    ------
++    tuple (version, sha)
++        The Qiita version and SHA. SHA can be an empty string.
++    """
++    sha = r_client.get(REDIS_QIITA_GIT_SHA_KEY)
++    if sha is None:
++        sha = ''
++
+     return (qiita_pet_lib_version, sha)
+ 
+ 
+diff --git a/qiita_db/analysis.py b/qiita_db/analysis.py
+index 137bd78d9..2fa67acd3 100644
+--- a/qiita_db/analysis.py
++++ b/qiita_db/analysis.py
+@@ -69,6 +69,22 @@ class Analysis(qdb.base.QiitaObject):
+     _portal_table = "analysis_portal"
+     _analysis_id_column = 'analysis_id'
+ 
++    @classmethod
++    def iter(cls):
++        """Iter over the analyses"""
++        with qdb.sql_connection.TRN:
++            sql = """SELECT DISTINCT analysis_id
++                     FROM qiita.analysis
++                     JOIN qiita.analysis_portal USING (analysis_id)
++                     JOIN qiita.portal_type USING (portal_type_id)
++                     WHERE portal = %s
++                     ORDER BY analysis_id"""
++            qdb.sql_connection.TRN.add(sql, [qiita_config.portal])
++            aids = qdb.sql_connection.TRN.execute_fetchflatten()
++
++        for aid in aids:
++            yield cls(aid)
++
+     @classmethod
+     def get_by_status(cls, status):
+         """Returns all Analyses with given status
+diff --git a/qiita_db/metadata_template/base_metadata_template.py b/qiita_db/metadata_template/base_metadata_template.py
+index ec5cbeba9..589707035 100644
+--- a/qiita_db/metadata_template/base_metadata_template.py
++++ b/qiita_db/metadata_template/base_metadata_template.py
+@@ -63,8 +63,10 @@ def _helper_get_categories(table):
+                  WHERE sample_id = '{1}'""".format(table, QIITA_COLUMN_NAME)
+         qdb.sql_connection.TRN.add(sql)
+         results = qdb.sql_connection.TRN.execute_fetchflatten()
+-        if results:
++        if results and results != [None]:
+             results = sorted(loads(results[0]))
++        else:
++            results = []
+         return results
+ 
+ 
+@@ -1179,7 +1181,7 @@ def _common_to_dataframe_steps(self, samples=None):
+             data = qdb.sql_connection.TRN.execute_fetchindex()
+             df = pd.DataFrame([d for _, d in data], index=[i for i, _ in data],
+                               dtype=str)
+-            df.index.name = 'sample_id'
++            df.index.name = 'sample_name'
+             df.where((pd.notnull(df)), None)
+             id_column_name = 'qiita_%sid' % (self._table_prefix)
+             if id_column_name == 'qiita_sample_id':
+diff --git a/qiita_db/metadata_template/test/test_sample_template.py b/qiita_db/metadata_template/test/test_sample_template.py
+index 33c2fca2d..5756b07d1 100644
+--- a/qiita_db/metadata_template/test/test_sample_template.py
++++ b/qiita_db/metadata_template/test/test_sample_template.py
+@@ -1940,7 +1940,7 @@ def test_to_dataframe(self):
+                 'scientific_name': 'homo sapiens'},
+             }
+         exp = pd.DataFrame.from_dict(exp_dict, orient='index', dtype=str)
+-        exp.index.name = 'sample_id'
++        exp.index.name = 'sample_name'
+         obs.sort_index(axis=0, inplace=True)
+         obs.sort_index(axis=1, inplace=True)
+         exp.sort_index(axis=0, inplace=True)
+diff --git a/qiita_db/sql_connection.py b/qiita_db/sql_connection.py
+index f539f5071..f60a01a4c 100644
+--- a/qiita_db/sql_connection.py
++++ b/qiita_db/sql_connection.py
+@@ -198,7 +198,10 @@ def _raise_execution_error(self, sql, sql_args, error):
+             ec_lu = errorcodes.lookup(error.pgcode)
+             raise ValueError(
+                 "Error running SQL: %s. MSG: %s\n" % (ec_lu, str(error)))
+-        except (KeyError, AttributeError, TypeError):
++        # the order of except statements is important, do not change
++        except (KeyError, AttributeError, TypeError) as error:
++            raise ValueError("Error running SQL query: %s" % str(error))
++        except ValueError as error:
+             raise ValueError("Error running SQL query: %s" % str(error))
+ 
+     @_checker
+diff --git a/qiita_db/test/test_analysis.py b/qiita_db/test/test_analysis.py
+index 46a6d930b..1e3f509d4 100644
+--- a/qiita_db/test/test_analysis.py
++++ b/qiita_db/test/test_analysis.py
+@@ -22,6 +22,16 @@
+ # -----------------------------------------------------------------------------
+ 
+ 
++class TestAnalysisIter(TestCase):
++    def test_iter(self):
++        obs = list(qdb.analysis.Analysis.iter())
++        exp = [
++            qdb.analysis.Analysis(1), qdb.analysis.Analysis(2),
++            qdb.analysis.Analysis(3), qdb.analysis.Analysis(4),
++            qdb.analysis.Analysis(5), qdb.analysis.Analysis(6)]
++        self.assertCountEqual(obs, exp)
++
++
+ @qiita_test_checker()
+ class TestAnalysis(TestCase):
+     def setUp(self):
+diff --git a/qiita_pet/handlers/admin_processing_job.py b/qiita_pet/handlers/admin_processing_job.py
+index 7bef7ec88..733ceda68 100644
+--- a/qiita_pet/handlers/admin_processing_job.py
++++ b/qiita_pet/handlers/admin_processing_job.py
+@@ -20,7 +20,8 @@
+ 
+ class AdminProcessingJobBaseClass(BaseHandler):
+     def _check_access(self):
+-        if self.current_user.level not in {'admin', 'wet-lab admin'}:
++        if self.current_user is None or self.current_user.level not in {
++                'admin', 'wet-lab admin'}:
+             raise HTTPError(403, reason="User %s doesn't have sufficient "
+                             "privileges to view error page" %
+                             self.current_user.email)
+diff --git a/qiita_pet/support_files/doc/source/processingdata/processing-recommendations.rst b/qiita_pet/support_files/doc/source/processingdata/processing-recommendations.rst
+index ceb2c5a68..0f43cfd28 100755
+--- a/qiita_pet/support_files/doc/source/processingdata/processing-recommendations.rst
++++ b/qiita_pet/support_files/doc/source/processingdata/processing-recommendations.rst
+@@ -127,6 +127,33 @@ Reference databases
+ 
+ Note that some of these are legacy option but not available for new processing.
+ 
++
++
++#. WoLr2 (“Web of Life” release 2): A significant upgrade from WoLr1. The genome
++   pool is an even representation of microbial diversity, sampled from
++   non-redundant bacterial and archaeal genomes from NCBI (RefSeq and GenBank,
++   complete and draft). A high-quality reference phylogeny was reconstructed
++   using the uDance workflow (manuscript in submission). Taxonomic
++   classifications were curated according to phylogeny based on GTDB (default)
++   and NCBI. Functional annotations were performed using EggNOG, GO, KEGG,
++   MetaCyc, Pfam and UniRef.
++
++   -  Domains: Bacteria, Archaea
++   -  Number of genomes: 15,953
++   -  Total length (bp): 48,809,171,826
++   -  Citation: Zhu Q, Mai U, Pfeiffer W, et al. Phylogenomics of 10,575 genomes
++      reveals evolutionary proximity between domains Bacteria and Archaea. Nat
++      Commun. 2019. 10(1):5477. doi: 10.1038/s41467-019-13443-4.
++   -  Numbers of taxonomic units:
++
++      - Domains: 2
++      - Phyla: 124
++      - Classes: 321
++      - Orders: 914
++      - Families: 2,057
++      - Genera: 6,811
++      - Species: 12,258
++
+ #. WoLr1 ("Web of Life" release 1): An even representation of microbial diversity, selected using an prototype
+    selection algorithm based on the MinHash distance matrix among all non-redundant bacterial and archaeal genomes
+    from NCBI (RefSeq and GenBank, complete and draft), plus several genome quality control criteria. A
+diff --git a/qiita_pet/templates/study_ajax/sample_prep_summary.html b/qiita_pet/templates/study_ajax/sample_prep_summary.html
+index a693a752a..115875159 100644
+--- a/qiita_pet/templates/study_ajax/sample_prep_summary.html
++++ b/qiita_pet/templates/study_ajax/sample_prep_summary.html
+@@ -63,7 +63,7 @@
+     var prep_names = {% raw columns %};
+ 
+     // adding header
+-    var header = ['sample_id']
++    var header = ['sample_name']
+     $.each(prep_colums, function(i, prep){
+       header.push(prep_names[prep]);
+     });
+diff --git a/qiita_pet/test/rest/test_study_preparation.py b/qiita_pet/test/rest/test_study_preparation.py
+index 91a3e90a2..a4f8c3dce 100644
+--- a/qiita_pet/test/rest/test_study_preparation.py
++++ b/qiita_pet/test/rest/test_study_preparation.py
+@@ -56,7 +56,7 @@ def test_post_valid_study(self):
+         exp = json_decode(response.body)
+         exp_prep = PrepTemplate(exp['id']).to_dataframe()
+ 
+-        prep_table.index.name = 'sample_id'
++        prep_table.index.name = 'sample_name'
+ 
+         # sort columns to be comparable
+         prep_table = prep_table[sorted(prep_table.columns.tolist())]
+diff --git a/scripts/qiita b/scripts/qiita
+index 99e61e989..0e182f047 100755
+--- a/scripts/qiita
++++ b/scripts/qiita
+@@ -20,6 +20,7 @@ import tornado.ioloop
+ from psycopg2 import OperationalError
+ 
+ import qiita_db as qdb
++from qiita_core.util import update_redis_qiita_sha_version
+ from qiita_core.qiita_settings import qiita_config, r_client
+ from qiita_ware.ebi import EBISubmission
+ from qiita_ware.commands import submit_EBI as _submit_EBI
+@@ -356,6 +357,7 @@ def start(port, master):
+             p.start()
+ 
+     if master:
++        update_redis_qiita_sha_version()
+         # Create/repopulate the usernames key so we can do autocomplete for
+         # sharing. Note that we only do it in master so this is not created in
+         # all workers and possibly hit this error:
+diff --git a/scripts/qiita-recover-jobs b/scripts/qiita-recover-jobs
+index 75939ad7e..cc2e2c23e 100644
+--- a/scripts/qiita-recover-jobs
++++ b/scripts/qiita-recover-jobs
+@@ -50,6 +50,7 @@ def _retrieve_queue_jobs():
+ 
+     # ignore the merge-jobs and get unique values
+     qiita_jids = jobs.NAME.str.replace('merge-', '').unique()
++    qiita_jids = [x.replace('.txt', '') for x in qiita_jids]
+ 
+     return set(qiita_jids)
+ 

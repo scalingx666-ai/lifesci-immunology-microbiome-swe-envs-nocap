@@ -1,0 +1,168 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index ece8e6f2..42740c19 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -6,6 +6,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🚀 Features
+ 
++* {func}`ep.pp.summarize_measurements <ehrapy.preprocessing.summarize_measurements>` computes the number of values, their standard deviation and, for longitudinal data, their slope over time ([#1150](https://github.com/theislab/ehrapy/pull/1150)) @Zethson
+ * {func}`ep.pl.trajectories <ehrapy.plot.trajectories>` plots the mean of longitudinal variables over time with a confidence band for every group of observations ([#1146](https://github.com/theislab/ehrapy/pull/1146)) @Zethson
+ * {func}`ep.pp.gradient_boosting_impute <ehrapy.preprocessing.gradient_boosting_impute>` imputes every variable with a gradient boosting model, which for longitudinal data also uses the closest observed values before and after each timepoint @Zethson
+ 
+diff --git a/ehrapy/preprocessing/_summarize_measurements.py b/ehrapy/preprocessing/_summarize_measurements.py
+index cdfe2c3f..c392cd39 100644
+--- a/ehrapy/preprocessing/_summarize_measurements.py
++++ b/ehrapy/preprocessing/_summarize_measurements.py
+@@ -16,6 +16,7 @@
+     from collections.abc import Iterable, Sequence
+ 
+     type Array = np.ndarray | DaskArray
++    type Statistic = Literal["min", "max", "mean", "median", "first", "last", "count", "std", "slope"]
+ 
+ 
+ def summarize_measurements(
+@@ -23,13 +24,14 @@ def summarize_measurements(
+     *,
+     layer: str | None = None,
+     var_names: Iterable[str] | None = None,
+-    statistics: Iterable[Literal["min", "max", "mean", "median", "first", "last"]] = ("min", "max", "mean"),
++    statistics: Iterable[Statistic] = ("min", "max", "mean"),
+ ) -> EHRData:
+     """Summarizes numerical measurements into statistics such as their minimum, maximum and average values.
+ 
+     For 3D data, every variable is aggregated over the time axis of each observation, ignoring missing values.
+     This is how longitudinal data reaches the functions that only support 2D data.
+-    The statistics `"first"` and `"last"` are the first and last non-missing value.
++    The statistics `"first"` and `"last"` are the first and last non-missing value, `"count"` is the number of non-missing values and `"std"` their sample standard deviation.
++    `"slope"` is the least-squares change per timepoint, which only exists for 3D data.
+     For 2D data, rows that share an observation name are aggregated.
+ 
+     Args:
+@@ -58,6 +60,8 @@ def summarize_measurements(
+     if missing := set(var_names) - set(edata.var_names):
+         raise KeyError(f"Variables not found: {missing}")
+     statistics = list(statistics)
++    if X.ndim != 3 and "slope" in statistics:
++        raise ValueError("The statistic 'slope' needs 3D data with a time axis.")
+     values = X[:, edata.var_names.get_indexer(var_names)]
+     var = pd.DataFrame(index=[f"{var}_{statistic}" for var in var_names for statistic in statistics])
+ 
+@@ -127,6 +131,13 @@ def _segment_statistic(
+         case "mean":
+             with np.errstate(invalid="ignore"):
+                 return np.add.reduceat(np.where(valid, values, 0), starts) / count
++        case "count":
++            return count.astype(np.float64)
++        case "std":
++            total = np.add.reduceat(np.where(valid, values, 0), starts)
++            squares = np.add.reduceat(np.where(valid, values**2, 0), starts)
++            with np.errstate(invalid="ignore", divide="ignore"):
++                return np.sqrt(np.maximum(squares - total**2 / count, 0) / (count - 1))
+         case "median":
+             ordered = values[np.lexsort((values, np.repeat(starts, n_stored)))]
+             n_negative = np.add.reduceat(ordered < 0, starts, dtype=np.intp)
+@@ -165,6 +176,20 @@ def _aggregate_time(X: Array, statistic: str) -> Array:
+             return xpx.nanmean(X, axis=2)
+         case "median":
+             return nanquantile(X, 0.5, axis=2)
++        case "count":
++            return xp.sum(xp.astype(~xp.isnan(X), X.dtype), axis=2)
++        case "std" | "slope":
++            valid = ~xp.isnan(X)
++            n = xp.sum(xp.astype(valid, X.dtype), axis=2, keepdims=True)
++            value_mean = xp.sum(xp.where(valid, X, 0), axis=2, keepdims=True) / xp.where(n > 0, n, xp.nan)
++            if statistic == "std":
++                squares = xp.sum(xp.where(valid, (X - value_mean) ** 2, 0), axis=2)
++                return xp.sqrt(squares / xp.where(n[..., 0] > 1, n[..., 0] - 1, xp.nan))
++            time = xp.astype(xp.arange(X.shape[2]), X.dtype)
++            time_mean = xp.sum(xp.where(valid, time, 0), axis=2, keepdims=True) / xp.where(n > 0, n, xp.nan)
++            covariance = xp.sum(xp.where(valid, (time - time_mean) * (X - value_mean), 0), axis=2)
++            variance = xp.sum(xp.where(valid, (time - time_mean) ** 2, 0), axis=2)
++            return covariance / xp.where(variance > 0, variance, xp.nan)
+         case "first" | "last":
+             valid = ~xp.isnan(X)
+             if statistic == "last":
+diff --git a/tests/preprocessing/test_summarize_measurements.py b/tests/preprocessing/test_summarize_measurements.py
+index 8fab528b..eb649b0a 100644
+--- a/tests/preprocessing/test_summarize_measurements.py
++++ b/tests/preprocessing/test_summarize_measurements.py
+@@ -10,7 +10,7 @@
+ from ehrapy.preprocessing import summarize_measurements
+ from tests.conftest import forbid_dask_compute
+ 
+-STATISTICS = ["min", "max", "mean", "median", "first", "last"]
++STATISTICS = ["min", "max", "mean", "median", "first", "last", "count", "std"]
+ 
+ 
+ @pytest.fixture
+@@ -63,6 +63,11 @@ def _non_missing_at(x: np.ndarray, position: int) -> float:
+     return x[position] if len(x) else np.nan
+ 
+ 
++def _slope(x: np.ndarray) -> float:
++    observed = ~np.isnan(x)
++    return np.polyfit(np.flatnonzero(observed), x[observed], 1)[0] if observed.sum() > 1 else np.nan
++
++
+ @pytest.mark.filterwarnings("ignore:Mean of empty slice:RuntimeWarning")
+ def test_summarize_measurements_3D(rng):
+     X = rng.normal(size=(5, 3, 4))
+@@ -71,7 +76,7 @@ def test_summarize_measurements_3D(rng):
+     obs = pd.DataFrame({"group": list("aabbc")}, index=[f"pat{i}" for i in range(5)])
+     edata = ed.EHRData(shape=(5, 3), obs=obs, layers={DEFAULT_TEM_LAYER_NAME: X})
+ 
+-    summary = summarize_measurements(edata, layer=DEFAULT_TEM_LAYER_NAME, statistics=STATISTICS)
++    summary = summarize_measurements(edata, layer=DEFAULT_TEM_LAYER_NAME, statistics=[*STATISTICS, "slope"])
+ 
+     expected = {
+         "min": np.nanmin(X, axis=2),
+@@ -80,9 +85,12 @@ def test_summarize_measurements_3D(rng):
+         "median": np.nanmedian(X, axis=2),
+         "first": np.apply_along_axis(_non_missing_at, 2, X, 0),
+         "last": np.apply_along_axis(_non_missing_at, 2, X, -1),
++        "count": (~np.isnan(X)).sum(axis=2),
++        "std": np.nanstd(X, axis=2, ddof=1),
++        "slope": np.apply_along_axis(_slope, 2, X),
+     }
+-    assert summary.shape == (5, 3 * len(STATISTICS), 1)
+-    assert summary.var_names.tolist() == [f"{var}_{stat}" for var in edata.var_names for stat in STATISTICS]
++    assert summary.shape == (5, 3 * len(expected), 1)
++    assert summary.var_names.tolist() == [f"{var}_{stat}" for var in edata.var_names for stat in expected]
+     pd.testing.assert_frame_equal(summary.obs, edata.obs)
+     for stat, values in expected.items():
+         np.testing.assert_allclose(summary[:, [f"{var}_{stat}" for var in edata.var_names]].X, values)
+@@ -109,11 +117,12 @@ def test_summarize_measurements_array_types(array_type, ndim, rng):
+     def make_edata(X):
+         return ed.EHRData(shape=shape[:2], obs=obs, layers={DEFAULT_TEM_LAYER_NAME: X})
+ 
+-    expected = summarize_measurements(make_edata(X), layer=DEFAULT_TEM_LAYER_NAME, statistics=STATISTICS)
++    statistics = STATISTICS if ndim == 2 else [*STATISTICS, "slope"]
++    expected = summarize_measurements(make_edata(X), layer=DEFAULT_TEM_LAYER_NAME, statistics=statistics)
+     edata = make_edata(array_type(X))
+ 
+     with forbid_dask_compute():
+-        result = summarize_measurements(edata, layer=DEFAULT_TEM_LAYER_NAME, statistics=STATISTICS)
++        result = summarize_measurements(edata, layer=DEFAULT_TEM_LAYER_NAME, statistics=statistics)
+ 
+     assert type(result.X) is type(edata.layers[DEFAULT_TEM_LAYER_NAME])
+     if array_type.flags & Flags.Dask:
+@@ -121,3 +130,18 @@ def make_edata(X):
+     pd.testing.assert_index_equal(result.obs_names, expected.obs_names)
+     pd.testing.assert_index_equal(result.var_names, expected.var_names)
+     np.testing.assert_allclose(to_dense(result.X, to_cpu_memory=True), expected.X, equal_nan=True)
++
++
++def test_summarize_measurements_2D_count_std(edata_to_expand):
++    summary = summarize_measurements(edata_to_expand, var_names=["measurement2"], statistics=["count", "std"])
++
++    values = edata_to_expand[:, "measurement2"].X.ravel()
++    np.testing.assert_allclose(summary.X[:, 0].ravel(), [3, 2, 1])
++    np.testing.assert_allclose(
++        summary.X[:, 1].ravel(), [np.std(values[:3], ddof=1), np.std(values[3:5], ddof=1), np.nan]
++    )
++
++
++def test_summarize_measurements_slope_needs_3D(edata_to_expand):
++    with pytest.raises(ValueError, match="needs 3D data"):
++        summarize_measurements(edata_to_expand, statistics=["slope"])

@@ -1,0 +1,671 @@
+diff --git a/woltka/align.py b/woltka/align.py
+index 63c61f0..96098a4 100644
+--- a/woltka/align.py
++++ b/woltka/align.py
+@@ -30,7 +30,6 @@
+ 
+ def plain_mapper(fh, fmt=None, n=1000):
+     """Read an alignment file in chunks and yield query-to-subject(s) maps.
+-
+     Parameters
+     ----------
+     fh : file handle
+@@ -39,14 +38,12 @@ def plain_mapper(fh, fmt=None, n=1000):
+         Alignment file format.
+     n : int, optional
+         Number of lines per chunk.
+-
+     Yields
+     ------
+     deque of str
+         Query queue.
+     deque of set of str
+         Subject(s) queue.
+-
+     Notes
+     -----
+     The design of this function aims to couple with the extremely large size of
+@@ -111,6 +108,71 @@ def plain_mapper(fh, fmt=None, n=1000):
+     yield qryque, subque
+ 
+ 
++def range_mapper(fh, fmt=None, n=1000):
++    """Read an alignment file and yield maps of query to subject(s) and their
++    ranges.
++
++    Parameters
++    ----------
++    fh : file handle
++        Alignment file to parse.
++    fmt : str, optional
++        Alignment file format.
++    n : int, optional
++        Number of lines per chunk.
++
++    Yields
++    ------
++    deque of str
++        Query queue.
++    deque of dict of str to list of int
++        Subject-to-ranges queue.
++
++    Notes
++    -----
++    Same as `plain_mapper`, except that it also returns subject ranges.
++
++    Ranges are stored as a one-dimensional, interleaved list of start1, end1,
++    start2, end2, start3, end3...
++
++    See Also
++    --------
++    plain_mapper
++    """
++    fmt, head = (fmt, []) if fmt else infer_align_format(fh)
++    parser = assign_parser(fmt)
++    qryque, subque = deque(), deque()
++    qry_append, sub_append = qryque.append, subque.append
++    this = None
++    target = n
++    for i, line in enumerate(chain(iter(head), fh)):
++
++        # retain subject range
++        try:
++            query, subject, _, _, start, end = parser(line)[:6]
++        except (TypeError, IndexError):
++            continue
++
++        # range must be positive integers
++        if start and end:
++
++            if query == this:
++                subque[-1].setdefault(subject, []).extend((start, end))
++            else:
++                if i >= target:
++                    yield qryque, subque
++                    qryque, subque = deque(), deque()
++                    qry_append, sub_append = qryque.append, subque.append
++                    target = i + n
++                qry_append(query)
++
++                # return subject Id and range
++                sub_append({subject: [start, end]})
++
++                this = query
++    yield qryque, subque
++
++
+ def infer_align_format(fh):
+     """Guess the format of an alignment file based on content.
+ 
+diff --git a/woltka/cli.py b/woltka/cli.py
+index 96a94de..996afad 100644
+--- a/woltka/cli.py
++++ b/woltka/cli.py
+@@ -159,6 +159,9 @@ def cli():
+     '--zipmap', 'outmap_zip', default='gz',
+     type=click.Choice(['none', 'gz', 'bz2', 'xz'], case_sensitive=False),
+     help='Compress read-to-feature maps using this algorithm.')
++@click.option(
++    '--outcov', 'outcov_dir', type=click.Path(dir_okay=True),
++    help='Write subject coverage maps to this directory.')
+ # performance
+ @click.option(
+     '--chunk', type=click.INT, default=None,
+diff --git a/woltka/coverage.py b/woltka/coverage.py
+new file mode 100644
+index 0000000..b1151bf
+--- /dev/null
++++ b/woltka/coverage.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++
++# ----------------------------------------------------------------------------
++# Copyright (c) 2020--, Qiyun Zhu.
++#
++# Distributed under the terms of the Modified BSD License.
++#
++# The full license is in the file LICENSE, distributed with this software.
++# ----------------------------------------------------------------------------
++
++
++"""Functions for calculating coverage of subject sequences.
++
++The "coverage" refers to the ranges of a subject sequence (e.g., genome) that
++are covered by at least one query sequence (e.g., short sequencing read).
++
++The functions `merge_ranges` and `parse_ranges` were modified based on the
++`SortedRangeList` class implemented by Daniel Hakim (@dhakim87) in the Zebra
++Filter program (https://github.com/ucsd-cmi/zebra_filter).
++"""
++
++from os import makedirs
++from os.path import join
++
++
++def merge_ranges(ranges):
++    """Merge short, fragmental ranges into long, continuous ones.
++
++    Parameters
++    ----------
++    ranges : list of int
++        Ranges to merge.
++
++    Returns
++    -------
++    list of int
++        Merged ranges.
++
++    Notes
++    -----
++    Ranges that have overlaps will be merged into one. For example:
++
++    >>> merge_ranges([1, 3, 2, 4, 6, 8, 7, 9])
++    [1, 4, 6, 9]
++    """
++    res = []
++    res_extend = res.extend
++    cstart, cend = None, None
++    for start, end in sorted(zip(*[iter(ranges)] * 2)):
++        if cend is None:
++            # case 1: no active range, start active range
++            cstart, cend = start, end
++        elif cend >= start - 1:
++            # case 2: active range continues through this range
++            # extend active range
++            cend = max(cend, end)
++        else:
++            # case 3: active range ends before this range begins
++            # write new range out, then start new active range
++            res_extend((cstart, cend))
++            cstart, cend = start, end
++    if cend is not None:
++        res_extend((cstart, cend))
++    return res
++
++
++def parse_ranges(rmaps, covers, chunk=20000):
++    """Extract range information from read maps.
++
++    Parameters
++    ----------
++    rmaps : dict of dict
++        Read map data structure.
++    covers : dict of list
++        Subject coverage data structure.
++    chunk : int, optional
++        Auto-compress after adding this many new ranges.
++
++    Notes
++    -----
++    The `covers` data structure is a dictionary, where the key is a tuple of
++    (sample, subject), and the value is a list. The first element of the list
++    is an integer indicating how many new ranges have been added since last
++    merge, and the remaining elements are individual ranges.
++
++    Once the range counter reaches the threshold specified by `chunk`, an
++    operation will be automatically triggered to merge small ranges into large,
++    continuous ones, so as to reduce memory space and to improve downstream
++    operations.
++
++    See Also
++    --------
++    merge_ranges
++    """
++    add_cover = covers.setdefault
++    for sample, (_, subque) in rmaps.items():
++        for subjects in subque:
++            for subject, ranges in subjects.items():
++                cover = add_cover((sample, subject), [0, []])
++                count = cover[0] + len(ranges)
++                if count >= chunk:
++                    cover[0] = 0
++                    cover[1] = merge_ranges(cover[1] + ranges)
++                else:
++                    cover[0] = count
++                    cover[1].extend(ranges)
++
++
++def calc_coverage(covers):
++    """Calculate coverage per sample per subject based on ranges.
++
++    Parameters
++    ----------
++    covers : dict of list
++        Subject coverage data structure.
++
++    Returns
++    -------
++    dict of dict of list of int
++        Subject coverage data.
++
++    Notes
++    -----
++    This function is executed at last after all ranges have been added. It
++    performs a final merge. Then it converts the dictionary with keys as
++    (sample, subject) into a nested dictionary of sample -> subject -> ranges.
++
++    See Also
++    --------
++    merge_ranges
++    """
++    res = {}
++    add_sample = res.setdefault
++    for (sample, subject), (_, ranges) in covers.items():
++        add_sample(sample, {})[subject] = merge_ranges(ranges)
++    return res
++
++
++def write_coverage(covers, outdir):
++    """Write subject coverage to per sample output files.
++
++    Parameters
++    ----------
++    covers : dict of dict
++        Coverage data structure.
++    outdir : str
++        Directory of output files.
++    """
++    makedirs(outdir, exist_ok=True)
++    for sample, cover in sorted(covers.items()):
++        with open(join(outdir, f'{sample}.cov'), 'w') as fh:
++            for subject, ranges in sorted(cover.items()):
++                for start, end in sorted(zip(*[iter(ranges)] * 2)):
++                    print(subject, start, end, sep='\t', file=fh)
+diff --git a/woltka/tests/test_align.py b/woltka/tests/test_align.py
+index bfcc9ff..5189fd7 100644
+--- a/woltka/tests/test_align.py
++++ b/woltka/tests/test_align.py
+@@ -16,9 +16,9 @@
+ 
+ from woltka.file import openzip
+ from woltka.align import (
+-    plain_mapper, infer_align_format, assign_parser, parse_map_line,
+-    parse_b6o_line, parse_sam_line, cigar_to_lens, parse_kraken,
+-    parse_centrifuge)
++    plain_mapper, range_mapper, infer_align_format, assign_parser,
++    parse_map_line, parse_b6o_line, parse_sam_line, cigar_to_lens,
++    parse_kraken, parse_centrifuge)
+ 
+ 
+ class AlignTests(TestCase):
+@@ -105,6 +105,29 @@ def _res2lst(res):
+         self.assertEqual(str(ctx.exception), (
+             'Cannot determine alignment file format.'))
+ 
++    def test_range_mapper(self):
++
++        def _res2lst(res):
++            return tuple(tuple(list(x) for x in y) for y in res)
++
++        aln = StringIO('\n'.join((
++            'R1	G1	95	20	0	0	1	20	10	29	1	1',
++            'R2	G1	95	20	0	0	1	20	16	35	1	1',
++            'R3	G2	95	20	0	0	1	20	39	21	1	1',
++            'R4	G2	95	20	0	0	20	1	41	22	1	1',
++            'R5	G3	95	20	0	0	20	1	30	49	1	1',
++            'R5	G3	95	20	0	0	20	1	50	69	1	1',
++            'Rx	Gx	95	20	0	0	1	20	0	0	1	1',
++            '# this is not an alignment')))
++        obs = _res2lst(range_mapper(aln))[0]
++        exp = [('R1', {'G1': [10, 29]}),
++               ('R2', {'G1': [16, 35]}),
++               ('R3', {'G2': [21, 39]}),
++               ('R4', {'G2': [22, 41]}),
++               ('R5', {'G3': [30, 49, 50, 69]})]
++        self.assertListEqual(list(obs[0]), [x[0] for x in exp])
++        self.assertListEqual(list(obs[1]), [x[1] for x in exp])
++
+     def test_infer_align_format(self):
+         # simple cases
+         # map
+diff --git a/woltka/tests/test_coverage.py b/woltka/tests/test_coverage.py
+new file mode 100644
+index 0000000..2b094cf
+--- /dev/null
++++ b/woltka/tests/test_coverage.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++
++# ----------------------------------------------------------------------------
++# Copyright (c) 2020--, Qiyun Zhu.
++#
++# Distributed under the terms of the Modified BSD License.
++#
++# The full license is in the file LICENSE, distributed with this software.
++# ----------------------------------------------------------------------------
++
++from unittest import TestCase, main
++from os.path import join, dirname, realpath
++from os import makedirs
++from shutil import rmtree
++from tempfile import mkdtemp
++
++from woltka.coverage import (
++    merge_ranges, parse_ranges, calc_coverage, write_coverage)
++
++
++class CoverageTests(TestCase):
++    def setUp(self):
++        self.tmpdir = mkdtemp()
++        self.datdir = join(dirname(realpath(__file__)), 'data')
++
++    def tearDown(self):
++        rmtree(self.tmpdir)
++
++    def test_merge_ranges(self):
++        # ranges that are sorted and overlapped
++        obs = merge_ranges([1, 3, 2, 4, 6, 8, 7, 9])
++        exp = [1, 4, 6, 9]
++        self.assertListEqual(obs, exp)
++
++        # unsorted ranges
++        obs = merge_ranges([4, 6, 1, 4, 5, 9])
++        exp = [1, 9]
++        self.assertListEqual(obs, exp)
++
++        # ranges that are connected (but not overlapped)
++        obs = merge_ranges([1, 2, 3, 4, 5, 6])
++        exp = [1, 6]
++        self.assertListEqual(obs, exp)
++
++        # empty range list
++        self.assertListEqual(merge_ranges([]), [])
++
++    def test_parse_ranges(self):
++        rmap = {'S1': (['R1', 'R2', 'R3'], [
++                    {'G1': [1, 100]},
++                    {'G1': [1, 50, 251, 300]},
++                    {'G1': [1, 50], 'G2': [101, 150]}]),
++                'S2': (['R1', 'R3', 'R4'], [
++                    {'G2': [151, 200, 51, 100]},
++                    {'G3': [76, 125], 'G4': [26, 75, 101, 150]},
++                    {'G2': [26, 75], 'G3': [1, 50]}]),
++                'S3': (['R2', 'R4', 'R5'], [
++                    {'G1': [1, 50], 'G2': [51, 100]},
++                    {'G1': [51, 100, 151, 200]},
++                    {'G1': [101, 150], 'G2': [1, 50]}])}
++
++        # add ranges but don't merge
++        obs = {}
++        parse_ranges(rmap, obs)
++        exp = {('S1', 'G1'): [8, [1, 100, 1, 50, 251, 300, 1, 50]],
++               ('S1', 'G2'): [2, [101, 150]],
++               ('S2', 'G2'): [6, [151, 200, 51, 100, 26, 75]],
++               ('S2', 'G3'): [4, [76, 125, 1, 50]],
++               ('S2', 'G4'): [4, [26, 75, 101, 150]],
++               ('S3', 'G1'): [8, [1, 50, 51, 100, 151, 200, 101, 150]],
++               ('S3', 'G2'): [4, [51, 100, 1, 50]]}
++        self.assertDictEqual(obs, exp)
++
++        # merge while adding
++        obs = {}
++        parse_ranges(rmap, obs, chunk=1)
++        exp = {('S1', 'G1'): [0, [1, 100, 251, 300]],
++               ('S1', 'G2'): [0, [101, 150]],
++               ('S2', 'G2'): [0, [26, 100, 151, 200]],
++               ('S2', 'G3'): [0, [1, 50, 76, 125]],
++               ('S2', 'G4'): [0, [26, 75, 101, 150]],
++               ('S3', 'G1'): [0, [1, 200]],
++               ('S3', 'G2'): [0, [1, 100]]}
++        self.assertDictEqual(obs, exp)
++
++    def test_calc_coverage(self):
++        cov = {('S1', 'G1'): [8, [1, 100, 1, 50, 251, 300, 1, 50]],
++               ('S1', 'G2'): [2, [101, 150]],
++               ('S2', 'G2'): [6, [151, 200, 51, 100, 26, 75]],
++               ('S2', 'G3'): [4, [76, 125, 1, 50]],
++               ('S2', 'G4'): [4, [26, 75, 101, 150]],
++               ('S3', 'G1'): [8, [1, 50, 51, 100, 151, 200, 101, 150]],
++               ('S3', 'G2'): [4, [51, 100, 1, 50]]}
++        obs = calc_coverage(cov)
++        exp = {'S1': {'G1': [1, 100, 251, 300],
++                      'G2': [101, 150]},
++               'S2': {'G2': [26, 100, 151, 200],
++                      'G3': [1, 50, 76, 125],
++                      'G4': [26, 75, 101, 150]},
++               'S3': {'G1': [1, 200],
++                      'G2': [1, 100]}}
++        self.assertDictEqual(obs, exp)
++
++    def test_write_coverage(self):
++        cov = {'S1': {'G1': [1, 100, 251, 300],
++                      'G2': [101, 150]},
++               'S2': {'G2': [26, 100, 151, 200],
++                      'G3': [1, 50, 76, 125],
++                      'G4': [26, 75, 101, 150]},
++               'S3': {'G1': [1, 200],
++                      'G2': [1, 100]}}
++        outdir = join(self.tmpdir, 'outdir')
++        makedirs(outdir)
++        write_coverage(cov, outdir)
++        with open(join(outdir, 'S1.cov'), 'r') as f:
++            obs = f.read().splitlines()
++        exp = ['G1\t1\t100', 'G1\t251\t300', 'G2\t101\t150']
++        self.assertListEqual(obs, exp)
++        with open(join(outdir, 'S2.cov'), 'r') as f:
++            obs = f.read().splitlines()
++        exp = ['G2\t26\t100', 'G2\t151\t200', 'G3\t1\t50',
++               'G3\t76\t125', 'G4\t26\t75', 'G4\t101\t150']
++        self.assertListEqual(obs, exp)
++        with open(join(outdir, 'S3.cov'), 'r') as f:
++            obs = f.read().splitlines()
++        exp = ['G1\t1\t200', 'G2\t1\t100']
++        self.assertListEqual(obs, exp)
++        rmtree(outdir)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/woltka/tests/test_workflow.py b/woltka/tests/test_workflow.py
+index 9f15c4e..86abee9 100644
+--- a/woltka/tests/test_workflow.py
++++ b/woltka/tests/test_workflow.py
+@@ -7,9 +7,8 @@
+ #
+ # The full license is in the file LICENSE, distributed with this software.
+ # ----------------------------------------------------------------------------
+-
+ from unittest import TestCase, main
+-from os import remove
++from os import remove, makedirs
+ from os.path import join, dirname, realpath
+ from shutil import rmtree
+ from tempfile import mkdtemp
+@@ -45,6 +44,21 @@ def test_workflow(self):
+             self.datdir, 'output', 'bowtie2.ogu.tsv')))
+         remove(output_fp)
+ 
++    def test_coverage(self):
++        # simplest ogu workflow
++        input_fp = join(self.datdir, 'align', 'bowtie2')
++        output_fp = join(self.tmpdir, 'tmp.tsv')
++        outcov_dir = join(self.tmpdir, 'outcov')
++        makedirs(outcov_dir)
++        workflow(input_fp, output_fp, outcov_dir=outcov_dir)['none']
++        with open(join(outcov_dir, 'S04.cov'), 'r') as f:
++            obs = f.read().splitlines()
++        self.assertEqual(len(obs), 1078)
++        self.assertEqual(obs[10], 'G000007265\t2092666\t2092815')
++        self.assertEqual(obs[200], 'G000215745\t768758\t769038')
++        remove(output_fp)
++        rmtree(outcov_dir)
++
+     def test_classify(self):
+         # simplest ogu workflow
+         input_fp = join(self.datdir, 'align', 'bowtie2')
+diff --git a/woltka/workflow.py b/woltka/workflow.py
+index 6c500e4..69b1e46 100644
+--- a/woltka/workflow.py
++++ b/woltka/workflow.py
+@@ -28,7 +28,7 @@
+ from .file import (
+     openzip, readzip, path2stem, stem2rank, read_ids, id2file_from_dir,
+     id2file_from_map, read_map_uniq, read_map_1st, write_readmap)
+-from .align import plain_mapper
++from .align import plain_mapper, range_mapper
+ from .classify import (
+     assign_none, assign_free, assign_rank, counter, counter_size,
+     counter_strat, counter_size_strat)
+@@ -38,6 +38,7 @@
+ from .ordinal import (
+     ordinal_mapper, read_gene_coords, whether_prefix, calc_gene_lens)
+ from .table import prep_table, write_table
++from .coverage import parse_ranges, calc_coverage, write_coverage
+ 
+ 
+ def workflow(input_fp:     str,
+@@ -80,6 +81,7 @@ def workflow(input_fp:     str,
+              add_lineage: bool = False,
+              outmap_dir:   str = None,
+              outmap_zip:   str = 'gz',
++             outcov_dir:   str = None,
+              # performance
+              chunk:        int = None,
+              cache:        int = 1024,
+@@ -118,7 +120,8 @@ def workflow(input_fp:     str,
+         map_rank, zippers)
+ 
+     # build mapping module
+-    mapper, chunk = build_mapper(coords_fp, overlap, chunk, zippers)
++    mapper, chunk = build_mapper(
++        coords_fp, outcov_dir, overlap, chunk, zippers)
+ 
+     # parse length map
+     sizes = parse_sizes(sizes, mapper, zippers)
+@@ -131,7 +134,7 @@ def workflow(input_fp:     str,
+         mapper, files, samples, input_fmt, demux, trimsub, tree, rankdic,
+         namedic if name_as_id else None, root, ranks, rank2dir, outmap_zip,
+         uniq, major, above, subok, sizes, unassigned, stratmap, chunk, cache,
+-        zippers)
++        zippers, outcov_dir)
+ 
+     # convert counts to fractions
+     frac_profiles(data, frac)
+@@ -173,7 +176,8 @@ def classify(mapper:  object,
+              stratmap:  dict = None,
+              chunk:      int = None,
+              cache:      int = 1024,
+-             zippers:   dict = None) -> dict:
++             zippers:   dict = None,
++             outcov_dir: str = None) -> dict:
+     """Core of the classification workflow.
+ 
+     Parameters
+@@ -235,6 +239,8 @@ def classify(mapper:  object,
+         LRU cache size for classification results at each rank.
+     zippers : dict, optional
+         External compression programs.
++    outcov_dir : str, optional
++        Write Subject coverage maps to directory.
+ 
+     Returns
+     -------
+@@ -246,6 +252,7 @@ def classify(mapper:  object,
+     Subject(s) of each query are sorted and converted into a tuple, which is
+     hashable, a property necessary for subsequent assignment result caching.
+     """
++
+     data = {x: {} for x in ranks}
+ 
+     # assigners for each rank
+@@ -258,6 +265,9 @@ def classify(mapper:  object,
+               'sizes': sizes, 'unasgd': unasgd, 'rank2dir': rank2dir,
+               'outzip': outzip if outzip != 'none' else None}
+ 
++    # (optional) subject coverage data
++    covers = {} if outcov_dir else None
++
+     # current sample Id
+     csample = False
+ 
+@@ -275,16 +285,20 @@ def classify(mapper:  object,
+             for qryque, subque in mapper(fh, fmt=fmt, n=chunk):
+                 nqry += len(qryque)
+ 
+-                # (optional) strip indices and generate tuples
+-                subque = deque(map(tuple, map(sorted, strip_suffix(
+-                    subque, trimsub) if trimsub else subque)))
+-
+                 # (optional) demultiplex and generate per-sample maps
+                 rmaps = demultiplex(qryque, subque, samples) if demux else {
+                     files[fp] if files else None: (qryque, subque)}
+ 
++                # (optional) calculate subject coverage
++                if outcov_dir:
++                    parse_ranges(rmaps, covers)
++
+                 # assign reads at each rank
+-                for sample, rmap in rmaps.items():
++                for sample, (qryque, subque) in rmaps.items():
++
++                    # (optional) strip suffixes from subject Ids
++                    subque = deque(map(tuple, map(sorted, strip_suffix(
++                        subque, trimsub) if trimsub else subque)))
+ 
+                     # (optional) read strata of current sample into cache
+                     if stratmap and sample != csample:
+@@ -294,7 +308,8 @@ def classify(mapper:  object,
+ 
+                     # call assignment workflow for each rank
+                     for rank in ranks:
+-                        assign_readmap(*rmap, data, rank, sample, **kwargs)
++                        assign_readmap(
++                            qryque, subque, data, rank, sample, **kwargs)
+ 
+                 # show progress
+                 istep = nqry // 1000000 - nstep
+@@ -305,6 +320,12 @@ def classify(mapper:  object,
+         click.echo(' Done.')
+         click.echo(f'  Number of sequences classified: {nqry}.')
+ 
++    # write coverage maps
++    if outcov_dir:
++        click.echo('Calculating per sample coverage...', nl=False)
++        write_coverage(calc_coverage(covers), outcov_dir)
++        click.echo(' Done.')
++
+     click.echo('Classification completed.')
+     return data
+ 
+@@ -447,16 +468,19 @@ def parse_strata(fp:       str = None,
+     return {k: join(fp, v) for k, v in map_.items()}
+ 
+ 
+-def build_mapper(coords_fp: str = None,
+-                 overlap:   int = None,
+-                 chunk:     int = None,
+-                 zippers:  dict = None) -> Tuple[callable, int]:
++def build_mapper(coords_fp:  str = None,
++                 outcov_dir: str = None,
++                 overlap:    int = None,
++                 chunk:      int = None,
++                 zippers:   dict = None) -> Tuple[callable, int]:
+     """Build mapper function (plain or ordinal).
+ 
+     Parameters
+     ----------
+     coords_fp : str, optional
+         Path to gene coordinates file.
++    outcov_dir : str, optional
++        Path to output subject coverage directory.
+     overlap : int, optional
+         Read/gene overlapping percentage threshold.
+     chunk : int, optional
+@@ -494,7 +518,7 @@ def build_mapper(coords_fp: str = None,
+                        th=overlap and overlap / 100), chunk
+     else:
+         chunk = chunk or 1000
+-        return plain_mapper, chunk
++        return range_mapper if outcov_dir else plain_mapper, chunk
+ 
+ 
+ def parse_sizes(sizes:       str,
+@@ -944,7 +968,7 @@ def assign_readmap(qryque:    list,
+                 major=major, above=above, uniq=uniq))
+         assigner = assigners[rank]
+ 
+-    # call assigner on suject(s) per query
++    # call assigner on subject(s) per query
+     taxque = map(assigner, subque)
+ 
+     # report or drop unassigned

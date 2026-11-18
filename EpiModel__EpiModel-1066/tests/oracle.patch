@@ -1,0 +1,1041 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 9768f0dc..9ada17a7 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -264,3 +264,4 @@ Other exported accessors and helpers worth knowing:
+ - **Restart & truncation**: `truncate_sim()` is an S3 generic over `dcm` / `icm` / `netsim` with a `reset.time` argument; `make_restart_point()` trims a `netsim` to the minimum state needed to resume.
+ - **Attribute utilities**: `overwrite_attrs()` applies an `init_attr` data frame at initialization; `get_core_attributes()` lists the core attributes and their types (#969).
+ - **Parameter tables**: `param.net_from_table()` / `param.net_to_table()` convert between list and data.frame parameter representations.
++- **Degree distributions**: `get_degree_dist()` computes the cumulative or momentary degree distribution from a `netdx` timed edgelist (`netdx(keep.tedgelist = TRUE)`); `plot.netdx(type = "cumldeg")` plots it, optionally overlaying the momentary distribution (#1050).
+diff --git a/NAMESPACE b/NAMESPACE
+index fb550568..84c23430 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -107,6 +107,7 @@ export(get_cumulative_edgelist)
+ export(get_cumulative_edgelists_df)
+ export(get_current_timestep)
+ export(get_degree)
++export(get_degree_dist)
+ export(get_discordant_edgelist)
+ export(get_edgelist)
+ export(get_edgelists_df)
+@@ -236,7 +237,10 @@ importFrom(grDevices,colorRampPalette)
+ importFrom(grDevices,rgb)
+ importFrom(graphics,abline)
+ importFrom(graphics,arrows)
++importFrom(graphics,axis)
++importFrom(graphics,barplot)
+ importFrom(graphics,boxplot)
++importFrom(graphics,grid)
+ importFrom(graphics,legend)
+ importFrom(graphics,lines)
+ importFrom(graphics,mtext)
+@@ -244,6 +248,7 @@ importFrom(graphics,par)
+ importFrom(graphics,plot)
+ importFrom(graphics,points)
+ importFrom(graphics,polygon)
++importFrom(graphics,segments)
+ importFrom(graphics,text)
+ importFrom(graphics,title)
+ importFrom(lazyeval,lazy_dots)
+diff --git a/NEWS.md b/NEWS.md
+index f9986ba4..e3f90f09 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -4,6 +4,7 @@
+ 
+ ### NEW FEATURES
+ 
++- Add a cumulative degree distribution plot to `plot.netdx()`, via `type = "cumldeg"`, along with the `get_degree_dist()` function that calculates it. Both work off the timed edgelist, so they require a `netdx()` run with `keep.tedgelist = TRUE`. The cumulative distribution counts the partners each node accumulates over the simulation, rather than the partners held at one moment in time; `momentary = TRUE` overlays the momentary distribution over the same window for comparison, and `window` restricts both to a period of interest. Two models with the same mean degree and mean partnership duration accumulate the same number of partners per node even when their momentary degree distributions differ, which the `?plot.netdx` example shows for models with high and low concurrency. Closes #1050.
+ - Add an `ergm.ego.popsize` argument to `netest()` exposing the `popsize` parameter of `ergm.ego::ergm.ego()`. Defaults to `0` (preserves prior behavior); set to `1` for per-capita scaling of the edges coefficient, which lets the fitted model be applied to networks of arbitrary size. Closes #936.
+ 
+ ### BUG FIXES
+diff --git a/R/EpiModel-package.R b/R/EpiModel-package.R
+index b3575ea1..d5a0eade 100644
+--- a/R/EpiModel-package.R
++++ b/R/EpiModel-package.R
+@@ -180,7 +180,8 @@
+ #' @import ergm network networkLite networkDynamic tergm ggplot2
+ #' @importFrom deSolve dede ode
+ #' @importFrom RColorBrewer brewer.pal brewer.pal.info
+-#' @importFrom graphics abline arrows boxplot legend lines mtext par plot points polygon text title
++#' @importFrom graphics abline arrows axis barplot boxplot grid legend lines mtext par plot points
++#' @importFrom graphics polygon segments text title
+ #' @importFrom grDevices col2rgb colorRampPalette rgb adjustcolor
+ #' @importFrom stats complete.cases quantile rbinom rgeom sd setNames simulate
+ #' @importFrom stats supsmu terms.formula update dgeom coef na.omit
+diff --git a/R/degree.dist.R b/R/degree.dist.R
+new file mode 100644
+index 00000000..f1a38908
+--- /dev/null
++++ b/R/degree.dist.R
+@@ -0,0 +1,211 @@
++#' @title Extract Degree Distributions from Network Diagnostics
++#'
++#' @description Calculates the cumulative or momentary degree distribution from
++#'              the timed edgelist of a dynamic [netdx()] simulation.
++#'
++#' @param x An `EpiModel` object of class `netdx`, run with
++#'        `dynamic = TRUE` and `keep.tedgelist = TRUE`.
++#' @param type Distribution to calculate, either `"cumulative"` for the number
++#'        of partners each node accumulates over the observation window, or
++#'        `"momentary"` for the number of partners each node has at a single
++#'        point in time, averaged over the time steps in the window.
++#' @param sims A vector of simulation numbers to include. The default is all
++#'        simulations in `x`.
++#' @param window A vector of length 2 giving the first and last time step of
++#'        the observation window, on the time scale of the timed edgelist
++#'        (which starts at 0). The default is the full simulation,
++#'        `c(0, x$nsteps)`.
++#' @param unique.partners If `TRUE`, a dyad that forms, dissolves, and then
++#'        re-forms within the window contributes one partner to the cumulative
++#'        degree of each node; if `FALSE`, it contributes one per partnership.
++#'        Only used when `type = "cumulative"`.
++#'
++#' @details
++#' The momentary degree distribution is the distribution plotted by
++#' [plot.netdx()] when `degree(k)` terms are included in the `nwstats.formula`
++#' of [netdx()]: it counts the partners a node has at one moment in time. The
++#' cumulative degree distribution counts the partners a node accumulates across
++#' the whole observation window, so a node with one partner at a time and a
++#' node with several simultaneous partners may have the same cumulative degree.
++#'
++#' Partnerships are counted if they are active at any point in the window: a
++#' partnership contributes to the cumulative degree of both of its nodes when
++#' its spell overlaps `window`, and to the momentary degree of both nodes at
++#' each time step of the window in which it is active. Partnerships that are
++#' ongoing when the simulation ends are counted for the steps they are
++#' observed.
++#'
++#' Because the cumulative degree grows with the length of the observation
++#' window, `window` should be set to a substantively meaningful period (for
++#' example, one year of time steps) when comparing across models or against
++#' data.
++#'
++#' @return
++#' A `data.frame` with one row per simulation and degree value, and the
++#' columns:
++#'
++#'  * `sim`: the simulation number.
++#'  * `degree`: the degree value, from 0 to the maximum observed across the
++#'    selected simulations.
++#'  * `count`: the number of nodes with that degree. For
++#'    `type = "momentary"`, this is the mean number of nodes per time step,
++#'    and so need not be a whole number.
++#'  * `prop`: `count` divided by the network size.
++#'
++#' @seealso [plot.netdx()] with `type = "cumldeg"` to plot these distributions,
++#'   and [netdx()] to generate the input object.
++#'
++#' @keywords extract
++#' @export
++#'
++#' @examples
++#' \donttest{
++#' nw <- network_initialize(n = 100)
++#' est <- netest(nw, formation = ~edges, target.stats = 50,
++#'               coef.diss = dissolution_coefs(~offset(edges), duration = 10),
++#'               verbose = FALSE)
++#' dx <- netdx(est, nsims = 2, nsteps = 50, keep.tedgelist = TRUE,
++#'             verbose = FALSE)
++#'
++#' # Cumulative degree over the full simulation
++#' cd <- get_degree_dist(dx, type = "cumulative")
++#' head(cd)
++#'
++#' # Mean cumulative degree per simulation
++#' tapply(cd$degree * cd$prop, cd$sim, sum)
++#'
++#' # Momentary degree over the last 25 steps
++#' get_degree_dist(dx, type = "momentary", window = c(25, 50))
++#' }
++#'
++get_degree_dist <- function(x, type = c("cumulative", "momentary"), sims = NULL,
++                            window = NULL, unique.partners = TRUE) {
++
++  if (!inherits(x, "netdx")) {
++    stop("x must be an object of class netdx")
++  }
++  type <- match.arg(type)
++
++  if (x$dynamic == FALSE || is.null(x$tedgelist)) {
++    stop("Degree distributions require the timed edgelist: rerun netdx with ",
++         "dynamic = TRUE and keep.tedgelist = TRUE")
++  }
++
++  sims <- if (is.null(sims)) seq_len(x$nsims) else sims
++  if (max(sims) > x$nsims) {
++    stop("Maximum sim number is ", x$nsims)
++  }
++
++  window <- validate_degree_window(window, x$nsteps)
++  n <- network.size(x$nw)
++
++  dists <- lapply(x$tedgelist[sims], function(tel) {
++    if (type == "cumulative") {
++      degs <- tedgelist_cumulative_degree(tel, n, window, unique.partners)
++      tabulate(degs + 1, nbins = max(degs) + 1)
++    } else {
++      tedgelist_momentary_degree(tel, n, window)
++    }
++  })
++
++  ## put all sims on a common degree axis, running to the highest degree
++  ## observed in any of them
++  maxdeg <- max(0, vapply(dists, function(z) max(which(z > 0), 0) - 1, numeric(1)))
++
++  out <- do.call(
++    rbind,
++    Map(function(sim, dist) {
++      count <- numeric(maxdeg + 1)
++      obs <- seq_len(min(length(dist), maxdeg + 1))
++      count[obs] <- dist[obs]
++      data.frame(sim = sim, degree = 0:maxdeg, count = count)
++    }, sims, dists)
++  )
++  out$prop <- out$count / n
++  row.names(out) <- NULL
++
++  return(out)
++}
++
++## Validates the observation window for a degree distribution, returning a
++## length-2 numeric of the first and last time step to observe. Timed edgelists
++## from netdx start at time 0, so the full window is c(0, nsteps).
++validate_degree_window <- function(window, nsteps) {
++  window <- NVL(window, c(0, nsteps))
++  if (length(window) != 2 || !is.numeric(window) || anyNA(window)) {
++    stop("window must be a numeric vector of length 2, c(start, end)")
++  }
++  if (window[1] >= window[2]) {
++    stop("window start must be less than window end")
++  }
++  if (window[1] < 0 || window[2] > nsteps) {
++    stop("window must fall within the simulated time range, c(0, ", nsteps, ")")
++  }
++  window
++}
++
++#' @title Cumulative Degree of Each Node in a Timed Edgelist
++#'
++#' @param tedgelist A timed edgelist, as produced by
++#'   [`networkDynamic::as.data.frame.networkDynamic`].
++#' @param n Size of the network the edgelist was simulated on.
++#' @param window Length-2 numeric of the first and last time step to observe.
++#' @param unique.partners If `TRUE`, count distinct partners rather than
++#'   distinct partnerships.
++#'
++#' @return An integer vector of length `n`, giving the number of partners each
++#'   node has over `window`.
++#' @keywords internal
++tedgelist_cumulative_degree <- function(tedgelist, n, window,
++                                        unique.partners = TRUE) {
++  ## spells are half open, [onset, terminus), so a spell is observed if it is
++  ## active at any point in [window[1], window[2]]
++  active <- tedgelist$onset <= window[2] & tedgelist$terminus > window[1]
++  tail <- tedgelist$tail[active]
++  head <- tedgelist$head[active]
++
++  if (unique.partners == TRUE) {
++    dyads <- cbind(pmin(tail, head), pmax(tail, head))
++    keep <- !duplicated(dyads)
++    tail <- tail[keep]
++    head <- head[keep]
++  }
++
++  tabulate(c(tail, head), nbins = n)
++}
++
++#' @title Momentary Degree Distribution of a Timed Edgelist
++#'
++#' @inheritParams tedgelist_cumulative_degree
++#'
++#' @return A numeric vector of length `n`, giving the mean number of nodes per
++#'   time step with degree 0 through `n - 1` over `window`.
++#' @keywords internal
++tedgelist_momentary_degree <- function(tedgelist, n, window) {
++  nsteps <- window[2] - window[1] + 1
++
++  ## time indices of the steps at which each partnership starts and stops
++  ## contributing to degree, clamped to the window and shifted to start at 1
++  starts <- pmax(tedgelist$onset, window[1]) - window[1] + 1
++  stops <- pmin(tedgelist$terminus, window[2] + 1) - window[1] + 1
++  active <- starts < stops
++  starts <- starts[active]
++  stops <- stops[active]
++  nodes <- c(tedgelist$tail[active], tedgelist$head[active])
++
++  ## one entry per time step, holding the nodes gaining or losing a partner
++  ## at that step; stops may fall one step past the window, for partnerships
++  ## still active at its end
++  gains <- split(nodes, factor(rep(starts, 2), levels = seq_len(nsteps)))
++  losses <- split(nodes, factor(rep(stops, 2), levels = seq_len(nsteps + 1)))
++
++  degs <- integer(n)
++  dist <- numeric(n)
++  for (at in seq_len(nsteps)) {
++    degs <- degs + tabulate(gains[[at]], nbins = n) -
++      tabulate(losses[[at]], nbins = n)
++    dist <- dist + tabulate(degs + 1, nbins = n)
++  }
++
++  dist / nsteps
++}
+diff --git a/R/netdx.R b/R/netdx.R
+index 4ebd1a67..6f966ae3 100644
+--- a/R/netdx.R
++++ b/R/netdx.R
+@@ -129,8 +129,10 @@
+ #' @seealso
+ #' Estimate the network model with [`netest`] before running diagnostics.
+ #' Plot diagnostics with [`plot.netdx`] and print summary tables with
+-#' [`print.netdx`]. After diagnostics confirm a good fit, simulate the
+-#' epidemic with [`netsim`].
++#' [`print.netdx`]. With `keep.tedgelist = TRUE`, extract the timed edgelist
++#' with [as.data.frame.netdx()] and the cumulative or momentary degree
++#' distribution with [`get_degree_dist`]. After diagnostics confirm a good fit,
++#' simulate the epidemic with [`netsim`].
+ #'
+ #' @export
+ #'
+diff --git a/R/plot.degree.dist.R b/R/plot.degree.dist.R
+new file mode 100644
+index 00000000..7be26d24
+--- /dev/null
++++ b/R/plot.degree.dist.R
+@@ -0,0 +1,147 @@
++## Plotting helper for the degree distributions returned by get_degree_dist.
++##
++## `dists` is a named list of data.frames, one per distribution to draw, in the
++## long format returned by `get_degree_dist`. All are drawn in a single panel
++## on a shared degree axis, so that the momentary and cumulative distributions
++## of one model can be compared directly.
++plot_degree_dist <- function(dists, method = "l", maxdeg = NULL,
++                             sim.lines = FALSE, sim.col = NULL, sim.lwd = NULL,
++                             mean.line = TRUE, mean.col = NULL, mean.lwd = 2,
++                             mean.lty = 1, qnts = 0.5, qnts.col = NULL,
++                             qnts.alpha = 0.5, draw_legend = NULL, grid = FALSE,
++                             xlim = NULL, ylim = NULL, xlab = NULL, ylab = NULL,
++                             ...) {
++
++  method <- match.arg(method, c("l", "b"))
++  nseries <- length(dists)
++  nsims <- length(unique(dists[[1]]$sim))
++
++  ## shared degree axis across the distributions being drawn
++  ndeg <- max(vapply(dists, function(d) max(d$degree), numeric(1))) + 1
++
++  ## proportion of nodes at each degree, as a (degree x sim) matrix
++  mats <- lapply(dists, function(d) {
++    m <- matrix(0, nrow = ndeg, ncol = nsims)
++    obs <- seq_len(length(d$degree) / nsims)
++    m[obs, ] <- matrix(d$prop, ncol = nsims)
++    m
++  })
++
++  ## mean degree of each distribution, before any truncation of the axis
++  means <- vapply(mats, function(m) mean(colSums(m * (seq_len(ndeg) - 1))),
++                  numeric(1))
++
++  ## collapse the tail of the axis into a final "maxdeg+" category
++  lumped <- !is.null(maxdeg) && maxdeg < ndeg - 1
++  if (lumped) {
++    mats <- lapply(mats, function(m) {
++      out <- m[seq_len(maxdeg + 1), , drop = FALSE]
++      out[maxdeg + 1, ] <- colSums(m[seq(maxdeg + 1, ndeg), , drop = FALSE])
++      out
++    })
++    ndeg <- maxdeg + 1
++  }
++  degs <- seq_len(ndeg) - 1
++
++  ## Color palettes, following plot.netsim: blue then red
++  bpal <- c(4, 2, 3, 5:100)
++  sim.col <- rep(NVL(sim.col, bpal), length.out = nseries)
++  mean.col <- rep(NVL(mean.col, bpal), length.out = nseries)
++  qnts.col <- adjustcolor(rep(NVL(qnts.col, bpal), length.out = nseries),
++                          qnts.alpha)
++  sim.lwd <- NVL(sim.lwd, max(c(1 - nsims * 0.05, 0.5)))
++
++  draw_qnts <- is.numeric(qnts) && nsims > 1
++  if (draw_qnts) {
++    if (qnts < 0 || qnts > 1) {
++      stop("qnts must be between 0 and 1")
++    }
++    qnt.probs <- c((1 - qnts) / 2, 1 - (1 - qnts) / 2)
++    qnt.bands <- lapply(mats, function(m) {
++      apply(m, 1, quantile, probs = qnt.probs, na.rm = TRUE)
++    })
++  }
++
++  xlab <- NVL(xlab, "Degree")
++  ylab <- NVL(ylab, "Proportion of Nodes")
++  ylim <- NVL(ylim, c(0, 1.05 * max(unlist(c(
++    lapply(mats, rowMeans),
++    if (isTRUE(sim.lines)) mats,
++    if (isTRUE(draw_qnts)) qnt.bands
++  )))))
++
++  draw_legend <- NVL(draw_legend, nseries > 1)
++  legend.txt <- paste0(names(dists), " (mean = ", round(means, 2), ")")
++
++  ## axis labels: every degree if the axis is short, otherwise pretty ticks,
++  ## with the collapsed final category flagged with a "+"
++  ticks <- if (ndeg <= 15) degs else degs[degs %in% pretty(degs)]
++  if (lumped && !maxdeg %in% ticks) {
++    ticks <- c(ticks, maxdeg)
++  }
++  tick.labs <- as.character(ticks)
++  if (lumped) {
++    tick.labs[ticks == maxdeg] <- paste0(maxdeg, "+")
++  }
++
++  if (method == "l") {
++    plot(NULL, xlim = NVL(xlim, range(degs)), ylim = ylim, type = "n",
++         xlab = xlab, ylab = ylab, xaxt = "n", ...)
++    axis(1, at = ticks, labels = tick.labs)
++
++    for (j in seq_len(nseries)) {
++      if (isTRUE(draw_qnts)) {
++        polygon(c(degs, rev(degs)),
++                c(qnt.bands[[j]][1, ], rev(qnt.bands[[j]][2, ])),
++                col = qnts.col[j], border = NA)
++      }
++      if (isTRUE(sim.lines)) {
++        apply(mats[[j]], 2, function(y) {
++          lines(degs, y, lwd = sim.lwd, col = sim.col[j])
++        })
++      }
++      if (isTRUE(mean.line)) {
++        lines(degs, rowMeans(mats[[j]]), lwd = mean.lwd, col = mean.col[j],
++              lty = mean.lty)
++        points(degs, rowMeans(mats[[j]]), pch = 16, col = mean.col[j])
++      }
++    }
++
++    if (isTRUE(grid)) {
++      grid()
++    }
++    if (isTRUE(draw_legend)) {
++      legend("topright", legend = legend.txt, lwd = 2, col = mean.col,
++             cex = 0.75, bg = "white")
++    }
++  }
++
++  if (method == "b") {
++    heights <- do.call(rbind, lapply(mats, rowMeans))
++    dimnames(heights) <- list(names(dists), degs)
++
++    ## bar labels are drawn from the tick set rather than by barplot itself,
++    ## which thins them unpredictably when the degree axis is long
++    bar.args <- list(height = heights, beside = TRUE, ylim = ylim,
++                     xlab = xlab, ylab = ylab, axisnames = FALSE, ...)
++    bar.args$col <- NVL(bar.args$col, mean.col)
++    mids <- do.call(barplot, bar.args)
++    axis(1, at = colMeans(mids)[match(ticks, degs)], labels = tick.labs,
++         lty = 0)
++
++    if (isTRUE(draw_qnts)) {
++      for (j in seq_len(nseries)) {
++        segments(mids[j, ], qnt.bands[[j]][1, ], mids[j, ],
++                 qnt.bands[[j]][2, ])
++      }
++    }
++
++    if (isTRUE(grid)) {
++      grid(nx = NA, ny = NULL)
++    }
++    if (isTRUE(draw_legend)) {
++      legend("topright", legend = legend.txt, pch = 15, col = bar.args$col,
++             cex = 0.75, bg = "white")
++    }
++  }
++}
+diff --git a/R/plot.netdx.R b/R/plot.netdx.R
+index dd949b1f..5e2a9c3b 100644
+--- a/R/plot.netdx.R
++++ b/R/plot.netdx.R
+@@ -6,11 +6,12 @@
+ #' @param x An `EpiModel` object of class `netdx`.
+ #' @param type Plot type, with options of `"formation"` for network
+ #'        model formation statistics, `"duration"` for dissolution model
+-#'        statistics for average edge duration, or `"dissolution"` for
++#'        statistics for average edge duration, `"dissolution"` for
+ #'        dissolution model statistics for proportion of ties dissolved per time
+-#'        step.
++#'        step, or `"cumldeg"` for the cumulative degree distribution.
+ #' @param method Plot method, with options of `"l"` for line plots and
+-#'        `"b"` for box plots.
++#'        `"b"` for box plots. For `type = "cumldeg"`, `"b"` gives a bar plot
++#'        of the degree distribution.
+ #' @param sims A vector of simulation numbers to plot.
+ #' @param stats Statistics to plot. For `type = "formation"`, `stats`
+ #'        are among those specified in the call to [netdx()];
+@@ -19,6 +20,18 @@
+ #'        is to plot all statistics.
+ #' @param plots.joined If `TRUE`, combine all statistics in one plot,
+ #'        versus one plot per statistic if `FALSE`.
++#' @param momentary If `TRUE`, add the momentary degree distribution to the
++#'        cumulative degree plot for comparison. Used only when
++#'        `type = "cumldeg"`.
++#' @param window A vector of length 2 giving the first and last time step over
++#'        which degrees are counted, with the default of the full simulation.
++#'        Used only when `type = "cumldeg"`.
++#' @param maxdeg Highest degree to show on the x-axis, with degrees above it
++#'        collapsed into a final `"maxdeg+"` category. Used only when
++#'        `type = "cumldeg"`.
++#' @param unique.partners If `TRUE`, a dyad that forms, dissolves, and then
++#'        re-forms within the window counts as one cumulative partner rather
++#'        than two. Used only when `type = "cumldeg"`.
+ #' @inheritParams plot.netsim
+ #' @inheritParams graphics::plot
+ #'
+@@ -53,11 +66,31 @@
+ #' statistics requested. The layout of the separate plots within the larger plot
+ #' window is also based on the number of statistics.
+ #'
++#' The `cumldeg` plot shows the cumulative degree distribution: the proportion
++#' of nodes with each count of partners accumulated over the simulation, rather
++#' than the count held at one point in time. It requires a `netdx` object run
++#' with `keep.tedgelist = TRUE`, since it is calculated from the timed edgelist
++#' with [get_degree_dist()]. Setting `momentary = TRUE` adds the momentary
++#' degree distribution over the same window, calculated from the same edgelist,
++#' which is the distribution summarized by the `degree(k)` terms of the
++#' formation plot. Two models with the same mean degree and mean partnership
++#' duration have the same mean cumulative degree even when their momentary
++#' degree distributions differ, as the example below shows for models with high
++#' and low concurrency. Legend entries report the mean of each distribution.
++#'
++#' Because the cumulative degree grows with the length of the observation
++#' window, use `window` to restrict it to a substantively meaningful period
++#' when comparing across models. The lines or bars show the mean across
++#' simulations, with `qnts` giving the inter-simulation quantile band; the
++#' `targ.line`, `mean.smooth`, `qnts.smooth`, and `plots.joined` arguments do
++#' not apply to this plot type.
++#'
+ #' @method plot netdx
+ #' @export
+ #'
+ #' @keywords plot
+-#' @seealso [netdx()]
++#' @seealso [netdx()], and [get_degree_dist()] for the degree distributions
++#'   behind `type = "cumldeg"`.
+ #'
+ #' @examples
+ #' \dontrun{
+@@ -116,6 +149,46 @@
+ #' # Dissolution statistics plot
+ #' plot(dx2, type = "dissolution", qnts = 0.25, grid = TRUE)
+ #' plot(dx2, type = "dissolution", method = "b", col = "pink1")
++#'
++#' # Cumulative degree distribution: two models with the same mean degree and
++#' # the same mean partnership duration, differing only in how much
++#' # concurrency (overlapping partnerships) they allow
++#' nw <- network_initialize(n = 500)
++#' coef.diss <- dissolution_coefs(dissolution = ~offset(edges), duration = 25)
++#'
++#' est.hi <- netest(nw, formation = ~edges + concurrent,
++#'                  target.stats = c(200, 150), coef.diss = coef.diss,
++#'                  verbose = FALSE)
++#' est.lo <- netest(nw, formation = ~edges + concurrent,
++#'                  target.stats = c(200, 40), coef.diss = coef.diss,
++#'                  verbose = FALSE)
++#'
++#' dx.hi <- netdx(est.hi, nsims = 5, nsteps = 250, keep.tedgelist = TRUE,
++#'                nwstats.formula = ~edges + concurrent + degree(0:3))
++#' dx.lo <- netdx(est.lo, nsims = 5, nsteps = 250, keep.tedgelist = TRUE,
++#'                nwstats.formula = ~edges + concurrent + degree(0:3))
++#'
++#' # The momentary degree distributions are far apart: about half the nodes in
++#' # the high-concurrency model have no partner at any given time and a quarter
++#' # have two, while most nodes in the low-concurrency model have exactly one.
++#' # Over 250 time steps both accumulate about 8.5 partners per node.
++#' par(mfrow = c(1, 2))
++#' plot(dx.hi, type = "cumldeg", momentary = TRUE, xlim = c(0, 25),
++#'      main = "High concurrency")
++#' plot(dx.lo, type = "cumldeg", momentary = TRUE, xlim = c(0, 25),
++#'      main = "Low concurrency")
++#'
++#' # As bars, with the tail of the distribution collapsed into one category
++#' # and the inter-simulation range shown
++#' par(mfrow = c(1, 1))
++#' plot(dx.hi, type = "cumldeg", method = "b", maxdeg = 15, qnts = 0.95)
++#'
++#' # Partners accumulated over the last 100 steps only
++#' plot(dx.hi, type = "cumldeg", window = c(150, 250), momentary = TRUE)
++#'
++#' # The plotted distributions are returned invisibly
++#' dd <- plot(dx.hi, type = "cumldeg")
++#' tapply(dd$degree * dd$prop, dd$sim, sum)
+ #' }
+ #'
+ plot.netdx <- function(x, type = "formation", method = "l", sims = NULL,
+@@ -127,12 +200,50 @@ plot.netdx <- function(x, type = "formation", method = "l", sims = NULL,
+                        targ.col = NULL, targ.lwd = 2, targ.lty = 2,
+                        plots.joined = NULL, legend = NULL, grid = FALSE,
+                        xlim = NULL, xlab = NULL, ylim = NULL, ylab = NULL,
+-                       ...) {
++                       momentary = FALSE, window = NULL, maxdeg = NULL,
++                       unique.partners = TRUE, ...) {
+ 
+-  type <- match.arg(type, c("formation", "duration", "dissolution"))
++  type <- match.arg(type, c("formation", "duration", "dissolution", "cumldeg"))
+   sims <- if (is.null(sims)) seq_len(x$nsims) else sims
+   if (max(sims) > x$nsims) stop("Maximum sim number is", x$nsims)
+ 
++  # Cumulative Degree Plot -----------------------------------------------------
++  if (type == "cumldeg") {
++    dists <- list(cumulative = get_degree_dist(x, type = "cumulative",
++                                               sims = sims, window = window,
++                                               unique.partners = unique.partners))
++    if (isTRUE(momentary)) {
++      dists$momentary <- get_degree_dist(x, type = "momentary", sims = sims,
++                                         window = window)
++    }
++
++    plot_degree_dist(
++      dists = dists,
++      method = method,
++      maxdeg = maxdeg,
++      sim.lines = sim.lines,
++      sim.col = sim.col,
++      sim.lwd = sim.lwd,
++      mean.line = mean.line,
++      mean.col = mean.col,
++      mean.lwd = mean.lwd,
++      mean.lty = mean.lty,
++      qnts = qnts,
++      qnts.col = qnts.col,
++      qnts.alpha = qnts.alpha,
++      draw_legend = legend,
++      grid = grid,
++      xlim = xlim, xlab = xlab,
++      ylim = ylim, ylab = ylab,
++      ...
++    )
++
++    out <- do.call(rbind, Map(function(nm, d) cbind(type = nm, d),
++                              names(dists), dists))
++    row.names(out) <- NULL
++    return(invisible(out))
++  }
++
+   # Formation Plot -------------------------------------------------------------
+   if (type == "formation") {
+     stats_table <- x$stats.table.formation
+diff --git a/man/get_degree_dist.Rd b/man/get_degree_dist.Rd
+new file mode 100644
+index 00000000..00d731ff
+--- /dev/null
++++ b/man/get_degree_dist.Rd
+@@ -0,0 +1,99 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/degree.dist.R
++\name{get_degree_dist}
++\alias{get_degree_dist}
++\title{Extract Degree Distributions from Network Diagnostics}
++\usage{
++get_degree_dist(
++  x,
++  type = c("cumulative", "momentary"),
++  sims = NULL,
++  window = NULL,
++  unique.partners = TRUE
++)
++}
++\arguments{
++\item{x}{An \code{EpiModel} object of class \code{netdx}, run with
++\code{dynamic = TRUE} and \code{keep.tedgelist = TRUE}.}
++
++\item{type}{Distribution to calculate, either \code{"cumulative"} for the number
++of partners each node accumulates over the observation window, or
++\code{"momentary"} for the number of partners each node has at a single
++point in time, averaged over the time steps in the window.}
++
++\item{sims}{A vector of simulation numbers to include. The default is all
++simulations in \code{x}.}
++
++\item{window}{A vector of length 2 giving the first and last time step of
++the observation window, on the time scale of the timed edgelist
++(which starts at 0). The default is the full simulation,
++\code{c(0, x$nsteps)}.}
++
++\item{unique.partners}{If \code{TRUE}, a dyad that forms, dissolves, and then
++re-forms within the window contributes one partner to the cumulative
++degree of each node; if \code{FALSE}, it contributes one per partnership.
++Only used when \code{type = "cumulative"}.}
++}
++\value{
++A \code{data.frame} with one row per simulation and degree value, and the
++columns:
++\itemize{
++\item \code{sim}: the simulation number.
++\item \code{degree}: the degree value, from 0 to the maximum observed across the
++selected simulations.
++\item \code{count}: the number of nodes with that degree. For
++\code{type = "momentary"}, this is the mean number of nodes per time step,
++and so need not be a whole number.
++\item \code{prop}: \code{count} divided by the network size.
++}
++}
++\description{
++Calculates the cumulative or momentary degree distribution from
++the timed edgelist of a dynamic \code{\link[=netdx]{netdx()}} simulation.
++}
++\details{
++The momentary degree distribution is the distribution plotted by
++\code{\link[=plot.netdx]{plot.netdx()}} when \code{degree(k)} terms are included in the \code{nwstats.formula}
++of \code{\link[=netdx]{netdx()}}: it counts the partners a node has at one moment in time. The
++cumulative degree distribution counts the partners a node accumulates across
++the whole observation window, so a node with one partner at a time and a
++node with several simultaneous partners may have the same cumulative degree.
++
++Partnerships are counted if they are active at any point in the window: a
++partnership contributes to the cumulative degree of both of its nodes when
++its spell overlaps \code{window}, and to the momentary degree of both nodes at
++each time step of the window in which it is active. Partnerships that are
++ongoing when the simulation ends are counted for the steps they are
++observed.
++
++Because the cumulative degree grows with the length of the observation
++window, \code{window} should be set to a substantively meaningful period (for
++example, one year of time steps) when comparing across models or against
++data.
++}
++\examples{
++\donttest{
++nw <- network_initialize(n = 100)
++est <- netest(nw, formation = ~edges, target.stats = 50,
++              coef.diss = dissolution_coefs(~offset(edges), duration = 10),
++              verbose = FALSE)
++dx <- netdx(est, nsims = 2, nsteps = 50, keep.tedgelist = TRUE,
++            verbose = FALSE)
++
++# Cumulative degree over the full simulation
++cd <- get_degree_dist(dx, type = "cumulative")
++head(cd)
++
++# Mean cumulative degree per simulation
++tapply(cd$degree * cd$prop, cd$sim, sum)
++
++# Momentary degree over the last 25 steps
++get_degree_dist(dx, type = "momentary", window = c(25, 50))
++}
++
++}
++\seealso{
++\code{\link[=plot.netdx]{plot.netdx()}} with \code{type = "cumldeg"} to plot these distributions,
++and \code{\link[=netdx]{netdx()}} to generate the input object.
++}
++\keyword{extract}
+diff --git a/man/netdx.Rd b/man/netdx.Rd
+index a65e515c..0e893dd3 100644
+--- a/man/netdx.Rd
++++ b/man/netdx.Rd
+@@ -222,6 +222,8 @@ plot(dx3, type = "dissolution", mean.smooth = FALSE, mean.col = "red")
+ \seealso{
+ Estimate the network model with \code{\link{netest}} before running diagnostics.
+ Plot diagnostics with \code{\link{plot.netdx}} and print summary tables with
+-\code{\link{print.netdx}}. After diagnostics confirm a good fit, simulate the
+-epidemic with \code{\link{netsim}}.
++\code{\link{print.netdx}}. With \code{keep.tedgelist = TRUE}, extract the timed edgelist
++with \code{\link[=as.data.frame.netdx]{as.data.frame.netdx()}} and the cumulative or momentary degree
++distribution with \code{\link{get_degree_dist}}. After diagnostics confirm a good fit,
++simulate the epidemic with \code{\link{netsim}}.
+ }
+diff --git a/man/plot.netdx.Rd b/man/plot.netdx.Rd
+index e321efc4..17ce7ea1 100644
+--- a/man/plot.netdx.Rd
++++ b/man/plot.netdx.Rd
+@@ -34,6 +34,10 @@
+   xlab = NULL,
+   ylim = NULL,
+   ylab = NULL,
++  momentary = FALSE,
++  window = NULL,
++  maxdeg = NULL,
++  unique.partners = TRUE,
+   ...
+ )
+ }
+@@ -42,12 +46,13 @@
+ 
+ \item{type}{Plot type, with options of \code{"formation"} for network
+ model formation statistics, \code{"duration"} for dissolution model
+-statistics for average edge duration, or \code{"dissolution"} for
++statistics for average edge duration, \code{"dissolution"} for
+ dissolution model statistics for proportion of ties dissolved per time
+-step.}
++step, or \code{"cumldeg"} for the cumulative degree distribution.}
+ 
+ \item{method}{Plot method, with options of \code{"l"} for line plots and
+-\code{"b"} for box plots.}
++\code{"b"} for box plots. For \code{type = "cumldeg"}, \code{"b"} gives a bar plot
++of the degree distribution.}
+ 
+ \item{sims}{A vector of simulation numbers to plot.}
+ 
+@@ -120,6 +125,22 @@ versus one plot per statistic if \code{FALSE}.}
+ 
+ \item{ylab}{a label for the y axis, defaults to a description of \code{y}.}
+ 
++\item{momentary}{If \code{TRUE}, add the momentary degree distribution to the
++cumulative degree plot for comparison. Used only when
++\code{type = "cumldeg"}.}
++
++\item{window}{A vector of length 2 giving the first and last time step over
++which degrees are counted, with the default of the full simulation.
++Used only when \code{type = "cumldeg"}.}
++
++\item{maxdeg}{Highest degree to show on the x-axis, with degrees above it
++collapsed into a final \code{"maxdeg+"} category. Used only when
++\code{type = "cumldeg"}.}
++
++\item{unique.partners}{If \code{TRUE}, a dyad that forms, dissolves, and then
++re-forms within the window counts as one cumulative partner rather
++than two. Used only when \code{type = "cumldeg"}.}
++
+ \item{...}{Additional arguments to pass.}
+ }
+ \description{
+@@ -156,6 +177,25 @@ are joined in one plot or plotted separately, assuming there are multiple
+ statistics in the model. The default is based on the number of network
+ statistics requested. The layout of the separate plots within the larger plot
+ window is also based on the number of statistics.
++
++The \code{cumldeg} plot shows the cumulative degree distribution: the proportion
++of nodes with each count of partners accumulated over the simulation, rather
++than the count held at one point in time. It requires a \code{netdx} object run
++with \code{keep.tedgelist = TRUE}, since it is calculated from the timed edgelist
++with \code{\link[=get_degree_dist]{get_degree_dist()}}. Setting \code{momentary = TRUE} adds the momentary
++degree distribution over the same window, calculated from the same edgelist,
++which is the distribution summarized by the \code{degree(k)} terms of the
++formation plot. Two models with the same mean degree and mean partnership
++duration have the same mean cumulative degree even when their momentary
++degree distributions differ, as the example below shows for models with high
++and low concurrency. Legend entries report the mean of each distribution.
++
++Because the cumulative degree grows with the length of the observation
++window, use \code{window} to restrict it to a substantively meaningful period
++when comparing across models. The lines or bars show the mean across
++simulations, with \code{qnts} giving the inter-simulation quantile band; the
++\code{targ.line}, \code{mean.smooth}, \code{qnts.smooth}, and \code{plots.joined} arguments do
++not apply to this plot type.
+ }
+ \examples{
+ \dontrun{
+@@ -214,10 +254,51 @@ plot(dx2, type = "duration", sim.line = TRUE, sim.lwd = 0.3,
+ # Dissolution statistics plot
+ plot(dx2, type = "dissolution", qnts = 0.25, grid = TRUE)
+ plot(dx2, type = "dissolution", method = "b", col = "pink1")
++
++# Cumulative degree distribution: two models with the same mean degree and
++# the same mean partnership duration, differing only in how much
++# concurrency (overlapping partnerships) they allow
++nw <- network_initialize(n = 500)
++coef.diss <- dissolution_coefs(dissolution = ~offset(edges), duration = 25)
++
++est.hi <- netest(nw, formation = ~edges + concurrent,
++                 target.stats = c(200, 150), coef.diss = coef.diss,
++                 verbose = FALSE)
++est.lo <- netest(nw, formation = ~edges + concurrent,
++                 target.stats = c(200, 40), coef.diss = coef.diss,
++                 verbose = FALSE)
++
++dx.hi <- netdx(est.hi, nsims = 5, nsteps = 250, keep.tedgelist = TRUE,
++               nwstats.formula = ~edges + concurrent + degree(0:3))
++dx.lo <- netdx(est.lo, nsims = 5, nsteps = 250, keep.tedgelist = TRUE,
++               nwstats.formula = ~edges + concurrent + degree(0:3))
++
++# The momentary degree distributions are far apart: about half the nodes in
++# the high-concurrency model have no partner at any given time and a quarter
++# have two, while most nodes in the low-concurrency model have exactly one.
++# Over 250 time steps both accumulate about 8.5 partners per node.
++par(mfrow = c(1, 2))
++plot(dx.hi, type = "cumldeg", momentary = TRUE, xlim = c(0, 25),
++     main = "High concurrency")
++plot(dx.lo, type = "cumldeg", momentary = TRUE, xlim = c(0, 25),
++     main = "Low concurrency")
++
++# As bars, with the tail of the distribution collapsed into one category
++# and the inter-simulation range shown
++par(mfrow = c(1, 1))
++plot(dx.hi, type = "cumldeg", method = "b", maxdeg = 15, qnts = 0.95)
++
++# Partners accumulated over the last 100 steps only
++plot(dx.hi, type = "cumldeg", window = c(150, 250), momentary = TRUE)
++
++# The plotted distributions are returned invisibly
++dd <- plot(dx.hi, type = "cumldeg")
++tapply(dd$degree * dd$prop, dd$sim, sum)
+ }
+ 
+ }
+ \seealso{
+-\code{\link[=netdx]{netdx()}}
++\code{\link[=netdx]{netdx()}}, and \code{\link[=get_degree_dist]{get_degree_dist()}} for the degree distributions
++behind \code{type = "cumldeg"}.
+ }
+ \keyword{plot}
+diff --git a/man/tedgelist_cumulative_degree.Rd b/man/tedgelist_cumulative_degree.Rd
+new file mode 100644
+index 00000000..c9df79f9
+--- /dev/null
++++ b/man/tedgelist_cumulative_degree.Rd
+@@ -0,0 +1,27 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/degree.dist.R
++\name{tedgelist_cumulative_degree}
++\alias{tedgelist_cumulative_degree}
++\title{Cumulative Degree of Each Node in a Timed Edgelist}
++\usage{
++tedgelist_cumulative_degree(tedgelist, n, window, unique.partners = TRUE)
++}
++\arguments{
++\item{tedgelist}{A timed edgelist, as produced by
++\code{\link[networkDynamic:as.data.frame.networkDynamic]{networkDynamic::as.data.frame.networkDynamic}}.}
++
++\item{n}{Size of the network the edgelist was simulated on.}
++
++\item{window}{Length-2 numeric of the first and last time step to observe.}
++
++\item{unique.partners}{If \code{TRUE}, count distinct partners rather than
++distinct partnerships.}
++}
++\value{
++An integer vector of length \code{n}, giving the number of partners each
++node has over \code{window}.
++}
++\description{
++Cumulative Degree of Each Node in a Timed Edgelist
++}
++\keyword{internal}
+diff --git a/man/tedgelist_momentary_degree.Rd b/man/tedgelist_momentary_degree.Rd
+new file mode 100644
+index 00000000..f7f4b33a
+--- /dev/null
++++ b/man/tedgelist_momentary_degree.Rd
+@@ -0,0 +1,24 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/degree.dist.R
++\name{tedgelist_momentary_degree}
++\alias{tedgelist_momentary_degree}
++\title{Momentary Degree Distribution of a Timed Edgelist}
++\usage{
++tedgelist_momentary_degree(tedgelist, n, window)
++}
++\arguments{
++\item{tedgelist}{A timed edgelist, as produced by
++\code{\link[networkDynamic:as.data.frame.networkDynamic]{networkDynamic::as.data.frame.networkDynamic}}.}
++
++\item{n}{Size of the network the edgelist was simulated on.}
++
++\item{window}{Length-2 numeric of the first and last time step to observe.}
++}
++\value{
++A numeric vector of length \code{n}, giving the mean number of nodes per
++time step with degree 0 through \code{n - 1} over \code{window}.
++}
++\description{
++Momentary Degree Distribution of a Timed Edgelist
++}
++\keyword{internal}
+diff --git a/tests/testthat/test-netdx.R b/tests/testthat/test-netdx.R
+index 4021167a..09f6a060 100644
+--- a/tests/testthat/test-netdx.R
++++ b/tests/testthat/test-netdx.R
+@@ -478,3 +478,94 @@ test_that("plot.netdx labels duration and dissolution axes", {
+   expect_equal(seen$xlab, "My X")
+   expect_equal(seen$ylab, "My Y")
+ })
++
++test_that("timed edgelist degree helpers count spells correctly", {
++  # Two partnerships of node 1, in sequence: 1-2 over steps 0 and 1, then
++  # 1-3 over steps 2 and 3. Node 4 is never partnered.
++  tel <- data.frame(onset = c(0, 2), terminus = c(2, 4),
++                    tail = c(1, 1), head = c(2, 3))
++
++  expect_equal(tedgelist_cumulative_degree(tel, n = 4, window = c(0, 3)),
++               c(2, 1, 1, 0))
++  # only the first partnership falls in this window
++  expect_equal(tedgelist_cumulative_degree(tel, n = 4, window = c(0, 1)),
++               c(1, 1, 0, 0))
++  # a repeated dyad counts once as a partner but twice as a partnership
++  rep.tel <- data.frame(onset = c(0, 2), terminus = c(2, 4),
++                        tail = c(1, 1), head = c(2, 2))
++  expect_equal(tedgelist_cumulative_degree(rep.tel, n = 4, window = c(0, 3)),
++               c(1, 1, 0, 0))
++  expect_equal(tedgelist_cumulative_degree(rep.tel, n = 4, window = c(0, 3),
++                                           unique.partners = FALSE),
++               c(2, 2, 0, 0))
++
++  # exactly one partnership is active at each of the four steps
++  mom <- tedgelist_momentary_degree(tel, n = 4, window = c(0, 3))
++  expect_equal(mom[1:2], c(2, 2))
++  expect_equal(sum(mom), 4)
++  # the second partnership has not formed yet over the first two steps
++  mom <- tedgelist_momentary_degree(tel, n = 4, window = c(0, 1))
++  expect_equal(mom[1:2], c(2, 2))
++})
++
++test_that("get_degree_dist and plot.netdx cumldeg", {
++  skip_on_cran()
++  set.seed(1)
++  num <- 50
++  nw <- network_initialize(n = num)
++  coef.diss <- dissolution_coefs(dissolution = ~offset(edges), duration = 5)
++  est <- netest(nw, ~edges, 15, coef.diss, verbose = FALSE)
++  dx <- netdx(est, nsims = 2, nsteps = 20, keep.tedgelist = TRUE,
++              verbose = FALSE)
++
++  cd <- get_degree_dist(dx, type = "cumulative")
++  expect_named(cd, c("sim", "degree", "count", "prop"))
++  expect_equal(sort(unique(cd$sim)), 1:2)
++  expect_equal(as.vector(tapply(cd$count, cd$sim, sum)), rep(num, 2))
++  expect_equal(as.vector(tapply(cd$prop, cd$sim, sum)), rep(1, 2))
++  expect_equal(cd$degree, rep(0:(nrow(cd) / 2 - 1), 2))
++
++  # matches a direct tabulation of the timed edgelist
++  tel <- dx$tedgelist[[1]]
++  degs <- tabulate(c(tel$tail, tel$head), nbins = num)
++  cd1 <- get_degree_dist(dx, type = "cumulative", sims = 1,
++                         unique.partners = FALSE)
++  expect_equal(cd1$count, tabulate(degs + 1, nbins = nrow(cd1)))
++
++  md <- get_degree_dist(dx, type = "momentary")
++  expect_equal(as.vector(tapply(md$prop, md$sim, sum)), rep(1, 2))
++  # mean momentary degree over all steps equals twice the mean edge count
++  mean.deg <- sum(md$degree * md$prop) / 2
++  mean.edges <- mean(c(dx$stats[[1]][, "edges"], dx$stats[[2]][, "edges"]))
++  expect_lt(abs(mean.deg - 2 * mean.edges / num), 0.1)
++
++  # a shorter window accumulates no more partners than the full simulation
++  cd.win <- get_degree_dist(dx, type = "cumulative", window = c(10, 20))
++  expect_lte(sum(cd.win$degree * cd.win$prop), sum(cd$degree * cd$prop))
++
++  expect_error(get_degree_dist(est), "class netdx")
++  expect_error(get_degree_dist(dx, window = c(0, 100)), "simulated time range")
++  expect_error(get_degree_dist(dx, window = c(10, 5)), "less than window end")
++  expect_error(get_degree_dist(dx, window = 10), "length 2")
++
++  dx.nokeep <- netdx(est, nsims = 1, nsteps = 10, verbose = FALSE)
++  expect_error(get_degree_dist(dx.nokeep), "keep.tedgelist = TRUE")
++  expect_error(plot(dx.nokeep, type = "cumldeg"), "keep.tedgelist = TRUE")
++
++  # Plots
++  plot(dx, type = "cumldeg")
++  plot(dx, type = "cumldeg", momentary = TRUE, grid = TRUE)
++  plot(dx, type = "cumldeg", method = "b", qnts = FALSE)
++  plot(dx, type = "cumldeg", method = "b", momentary = TRUE, maxdeg = 3)
++  plot(dx, type = "cumldeg", sims = 1, sim.lines = TRUE, mean.line = FALSE)
++  plot(dx, type = "cumldeg", sim.col = "green", mean.col = "black",
++       qnts.col = "grey", legend = TRUE, xlab = "cumul deg", ylab = "prop")
++
++  out <- plot(dx, type = "cumldeg", momentary = TRUE)
++  expect_equal(unique(out$type), c("cumulative", "momentary"))
++  expect_named(out, c("type", "sim", "degree", "count", "prop"))
++  expect_equal(out$degree[out$type == "cumulative"], cd$degree)
++  expect_equal(out$count[out$type == "cumulative"], cd$count)
++
++  expect_error(plot(dx, type = "cumldeg", qnts = 5), "qnts must be between")
++})

@@ -1,0 +1,496 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 21494973..84add7a7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,37 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## Unreleased
++
++### Why a read did not map
++
++`mapped_fraction` on its own made three different diagnoses into one number: the wrong organism, a
++library with almost no receptor content, and a `--min-score` that is too strict. The `run/map`
++scope now carries an `unmapped.*` **ledger** — `prefilter_rejected`, `no_hit`,
++`hit_not_in_reference`, `constant_only`, `below_min_score` — and the `sample` scope carries each
++as a fraction of `total_reads`, because a count of 788 says nothing beside another sample's 788.
++
++`no_hit` and `hit_not_in_reference` are separated because to the caller they are the same missing
++row and they are completely different problems. The second is how 2.23.0's first-run defect
++presented — every segment target resolving to `None` against a reference loaded before its markup
++was written — and all it looked like from outside was a low mapped fraction and exit 0.
++
++It is a **ledger**, so it states its own completeness: `accounted` is `mapped_reads` plus every
++bucket, and it should equal `total_reads`. On `tests/data/rnaseq_real`, 453 + 788 + 8 + 54 + 17 =
++1,320. `accounted` is **recomputed** when per-shard reports are merged rather than summed — a
++bucket wired into the single-file path and not into the shard merge would look fine on a laptop
++and be wrong on every cluster run, and summing an inherited `accounted` would hide exactly that.
++A four-read-group run of the fixture now reports a ledger identical to the single-file run.
++
++⚠ `constant_only` counts **reads**; the older `constant_only_fragments` counts **fragments**, and
++both stay. They differ on purpose: the constant-region rule also drops the constant-only *mate* of
++a fragment it keeps — the read whose isotype it has just donated — which `constant_only_fragments`
++never counted. Using the fragment count in the ledger left 45 of 1,320 reads in no bucket at all.
++
++Not done: splitting `no_hit` into no-V / no-J / V-and-J-on-different-mates, as MiXCR does. That
++needs the rejection reason to survive out of `_best_hits`, inside the per-read hot path; it is
++roadmapped behind a measurement rather than guessed at.
++
+ ## 2.24.0
+ 
+ ### Quality control: the distributions, a cohort table, and one HTML file
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 4f7d652b..01150f43 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -147,15 +147,21 @@ samples (read groups) across the CLI, SLURM, Nextflow and Snakemake.
+   - [x] **`arda qc report` -- one self-contained HTML file.** Data inlined, SVG drawn by plain
+         JavaScript, **no CDN, no bundle, no new dependency** -- it opens air-gapped and survives
+         the results directory. Same stance as `scplot`'s always-written gnuplot script.
+-  - [ ] **Why a read did NOT map has no breakdown.** A run reports `mapped_fraction` and
+-        nothing about the other side of it, so "wrong organism", "no receptor content in this
+-        library" and "reads too short to reach a V" are one number. MiXCR splits its
+-        not-aligned count by reason (no hits / no V / no J / no CDR3 parts / low total score /
+-        V and J on different mates) and that is the most useful thing arda's report lacks.
+-        arda has fragments of it already — `prefilter_stats.{seen,passed}`,
+-        `constant_only_fragments`, `segment_search.reasons` — but each only under a particular
+-        flag, and none covers a read that mmseqs simply did not hit. Doing it properly means new
+-        counters on the Stage-1 hot path, so it is its own change, not a QC one.
++  - [x] **Why a read did NOT map.** `mapped_fraction` alone made "wrong organism", "no
++        receptor content in this library" and "`--min-score` too strict" one number. The
++        `run/map` scope now carries an `unmapped.*` ledger — `prefilter_rejected`, `no_hit`,
++        `hit_not_in_reference`, `constant_only`, `below_min_score` — plus `accounted`, and the
++        `sample` scope carries each as a fraction of `total_reads`. Never: it is a LEDGER, so it
++        states its own completeness instead of leaving the reader to sum, and `accounted` is
++        RECOMPUTED on a shard merge rather than summed — a bucket wired into the single-file
++        path and not the merge would look fine on a laptop and be wrong on every cluster run.
++        Never: `constant_only` counts READS, not the fragments `constant_only_fragments` counts;
++        the rule also drops the constant-only MATE of a fragment it keeps, and using the
++        fragment count left 45 of 1,320 reads on `tests/data/rnaseq_real` in no bucket at all.
++    - [ ] **Splitting `no_hit` further** — no V / no J / V and J on different mates, as MiXCR
++          does — is not done. It needs the reason a hit was rejected to survive out of
++          `_best_hits`, which is inside the per-read hot path; measure the cost before adding
++          it, and only if a real library makes `no_hit` ambiguous.
+   - [ ] **Repertoire biology stays out**, deliberately. Diversity, clonality, rarefaction,
+         overlap and cross-sample clonotype matching are `vdjtools`', which takes arda as a base
+         dependency. arda's QC answers "did this run work, and is this sample like its batch".
+diff --git a/docs/qc.rst b/docs/qc.rst
+index 7ecdc11c..dd20a5d8 100644
+--- a/docs/qc.rst
++++ b/docs/qc.rst
+@@ -158,6 +158,64 @@ clonotype table, assembly rescues included — not ``correct.reads``, which is e
+    counter names that subset — so any fraction built from them would be nearly right, which is
+    worse than a count.
+ 
++Why a read did not map
++----------------------
++
++``mapped_fraction`` on its own makes three different diagnoses into one number: the wrong
++organism, a library with almost no receptor content, and a ``--min-score`` that is too strict.
++The ``run/map`` scope carries an ``unmapped.*`` **ledger** that separates them, and every read
++arda was handed is in exactly one bucket or in ``mapped_reads``:
++
++.. list-table::
++   :header-rows: 1
++   :widths: 30 70
++
++   * - bucket
++     - what it means, and what to do about it
++   * - ``prefilter_rejected``
++     - the k-mer screen rejected the read before MMseqs2 saw it (``--prefilter`` only). Near 1.0
++       on a library that should have receptor content means the screen is eating it.
++   * - ``no_hit``
++     - MMseqs2 returned nothing. The honest "this is not a receptor read" — and, in bulk, most
++       of the library. Unexpectedly high across a whole batch: check ``--organism``.
++   * - ``hit_not_in_reference``
++     - a read hit a target the loaded reference does not carry. This is an index/reference
++       mismatch, not biology; rebuild with ``arda build-index``.
++   * - ``constant_only``
++     - every read of the fragment lay inside the constant region: receptor mRNA with no V(D)J.
++       Normal on a long insert, where R2 sits deep in C and donates its isotype to R1.
++   * - ``below_min_score``
++     - the read aligned but under ``--min-score``. Large means the cutoff is doing the
++       rejecting, not the library.
++   * - ``accounted``
++     - ``mapped_reads`` plus every bucket above. **It should equal** ``total_reads``.
++
++.. code-block:: text
++
++   $ arda stats -r L.arda.json -o - | grep unmapped
++   run     map  unmapped.accounted            1320
++   run     map  unmapped.below_min_score        17
++   run     map  unmapped.constant_only          54
++   run     map  unmapped.no_hit                  8
++   run     map  unmapped.prefilter_rejected    788
++
++``tests/data/rnaseq_real`` through ``arda rnaseq``: 453 mapped + 788 + 8 + 54 + 17 = 1,320.
++
++.. important::
++
++   ``accounted`` is stated by the report rather than left for the reader to add up, and it is
++   **recomputed** when per-shard reports are merged rather than summed. A ledger that silently
++   stops balancing — because a bucket was wired into the single-file path and not into the shard
++   merge — is worse than no ledger: it would look fine on a laptop and be wrong on every cluster
++   run.
++
++   ``constant_only`` counts **reads**, while the older ``constant_only_fragments`` counts
++   fragments. They differ on purpose: the constant-region rule also drops the constant-only
++   *mate* of a fragment it keeps, which is exactly the read whose isotype it just donated.
++
++Each bucket also appears in the ``sample`` scope as ``unmapped_<bucket>_fraction`` over
++``map.total_reads``, because a count of 788 says nothing beside another sample's 788.
++
+ Distributions
+ -------------
+ 
+diff --git a/src/arda/annotate/mapper.py b/src/arda/annotate/mapper.py
+index 9084e1ba..37c5253c 100644
+--- a/src/arda/annotate/mapper.py
++++ b/src/arda/annotate/mapper.py
+@@ -1371,6 +1371,7 @@ def _annotate_chunk(
+     segment_only_v: bool = False,
+     shm: str = "framework",
+     complete_junction_nt: int = 0,
++    unmapped: dict | None = None,
+ ) -> list[dict]:
+     """Annotate one batch against a preloaded reference + cached target DB.
+ 
+@@ -1383,6 +1384,13 @@ def _annotate_chunk(
+     default) keeps the one-pass search. ``combos`` is ``combinations.tsv`` preloaded by the
+     caller -- it is 550 KB and re-parsing it per chunk is pure waste. Counters are accumulated
+     into ``report`` when given.
++
++    ``unmapped`` accumulates WHY a record produced no row, which is only knowable here. A read
++    mmseqs returned nothing for (``no_hit``) and a read whose best target the loaded reference
++    does not carry (``hit_not_in_reference``) are the same missing row to the caller and
++    completely different problems. The second is how 2.23.0's first-run defect presented -- every
++    segment target resolving to ``None`` against a reference loaded before its markup was written
++    -- and all it looked like from outside was a low mapped fraction and exit 0.
+     """
+     if not records:
+         return []
+@@ -1433,6 +1441,9 @@ def _annotate_chunk(
+         hit = best.get(qid)
+         entry = ref.get(hit["target"]) if hit else None
+         if hit is None or entry is None:
++            if unmapped is not None:
++                why = "no_hit" if hit is None else "hit_not_in_reference"
++                unmapped[why] = unmapped.get(why, 0) + 1
+             if mapped_only:
+                 continue
+             rec = {c: "" for c in AIRR_COLUMNS}
+diff --git a/src/arda/rnaseq/map.py b/src/arda/rnaseq/map.py
+index aea138cc..954754c8 100644
+--- a/src/arda/rnaseq/map.py
++++ b/src/arda/rnaseq/map.py
+@@ -560,6 +560,12 @@ class RnaseqReport:
+     # k-mer prefilter accounting, empty when it is off. `prefilter_passed / prefilter_seen` is the
+     # only number that says whether it earned its keep on this library.
+     prefilter_stats: dict = field(default_factory=dict)
++    # Why the reads that produced no row produced none. `mapped_fraction` alone makes "wrong
++    # organism", "this library has almost no receptor content" and "--min-score is too strict"
++    # into one number, and they are the three different things it is usually asked to mean.
++    # ⚠ This is a LEDGER: every read arda was handed is in exactly one bucket here or in
++    # `mapped_reads`, and `unmapped_accounted` says so rather than leaving the reader to add up.
++    unmapped: dict = field(default_factory=dict)
+ 
+     @property
+     def mapped_fraction(self) -> float:
+@@ -568,6 +574,13 @@ def mapped_fraction(self) -> float:
+     def as_dict(self) -> dict:
+         d = self.__dict__.copy()
+         d["mapped_fraction"] = self.mapped_fraction
++        if self.total_reads:
++            # Never: the ledger states its own completeness rather than implying it. A bucket
++            # added later and not wired into a shard merge would otherwise just make the numbers
++            # quietly stop summing, and nothing reads a sum that is never taken.
++            d["unmapped"] = dict(self.unmapped)
++            d["unmapped"]["accounted"] = (
++                self.mapped_reads + sum(v for k, v in self.unmapped.items() if k != "accounted"))
+         return d
+ 
+ 
+@@ -762,14 +775,28 @@ def flush(batch: list) -> None:
+                     indel_rescue=indel_rescue,
+                     segment_only_v=segment_only_v, shm=shm,
+                     complete_junction_nt=complete_junction_nt,
+-                    report=report.segment_search if segment_db else None)
++                    report=report.segment_search if segment_db else None,
++                    unmapped=report.unmapped)
+                 if drop_constant_only:
++                    n_before = len(keep)
+                     keep, n_drop, n_iso = _apply_constant_rule(keep)
+                     report.constant_only_fragments += n_drop
+                     report.isotype_from_mate += n_iso
++                    # Never: the LENGTH DELTA, not `n_drop`. `n_drop` counts FRAGMENTS dropped
++                    # whole, while `_apply_constant_rule` also drops the constant-only MATE of a
++                    # fragment that survived -- a record it never counts, because donating its
++                    # isotype is the point. The ledger is per read, so using `n_drop` left 45 of
++                    # 1,320 reads on `tests/data/rnaseq_real` in no bucket at all.
++                    # `constant_only_fragments` keeps its fragment semantics; callers read it.
++                    report.unmapped["constant_only"] = (
++                        report.unmapped.get("constant_only", 0) + n_before - len(keep))
+                 if min_score > 0:
++                    n_before = len(keep)
+                     keep = [r for r in keep
+                             if float(r.get("mmseqs2_score") or 0) >= min_score]
++                    # The bucket that says the cutoff is doing the rejecting, not the library.
++                    report.unmapped["below_min_score"] = (
++                        report.unmapped.get("below_min_score", 0) + n_before - len(keep))
+                 if not keep:
+                     return
+                 if with_junction_quality:
+@@ -850,6 +877,9 @@ def flush(batch: list) -> None:
+                         report.prefilter_stats.get("seen", 0) + len(chunk))
+                     report.prefilter_stats["passed"] = (
+                         report.prefilter_stats.get("passed", 0) + len(survivors))
++                    report.unmapped["prefilter_rejected"] = (
++                        report.unmapped.get("prefilter_rejected", 0)
++                        + len(chunk) - len(survivors))
+                 else:
+                     survivors = chunk
+                 pending.extend(survivors)
+diff --git a/src/arda/rnaseq/pipeline.py b/src/arda/rnaseq/pipeline.py
+index da554ded..bb9db51f 100644
+--- a/src/arda/rnaseq/pipeline.py
++++ b/src/arda/rnaseq/pipeline.py
+@@ -355,14 +355,28 @@ def _merge_map_reports(shards: list[dict]) -> dict:
+         # this library, and a sharded run used to report nothing at all.
+         "prefilter_stats": _sum_counters(shards, "prefilter_stats"),
+         "segment_search": _merge_segment_reports(shards),
++        # Never: `accounted` is RECOMPUTED from the merged totals, not summed like the buckets
++        # around it. Summing it would be right only by coincidence, and the moment it stopped
++        # agreeing with `mapped_reads + the buckets` the ledger would go on looking balanced --
++        # which is the one thing a ledger must not do.
++        "unmapped": _merge_unmapped(shards, mapped),
+     }
+ 
+ 
++def _merge_unmapped(shards: list[dict], mapped_reads: int) -> dict:
++    """Sum the per-shard unmapped ledger and restate its completeness over the whole sample."""
++    out = _sum_counters(shards, "unmapped")
++    out.pop("accounted", None)
++    if out:
++        out["accounted"] = mapped_reads + sum(out.values())
++    return out
++
++
+ def _sum_counters(shards: list[dict], key: str) -> dict:
+     """Add up one report sub-dict of FLAT integer counters across shards, keeping key order.
+ 
+-    Only ``prefilter_stats`` (``seen`` / ``passed``) has that shape. ``segment_search`` does not:
+-    see :func:`_merge_segment_reports`.
++    ``prefilter_stats`` (``seen`` / ``passed``) and ``unmapped`` have that shape;
++    ``segment_search`` does not, see :func:`_merge_segment_reports`.
+     """
+     out: dict[str, int] = {}
+     for s in shards:
+diff --git a/src/arda/stats.py b/src/arda/stats.py
+index b97f31f2..0702256b 100644
+--- a/src/arda/stats.py
++++ b/src/arda/stats.py
+@@ -207,6 +207,15 @@ def _yield_rows(rep: dict, out: list[tuple]) -> None:
+     _ratio(rep, out, "contigs_complete_fraction",
+            ("assemble", "contigs_complete"), ("assemble", "contigs"))
+ 
++    # The unmapped ledger, as fractions of the reads arda was handed. Same argument as above and
++    # the same denominator for every bucket, stated once: `prefilter_rejected` of 788 says nothing
++    # next to another sample's 788, but 0.597 against a batch median of 0.61 says the prefilter is
++    # behaving and 0.99 says it is eating the library.
++    total = (rep.get("map") or {}).get("total_reads")
++    for bucket, n in sorted(((rep.get("map") or {}).get("unmapped") or {}).items()):
++        if bucket != "accounted" and isinstance(n, int) and isinstance(total, int) and total:
++            out.append(("sample", "", f"unmapped_{bucket}_fraction", _fmt(n / total)))
++
+ 
+ def _gene_universe(organism: str) -> dict[tuple[str, str], set[str]]:
+     """``(locus, segment) -> {gene}`` from the reference's own anchor table.
+diff --git a/tests/synthetic/test_unmapped_ledger_real.py b/tests/synthetic/test_unmapped_ledger_real.py
+new file mode 100644
+index 00000000..adb8151f
+--- /dev/null
++++ b/tests/synthetic/test_unmapped_ledger_real.py
+@@ -0,0 +1,77 @@
++"""The unmapped ledger against real reads, on both delivery paths.
++
++The contract is that it **adds up**: every read arda was handed is in exactly one bucket or in
++`mapped_reads`. That cannot be checked against a stub — the buckets are filled by mmseqs returning
++nothing, by the constant-region rule, and by the score cutoff, three places with nothing in common
++— so it is checked here, on `tests/data/rnaseq_real`, the fixture every other end-to-end claim in
++this repo is measured on.
++"""
++
++import json
++
++import pytest
++
++from arda.cluster import split_pairs
++from arda.rnaseq import pipeline
++from tests.conftest import requires_human_db, requires_mmseqs
++
++pytestmark = [requires_mmseqs, requires_human_db]
++
++READS_1 = "tests/data/rnaseq_real/reads_1.fq.gz"
++READS_2 = "tests/data/rnaseq_real/reads_2.fq.gz"
++
++
++@pytest.fixture(scope="module")
++def whole(tmp_path_factory):
++    out = tmp_path_factory.mktemp("ledger_whole")
++    pipeline.run([(READS_1, READS_2)], out, "L", threads=2, prefilter=True)
++    return json.loads((out / "L.arda.json").read_text())["map"]
++
++
++@pytest.fixture(scope="module")
++def lanes(tmp_path_factory):
++    chunks = split_pairs(READS_1, tmp_path_factory.mktemp("chunks"), shards=4, r2=READS_2)
++    out = tmp_path_factory.mktemp("ledger_lanes")
++    pipeline.run(chunks, out, "L", threads=2, prefilter=True)
++    return json.loads((out / "L.arda.json").read_text())["map"]
++
++
++def test_every_read_is_in_exactly_one_bucket(whole):
++    led = whole["unmapped"]
++    buckets = {k: v for k, v in led.items() if k != "accounted"}
++    assert whole["mapped_reads"] + sum(buckets.values()) == whole["total_reads"]
++    assert led["accounted"] == whole["total_reads"]
++
++
++def test_the_buckets_are_the_ones_a_reader_can_act_on(whole):
++    """Each names a different remedy: drop the prefilter, check the organism, expect
++    constant-only mates on a long insert, lower `--min-score`."""
++    assert {"prefilter_rejected", "no_hit", "constant_only", "below_min_score"} <= set(
++        whole["unmapped"])
++
++
++def test_the_constant_rule_is_counted_in_READS_not_fragments(whole):
++    """Never: `_apply_constant_rule` also drops the constant-only MATE of a fragment it keeps,
++    which `constant_only_fragments` never counts — that is the whole point of the donation. Using
++    the fragment count here left 45 of 1,320 reads in no bucket at all."""
++    assert whole["unmapped"]["constant_only"] >= whole["constant_only_fragments"]
++
++
++def test_a_lane_split_sample_reports_the_same_ledger_as_one_file(whole, lanes):
++    """A bucket wired into the single-file path and not into the shard merge looks fine on a
++    laptop and is wrong on every cluster run."""
++    assert lanes["unmapped"] == whole["unmapped"]
++    assert lanes["unmapped"]["accounted"] == lanes["total_reads"]
++
++
++def test_the_ledger_reaches_the_qc_table_as_comparable_fractions(tmp_path, whole):
++    """Counts do not compare across samples of different depth; the fractions do."""
++    from arda.stats import collect
++
++    (tmp_path / "r.json").write_text(json.dumps({"map": whole}))
++    rows = collect(report=tmp_path / "r.json")
++    sample = {m: v for s, k, m, v in rows if s == "sample"}
++    assert float(sample["unmapped_prefilter_rejected_fraction"]) == pytest.approx(
++        whole["unmapped"]["prefilter_rejected"] / whole["total_reads"], rel=1e-5)
++    run = {m for s, k, m, v in rows if s == "run"}
++    assert "unmapped.no_hit" in run
+diff --git a/tests/unit/test_unmapped_ledger.py b/tests/unit/test_unmapped_ledger.py
+new file mode 100644
+index 00000000..135cebfe
+--- /dev/null
++++ b/tests/unit/test_unmapped_ledger.py
+@@ -0,0 +1,99 @@
++"""Why a read did not map — the Stage-1 ledger.
++
++`mapped_fraction` alone makes three different diagnoses into one number: "wrong organism",
++"this library has almost no receptor content", and "`--min-score` is too strict". The ledger
++separates them, and the contract that makes it worth reading is that it **adds up**: every read
++arda was handed is in exactly one bucket, or in `mapped_reads`.
++
++A ledger that silently stops balancing is worse than no ledger, so `accounted` is stated by the
++report rather than left for the reader to sum — and asserted here on both delivery paths, because
++a bucket wired into the single-file path and not into the shard merge would look fine on a laptop
++and be wrong on every cluster run.
++"""
++
++from __future__ import annotations
++
++from arda.annotate import mapper
++from arda.rnaseq.map import RnaseqReport
++from arda.rnaseq.pipeline import _merge_map_reports
++
++
++def _report(**kw) -> dict:
++    return _rep(**kw).as_dict()
++
++
++def _rep(**kw) -> RnaseqReport:
++    return RnaseqReport(input="reads.fq", organism="human", **kw)
++
++
++def test_the_ledger_states_its_own_completeness():
++    d = _report(total_reads=100, mapped_reads=40,
++                unmapped={"no_hit": 50, "below_min_score": 10})
++    assert d["unmapped"]["accounted"] == 100 == d["total_reads"]
++
++
++def test_a_ledger_that_does_not_balance_says_so_rather_than_looking_fine():
++    """The whole point: a bucket someone forgets to wire in shows up as a shortfall."""
++    d = _report(total_reads=100, mapped_reads=40, unmapped={"no_hit": 50})
++    assert d["unmapped"]["accounted"] == 90
++    assert d["unmapped"]["accounted"] != d["total_reads"]
++
++
++def test_accounted_is_never_summed_twice_when_a_report_is_rebuilt():
++    rep = _rep(total_reads=100, mapped_reads=40, unmapped={"no_hit": 60})
++    assert rep.as_dict()["unmapped"]["accounted"] == 100
++    # `as_dict` is called more than once on a live report — `run()` rewrites the JSON with the
++    # whole-run wall time — and an `accounted` that accumulated would drift a little each time.
++    assert rep.as_dict()["unmapped"]["accounted"] == 100
++
++
++def test_a_report_with_no_reads_has_no_ledger_to_state():
++    assert _report(total_reads=0, mapped_reads=0)["unmapped"] == {}
++
++
++# ── the merge ─────────────────────────────────────────────────────────────────────────────────
++
++def test_shards_sum_their_buckets_and_restate_completeness():
++    shards = [
++        {"total_reads": 100, "mapped_reads": 30, "organism": "human", "paired": True,
++         "input": "a.fq", "unmapped": {"no_hit": 60, "below_min_score": 10, "accounted": 100}},
++        {"total_reads": 50, "mapped_reads": 20, "organism": "human", "paired": True,
++         "input": "b.fq", "unmapped": {"no_hit": 25, "constant_only": 5, "accounted": 50}},
++    ]
++    merged = _merge_map_reports(shards)
++    assert merged["unmapped"] == {"no_hit": 85, "below_min_score": 10, "constant_only": 5,
++                                  "accounted": 150}
++    assert merged["unmapped"]["accounted"] == merged["total_reads"]
++
++
++def test_the_merge_recomputes_accounted_rather_than_adding_the_shards_up():
++    """Summing `accounted` is right only by coincidence. If a shard's own ledger was short, the
++    merged one must be short too — not look balanced because the arithmetic was inherited."""
++    shards = [
++        {"total_reads": 100, "mapped_reads": 30, "organism": "human", "paired": True,
++         "input": "a.fq", "unmapped": {"no_hit": 10, "accounted": 100}},   # shard lies: 30+10=40
++    ]
++    merged = _merge_map_reports(shards)
++    assert merged["unmapped"]["accounted"] == 40
++    assert merged["unmapped"]["accounted"] != merged["total_reads"]
++
++
++def test_a_sample_with_no_ledger_at_all_merges_to_no_ledger():
++    shards = [{"total_reads": 10, "mapped_reads": 10, "organism": "human", "paired": False,
++               "input": "a.fq"}]
++    assert _merge_map_reports(shards)["unmapped"] == {}
++
++
++# ── the mapper's side ─────────────────────────────────────────────────────────────────────────
++
++def test_the_mapper_takes_the_ledger_and_leaves_it_alone_when_not_asked():
++    """`unmapped=None` is the default, so every existing caller is unchanged. The two reasons
++    only the mapper can distinguish — `no_hit` and `hit_not_in_reference` — need mmseqs and a
++    real reference, so they are asserted end to end in
++    `tests/synthetic/test_unmapped_ledger_real.py` rather than against a stub here."""
++    import inspect
++
++    sig = inspect.signature(mapper._annotate_chunk)
++    assert sig.parameters["unmapped"].default is None
++    assert mapper._annotate_chunk([], None, None, "nt", threads=1, sensitivity=5.7,
++                                  mm_strand=None) == []

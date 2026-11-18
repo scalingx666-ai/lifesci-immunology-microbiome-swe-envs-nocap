@@ -1,0 +1,246 @@
+diff --git a/anvio/docs/workflows/metagenomics.md b/anvio/docs/workflows/metagenomics.md
+index dc2941b8dc..29160c8639 100644
+--- a/anvio/docs/workflows/metagenomics.md
++++ b/anvio/docs/workflows/metagenomics.md
+@@ -746,7 +746,7 @@ But, just in case, here is an example of how to use SLURM with `anvi-run-workflo
+ anvi-run-workflow -w metagenomics \
+                   -c config.json \
+                   --additional-params \
+-                      --cores 48 \
++                      --jobs 10 \
+                       --cluster \
+                           'sbatch --job-name=CHOOSE_A_NICE_JOB_NAME \
+                                   --account=YOUR_ACCOUNT \
+@@ -755,7 +755,7 @@ anvi-run-workflow -w metagenomics \
+                                   --nodes={threads}'
+ ```
+ 
+-Notice that when you use `--cluster`, snakemake also requires you to include the `--cores / --jobs`. From the `snakemake` help menu:
++When you use `--cluster`, snakemake also requires you to tell it how many jobs may be in the queue at the same time, via `--jobs` (a.k.a. `--cores`). From the `snakemake` help menu:
+ 
+ ```
+ --cores [N], --jobs [N], -j [N]
+@@ -764,24 +764,10 @@ Notice that when you use `--cluster`, snakemake also requires you to include the
+                         cores.
+ ```
+ 
+-We use `qsub` on our system, and we have found the behaviour a little funny in this case, where if we choose `--cores N`, then snakemake would submit `N` jobs, regardless of the number of threads each job is requesting. And hence we added the option to use the `--resources` argument, so the command from above would look like this:
++In the example above, `--jobs 10` means that at most 10 jobs are submitted to the queue in parallel. Note that this is a count of *jobs*, not CPUs: if those 10 jobs each request 20 threads, that is 200 CPUs. To cap the *total* number of threads (CPUs) used across all running jobs, snakemake uses a resource called `nodes` — every anvi'o workflow rule declares a `nodes` value equal to its number of threads. **anvi'o sets this `nodes` budget for you automatically**, using the `max_threads` value from your config file, so you normally do not need to pass `--resources` at all.
+ 
+-
+-```bash
+-anvi-run-workflow -w metagenomics \
+-                  -c config.json \
+-                      --additional-params \
+-                          --cores 10 \
+-                          --resources nodes=48 \
+-                          --cluster \
+-                              'sbatch --job-name=CHOOSE_A_NICE_JOB_NAME \
+-                                      --account=YOUR_ACCOUNT \
+-                                      --output={log} \
+-                                      --error={log} \
+-                                      --nodes={threads}'
+-```
+-
+-Now, at most 10 jobs would be submitted to the queue in parallel, but only as long as the total number of threads (nodes) that is requested by the submitted jobs doesn't go above 48. So if we have 3 `anvi-run-hmms` jobs and each require 20 threads, then only two would run in parallel.
++{:.notice}
++If you want to set the total-CPU ceiling explicitly — for example, to a value different from your config's `max_threads` — you can pass it yourself with `--resources nodes=MAX_THREAD`. For instance, adding `--resources nodes=48` to `--additional-params` guarantees that the combined number of threads requested by all simultaneously running jobs never exceeds 48 (so if you have 3 jobs each requiring 20 threads, only two would run in parallel). An explicit `--resources` value always takes precedence over the one anvi'o would otherwise derive from `max_threads`. One caveat: for the automatic behavior to kick in, let anvi'o manage `--cores` for you (i.e. use `--jobs` as in the example above rather than passing your own `--cores`); if you pass `--cores` yourself, anvi'o assumes you are managing resources manually and will not auto-set `nodes`.
+ 
+ ### How to use metaSPAdes for assembly
+ 
+diff --git a/anvio/workflows/__init__.py b/anvio/workflows/__init__.py
+index ac4f1c43ee..bf42b7039f 100644
+--- a/anvio/workflows/__init__.py
++++ b/anvio/workflows/__init__.py
+@@ -413,6 +413,21 @@ def go(self, skip_dry_run=False):
+         else:
+             if max_num_cpus_requested_by_the_workflow:
+                 sys.argv.extend(['-p', '--cores', f'{max_num_cpus_requested_by_the_workflow}'])
++
++                # `--cores` only bounds locally-run jobs; jobs dispatched to a cluster via `--cluster`
++                # are not counted against it. Every rule declares `resources: nodes=<threads>`, so we
++                # also pass the same budget as `--resources nodes=N` to cap the total number of threads
++                # in flight across dispatched jobs too. We skip this if the user set `--resources`
++                # themselves via `--additional-params`, in which case their value takes precedence.
++                user_set_resources = self.additional_params and '--resources' in self.additional_params
++                if not user_set_resources:
++                    sys.argv.extend(['--resources', f'nodes={max_num_cpus_requested_by_the_workflow}'])
++                    self.run.info('Total thread budget (--cores & --resources nodes)', max_num_cpus_requested_by_the_workflow)
++                else:
++                    self.run.warning("anvi'o found a `--resources` parameter in your `--additional-params`, so it did "
++                                     "NOT auto-set the `nodes` resource from your config's `max_threads`. Your "
++                                     "`--resources` value takes precedence, and you are responsible for making sure "
++                                     "it includes a sensible `nodes` budget if you are submitting jobs to a cluster.")
+             else:
+                 sys.argv.extend(['-p'])
+             try:
+@@ -604,6 +619,15 @@ def get_default_config(self):
+         else:
+             c = self.fill_empty_config_params(self.default_config)
+ 
++        # `max_threads` is a global general parameter (see `get_global_general_params`) that governs
++        # the total-thread budget for the workflow (it is passed to snakemake as `--cores` and
++        # `--resources nodes`). It is not declared in most workflows' `params.json`, so we make sure
++        # it always shows up in the default config. We only set it when a workflow's schema did not
++        # already provide it, so any workflow-specific default (e.g. trnaseq) is preserved. An empty
++        # string means "unset", which is how `get_max_num_cpus_requested_by_the_workflow` treats it.
++        if 'max_threads' not in c:
++            c["max_threads"] = ''
++
+         c["output_dirs"] = self.dirs_dict
+         c["config_version"] = workflow_config_version
+         c["workflow_name"] = self.name
+diff --git a/anvio/workflows/contigs/Snakefile b/anvio/workflows/contigs/Snakefile
+index d80d62a804..df0c02a013 100644
+--- a/anvio/workflows/contigs/Snakefile
++++ b/anvio/workflows/contigs/Snakefile
+@@ -41,7 +41,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ localrules:
+diff --git a/anvio/workflows/ecophylo/Snakefile b/anvio/workflows/ecophylo/Snakefile
+index af0b4d47ac..3e851bfe31 100644
+--- a/anvio/workflows/ecophylo/Snakefile
++++ b/anvio/workflows/ecophylo/Snakefile
+@@ -37,7 +37,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ rule ECOPHYLO_WORKFLOW_target_rule:
+diff --git a/anvio/workflows/metagenomics/Snakefile b/anvio/workflows/metagenomics/Snakefile
+index 26564b23d4..9c14d0e415 100755
+--- a/anvio/workflows/metagenomics/Snakefile
++++ b/anvio/workflows/metagenomics/Snakefile
+@@ -53,7 +53,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ # SR/LR assembler availability from the workflow class
+diff --git a/anvio/workflows/pangenomics/Snakefile b/anvio/workflows/pangenomics/Snakefile
+index 09cbc50823..94ce5e2b5d 100644
+--- a/anvio/workflows/pangenomics/Snakefile
++++ b/anvio/workflows/pangenomics/Snakefile
+@@ -41,7 +41,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ rule pangenomics_target_rule:
+diff --git a/anvio/workflows/phylogenomics/Snakefile b/anvio/workflows/phylogenomics/Snakefile
+index 10f7c8b4e8..a332c000a4 100644
+--- a/anvio/workflows/phylogenomics/Snakefile
++++ b/anvio/workflows/phylogenomics/Snakefile
+@@ -45,7 +45,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ rule phylogenomics_target_rule:
+diff --git a/anvio/workflows/sra_download/Snakefile b/anvio/workflows/sra_download/Snakefile
+index d3109c1f52..2df3a2f68e 100644
+--- a/anvio/workflows/sra_download/Snakefile
++++ b/anvio/workflows/sra_download/Snakefile
+@@ -56,7 +56,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ remove_tmp = M.get_param_value_from_config(["Remove_unzipped_SRA_files"])
+diff --git a/anvio/workflows/trnaseq/Snakefile b/anvio/workflows/trnaseq/Snakefile
+index 49c37f2e71..73918c23f5 100644
+--- a/anvio/workflows/trnaseq/Snakefile
++++ b/anvio/workflows/trnaseq/Snakefile
+@@ -29,7 +29,16 @@ def rule_log(rule_name, log_file_name="log"):
+     if not log_file_name.endswith(".log"):
+         log_file_name = f"{log_file_name}.log"
+ 
+-    return os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++    log_path = os.path.join(dirs_dict["LOGS_DIR"], rule_name, log_file_name)
++
++    # Ensure the per-rule log subdirectory exists. This is essential for cluster
++    # submission (e.g. via clusterize), where the submit command opens the log file
++    # at submission time and fails if its parent directory does not already exist.
++    # Doing it here guarantees the directory exists for *every* rule that declares a
++    # log, regardless of whether the rule is registered in `self.rules`.
++    os.makedirs(os.path.dirname(log_path), exist_ok=True)
++
++    return log_path
+ 
+ 
+ rule trnaseq_workflow_target_rule:

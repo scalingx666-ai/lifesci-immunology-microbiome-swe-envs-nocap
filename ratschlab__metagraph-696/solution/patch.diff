@@ -1,0 +1,183 @@
+diff --git a/metagraph/external-libraries/sshash b/metagraph/external-libraries/sshash
+index 98efeb8b5f..edaf0c1544 160000
+--- a/metagraph/external-libraries/sshash
++++ b/metagraph/external-libraries/sshash
+@@ -1 +1 @@
+-Subproject commit 98efeb8b5f237f1901cbf7a84af17e897134ff7c
++Subproject commit edaf0c154410ba2109eb7a0fa5e7344df76f5241
+diff --git a/metagraph/integration_tests/test_build.py b/metagraph/integration_tests/test_build.py
+index 2646fa33f9..6ac7d608f2 100644
+--- a/metagraph/integration_tests/test_build.py
++++ b/metagraph/integration_tests/test_build.py
+@@ -5,6 +5,7 @@
+ from tempfile import TemporaryDirectory
+ import glob
+ import os
++import resource
+ from base import PROTEIN_MODE, DNA_MODE, TestingBase, METAGRAPH, TEST_DATA_DIR, graph_file_extension
+ 
+ 
+@@ -47,6 +48,32 @@ def test_simple_all_graphs(self, build):
+         self.assertEqual('591997', stats_graph['nodes (k)'])
+         self.assertEqual('basic', stats_graph['mode'])
+ 
++    @parameterized.expand([('soft', False), ('soft_and_hard', True)])
++    @unittest.skipIf(PROTEIN_MODE, "Contigs from a DNA graph")
++    def test_sshash_low_open_file_limit(self, _, lower_hard):
++        """Each of 32 threads writes a sorted SSHash run, more than the limit allows open.
++        A low soft limit is raised at startup; a low hard limit needs SSHash's bounded merge."""
++        construct_command = f'{METAGRAPH} build -k 20 -o {self.tempdir.name}/graph \
++                                {TEST_DATA_DIR}/transcripts_1000.fa'
++        self.assertEqual(subprocess.run([construct_command], shell=True).returncode, 0)
++        transform_command = f'{METAGRAPH} transform --to-fasta -o {self.tempdir.name}/contigs \
++                                {self.tempdir.name}/graph.dbg'
++        self.assertEqual(subprocess.run([transform_command], shell=True).returncode, 0)
++
++        def lower_limit():
++            _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
++            resource.setrlimit(resource.RLIMIT_NOFILE, (24, 24 if lower_hard else hard))
++
++        construct_command = f'{METAGRAPH} build --graph sshash -k 20 -p 32 \
++                                --disk-swap {self.tempdir.name} -o {self.tempdir.name}/graph \
++                                {self.tempdir.name}/contigs.fasta.gz'
++        res = subprocess.run([construct_command], shell=True, preexec_fn=lower_limit)
++        self.assertEqual(res.returncode, 0)
++
++        stats_graph = self._get_stats(self.tempdir.name + '/graph.sshashdbg')
++        self.assertEqual(stats_graph['returncode'], 0)
++        self.assertEqual('591997', stats_graph['nodes (k)'])
++
+     @parameterized.expand(succinct_states)
+     def test_build_succinct_in_ram(self, state):
+         construct_command = f'{METAGRAPH} build -k 20 --graph succinct --state {state} \
+diff --git a/metagraph/src/cli/build.cpp b/metagraph/src/cli/build.cpp
+index 8345d43122..4971009716 100644
+--- a/metagraph/src/cli/build.cpp
++++ b/metagraph/src/cli/build.cpp
+@@ -248,7 +248,8 @@ int build_graph(Config *config) {
+         }
+ 
+     } else if (config->graph_type == Config::GraphType::SSHASH && !config->dynamic) {
+-        graph.reset(new DBGSSHash(files.at(0), config->k, config->graph_mode, config->num_chars));
++        graph.reset(new DBGSSHash(files.at(0), config->k, config->graph_mode, config->num_chars,
++                                  config->memory_available));
+         if (files.size() > 1) {
+             logger->error("DBGSSHash does not support multiple input files.");
+             exit(1);
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index 8990033b52..2d3346c7b8 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -1036,7 +1036,7 @@ if (advanced) {
+             fprintf(stderr, "\t   --mode \t\tk-mer indexing mode: basic / canonical / primary [basic]\n");
+ #endif
+             fprintf(stderr, "\t   --complete \t\tconstruct a complete graph (only for Bitmap graph) [off]\n");
+-            fprintf(stderr, "\t   --mem-cap-gb [INT] \tpreallocated buffer size in GB [1]\n");
++            fprintf(stderr, "\t   --mem-cap-gb [INT] \tpreallocated buffer size in GB (sshash: RAM budget, at least 8) [1]\n");
+ if (advanced) {
+             fprintf(stderr, "\t   --dynamic \t\tuse dynamic build method [off]\n");
+             fprintf(stderr, "\t-l --len-suffix [INT] \tk-mer suffix length for building graph from chunks [0]\n");
+diff --git a/metagraph/src/common/unix_tools.cpp b/metagraph/src/common/unix_tools.cpp
+index 5e5560dd16..47f758b687 100644
+--- a/metagraph/src/common/unix_tools.cpp
++++ b/metagraph/src/common/unix_tools.cpp
+@@ -122,6 +122,16 @@ size_t get_max_files_open() {
+     return max_files;
+ }
+ 
++void raise_max_files_open() {
++    struct rlimit lim;
++    if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur < lim.rlim_max) {
++        rlim_t soft = lim.rlim_cur;
++        lim.rlim_cur = lim.rlim_max;
++        if (setrlimit(RLIMIT_NOFILE, &lim) != 0)
++            logger->warn("Could not raise the limit on open files from {}", soft);
++    }
++}
++
+ int get_num_fds() {
+     FILE *p = popen(fmt::format("bash -c 'set -o pipefail; lsof -p {} | tail -n +2 | wc -l'", getpid()).c_str(), "r");
+     if (!p) {
+diff --git a/metagraph/src/common/unix_tools.hpp b/metagraph/src/common/unix_tools.hpp
+index 0cb7a7db56..e044549da6 100644
+--- a/metagraph/src/common/unix_tools.hpp
++++ b/metagraph/src/common/unix_tools.hpp
+@@ -26,6 +26,9 @@ size_t get_peak_RSS();
+ 
+ size_t get_max_files_open();
+ 
++// Raise the soft limit on open files to the hard limit
++void raise_max_files_open();
++
+ int get_num_fds();
+ 
+ /**
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.cpp b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+index ddbfe8a145..32f288a649 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.cpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.cpp
+@@ -175,7 +175,11 @@ generate_succ_pred(const DBGSSHash& graph, uint64_t num_nodes) {
+                            has_duplicates.load());
+ }
+ 
+-DBGSSHash::DBGSSHash(const std::string& input_filename, size_t k, Mode mode, size_t num_chars)
++DBGSSHash::DBGSSHash(const std::string& input_filename,
++                     size_t k,
++                     Mode mode,
++                     size_t num_chars,
++                     double ram_limit_gb)
+     : DBGSSHash(k, mode) {
+     if (k <= 1)
+         throw std::domain_error("k must be at least 2");
+@@ -206,6 +210,11 @@ DBGSSHash::DBGSSHash(const std::string& input_filename, size_t k, Mode mode, siz
+ 
+     build_config.verbose = common::get_verbose();
+     build_config.num_threads = get_num_threads();
++    // SSHash writes its minimizer tuples to sorted runs of ~RAM / (2 * threads) bytes
++    // each, so a larger budget means fewer and longer runs to merge
++    double ram_limit_GiB = ram_limit_gb * 1e9 / (1ull << 30);
++    if (std::isfinite(ram_limit_GiB) && ram_limit_GiB > build_config.ram_limit_in_GiB)
++        build_config.ram_limit_in_GiB = std::ceil(ram_limit_GiB);
+     build_config.allow_reverse_complement_duplicates = mode == BASIC;
+ 
+     // put SSHash's temp files under --disk-swap (default: ./) and clean them up
+diff --git a/metagraph/src/graph/representation/hash/dbg_sshash.hpp b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+index c07b760c0b..f635fc6574 100644
+--- a/metagraph/src/graph/representation/hash/dbg_sshash.hpp
++++ b/metagraph/src/graph/representation/hash/dbg_sshash.hpp
+@@ -33,10 +33,12 @@ class DBGSSHash : public DeBruijnGraph {
+                                 sshash::dictionary<kmer_t<KmerInt256>, sshash::decoded_offsets>>;
+ 
+     explicit DBGSSHash(size_t k, Mode mode = BASIC);
++    // |ram_limit_gb| (in GB) is SSHash's construction budget, never below its default
+     DBGSSHash(const std::string& input_filename,
+               size_t k,
+               Mode mode = BASIC,
+-              size_t num_chars = 0);
++              size_t num_chars = 0,
++              double ram_limit_gb = 0);
+ 
+     // SequenceGraph overrides
+     void add_sequence(
+diff --git a/metagraph/src/main.cpp b/metagraph/src/main.cpp
+index 8845d9f3d7..f2fd97d001 100644
+--- a/metagraph/src/main.cpp
++++ b/metagraph/src/main.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "common/logger.hpp"
+ #include "common/algorithms.hpp"
++#include "common/unix_tools.hpp"
+ #include "cli/config/config.hpp"
+ #include "cli/build.hpp"
+ #include "cli/annotate.hpp"
+@@ -24,6 +25,9 @@ using mtg::cli::Config;
+ int main(int argc, char *argv[]) {
+     auto config = std::make_unique<Config>(argc, argv);
+ 
++    // external merges (BOSS chunks, SSHash sorted runs) keep one file open per input
++    raise_max_files_open();
++
+     // Keep SPDLOG_LEVEL (or the INFO default) unless verbose was requested.
+     if (common::get_verbose())
+         logger->set_level(spdlog::level::trace);

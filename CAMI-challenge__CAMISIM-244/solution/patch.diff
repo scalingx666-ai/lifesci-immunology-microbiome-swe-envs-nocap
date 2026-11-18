@@ -1,0 +1,619 @@
+diff --git a/pipelines/metagenomic/config/metagenomic.config b/pipelines/metagenomic/config/metagenomic.config
+index 6e9c3ca..07df6ce 100644
+--- a/pipelines/metagenomic/config/metagenomic.config
++++ b/pipelines/metagenomic/config/metagenomic.config
+@@ -32,6 +32,13 @@ params {
+     // If the parameter is set to true, all samples will be considered.
+     pooled_gsa = true
+ 
++    // Custom sample combinations for merged gold standard assemblies.
++    // Specify as a list of lists, e.g., [[0,1,2], [2,3,4], [5,6]]
++    // Each inner list represents a group of samples to merge.
++    // If empty ([]), no custom merged GSAs will be generated.
++    // Example for patient-specific merging: [[0,1,2], [3,4,5]] merges samples 0-2 and 3-5 separately.
++    merged_gsa_combinations = []
++
+     // This parameter specifies whether the reads should be anonymized.
+     anonymization = true
+ 
+diff --git a/pipelines/metagenomic/metagenomic.nf b/pipelines/metagenomic/metagenomic.nf
+index 24cade5..cdc7519 100644
+--- a/pipelines/metagenomic/metagenomic.nf
++++ b/pipelines/metagenomic/metagenomic.nf
+@@ -17,6 +17,7 @@ include { metagenomesimulation_from_profile } from "${projectDir}/pipelines/meta
+ 
+ // include anonymization
+ include { anonymization } from "${projectDir}/pipelines/shared/anonymization"
++include { anonymize_merged_gsa } from "${projectDir}/pipelines/shared/anonymization"
+ 
+ // include binning
+ include { binning } from "${projectDir}/pipelines/shared/binning"
+@@ -211,11 +212,46 @@ workflow metagenomic {
+         merged_bam_file = merge_bam_files(merged_bam_per_sample.filter { params.pooled_gsa*.toString().contains(it[0]) }.map { it[1] }.collect())
+     }
+ 
++    // Generate merged GSAs for custom sample combinations (e.g., patient-specific)
++    if (params.containsKey('merged_gsa_combinations') && params.merged_gsa_combinations instanceof List && params.merged_gsa_combinations.size() > 0) {
++        def valid_sample_ids = (0..<params.number_of_samples).collect { it.toString() } as Set
++        def invalid_sample_ids = params.merged_gsa_combinations.flatten().collect { it.toString() }.findAll { !valid_sample_ids.contains(it) } as Set
++        if (invalid_sample_ids) {
++            error "Invalid sample id(s) in params.merged_gsa_combinations: ${invalid_sample_ids}. Valid sample ids are: ${valid_sample_ids}."
++        }
++
++        // Create a channel from the list of combinations with an index
++        combinations_ch = Channel.fromList(params.merged_gsa_combinations.withIndex())
++            .map { combination, idx -> tuple(idx, combination*.toString()) }
++
++        // For each combination, filter and collect the relevant BAM files
++        // NOTE: use collect(flat: false) so each [sample_id, bam_path] tuple is
++        // preserved as a list element instead of being flattened into a flat
++        // list of alternating ids/paths.
++        merged_bam_per_combination = merge_bam_files_by_combination(
++            combinations_ch,
++            merged_bam_per_sample.collect(flat: false)
++        )
++
++        // Generate GSA for each custom combination.
++        // Collect references once and pair each merged BAM with that single list.
++        // Do not combine with every reference and groupTuple(), because that
++        // repeats the same BAM path once per reference and causes Nextflow
++        // input file name collisions while staging.
++        merged_gsa_ch = generate_merged_gold_standard_assembly(
++            merged_bam_per_combination.combine(reference_fasta_files_ch.collect().map { [it] })
++        )
++    }
++
+     if (params.pooled_gsa) {
+         generate_pooled_gold_standard_assembly(merged_bam_file.combine(reference_fasta_files_ch).groupTuple())
+         // if requested, anonymize reads, gsa and pooled gsa
+         if(params.anonymization) {
+             anonymization(sample_wise_simulation.out[2], get_seed.out[1], get_seed.out[2], get_seed.out[3], gsa_for_all_reads_of_one_sample_ch, sample_wise_simulation.out[3], generate_pooled_gold_standard_assembly.out, merged_bam_file, genome_location_file_ch, metadata_ch)
++            // also anonymize merged gsa combinations (if any)
++            if (params.containsKey('merged_gsa_combinations') && params.merged_gsa_combinations instanceof List && params.merged_gsa_combinations.size() > 0) {
++                anonymize_merged_gsa(merged_gsa_ch, merged_bam_per_combination, get_seed.out[4], genome_location_file_ch, metadata_ch)
++            }
+         } else { // if no anonymization is requested, create binning gold standard
+             binning(gsa_for_all_reads_of_one_sample_ch, sample_wise_simulation.out[3], generate_pooled_gold_standard_assembly.out, merged_bam_file, genome_location_file_ch, metadata_ch)
+         }
+@@ -331,6 +367,74 @@ process merge_bam_files {
+     """
+ }
+ 
++/*
++* This process merges BAM files for a specific combination of samples.
++* Takes:
++*     combination_id: An identifier for the combination (index)
++*     sample_ids: List of sample IDs to include in this combination
++*     all_bam_tuples: All BAM file tuples (sample_id, bam_path)
++* Output:
++*     A tuple with combination_id and the path to the merged BAM file.
++*/
++process merge_bam_files_by_combination {
++
++    conda 'bioconda::samtools'
++
++    input:
++    tuple val(combination_id), val(sample_ids)
++    val all_bam_tuples
++
++    output:
++    tuple val(combination_id), val(sample_ids), path(file_name)
++
++    script:
++    file_name = "merged_combination_${combination_id}.bam"
++    compression = 5
++    memory = 1
++    threads_for_sort = Math.max(1, ((task.cpus ?: 1) as int))
++
++    // Filter BAM files that belong to the specified sample IDs
++    bam_to_merge = all_bam_tuples
++        .findAll { sample_id, bam_path -> sample_ids.contains(sample_id.toString()) }
++        .sort { a, b -> sample_ids.indexOf(a[0].toString()) <=> sample_ids.indexOf(b[0].toString()) }
++        .collect { sample_id, bam_path -> bam_path }
++        .join(' ')
++    """
++    samtools merge -u - ${bam_to_merge} | samtools sort -@ ${threads_for_sort} -l ${compression} -m ${memory}G -o ${file_name} -O bam
++    """
++}
++
++/*
++* This process generates a merged gold standard assembly for a custom sample combination.
++* Takes:
++*     A tuple with combination_id, sample_ids list, merged BAM file, and reference FASTA files.
++* Output:
++*     The path to the FASTA file with the merged gold standard assembly.
++*/
++process generate_merged_gold_standard_assembly {
++
++    conda 'bioconda::samtools'
++
++    input:
++    tuple val(combination_id), val(sample_ids), path(bam_file), path(reference_fasta_files)
++
++    output:
++    tuple val(combination_id), val(sample_ids), path(file_name)
++
++    script:
++    // Create a descriptive filename with the sample IDs
++    samples_str = sample_ids.join('_')
++    file_name = "gsa_merged_samples_${samples_str}.fasta"
++    """
++    cat ${reference_fasta_files} > reference.fasta
++    samtools faidx reference.fasta
++    python ${shared_scripts_dir}/bamToGold.py -st samtools -r reference.fasta -b ${bam_file} -l 1 -c 1 >> ${file_name}
++    mkdir --parents ${params.outdir}/merged_gsa
++    gzip -k ${file_name}
++    cp ${file_name}.gz ${params.outdir}/merged_gsa/
++    """
++}
++
+ /*
+ * This process generates the pooled gold standard assembly for serveral samples.
+ * Takes:
+@@ -353,7 +457,7 @@ process generate_pooled_gold_standard_assembly {
+     """
+     cat ${reference_fasta_files} > reference.fasta
+     samtools faidx reference.fasta
+-    perl -- ${shared_scripts_dir}/bamToGold.pl -st samtools -r reference.fasta -b ${bam_file} -l 1 -c 1 >> ${file_name}
++    python ${shared_scripts_dir}/bamToGold.py -st samtools -r reference.fasta -b ${bam_file} -l 1 -c 1 >> ${file_name}
+     mkdir --parents ${params.outdir}/pooled_gsa
+     gzip -k ${file_name}
+     cp ${file_name}.gz ${params.outdir}/pooled_gsa/
+@@ -629,6 +733,7 @@ process get_seed {
+     path ('seed_read_anonymisation.txt'), optional: true
+     path ('seed_gsa_anonymisation.txt'), optional: true
+     path ('seed_pooled_gsa_anonymisation.txt'), optional: true
++    path ('seed_merged_gsa_anonymisation.txt'), optional: true
+ 
+     script:
+     count_samples = params.number_of_samples
+@@ -637,8 +742,12 @@ process get_seed {
+     } else {
+         param_anonym = ""
+     }
++    merged_count = 0
++    if (params.containsKey('merged_gsa_combinations') && params.merged_gsa_combinations instanceof List) {
++        merged_count = params.merged_gsa_combinations.size()
++    }
+     """
+-    ${shared_scripts_dir}/get_seed.py -seed ${seed} -count_samples ${count_samples} -file_genome_locations ${genome_locations} ${param_anonym}
++    ${shared_scripts_dir}/get_seed.py -seed ${seed} -count_samples ${count_samples} -file_genome_locations ${genome_locations} ${param_anonym} -merged_count ${merged_count}
+     mkdir --parents ${params.outdir}/seed/
+     cp seed*.txt ${params.outdir}/seed/
+     """
+diff --git a/pipelines/metagenomic/sample_wise_simulation.nf b/pipelines/metagenomic/sample_wise_simulation.nf
+index faffa85..59958f3 100644
+--- a/pipelines/metagenomic/sample_wise_simulation.nf
++++ b/pipelines/metagenomic/sample_wise_simulation.nf
+@@ -171,7 +171,7 @@ process generate_gold_standard_assembly {
+     file_name = 'sample'.concat(sample_id.toString()).concat('_').concat(genome_id).concat('_gsa.fasta')
+     """
+     samtools faidx ${reference_fasta_file}
+-    perl -- ${shared_scripts_dir}/bamToGold.pl -st samtools -r ${reference_fasta_file} -b ${bam_file} -l 1 -c 1 >> ${file_name}
++    python ${shared_scripts_dir}/bamToGold.py -st samtools -r ${reference_fasta_file} -b ${bam_file} -l 1 -c 1 >> ${file_name}
+     mkdir --parents ${params.outdir}/sample_${sample_id}/gsa
+     gzip -k ${file_name}
+     cp ${file_name}.gz ${params.outdir}/sample_${sample_id}/gsa/
+@@ -321,6 +321,8 @@ process remove_spaces_from_reference_genome {
+  */
+ process get_fastq_for_sample_single_end {
+ 
++    conda 'conda-forge::pigz'
++
+     input:
+     tuple val(sample_id), path(read_files)
+ 
+@@ -341,6 +343,8 @@ process get_fastq_for_sample_single_end {
+  */
+ process get_fastq_for_sample_paired_end {
+ 
++    conda 'conda-forge::pigz'
++
+     input:
+     tuple val(sample_id), path(first_read_files), path(second_read_files)
+ 
+diff --git a/pipelines/shared/anonymization.nf b/pipelines/shared/anonymization.nf
+index 932224b..145abf8 100644
+--- a/pipelines/shared/anonymization.nf
++++ b/pipelines/shared/anonymization.nf
+@@ -443,3 +443,174 @@ process pooled_gs_contig_mapping {
+     cp ${gsa_mapping_file}.gz ${params.outdir}
+     """
+ }
++
++/**
++* This sub-workflow anonymizes the merged gold standard assemblies (one per
++* custom combination defined via `merged_gsa_combinations`). For each
++* combination it shuffles the contigs of the merged GSA, anonymizes them and
++* produces a `gsa_mapping.tsv.gz` file mapping the anonymized contig ids back
++* to their original "labels".
++*
++* Takes:
++*   merged_gsa_ch              tuple val(combination_id), val(sample_ids), path(gsa_fasta)
++*   merged_bam_per_combination tuple val(combination_id), val(sample_ids), path(merged_bam)
++*   seed_file_merged_gsa_ch    path  seed_merged_gsa_anonymisation.txt
++*   genome_location_file_ch    path  genome_locations.tsv
++*   metadata_ch                path  metadata.tsv
++**/
++workflow anonymize_merged_gsa {
++
++    take: merged_gsa_ch
++    take: merged_bam_per_combination
++    take: seed_file_merged_gsa_ch
++    take: genome_location_file_ch
++    take: metadata_ch
++
++    main:
++
++        // parse seeds: header is 2 lines, then combination_id\tseed
++        seed_merged_ch = seed_file_merged_gsa_ch.splitCsv(sep:'\t', skip:2)
++            .map { combination_id, seed -> tuple(combination_id.toString(), seed) }
++
++        // index merged gsa channel by stringified combination_id for joining
++        merged_gsa_keyed_ch = merged_gsa_ch
++            .map { combination_id, sample_ids, gsa -> tuple(combination_id.toString(), sample_ids, gsa) }
++
++        merged_bam_keyed_ch = merged_bam_per_combination
++            .map { combination_id, sample_ids, bam -> tuple(combination_id.toString(), bam) }
++
++        // shuffle/anonymize the contigs of the merged GSA per combination
++        shuffle_input_ch = merged_gsa_keyed_ch
++            .map { combination_id, sample_ids, gsa -> tuple(combination_id, sample_ids, gsa) }
++            .join(seed_merged_ch)
++        shuffle_merged_gsa(shuffle_input_ch)
++
++        // start positions from the corresponding merged BAM
++        read_start_positions_from_merged_combination_bam(merged_bam_keyed_ch)
++
++        // build the gsa_mapping.tsv per combination
++        mapping_in_ch = shuffle_merged_gsa.out[1]
++            .join(read_start_positions_from_merged_combination_bam.out)
++            .combine(genome_location_file_ch)
++            .combine(metadata_ch)
++        merged_gs_contig_mapping(mapping_in_ch)
++}
++
++/*
++* This process shuffles and anonymizes the merged gsa of one custom sample
++* combination.
++* Takes:
++*    A tuple with the combination id, the list of sample ids, the merged gsa
++*    file and the generated seed.
++* Output:
++*    The anonymous merged gsa file (per combination).
++*    The temp contig mapping file (per combination), containing the original
++*    contig id and the anonymous contig id.
++*/
++process shuffle_merged_gsa {
++
++    conda "conda-forge::biopython=1.83"
++
++    input:
++    tuple val(combination_id), val(sample_ids), path(gsa_file), val(seed)
++
++    output:
++    tuple val(combination_id), val(sample_ids), path(anonymous_gsa_file)
++    tuple val(combination_id), val(sample_ids), path(tmp_reads_mapping_file)
++
++    script:
++    samples_str = sample_ids.join('_')
++    anonymous_gsa_file = "anonymous_gsa_merged_samples_${samples_str}.fasta"
++    tmp_reads_mapping_file = "tmp_contig_mapping_merged_samples_${samples_str}.tsv"
++    """
++    touch ${anonymous_gsa_file}
++    touch ${tmp_reads_mapping_file}
++    get_seeded_random() { seed="\$1"; openssl enc -aes-256-ctr -pass pass:"\$seed" -nosalt < /dev/zero 2>/dev/null; };
++    cat ${gsa_file} \\
++      | paste -d "\\t" - - \\
++      | shuf --random-source=<(get_seeded_random ${seed}) \\
++      | tr "\\t" "\\n" \\
++      | tr -d '\\000' \\
++      | python3 ${shared_scripts_dir}/anonymizer.py -prefix M${combination_id}C -format fasta -map ${tmp_reads_mapping_file} -out ${anonymous_gsa_file} -s
++    mkdir --parents ${params.outdir}/merged_gsa
++    gzip -k ${anonymous_gsa_file}
++    cp ${anonymous_gsa_file}.gz ${params.outdir}/merged_gsa/
++    """
++}
++
++/*
++* This process parses 'read' start positions from a merged BAM file produced
++* for one custom sample combination.
++* Takes:
++*   A tuple with the combination id and the merged BAM file.
++* Output:
++*   A tuple with the combination id and the file containing the read start
++*   positions.
++*/
++process read_start_positions_from_merged_combination_bam {
++
++    conda 'bioconda::samtools=1.13'
++
++    input:
++    tuple val(combination_id), path(merged_bam_file)
++
++    output:
++    tuple val(combination_id), path(filename)
++
++    script:
++    filename = "read_start_positions_combination_${combination_id}"
++    """
++    set -o pipefail
++    samtools view ${merged_bam_file} | awk '{print \$3 "\\t" \$4}' >> ${filename}
++    """
++}
++
++/*
++* This process creates a gold standard contig mapping file for a merged gsa of
++* one custom sample combination.
++* Takes:
++*   The temp contig mapping file, the read start positions of the merged BAM,
++*   the genome locations file and the metadata file (all per combination).
++* Output:
++*   The gsa_mapping.tsv file for the given combination.
++*/
++process merged_gs_contig_mapping {
++
++    conda "conda-forge::biopython=1.83 conda-forge::python=3.11.5"
++
++    input:
++    tuple val(combination_id), val(sample_ids), path(tmp_contig_mapping_file), path(read_start_positions), path(genome_locations_file), path(metadata_file)
++
++    output:
++    tuple val(combination_id), val(sample_ids), path(gsa_mapping_file)
++
++    script:
++    samples_str = sample_ids.join('_')
++    gsa_mapping_file = "gsa_mapping.tsv"
++    simulator = ""
++    real_fastq = ""
++    if(params.type.equals("nanosim3")) {
++        if(params.simulate_fastq_directly){
++            real_fastq = "-nanosim_real_fastq"
++        }
++    } else if(params.type.equals("wgsim")){
++            simulator = "-simulator wgsim"
++    } else if(params.type.equals("art_modern")){
++            simulator = "-simulator art_modern"
++    }
++
++    if(params.pipeline.equals("metatranscriptomic")){
++        metatranscriptomic = "-metatranscriptomic"
++    } else {
++        metatranscriptomic = ""
++    }
++    """
++    touch ${gsa_mapping_file}
++    python ${shared_scripts_dir}/goldstandardfileformat.py -contig -input ${tmp_contig_mapping_file} -genomes ${genome_locations_file} -metadata ${metadata_file} -out ${gsa_mapping_file} -projectDir ${projectDir} ${real_fastq} ${simulator} ${metatranscriptomic} -read_positions ${read_start_positions}
++    mkdir --parents ${params.outdir}/merged_gsa
++    gzip -k ${gsa_mapping_file}
++    # Use the descriptive per-combination name in the output directory to avoid
++    # collisions between combinations.
++    cp ${gsa_mapping_file}.gz ${params.outdir}/merged_gsa/gsa_mapping_merged_samples_${samples_str}.tsv.gz
++    """
++}
+diff --git a/pipelines/shared/scripts/bamToGold.py b/pipelines/shared/scripts/bamToGold.py
+new file mode 100644
+index 0000000..3040519
+--- /dev/null
++++ b/pipelines/shared/scripts/bamToGold.py
+@@ -0,0 +1,114 @@
++#!/usr/bin/env python
++"""
++Convert BAM file to gold standard assembly.
++"""
++
++import argparse
++import subprocess
++import sys
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description="Generate gold standard assembly from BAM file using samtools mpileup"
++    )
++    parser.add_argument(
++        "-r", "--reference", required=True,
++        help="Reference FASTA file (indexed with faidx)"
++    )
++    parser.add_argument(
++        "-b", "--bam", required=True,
++        help="Sorted BAM file"
++    )
++    parser.add_argument(
++        "-l", "--length", type=int, required=True,
++        help="Length cutoff for output sequences"
++    )
++    parser.add_argument(
++        "-c", "--coverage", type=int, required=True,
++        help="Minimum coverage threshold"
++    )
++    parser.add_argument(
++        "-st", "--samtools", default="samtools",
++        help="Path to samtools executable (default: samtools)"
++    )
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++
++    # Build samtools mpileup command
++    cmd = [
++        args.samtools, "mpileup",
++        "-B", "-Q", "0",
++        "-f", args.reference,
++        args.bam
++    ]
++
++    pos = -42
++    seq = ""
++    start = 0
++    stop = 0
++    seqname = ""
++    previous_sequence_name = ""
++
++    # Run samtools mpileup and process output
++    try:
++        process = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.DEVNULL,
++            text=True
++        )
++
++        for line in process.stdout:
++            # mpileup output format: seqname, pos, ref_base, coverage, ...
++            # We only need the first 4 fields (equivalent to cut -f1,2,3,4)
++            fields = line.strip().split('\t')
++            if len(fields) < 4:
++                continue
++
++            seqname = fields[0]
++            current_pos = int(fields[1])
++            ref_base = fields[2]
++            coverage = int(fields[3])
++
++            # Check if contig is done (new sequence or non-consecutive position)
++            if seqname != previous_sequence_name or (pos + 1) != current_pos:
++                # Output previous sequence if it meets length cutoff
++                if len(seq) >= args.length and previous_sequence_name != "":
++                    stop = pos
++                    header = f">{previous_sequence_name}_from_{start}_to_{stop}_total_{len(seq)}"
++                    print(header)
++                    print(seq)
++
++                previous_sequence_name = seqname
++                start = current_pos
++                seq = ""
++
++            pos = current_pos
++
++            # Add base to sequence if coverage threshold is met
++            if coverage >= args.coverage:
++                seq += ref_base
++
++        process.wait()
++
++        # Catch the last sequence
++        if len(seq) >= args.length:
++            stop = pos
++            header = f">{previous_sequence_name}_from_{start}_to_{stop}_total_{len(seq)}"
++            print(header)
++            print(seq)
++
++    except FileNotFoundError:
++        print(f"Error: samtools not found at '{args.samtools}'", file=sys.stderr)
++        sys.exit(1)
++    except Exception as e:
++        print(f"Error: {e}", file=sys.stderr)
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/pipelines/shared/scripts/get_seed.py b/pipelines/shared/scripts/get_seed.py
+index bed0211..2a5dd81 100755
+--- a/pipelines/shared/scripts/get_seed.py
++++ b/pipelines/shared/scripts/get_seed.py
+@@ -3,7 +3,7 @@
+ import random
+ import sys
+ import argparse
+-    
++
+ if __name__ == "__main__":
+ 
+     parser = argparse.ArgumentParser()
+@@ -16,23 +16,29 @@
+ 		"-count_samples",
+ 		help="the sample count",
+ 		action='store',
+-		default="")  
++		default="")
+     parser.add_argument(
+ 		"-file_genome_locations",
+ 		help="the file containing the genome locations",
+ 		action='store',
+-		default="")      
++		default="")
+     parser.add_argument(
+ 		"-anonym_seed",
+ 		help="whether seeds for anonymization should be generated",
+ 		action="store_true",
+ 		default=False)
+-    options = parser.parse_args()    
++    parser.add_argument(
++        "-merged_count",
++        help="number of merged gsa combinations that need a dedicated anonymization seed",
++        action='store',
++        default="0")
++    options = parser.parse_args()
+ 
+     seed = int(options.seed)
+     count_samples = int(options.count_samples)
+     file_genome_locations = options.file_genome_locations
+     anonym_seed = options.anonym_seed
++    merged_count = int(options.merged_count)
+ 
+     genome_id_list = []
+ 
+@@ -48,15 +54,15 @@
+     text = text + "genome_id" + '\t' + "sample_id" + '\t' + "seed" + '\n'
+ 
+     random.seed(seed)
+-    
++
+     f = open("seed.txt", "w")
+-    
++
+ 
+     for i in range(count_samples):
+         for genome in genome_id_list:
+             sample_seed = random.randint(0, sys.maxsize)
+             text = text + genome + '\t' + str(i) + '\t' + str(sample_seed) + '\n'
+-        
++
+     f.write(text)
+     f.close()
+ 
+@@ -71,7 +77,7 @@
+         for i in range(count_samples):
+             sample_seed = random.randint(0, sys.maxsize)
+             text = text + str(i) + '\t' + str(sample_seed) + '\n'
+-        
++
+         f.write(text)
+         f.close()
+ 
+@@ -84,7 +90,7 @@
+         for i in range(count_samples):
+             sample_seed = random.randint(0, sys.maxsize)
+             text = text + str(i) + '\t' + str(sample_seed) + '\n'
+-        
++
+         f.write(text)
+         f.close()
+ 
+@@ -96,7 +102,21 @@
+ 
+         sample_seed = random.randint(0, sys.maxsize)
+         text = text + str(sample_seed) + '\n'
+-        
++
+         f.write(text)
+         f.close()
+ 
++        # file with seeds for merged gsa anonymization (one seed per combination)
++        if merged_count > 0:
++            text = "used_initial_seed" + '\t' + str(seed) + '\n'
++            text = text + "combination_id" + '\t' + "seed" + '\n'
++
++            f = open("seed_merged_gsa_anonymisation.txt", "w")
++
++            for i in range(merged_count):
++                sample_seed = random.randint(0, sys.maxsize)
++                text = text + str(i) + '\t' + str(sample_seed) + '\n'
++
++            f.write(text)
++            f.close()
++

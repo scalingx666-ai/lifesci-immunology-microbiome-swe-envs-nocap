@@ -1,0 +1,424 @@
+diff --git a/metagraph/docs/source/traverse.rst b/metagraph/docs/source/traverse.rst
+index cefe37be3b..6ca612f14c 100644
+--- a/metagraph/docs/source/traverse.rst
++++ b/metagraph/docs/source/traverse.rst
+@@ -21,12 +21,14 @@ It has one server route:
+ The route is experimental. Its request and response fields can change in a later release
+ without notice.
+ 
+-A server on a single index serves the route. A server started with a list of graphs does not.
++A server on a single index serves the route:
+ 
+ .. code-block:: text
+ 
+     metagraph server_query -i graph.dbg -a annotation.annodbg
+ 
++So does a server started with a list of graphs. See `A list of graphs`_.
++
+ A request is a JSON object. The server refuses a field it does not know with HTTP 400, so a
+ misspelled field is never ignored.
+ 
+@@ -66,6 +68,51 @@ a header label only when its record holds them at consecutive coordinates. ``/tr
+ a record that holds them out of order and reports it in ``dropped_labels``. A seed left
+ without a label reports ``no_carrier``.
+ 
++A list of graphs
++----------------
++
++A server started with a list of graphs walks every selected graph. The ``graphs`` field selects
++them by name, as in ``/search``:
++
++.. code-block:: json
++
++    {
++      "graphs": ["bacteria", "plants"],
++      "seeds": [{"sequence": "ATGGAATTGCCC...", "labels": ["NZ_CM008882.1"]}]
++    }
++
++Without ``graphs``, the server walks every graph of a list with at most 10 names. A longer list
++needs the field. A name can hold several graphs. All of them are walked.
++
++Each entry of ``results`` then holds ``walks`` instead of one walk:
++
++.. code-block:: json
++
++    {
++      "strategy": {...},
++      "results": [
++        {"walks": [
++          {"graph": "bacteria", "seed": {...}, "label_dict": [...], "arms": {...}, "elapsed_ms": 12.5}
++        ]}
++      ]
++    }
++
++A walk has the fields of `The response`_ and the name of its ``graph``. ``walks`` holds one walk
++per graph that has the seed and at least one of its labels. Each graph follows the labels it
++has. A graph adds no walk in these cases:
++
++- A k-mer of the seed is not in the graph.
++- The graph has none of the named labels.
++- No label is on every k-mer of the seed.
++
++``walks`` is empty when no graph adds a walk. When a graph cannot determine the labels of a
++seed for another cause, its walk holds the ``error`` instead (``too_wide``, ``time_budget``,
++``ambiguous_header``).
++
++The server refuses a named label that no selected graph has with HTTP 400. A malformed seed and
++an ambiguous label fail the whole request, as on a single index. The time budget applies to each
++walk. The graphs are walked in parallel.
++
+ Terms
+ -----
+ 
+diff --git a/metagraph/integration_tests/test_traverse.py b/metagraph/integration_tests/test_traverse.py
+index 8f6921311a..86f02c1725 100644
+--- a/metagraph/integration_tests/test_traverse.py
++++ b/metagraph/integration_tests/test_traverse.py
+@@ -55,13 +55,13 @@ class TraverseServer(TraverseFixture):
+     def setUpClass(cls):
+         super().setUpClass()
+         cls.host = '127.0.0.1'
++        cls._prepare()
+         os.environ['NO_PROXY'] = cls.host
+         # the test classes run in parallel: each server gets a port that is free now
+         with socket.socket() as s:
+             s.bind((cls.host, 0))
+             port = s.getsockname()[1]
+-        cls.server, cls.port = start_server(cls.graph, cls.annotation, cls.host, port,
+-                                            cls.server_flags)
++        cls.server, cls.port = cls._start_server(port)
+         # the server answers 503 while it loads: wait until it answers
+         deadline = time.time() + 60
+         while True:
+@@ -75,6 +75,14 @@ def setUpClass(cls):
+                 raise RuntimeError(f'The server on port {cls.port} did not get ready')
+             time.sleep(0.05)
+ 
++    @classmethod
++    def _prepare(cls):
++        """Whatever the server needs, built before its port is chosen."""
++
++    @classmethod
++    def _start_server(cls, port):
++        return start_server(cls.graph, cls.annotation, cls.host, port, cls.server_flags)
++
+     @classmethod
+     def tearDownClass(cls):
+         cls.server.kill()
+@@ -165,6 +173,7 @@ def test_invalid_requests(self):
+             {'seeds': [{'sequence': self.X}], 'strategy': {'branching': {'max_label_branches': -1}}},
+             {'seeds': [{'sequence': self.X}] * 11},
+             {'seeds': [{'sequence': self.X}], 'graph': 'x'},
++            {'seeds': [{'sequence': self.X}], 'graphs': ['x']},  # no list of graphs here
+         ]:
+             self.assertEqual(400, self._post('traverse', request).status_code, request)
+         # there is no /resolve route
+@@ -197,6 +206,78 @@ def test_branch_limit(self):
+             self.assertEqual({self.P, self.Q}, flanks, branches)
+ 
+ 
++class TestTraverseGraphList(TraverseServer):
++    """A server on a list of graphs: record A is in the graph `one`, record B in `two`."""
++    mode = 'basic'
++
++    @classmethod
++    def _prepare(cls):
++        rows = []
++        for name, record, flank in [('one', 'A', cls.P), ('two', 'B', cls.Q)]:
++            base = f'{cls.tempdir.name}/{name}'
++            with open(base + '.fa', 'w') as f:
++                f.write(f'>{record}\n{cls.X + flank}\n')
++            cls._build_graph(base + '.fa', base + '.dbg', K, 'succinct', mode=cls.mode)
++            cls._annotate_graph(base + '.fa', base + '.dbg', base, 'column')
++            rows.append(f'{name},{base}.dbg,{base}.column.annodbg\n')
++        with open(cls.tempdir.name + '/graphs.csv', 'w') as f:
++            f.writelines(rows)
++
++    @classmethod
++    def _start_server(cls, port):
++        # as start_server: a server that exits at once lost its port to another test
++        for _ in range(100):
++            command = [METAGRAPH, 'server_query', cls.tempdir.name + '/graphs.csv',
++                       '--port', str(port), '--address', cls.host, '-p', '2']
++            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
++                                       stderr=subprocess.DEVNULL)
++            try:
++                process.wait(timeout=1)
++            except subprocess.TimeoutExpired:
++                return process, port
++            port += 1
++        raise RuntimeError("Couldn't start server")
++
++    def _flanks(self, walk):
++        right = walk['arms']['right']
++        return [''.join(right['segments'][s]['sequence'] for s in path['segments'])
++                for path in right['paths']]
++
++    def test_every_graph_is_walked(self):
++        out = self._traverse({'seeds': [{'sequence': self.X, 'labels': ['A', 'B']},
++                                        {'sequence': self.X}]})
++        # each graph follows the labels it has
++        for result in out['results']:
++            walks = result['walks']
++            self.assertEqual(['one', 'two'], [walk['graph'] for walk in walks])
++            self.assertEqual([['A'], ['B']], [walk['seed']['labels'] for walk in walks])
++            self.assertEqual([[self.P], [self.Q]], [self._flanks(walk) for walk in walks])
++
++    def test_selected_graphs(self):
++        seeds = [{'sequence': self.X}]
++        walks = self._traverse({'seeds': seeds, 'graphs': ['two']})['results'][0]['walks']
++        self.assertEqual(['two'], [walk['graph'] for walk in walks])
++        for graphs in [['three'], 'two']:
++            res = self._post('traverse', {'seeds': seeds, 'graphs': graphs})
++            self.assertEqual(400, res.status_code, graphs)
++        # a seed shorter than k in every graph
++        self.assertEqual(400, self._post('traverse', {'seeds': [{'sequence': self.X[:K - 1]}]}).status_code)
++
++    def test_graph_without_the_seed_or_its_labels(self):
++        out = self._traverse({'seeds': [
++            {'sequence': self.X, 'labels': ['A']},  # no graph but `one` has the label
++            {'sequence': self.P[:40]},              # no graph but `one` has the seed
++            {'sequence': self.Q[:20] + self.P[:20]},
++        ]})
++        self.assertEqual([['one'], ['one'], []],
++                         [[walk['graph'] for walk in result['walks']] for result in out['results']])
++
++    def test_label_in_no_selected_graph(self):
++        res = self._post('traverse', {'seeds': [{'sequence': self.X, 'labels': ['A', 'C']}]})
++        self.assertEqual(400, res.status_code)
++        self.assertIn("'C'", res.text)
++
++
+ class TestTraverseLimits(TraverseServer):
+     """The server's limits of a request."""
+     mode = 'basic'
+diff --git a/metagraph/src/cli/server.cpp b/metagraph/src/cli/server.cpp
+index 7504741e88..0779428ac7 100644
+--- a/metagraph/src/cli/server.cpp
++++ b/metagraph/src/cli/server.cpp
+@@ -654,7 +654,7 @@ int run_server(Config *config) {
+         });
+     };
+ 
+-    // the traversal routes serve a single index: their bounds outlive this block
++    // the bounds of the traversal route outlive this block
+     const TraverseLimits traverse_bounds = traverse_limits(*config);
+     auto traverse_index = [&]() -> const AnnotatedDBG& {
+         if (anno_graph.wait_for(0s) != std::future_status::ready)
+@@ -673,7 +673,33 @@ int run_server(Config *config) {
+                 });
+             };
+         };
+-        server.resource["^/traverse$"]["POST"] = traverse_route(process_traverse_request);
++        server.resource["^/traverse$"]["POST"] = traverse_route(
++            [](const Json::Value &request, const AnnotatedDBG &index, const TraverseLimits &limits) {
++                return process_traverse_request(request, index, limits);
++            });
++    } else {
++        // a list of graphs: the graphs are selected as in /search, and each one is walked
++        server.resource["^/traverse$"]["POST"] = [&](shared_ptr<HttpServer::Response> response,
++                                                    shared_ptr<HttpServer::Request> request) {
++            size_t request_id = num_requests++;
++            process_request(response, request, request_id, [&, request_id](const std::string &content) {
++                const Json::Value json = parse_json_string(content);
++                if (!json.isObject())
++                    throw std::invalid_argument("The request must be a JSON object");
++                if (json.isMember("graphs") && !json["graphs"].isArray())
++                    throw std::invalid_argument("'graphs' must be an array of graph names");
++                std::vector<std::string> names = filter_graphs_from_list(indexes, json, request_id);
++                std::sort(names.begin(), names.end());
++                std::vector<TraverseIndex> selected;
++                for (const std::string &name : names) {
++                    for (const auto &files : indexes.at(name)) {
++                        selected.push_back({ name, graphs_cache.at(files).get() });
++                    }
++                }
++                return Json::writeString(Json::StreamWriterBuilder(),
++                    process_traverse_request(json, selected, traverse_bounds, graphs_pool));
++            });
++        };
+     }
+ 
+     server.default_resource["GET"] = [&](shared_ptr<HttpServer::Response> response,
+diff --git a/metagraph/src/cli/traverse.cpp b/metagraph/src/cli/traverse.cpp
+index dcb7a46604..5344017a49 100644
+--- a/metagraph/src/cli/traverse.cpp
++++ b/metagraph/src/cli/traverse.cpp
+@@ -1,6 +1,9 @@
+ #include "traverse.hpp"
+ 
++#include <algorithm>
+ #include <cmath>
++#include <exception>
++#include <future>
+ #include <limits>
+ #include <set>
+ 
+@@ -8,6 +11,7 @@
+ #include "graph/traversal/label_oracle.hpp"
+ #include "graph/traversal/resolve.hpp"
+ #include "graph/traversal/walker.hpp"
++#include "common/threads/threading.hpp"
+ #include "config/config.hpp"
+ 
+ 
+@@ -446,5 +450,119 @@ Json::Value process_traverse_request(const Json::Value &request,
+     return out;
+ }
+ 
++namespace {
++
++// What one index of a multi-graph server gives for a request
++struct IndexWalks {
++    // per seed: its walk or its error, or null when the index gives nothing for the seed
++    std::vector<Json::Value> walks;
++    // per seed and named label: whether the index has the label
++    std::vector<std::vector<bool>> known;
++    // per seed: whether the seed is shorter than the index's k
++    std::vector<bool> too_short;
++};
++
++IndexWalks walk_index(const TraverseRequest &req, const TraverseIndex &index) {
++    const LabelOracle oracle(*index.anno_graph);
++    IndexWalks out;
++    for (const Seed &named : req.seeds) {
++        out.known.emplace_back();
++        Json::Value &walk = out.walks.emplace_back();
++        // the index follows the labels it has
++        Seed seed;
++        seed.sequence = named.sequence;
++        for (const std::string &name : named.labels) {
++            out.known.back().push_back(oracle.find_column(name) || oracle.find_header(name));
++            if (out.known.back().back())
++                seed.labels.push_back(name);
++        }
++        out.too_short.push_back(seed.sequence.size() < oracle.get_k());
++        // an index without the seed or its labels gives nothing, like a search without hits
++        if ((named.labels.size() && seed.labels.empty()) || out.too_short.back())
++            continue;
++        try {
++            // a malformed seed or an ambiguous label refuses the request
++            check_seed(oracle, seed);
++            walk = seed_result_to_json(traverse_seed(oracle, seed, req.strategy));
++        } catch (const SeedNotInGraph &) {
++            continue;
++        } catch (const SeedDerivationError &e) {
++            if (e.cause() == SeedDerivationError::NO_CARRIER)
++                continue;
++            walk = failed_seed_to_json(seed, e);
++        }
++        walk["graph"] = index.graph;
++    }
++    return out;
++}
++
++} // namespace
++
++Json::Value process_traverse_request(const Json::Value &request,
++                                     const std::vector<TraverseIndex> &indexes,
++                                     const TraverseLimits &limits,
++                                     ThreadPool &pool) {
++    // the server has read the selection
++    Json::Value fields = request;
++    if (fields.isObject())
++        fields.removeMember("graphs");
++    const TraverseRequest req = parse_traverse_request(fields, limits);
++
++    std::vector<IndexWalks> walked(indexes.size());
++    // the tasks refer to this frame: they are waited for before it is left, also on a throw
++    struct Pending {
++        std::vector<std::shared_future<std::exception_ptr>> futures;
++        ~Pending() {
++            for (auto &future : futures)
++                future.wait();
++        }
++    } pending;
++    auto &futures = pending.futures;
++    // once a task runs, recording its future must not allocate
++    futures.reserve(indexes.size());
++    for (size_t i = 0; i < indexes.size(); ++i) {
++        futures.push_back(pool.enqueue([&, i]() {
++            try {
++                walked[i] = walk_index(req, indexes[i]);
++            } catch (...) {
++                return std::current_exception();
++            }
++            return std::exception_ptr();
++        }));
++    }
++    std::exception_ptr failed;
++    for (auto &future : futures) {
++        if (auto e = future.get(); e && !failed)
++            failed = e;
++    }
++    if (failed)
++        std::rethrow_exception(failed);
++
++    Json::Value out;
++    out["strategy"] = strategy_to_json(req.strategy);
++    Json::Value results(Json::arrayValue);
++    for (size_t s = 0; s < req.seeds.size(); ++s) {
++        if (std::all_of(walked.begin(), walked.end(),
++                        [&](const IndexWalks &w) { return w.too_short[s]; }))
++            throw std::invalid_argument("Seed shorter than k");
++        const std::vector<std::string> &labels = req.seeds[s].labels;
++        for (size_t l = 0; l < labels.size(); ++l) {
++            if (std::none_of(walked.begin(), walked.end(),
++                             [&](const IndexWalks &w) { return w.known[s][l]; })) {
++                throw std::invalid_argument("Label not found in the selected graphs: '"
++                                            + labels[l] + "'");
++            }
++        }
++        Json::Value walks(Json::arrayValue);
++        for (IndexWalks &w : walked) {
++            if (!w.walks[s].isNull())
++                walks.append(std::move(w.walks[s]));
++        }
++        results.append(Json::objectValue)["walks"] = std::move(walks);
++    }
++    out["results"] = std::move(results);
++    return out;
++}
++
+ } // namespace cli
+ } // namespace mtg
+diff --git a/metagraph/src/cli/traverse.hpp b/metagraph/src/cli/traverse.hpp
+index dcee2e9204..63c5607534 100644
+--- a/metagraph/src/cli/traverse.hpp
++++ b/metagraph/src/cli/traverse.hpp
+@@ -3,10 +3,14 @@
+ 
+ #include <cstdint>
+ #include <stdexcept>
++#include <string>
++#include <vector>
+ 
+ #include <json/json.h>
+ 
+ 
++class ThreadPool;
++
+ namespace mtg {
+ 
+ namespace graph {
+@@ -39,6 +43,20 @@ class InvalidRequest : public std::invalid_argument {
+ Json::Value process_traverse_request(const Json::Value &request,
+                                      const graph::AnnotatedDBG &anno_graph,
+                                      const TraverseLimits &limits);
++
++// One index of a server started with a list of graphs
++struct TraverseIndex {
++    std::string graph;  // its name in the list
++    const graph::AnnotatedDBG *anno_graph;
++};
++
++// The same request on several indexes, walked in |pool|. Each seed gets one walk per index
++// that holds the seed and at least one of its labels.
++Json::Value process_traverse_request(const Json::Value &request,
++                                     const std::vector<TraverseIndex> &indexes,
++                                     const TraverseLimits &limits,
++                                     ThreadPool &pool);
++
+ } // namespace cli
+ } // namespace mtg
+ 

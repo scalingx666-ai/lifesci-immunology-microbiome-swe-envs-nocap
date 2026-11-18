@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Fix NYT data, remove Apple mobility data
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `246b12b47f93`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

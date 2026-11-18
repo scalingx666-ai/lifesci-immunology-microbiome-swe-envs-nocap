@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** MiXCR format update
+
+## Description
+
+Support for MiXCR 4.1 format and manual count column selection
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ef585c9d502d`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,702 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8cf382431..0e9d72672 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### `Added`
+ 
+ - [#1022](https://github.com/nf-core/ampliseq/issues/1022) - added new GloSED database for classification of Eukaryotic ITS. Not support for SH numbers as of yet. (by @tom-brekke)
+-- [#1021](https://github.com/nf-core/ampliseq/pull/1021),[#1023](https://github.com/nf-core/ampliseq/pull/1023),[#1025](https://github.com/nf-core/ampliseq/pull/1025) - Comparison of observed ASVs against expected sequences or their abundance is now available with `--expected_*` parameters (by @d4straub, reviewed by @erikrikarddaniel)
++- [#1021](https://github.com/nf-core/ampliseq/pull/1021),[#1023](https://github.com/nf-core/ampliseq/pull/1023),[#1025](https://github.com/nf-core/ampliseq/pull/1025),[#1048](https://github.com/nf-core/ampliseq/pull/1048) - Comparison of observed ASVs and taxonomic profiles against expected data is now available with `--expected_*` parameters (by @d4straub, reviewed by @erikrikarddaniel)
+ - [#1026](https://github.com/nf-core/ampliseq/pull/1026),[#1046](https://github.com/nf-core/ampliseq/pull/1046) - Add support for Oxford Nanopore Technology (ONT) R10.4 sequencing (preferably with SUP basecalling) with Savont (by @d4straub)
+ - [#1042](https://github.com/nf-core/ampliseq/pull/1042) - DADA2 taxonomy tables (`ASV_tax.*.tsv`, `ASV_tax_species.*.tsv`) now include one `<rank>_confidence` column per rank, in addition to the existing overall `confidence` column (by @erikrikarddaniel)
+ - [#1042](https://github.com/nf-core/ampliseq/pull/1042) - Added CI test coverage for `--addsh`, which previously had none (`test_pacbio_its` now also runs DADA2 taxonomy against the UNITE database it already uses for SINTAX) (by @erikrikarddaniel)
+@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ | software | previously | now   |
+ | -------- | ---------- | ----- |
+ | ITSxRust | 0.2.2      | 0.3.0 |
++| Savont   |            | 0.6.3 |
+ 
+ ### `Removed`
+ 
+diff --git a/bin/compare_profile.r b/bin/compare_profile.r
+new file mode 100755
+index 000000000..fc39a6641
+--- /dev/null
++++ b/bin/compare_profile.r
+@@ -0,0 +1,290 @@
++#!/usr/bin/env Rscript
++
++# Get params and files from the command line
++args <- commandArgs(trailingOnly=TRUE)
++if (length(args) < 3) {
++	stop("Usage: Rscript compare_profile.r <tag> <obsFILE> <expFILE> [fbeta_val] [mode]")
++}
++tag <- args[1] # tag for each sample
++obsFILE <- args[2] # observed abundance*, e.g. "abs-abund-table-3.tsv"
++expFILE <- args[3] # expected abundance*, e.g. "expected_taxonomy.tsv"
++fbeta_val <- if (length(args) >= 4) as.numeric(args[4]) else 2 # Fbeta weight, default 2; 1=precision and recall equally weighted (=F1 score), 2=weighs recall higher than precision, 0.5=weighs recall lower than precision.
++mode <- if (length(args) >= 5) args[5] else "complete" # mode: "complete" for full taxonomic string, "level" for only the label at the given level
++
++# Args check
++if (!(mode %in% c("complete", "level"))) {
++	stop(paste("Invalid mode:", mode, ". Must be either 'complete' or 'level'."))
++}
++
++# Load data frames from TSV files - with potential biom header
++print(paste("Loading observed taxonomies from",obsFILE))
++if (grepl("^# Constructed from biom file", readLines(obsFILE, n = 1))) {
++	observed_taxonomy <- read.table(obsFILE, header = TRUE, sep = "\t", skip = 1, comment.char = "", check.names = FALSE)
++} else {
++	observed_taxonomy <- read.table(obsFILE, header = TRUE, sep = "\t", skip = 0, comment.char = "", check.names = FALSE)
++}
++print(paste("Loading expected taxonomies from",expFILE))
++if (grepl("^# Constructed from biom file", readLines(expFILE, n = 1))) {
++	expected_taxonomy <- read.table(expFILE, header = TRUE, sep = "\t", skip = 1, comment.char = "", check.names = FALSE)
++} else {
++	expected_taxonomy <- read.table(expFILE, header = TRUE, sep = "\t", skip = 0, comment.char = "", check.names = FALSE)
++}
++
++# Determine common samples
++common_samples <- intersect(colnames(observed_taxonomy)[-1], colnames(expected_taxonomy)[-1])
++if (length(common_samples) == 0) {
++	stop("ERROR: No common samples found between observed and expected taxonomy files.")
++}
++print(paste("Processing", length(common_samples), "common samples:",paste(common_samples,collapse=",")))
++
++# Function to get taxonomic levels based on mode (e.g., complete: L1: x1, L2: x1;x2; level: L1: x1, L2: x2)
++get_taxa_by_mode <- function(taxa_vec, level, mode) {
++	s <- strsplit(as.character(taxa_vec), ";")
++	sapply(s, function(x) {
++		if (length(x) >= level && !is.na(x[level]) && x[level] != "") {
++			if (mode == "complete") {
++				if (all(x[1:level] != "" & !is.na(x[1:level]))) {
++					return(paste(x[1:level], collapse = ";"))
++				}
++			} else if (mode == "level") {
++				return(x[level])
++			}
++		}
++		NA
++	})
++}
++
++# Function for classification metrics
++calculate_classification_metrics <- function(tp, fp, fn, fbeta_val) {
++	recall <- if ((tp + fn) > 0) tp / (tp + fn) else NA
++	precision <- if ((tp + fp) > 0) tp / (tp + fp) else NA
++	f1 <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) 2 * (precision * recall) / (precision + recall) else NA
++	fbeta_res <- if (!is.na(precision) && !is.na(recall) && (fbeta_val^2 * precision + recall) > 0) (1 + fbeta_val^2) * precision * recall / (fbeta_val^2 * precision + recall) else NA
++	fdr <- if ((tp + fp) > 0) fp / (tp + fp) else NA
++	jaccard <- if ((tp + fp + fn) > 0) tp / (tp + fp + fn) else NA
++	return(list(recall=recall, precision=precision, f1=f1, fbeta=fbeta_res, fdr=fdr, jaccard=jaccard))
++}
++
++# Function for correlation metrics
++calculate_correlation_metrics <- function(tp_set, obs_taxa_all_lev, exp_taxa_all_lev, obs_vec, exp_vec) {
++	p_cor <- NA
++	s_rho <- NA
++	if (length(tp_set) > 1) {
++		obs_aggregated <- tapply(obs_vec, obs_taxa_all_lev, sum, na.rm=TRUE)
++		exp_aggregated <- tapply(exp_vec, exp_taxa_all_lev, sum, na.rm=TRUE)
++		obs_vals <- obs_aggregated[tp_set]
++		exp_vals <- exp_aggregated[tp_set]
++		if (sd(obs_vals, na.rm=TRUE) > 0 && sd(exp_vals, na.rm=TRUE) > 0) {
++			p_cor <- cor(obs_vals, exp_vals, method = "pearson")
++			s_rho <- cor(obs_vals, exp_vals, method = "spearman")
++		}
++	}
++	return(list(pearson_cor=p_cor, spearman_rho=s_rho))
++}
++
++# Function for distance metrics
++calculate_distance_metrics <- function(obs_taxa_at_lev, exp_taxa_at_lev, obs_taxa_all_lev, obs_vec, exp_vec) {
++	all_taxa <- union(obs_taxa_at_lev, exp_taxa_at_lev)
++	res <- list(bray_curtis=NA, hellinger=NA, jensen_shannon=NA, deviation=NA, mae=NA, rmse=NA, ps=NA)
++
++	if (length(all_taxa) > 0) {
++		obs_all_vals <- tapply(obs_vec, obs_taxa_all_lev, sum, na.rm=TRUE)[all_taxa]
++		exp_all_vals <- tapply(exp_vec, exp_taxa_all_lev, sum, na.rm=TRUE)[all_taxa]
++		obs_all_vals[is.na(obs_all_vals)] <- 0
++		exp_all_vals[is.na(exp_all_vals)] <- 0
++
++		sum_obs <- sum(obs_all_vals)
++		sum_exp <- sum(exp_all_vals)
++
++		if (sum_obs > 0 && sum_exp > 0) {
++			obs_rel <- obs_all_vals / sum_obs
++			exp_rel <- exp_all_vals / sum_exp
++
++			res$bray_curtis <- sum(abs(obs_rel - exp_rel)) / 2
++			res$hellinger <- sqrt(sum((sqrt(obs_rel) - sqrt(exp_rel))^2))
++
++			kl_div <- function(x, y, pseudocount = 1e-10) {
++				x <- x + pseudocount
++				y <- y + pseudocount
++				x <- x / sum(x)
++				y <- y / sum(y)
++				sum(x * log(x / y))
++			}
++			m <- 0.5 * (obs_rel + exp_rel)
++			res$jensen_shannon <- sqrt(0.5 * kl_div(obs_rel, m) + 0.5 * kl_div(exp_rel, m))
++
++			res$ps <- sum(pmin(obs_rel, exp_rel)) / sum(exp_rel)
++
++			valid_exp_rel <- exp_rel > 0
++			if (any(valid_exp_rel)) {
++				perc_dev <- abs((obs_rel[valid_exp_rel] - exp_rel[valid_exp_rel]) / exp_rel[valid_exp_rel]) * 100
++				res$deviation <- median(perc_dev, na.rm = TRUE)
++			}
++			res$mae <- mean(abs(obs_rel - exp_rel))
++			res$rmse <- sqrt(mean((obs_rel - exp_rel)^2))
++		}
++	}
++	return(res)
++}
++
++# Determine max taxonomic depth across both files
++max_obs_lev <- max(sapply(strsplit(as.character(observed_taxonomy[, 1]), ";"), length))
++max_exp_lev <- max(sapply(strsplit(as.character(expected_taxonomy[, 1]), ";"), length))
++max_lev <- max(max_obs_lev, max_exp_lev)
++print(paste("Processing", max_lev, "taxonomic levels"))
++
++# Use a list to store results
++results_list <- list()
++res_counter <- 1
++
++for (s in common_samples) {
++	idx_obs <- which(colnames(observed_taxonomy) == s)
++	idx_exp <- which(colnames(expected_taxonomy) == s)
++
++	for (l in 1:max_lev) {
++		level_name <- paste0("L", l)
++
++		# Taxon strings for this level for all entries based on the specified mode
++		obs_taxa_all_lev <- get_taxa_by_mode(observed_taxonomy[, 1], l, mode)
++		exp_taxa_all_lev <- get_taxa_by_mode(expected_taxonomy[, 1], l, mode)
++
++		# Observed taxa present in this sample at this level
++		obs_taxa_at_lev <- unique(obs_taxa_all_lev[observed_taxonomy[, idx_obs] > 0])
++		obs_taxa_at_lev <- obs_taxa_at_lev[!is.na(obs_taxa_at_lev) & obs_taxa_at_lev != ""]
++
++		# Expected taxa present in this sample at this level
++		exp_taxa_at_lev <- unique(exp_taxa_all_lev[expected_taxonomy[, idx_exp] > 0])
++		exp_taxa_at_lev <- exp_taxa_at_lev[!is.na(exp_taxa_at_lev) & exp_taxa_at_lev != ""]
++
++		# Calculate sets
++		tp_set <- intersect(obs_taxa_at_lev, exp_taxa_at_lev)
++		fp_set <- setdiff(obs_taxa_at_lev, exp_taxa_at_lev)
++		fn_set <- setdiff(exp_taxa_at_lev, obs_taxa_at_lev)
++
++		# Calculate counts
++		tp <- length(tp_set)
++		fp <- length(fp_set)
++		fn <- length(fn_set)
++		exp_count <- length(exp_taxa_at_lev)
++		obs_count <- length(obs_taxa_at_lev)
++
++		# Classification metrics - based on counts
++		metrics_class <- calculate_classification_metrics(tp, fp, fn, fbeta_val)
++
++		# Correlation calculations
++		metrics_corr <- calculate_correlation_metrics(tp_set, obs_taxa_all_lev, exp_taxa_all_lev, observed_taxonomy[, idx_obs], expected_taxonomy[, idx_exp])
++
++		# Distance and Error metrics
++		metrics_dist <- calculate_distance_metrics(obs_taxa_at_lev, exp_taxa_at_lev, obs_taxa_all_lev, observed_taxonomy[, idx_obs], expected_taxonomy[, idx_exp])
++
++		# Sequence of metrics as requested
++		metrics_seq <- list(
++			list(type = "exp", value = exp_count),
++			list(type = "obs", value = obs_count),
++			list(type = "TP",	value = tp),
++			list(type = "FN",	value = fn),
++			list(type = "FP",	value = fp),
++			list(type = "recall", value = metrics_class$recall),
++			list(type = "precision", value = metrics_class$precision),
++			list(type = "F1", value = metrics_class$f1),
++			list(type = "Fbeta", value = metrics_class$fbeta),
++			list(type = "fdr", value = metrics_class$fdr),
++			list(type = "jaccard", value = metrics_class$jaccard),
++			list(type = "TPs_exp", value = paste(head(tp_set, 100), collapse = ",")),
++			list(type = "FNs_exp", value = paste(head(fn_set, 100), collapse = ",")),
++			list(type = "FPs_obs", value = paste(head(fp_set, 100), collapse = ",")),
++			list(type = "bray-curtis", value = metrics_dist$bray_curtis),
++			list(type = "hellinger", value = metrics_dist$hellinger),
++			list(type = "jensen-shannon", value = metrics_dist$jensen_shannon),
++			list(type = "pearson_cor", value = metrics_corr$pearson_cor),
++			list(type = "spearman_rho", value = metrics_corr$spearman_rho),
++			list(type = "deviation", value = metrics_dist$deviation),
++			list(type = "mae", value = metrics_dist$mae),
++			list(type = "rmse", value = metrics_dist$rmse),
++			list(type = "ps", value = metrics_dist$ps)
++		)
++			for (m in metrics_seq) {
++			results_list[[res_counter]] <- data.frame(
++				sample = s,
++				level = level_name,
++				type = m$type,
++				value = as.character(m$value),
++				stringsAsFactors = FALSE
++			)
++			res_counter <- res_counter + 1
++		}
++	}
++}
++
++# Write detailed output
++results <- do.call(rbind, results_list)
++results$tag <- rep(tag, nrow(results))
++outfile <- "profile_per-sample.tsv"
++print(paste("Writing detailed output to:", outfile))
++write.table(results, outfile, sep = "\t", row.names = FALSE, quote = FALSE)
++
++# SUMMARY TABLE
++outfile <- "profile_summary.tsv"
++print(paste("Writing summary table to:", outfile))
++df_sum <- data.frame(level=character(), type=character(), median=numeric(), mean=numeric(), standard_error=numeric(), min=numeric(), max=numeric(), count=numeric(), stringsAsFactors=FALSE)
++
++# Convert values to numeric for summary
++results_num <- results
++results_num$value <- as.numeric(results_num$value)
++
++for (lev in unique(results_num$level)) {
++	for (type in unique(results_num$type)) {
++		if (type %in% c("TPs_exp","FNs_exp","FPs_obs")) next #exclude non-helpful entries
++		df_subset <- results_num[results_num$level == lev & results_num$type == type, ]
++		if (nrow(df_subset) == 0) next
++		COUNT <- sum( !is.na(df_subset$value) ) # counts all non-na values
++		MEDIAN <- median( df_subset$value, na.rm = TRUE )
++		MEAN <- mean( df_subset$value, na.rm = TRUE )
++		SE <- sd( df_subset$value, na.rm = TRUE ) / sqrt(length(df_subset$value))
++		MIN <- ifelse(COUNT==0, NA, min( df_subset$value, na.rm = TRUE ) ) # avoid -Inf when there are no values
++		MAX <- ifelse(COUNT==0, NA, max( df_subset$value, na.rm = TRUE ) ) # avoid Inf when there are no values
++		df_sum[nrow(df_sum) + 1,] <- list(lev, type, MEDIAN, MEAN, SE, MIN, MAX, COUNT)
++	}
++}
++df_sum$tag <- rep(tag, nrow(df_sum))
++write.table(df_sum, outfile, sep = "\t", row.names = FALSE, quote = FALSE)
++
++# LINE PLOT PER LEVEL
++plot_metrics <- c("F1", "recall", "precision")
++metric_colors <- c("F1" = "black", "recall" = "red", "precision" = "blue")
++
++all_levels <- unique(df_sum$level)
++levels_num <- 1:length(all_levels)
++
++draw_line_plot <- function() {
++	plot(NULL, xlim = c(1, length(all_levels)), ylim = c(0, 1),
++		xaxt = "n", xlab = "Level", ylab = "Median",
++		main = "Profile Summary Metrics")
++	axis(1, at = levels_num, labels = all_levels)
++
++	for (m in plot_metrics) {
++		subset_df <- subset(df_sum, type == m)
++		if (nrow(subset_df) > 0) {
++			y <- subset_df$median # alternative: subset_df$mean
++			se <- subset_df$standard_error
++			x <- 1:nrow(subset_df)
++			lines(x, y, col = metric_colors[m], lwd = 2, type = "b", pch = 19)
++			segments(x, y - se, x, y + se, col = metric_colors[m])
++		}
++	}
++	legend("bottomleft", legend = names(metric_colors), col = metric_colors, lty = 1, pch = 19, lwd = 2)
++}
++
++# Plot SVG
++outfile_svg <- "profile_lineplot.svg"
++print(paste("Writing lineplot SVG to:", outfile_svg))
++svg(outfile_svg, height = 8, width = 12)
++draw_line_plot()
++invisible(dev.off())
++
++# Plot PNG
++outfile_png <- "profile_lineplot.png"
++print(paste("Writing lineplot PNG to:", outfile_png))
++png(outfile_png, height = 400, width = 600)
++draw_line_plot()
++invisible(dev.off())
+diff --git a/conf/modules.config b/conf/modules.config
+index 68575dc44..5e5acf6a8 100644
+--- a/conf/modules.config
++++ b/conf/modules.config
+@@ -1297,6 +1297,16 @@ process {
+         ]
+     }
+ 
++    withName: COMPARE_PROFILE {
++        ext.mode = "level" // options for comparison: "complete" for full taxonomic string, "level" for only the label at the given level
++        ext.fbeta = 2 // Fbeta weight, default 2; 1=precision and recall equally weighted (=F1 score), 2=weighs recall higher than precision, 0.5=weighs recall lower than precision.
++        publishDir = [
++            path: { "${params.outdir}/comparison" },
++            mode: params.publish_dir_mode,
++            saveAs: { filename -> filename.equals('versions.yml') ? null : filename }
++        ]
++    }
++
+     withName: 'MULTIQC' {
+         ext.args   = { params.multiqc_title ? "--title \"$params.multiqc_title\"" : '' }
+         publishDir = [
+diff --git a/conf/test_savont.config b/conf/test_savont.config
+index 582c21f9a..b98518657 100644
+--- a/conf/test_savont.config
++++ b/conf/test_savont.config
+@@ -49,10 +49,8 @@ params {
+     expected_sequences = params.pipelines_testdata_base_path + "ampliseq/expected/D6305-D6311_ZymoBIOMICS.STD.refseq.v2.ssrRNAs.unique.fasta"
+     expected_abundances = params.pipelines_testdata_base_path + "ampliseq/expected/D6305-D6311_ZymoBIOMICS.STD.refseq.v2.ssrRNAs.unique.abundance.tsv"
+     expected_sequences_mismatches = 4
++    expected_profile = params.pipelines_testdata_base_path + "ampliseq/expected/D6305-D6311_ZymoBIOMICS.STD.refseq.v2.prokaryotes.profile.gtdb_R07-RS207.tsv"
+ 
+-    // restrict ANCOM analysis to higher taxonomic levels
+-    tax_agglom_max = 3
+-
+-    // Test ANCOMBC2
+-    ancombc2 = true
++    // export also higher taxonomic levels
++    tax_agglom_max = 7
+ }
+diff --git a/docs/output.md b/docs/output.md
+index dffdbd590..e7aac17d4 100644
+--- a/docs/output.md
++++ b/docs/output.md
+@@ -706,7 +706,10 @@ On request (`--ancombc2`), ANCOM-BC2 is applied to each suitable or specified me
+ 
+ ### Compare observed to expected outcome
+ 
+-The observed results can be compared to expected outcomes per sample, typically for samples with known composition such as mock communities, to assess the performance of the data generation and analysis. Steps to evaluate the produced ASVs are implemented in the pipeline.
++The observed results can be compared to expected outcomes per sample, typically for samples with known composition such as mock communities, to assess the performance of the data generation and analysis.
++Steps to evaluate the produced ASVs and taxonomic profile are implemented in the pipeline.
++
++#### Computed output files
+ 
+ When expected sequences are supplied, the following files will be produced:
+ 
+@@ -725,9 +728,42 @@ When expected sequences are supplied, the following files will be produced:
+ 
+ </details>
+ 
+-When expected abundances are available, additional performance metrics will be generated.
++When expected abundances are available, the following additional files will be produced:
++
++<details markdown="1">
++<summary>Output files</summary>
+ 
+-#### Metrics base on presence/absence:
++- `comparison/`
++  - `abundances_per-sample.tsv`: Tab-separated table with abundance of expected and observed sequences per sample, in long format.
++  - `performance_summary.tsv`: Tab-separated table with aggregated performance metrics.
++  - `performance_per-sample.tsv`: Tab-separated table with performance metrics per sample, in long format.
++  - `performance.log`: Log file, complementary to `nucleotide-differences.log`.
++  - `performance_boxplot.png`: Boxplot of number of aggregated performance metrics in png format.
++  - `performance_boxplot.svg`: Boxplot of number of aggregated performance metrics in svg format.
++- `comparison/per-sample`
++  - `<sample>_abundance_barplot.svg`: Side-by-Side bar plots in svg format.
++  - `<sample>_rank_abundance_curve.svg`: Rank Abundance Curves in svg format.
++  - `<sample>_scatter_loglog.svg`: Scatter plot: Observed vs. Expected Abundance (log-log) in svg format.
++
++</details>
++
++When expected profiles are available, the following files will be produced:
++
++<details markdown="1">
++<summary>Output files</summary>
++
++- `comparison/`
++  - `profile_summary.tsv`: Tab-separated table with aggregated performance metrics per taxonomic level.
++  - `profile_per-sample.tsv`: Tab-separated table with performance metrics per sample and taxonomic level, in long format.
++  - `profile.log`: Log file.
++  - `profile_lineplot.png`: Line plot of median F1 score, recall, and precision per taxonomic level in png format.
++  - `profile_lineplot.svg`: Line plot of median F1 score, recall, and precision per taxonomic level in svg format.
++
++</details>
++
++#### Computed comparative metrices within output files
++
++##### Metrics base on presence/absence:
+ 
+ - `observed`: Number of observed sequences
+ - `expected`: Number of expected sequences
+@@ -750,7 +786,7 @@ When expected abundances are available, additional performance metrics will be g
+ > [!WARNING]
+ > If the supplied expected sequences are not unique in the region of the alignment with the observed sequences, alignment matches are used to aggregate identical expected sequences and vice versa. In case there isn't an exact match to a set of identical expected sequences, those will not be aggregated and inflate the number of expected sequences.
+ 
+-#### Metrics based on abundances:
++##### Metrics based on abundances:
+ 
+ (1) based on filtered abundance tables, **excluding** non-matching sequences (FP & FN)
+ 
+@@ -769,25 +805,6 @@ These metrics would be inflated, dominated or skewed by false positives and fals
+ - `hellinger`: Hellinger Distance
+ - `jensen-shannon`: Jensen-Shannon Divergence
+ 
+-The following additional files will be produced:
+-
+-<details markdown="1">
+-<summary>Output files</summary>
+-
+-- `comparison/`
+-  - `abundances_per-sample.tsv`: Tab-separated table with abundance of expected and observed sequences per sample, in long format.
+-  - `performance_summary.tsv`: Tab-separated table with aggregated performance metrics.
+-  - `performance_per-sample.tsv`: Tab-separated table with performance metrics per sample, in long format.
+-  - `performance.log`: Log file, complementary to `nucleotide-differences.log`.
+-  - `performance_boxplot.png`: Boxplot of number of aggregated performance metrics in png format.
+-  - `performance_boxplot.svg`: Boxplot of number of aggregated performance metrics in svg format.
+-- `comparison/per-sample`
+-  - `<sample>_abundance_barplot.svg`: Side-by-Side bar plots in svg format.
+-  - `<sample>_rank_abundance_curve.svg`: Rank Abundance Curves in svg format.
+-  - `<sample>_scatter_loglog.svg`: Scatter plot: Observed vs. Expected Abundance (log-log) in svg format.
+-
+-</details>
+-
+ ### PICRUSt2
+ 
+ PICRUSt2 (Phylogenetic Investigation of Communities by Reconstruction of Unobserved States) is a software for predicting functional abundances based only on marker gene sequences. On demand (`--picrust`), Enzyme Classification numbers (EC), KEGG orthologs (KO) and MetaCyc ontology predictions will be made for each sample.
+diff --git a/main.nf b/main.nf
+index dbe6471a4..ca9be493f 100644
+--- a/main.nf
++++ b/main.nf
+@@ -180,6 +180,7 @@ params {
+     expected_sequences_region: String = 'query'
+     expected_sequences_mismatches: Integer = 0
+     expected_abundances: Path?
++    expected_profile: Path?
+     report_template: String = '${projectDir}/assets/report_template.Rmd'
+     report_css: String = '${projectDir}/assets/nf-core_style.css'
+     report_logo: String = '${projectDir}/assets/nf-core-ampliseq_logo_light_long.png'
+diff --git a/modules/local/compare_performance.nf b/modules/local/compare_performance.nf
+index 264760179..165327208 100644
+--- a/modules/local/compare_performance.nf
++++ b/modules/local/compare_performance.nf
+@@ -9,8 +9,8 @@ process COMPARE_PERFORMANCE {
+ 
+     input:
+     tuple val(meta), path(alignment) // alignment file with "query,target,mismatch_final"
+-    path(observed_abundances)        // ASV table from within pipeline
+-    path(expected_abundances)        // ASV table from params.expected_abundances
++    path(observed_abundances, stageAs: 'observed/*') // ASV table from within pipeline
++    path(expected_abundances, stageAs: 'expected/*') // ASV table from params.expected_abundances
+ 
+     output:
+     path("*.svg")                            , emit: svg
+diff --git a/modules/local/compare_profile.nf b/modules/local/compare_profile.nf
+new file mode 100644
+index 000000000..dd2fa2e29
+--- /dev/null
++++ b/modules/local/compare_profile.nf
+@@ -0,0 +1,39 @@
++process COMPARE_PROFILE {
++    tag "${meta.id}"
++    label 'process_single'
++
++    conda "conda-forge::r-base=4.2.1"
++    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
++        'https://depot.galaxyproject.org/singularity/r-base:4.2.1' :
++        'biocontainers/r-base:4.2.1' }"
++
++    input:
++    tuple val(meta), path(observed_profile, stageAs: 'observed/*') // Exported taxonomic profile table from within pipeline
++    path(expected_profile, stageAs: 'expected/*')
++
++    output:
++    path("*.svg")                        , emit: svg
++    path("*.png")                        , emit: png
++    path("profile_summary.tsv")          , emit: performance
++    path("profile_per-sample.tsv")       , emit: performance_per_sample
++    path("profile.log")                  , emit: log
++    path "versions.yml"                  , emit: versions, topic: versions
++
++    script:
++    def fbeta = task.ext.fbeta ?: 2
++    def mode = task.ext.mode ?: "complete"
++    """
++    compare_profile.r \\
++        "${meta.id}" \\
++        "$observed_profile" \\
++        "$expected_profile" \\
++        "$fbeta" \\
++        "$mode" \\
++        >"profile.log"
++
++    cat <<-END_VERSIONS > versions.yml
++    "${task.process}":
++        R: \$(R --version | sed -n 1p | sed 's/R version //g' | sed 's/\\s.*\$//')
++    END_VERSIONS
++    """
++}
+diff --git a/modules/local/compare_sequences.nf b/modules/local/compare_sequences.nf
+index 1c56e14a9..294afc8a7 100644
+--- a/modules/local/compare_sequences.nf
++++ b/modules/local/compare_sequences.nf
+@@ -9,8 +9,8 @@ process COMPARE_SEQUENCES {
+ 
+     input:
+     tuple val(meta), path(blast6out) // VSEARCH_USEARCHGLOBAL
+-    path(observed_abundances)        // ASV table from within pipeline
+-    path(expected_abundances)        // ASV table from params.expected_abundances
++    path(observed_abundances, stageAs: 'observed/*') // ASV table from within pipeline
++    path(expected_abundances, stageAs: 'expected/*') // ASV table from params.expected_abundances
+     val(similarity_threshold)        // Similarity threshold for maches of VSEARCH
+     val(query_or_target)             // what reagion to evaluate (query,target,alignment) from params.expected_sequences_region
+     val(trace_report_suffix)         // timestamp of pipeline info files
+diff --git a/nextflow_schema.json b/nextflow_schema.json
+index 48f3b5dc2..d32a58c8c 100644
+--- a/nextflow_schema.json
++++ b/nextflow_schema.json
+@@ -1022,6 +1022,14 @@
+                     "pattern": "^\\S+\\.(tsv|txt)$",
+                     "description": "Path to file of abundances of expected sequences in tsv format",
+                     "help_text": "Tab-separated table with header. First column is sequence IDs corresponding to the fasta file supplied with `--expected_sequences`. All further columns should have names corresponding to the sample names in `--input` or other input options. Samples will only compared to when they are in sequencing data input and the expected abundance input. This allows for example to only compare mock samples that were added to another data set as controls."
++                },
++                "expected_profile": {
++                    "type": "string",
++                    "format": "file-path",
++                    "mimetype": "text/tsv",
++                    "pattern": "^\\S+\\.(tsv|txt)$",
++                    "description": "Path to file of abundances of expected taxnonomies in tsv format",
++                    "help_text": "Tab-separated table with header. First column is taxonomic string (levels are semicolon-separated). All further columns should have names corresponding to the sample names in `--input` or other input options. Samples will only compared to when they are in sequencing data input and the expected profile input. This allows for example to only compare mock samples that were added to another data set as controls."
+                 }
+             },
+             "fa_icon": "fas fa-book-open"
+diff --git a/subworkflows/local/comparison_wf.nf b/subworkflows/local/comparison_wf.nf
+index 4e7766cc3..c1ffd21a6 100644
+--- a/subworkflows/local/comparison_wf.nf
++++ b/subworkflows/local/comparison_wf.nf
+@@ -1,6 +1,7 @@
+ include { VSEARCH_USEARCHGLOBAL as VSEARCH_USEARCHGLOBAL_BM } from '../../modules/nf-core/vsearch/usearchglobal/main'
+ include { COMPARE_SEQUENCES       } from '../../modules/local/compare_sequences'
+ include { COMPARE_PERFORMANCE     } from '../../modules/local/compare_performance'
++include { COMPARE_PROFILE         } from '../../modules/local/compare_profile'
+ 
+ workflow COMPARISON_WF {
+     take:
+@@ -10,8 +11,10 @@ workflow COMPARISON_WF {
+     query_or_target        // region to evaluate
+     ch_observed_sequences  // observed sequences (fasta)
+     ch_observed_abundances // observed sequences (abundance table)
++    ch_observed_profile    // observed taxonomic profile
+     ch_expected_sequences  // expected sequences (fasta)
+     ch_expected_abundances // expected sequences (abundance table)
++    ch_expected_profile    // expected taxonomic profile
+ 
+     main:
+     // Compare observed sequences to expected sequences (global alignment)
+@@ -25,14 +28,35 @@ workflow COMPARISON_WF {
+         "query+target+ql+tl+qilo+qihi+tilo+tihi+gaps+mism+qstrand" )
+ 
+     // Investigate mismatches per sample, plus barplot (y = number of sequences, x = number of mismatches)
+-    COMPARE_SEQUENCES ( VSEARCH_USEARCHGLOBAL_BM.out.tsv, ch_observed_abundances, ch_expected_abundances.ifEmpty([]), similarity_threshold, query_or_target, trace_report_suffix, val_params_string )
++    COMPARE_SEQUENCES (
++        VSEARCH_USEARCHGLOBAL_BM.out.tsv,
++        ch_observed_abundances,
++        ch_expected_abundances.ifEmpty([]),
++        similarity_threshold,
++        query_or_target,
++        trace_report_suffix,
++        val_params_string
++    )
+     COMPARE_SEQUENCES.out.warnings.subscribe{ it ->
+             if( it.countLines() > 0 ) { log.warn "about comparing sequences\n\n" + it.splitText().join("") }
+         }
+ 
+     // Calculate absence/presence performance metrics per sample such as precision, recall, F1 score
+     // Calculate abundance performance metrics per sample such as spearman's rho, RMSE, Bray-Curtis distance
+-    COMPARE_PERFORMANCE ( COMPARE_SEQUENCES.out.matches.map { it = [ [id: val_md5sum_version], file(it) ] }, ch_observed_abundances, ch_expected_abundances )
++    COMPARE_PERFORMANCE (
++        COMPARE_SEQUENCES.out.matches.map { it = [ [id: val_md5sum_version], file(it) ] },
++        ch_observed_abundances,
++        ch_expected_abundances
++    )
++
++    // Compare taxonomic profiles
++    COMPARE_PROFILE (
++        ch_observed_profile
++            .collect(sort: true) // all files originate from same work dir
++            .map { list -> list[-1] } // take only the file with the highest taxonomic level
++            .map { it = [ [id: val_md5sum_version], it ] },
++        ch_expected_profile
++    )
+ 
+     emit:
+     mismatch_barplot_png = COMPARE_SEQUENCES.out.png.collect()
+diff --git a/subworkflows/local/qiime2_export.nf b/subworkflows/local/qiime2_export.nf
+index 6c5707c0f..938f144ed 100644
+--- a/subworkflows/local/qiime2_export.nf
++++ b/subworkflows/local/qiime2_export.nf
+@@ -34,4 +34,5 @@ workflow QIIME2_EXPORT {
+     abs_fasta = QIIME2_EXPORT_ABSOLUTE.out.fasta
+     abs_tsv   = QIIME2_EXPORT_ABSOLUTE.out.tsv
+     rel_tsv   = QIIME2_EXPORT_RELASV.out.tsv
++    rel_tax   = QIIME2_EXPORT_RELTAX.out.tsv
+ }
+diff --git a/tests/savont.nf.test.snap b/tests/savont.nf.test.snap
+index 310610007..9e0033882 100644
+--- a/tests/savont.nf.test.snap
++++ b/tests/savont.nf.test.snap
+@@ -17,6 +17,9 @@
+                 "COMPARE_PERFORMANCE": {
+                     "R": "4.2.1"
+                 },
++                "COMPARE_PROFILE": {
++                    "R": "4.2.1"
++                },
+                 "COMPARE_SEQUENCES": {
+                     "R": "4.2.1"
+                 },
+@@ -183,6 +186,11 @@
+                 "comparison/performance_boxplot.svg",
+                 "comparison/performance_per-sample.tsv",
+                 "comparison/performance_summary.tsv",
++                "comparison/profile.log",
++                "comparison/profile_lineplot.png",
++                "comparison/profile_lineplot.svg",
++                "comparison/profile_per-sample.tsv",
++                "comparison/profile_summary.tsv",
+                 "comparison/vsearch_usearchglobal.tsv",
+                 "cutadapt",
+                 "cutadapt/Log1.trimmed.cutadapt.log",
+@@ -340,6 +348,10 @@
+                 "qiime2/abundance_tables",
+                 "qiime2/abundance_tables/abs-abund-table-2.tsv",
+                 "qiime2/abundance_tables/abs-abund-table-3.tsv",
++                "qiime2/abundance_tables/abs-abund-table-4.tsv",
++                "qiime2/abundance_tables/abs-abund-table-5.tsv",
++                "qiime2/abundance_tables/abs-abund-table-6.tsv",
++                "qiime2/abundance_tables/abs-abund-table-7.tsv",
+                 "qiime2/abundance_tables/count_table_filter_stats.tsv",
+                 "qiime2/abundance_tables/feature-table.biom",
+                 "qiime2/abundance_tables/feature-table.tsv",
+@@ -394,6 +406,10 @@
+                 "qiime2/rel_abundance_tables",
+                 "qiime2/rel_abundance_tables/rel-table-2.tsv",
+                 "qiime2/rel_abundance_tables/rel-table-3.tsv",
++                "qiime2/rel_abundance_tables/rel-table-4.tsv",
++                "qiime2/rel_abundance_tables/rel-table-5.tsv",
++                "qiime2/rel_abundance_tables/rel-table-6.tsv",
++                "qiime2/rel_abundance_tables/rel-table-7.tsv",
+                 "qiime2/rel_abundance_tables/rel-table-ASV.tsv",
+                 "qiime2/rel_abundance_tables/rel-table-ASV_with-DADA2-gtdb_R07-RS207-tax.tsv",
+                 "qiime2/representative_sequences",
+diff --git a/workflows/ampliseq.nf b/workflows/ampliseq.nf
+index d6ae2838c..893429c77 100644
+--- a/workflows/ampliseq.nf
++++ b/workflows/ampliseq.nf
+@@ -1212,7 +1212,7 @@ workflow AMPLISEQ {
+     //
+     // WORKFLOW: Comparison to expected
+     //
+-    if ( params.expected_sequences ) {
++    if ( params.expected_sequences || params.expected_profile ) {
+         def val_params_string = params.findAll{ it.key != 'trace_report_suffix' }.toString()
+         COMPARISON_WF (
+             ( val_params_string.md5() + "_${workflow.manifest.version}" ),  // md5sum of params (without variable time stamp in "trace_report_suffix") appended by pipeline version
+@@ -1221,8 +1221,10 @@ workflow AMPLISEQ {
+             params.expected_sequences_region,
+             run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.abs_fasta : ch_asv_fasta,  // observed sequences (fasta)
+             run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.rel_tsv : ch_asv_table,      // observed sequences (abundance table)
++            run_qiime2 && !params.skip_abundance_tables ? QIIME2_EXPORT.out.rel_tax : channel.empty(),   // observed taxonomic profile
+             params.expected_sequences ? channel.fromPath( params.expected_sequences ) : channel.empty(),  // expected sequences (fasta)
+-            params.expected_abundances ? channel.fromPath( params.expected_abundances ) : channel.empty() // expected sequences (abundance table)
++            params.expected_abundances ? channel.fromPath( params.expected_abundances ) : channel.empty(),// expected sequences (abundance table)
++            params.expected_profile ? channel.fromPath( params.expected_profile ) : channel.empty() // expected taxonomic profile
+         )
+     }
+ 

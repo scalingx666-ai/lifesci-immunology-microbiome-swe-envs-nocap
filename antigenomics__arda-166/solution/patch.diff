@@ -1,0 +1,776 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5d7f4ab..2a5c535 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,22 @@
+ What changed for you, per release. Anything not listed is internal.
+ Full release notes: <https://github.com/antigenomics/arda/releases>.
+ 
++## Unreleased
++
++- RNA mode now merges established observed mate overlaps by default; use
++  `--no-reconstruct` (Python `reconstruct=False`) for independent mates. Standalone
++  `map` and amplicon defaults are unchanged. The same policy reaches scheduled RNA
++  workflows. Overlap, mismatch and annotation score cutoffs are unchanged.
++- Preserve the measured quality of every selected merged base without confidence
++  inflation, allowing junction/mutation quality output with reconstruction. Preserve
++  R1's observed trailing bases when the second mate is contained in it.
++- If a longer merged J+C hit masks a complete original-mate junction, retry those
++  mates in one native batch and retain their established evidence. Track restored
++  pairs and actual unions separately, with a complete record ledger.
++- Merged overlaps are one fragment record; unmerged pairs remain two mate records.
++  This changes mapped-record/read denominators and can change calls and correction;
++  compare physical-fragment support separately when comparing older RNA runs.
++
+ ## 2.38.6
+ 
+ - Base junction amino-acid frame bridging on its own observed anchor span. An upstream V
+diff --git a/docs/usage.rst b/docs/usage.rst
+index 04c06cb..76f6cb1 100644
+--- a/docs/usage.rst
++++ b/docs/usage.rst
+@@ -327,8 +327,22 @@ The modes run these for you; run them separately when you want to shard Stage 1
+ **map** streams paired FASTQ and writes only the reads that map to a receptor scaffold. The
+ reference includes ``J + C`` constant-region scaffolds, so a read spanning the J→C splice still
+ maps and carries a ``c_call`` (CH1 exon) and a ``c_class`` isotype (``IGHG``/``IGHM``/``IGHA`` …
+-— the class, never the subclass). With ``--reconstruct``, overlapping mates are merged into one
+-fragment; a mismatch in the overlap is resolved base-by-base in favour of the higher-Phred call.
++— the class, never the subclass). RNA mode merges established observed mate overlaps by
++default (``--no-reconstruct`` retains independent mates). Standalone ``map`` and amplicon
++mode retain their independent-mate defaults; ``--reconstruct`` enables merging there.
++A mismatch in the overlap follows the higher-Phred observation (R1 wins ties). Each merged
++base retains its selected input quality, without boosting confidence at agreeing bases.
++Both observed tails are retained, including a mate contained inside R1. Missing qualities
++remain unknown. If a longer merged J+C hit masks a junction, original mates are checked in
++one bounded batch; a mate's existing complete junction above the unchanged score gate is
++retained instead. ``paired_fallback_fragments`` counts these restored pairs;
++``merged_fragments`` counts the unions actually retained. Overlap, mismatch and
++annotation-score gates are unchanged.
++
++A merged overlap is one fragment record; an unmerged pair remains two mate records.
++Consequently, record counts, read-length summaries and ``duplicate_count`` can change
++against independent-mate runs. Compare ``consensus_count`` and physical-fragment membership
++separately when evaluating that change.
+ 
+ **assemble** reconstructs clonotypes with a CDR3 too long for any single 100–150 bp read to span
+ (V(DD)J ultralong, ~20–40 aa): it anchors on Stage-1's per-read ``cdr3_start`` and grows contigs
+@@ -450,8 +464,8 @@ from the third. ``arda stats`` reads it to score its ``allele_candidate`` shortl
+ 
+    **The two quality columns use different encodings.** ``junction_quality`` is raw Phred+33
+    characters, so it lines up byte for byte with ``junction``; ``v_mutation_quality`` is comma-joined
+-   integers. Reading one as the other gives plausible numbers off by 33. Both are refused with
+-   ``--reconstruct``. See :doc:`qc`.
++   integers. Reading one as the other gives plausible numbers off by 33. Both work with
++   ``--reconstruct`` using selected-input base qualities. See :doc:`qc`.
+ 
+ Finishing a truncated junction from the germline
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/src/arda/cli.py b/src/arda/cli.py
+index 0df8164..38886fc 100644
+--- a/src/arda/cli.py
++++ b/src/arda/cli.py
+@@ -602,8 +602,8 @@ def rnaseq_map(
+              "is still in hand, and `correct --min-junction-q` needs it -- measured on a MIGEC "
+              "spike-in library, the mismatching base of a real variant reads median Q 34-35 "
+              "against median Q 16 for the sequencing-error cloud around it. OFF by default: it "
+-             "appends a non-schema column, so the default output is unchanged. Not usable with "
+-             "--reconstruct (a merged fragment has no single input quality string)."),
++             "appends a non-schema column, so the default output is unchanged. Merged bases "
++             "retain the measured quality of their selected input observation."),
+     mutation_quality: bool = typer.Option(
+         False, "--mutation-quality/--no-mutation-quality",
+         help="Also emit `v_mutation_quality` / `j_mutation_quality`: the read's Phred score at "
+@@ -612,8 +612,8 @@ def rnaseq_map(
+              "string in the mutation list -- what separates them is how often the mutation recurs "
+              "across an allele's reads and how good the base is, and only the second of those "
+              "needs a column. `arda stats` reads it for `allele_candidate mean_quality`. OFF by "
+-             "default (non-schema columns, and it re-walks the alignment in Python); not usable "
+-             "with --reconstruct."),
++             "default (non-schema columns, and it re-walks the alignment in Python). Merged "
++             "bases retain their selected-input qualities."),
+     shm: str = typer.Option("framework", "--shm", help=_SHM_HELP),
+     complete_junction_nt: int = typer.Option(
+         0, "--complete-junctions", help=_COMPLETE_JUNCTION_HELP),
+@@ -1212,7 +1212,7 @@ def rnaseq_mode(
+         help="Keep only complete junctions (C104..[FW]118, in frame, no stop) when forming "
+              "clonotypes."),
+     reconstruct: bool = typer.Option(
+-        False, "--reconstruct", help="Merge overlapping paired mates into one fragment."),
++        True, "--reconstruct/--no-reconstruct", help="Merge observed overlapping mates; retain selected-base qualities."),
+     min_score: float = typer.Option(
+         75.0, "--min-score", help="Min MMseqs2 bit score to keep a mapped read (0 = keep all)."),
+     kmer: int = typer.Option(
+@@ -1622,7 +1622,7 @@ def rnaseq_slurm(
+     threads: int = typer.Option(8, help="--cpus-per-task, and mmseqs threads."),
+     kmer: int = typer.Option(12, "--kmer", "-k", help="MMseqs2 -k (the memory knob)."),
+     min_score: float = typer.Option(75.0, "--min-score", help="Min bit score to keep a read."),
+-    reconstruct: bool = typer.Option(False, "--reconstruct", help="Merge overlapping mates."),
++    reconstruct: bool = typer.Option(True, "--reconstruct/--no-reconstruct", help="Merge observed overlapping mates."),
+     assemble: bool = typer.Option(True, "--assemble/--no-assemble", help="Stage 3."),
+     complete_only: bool = typer.Option(
+         True, "--complete-only/--all-junctions", help="Keep only complete junctions."),
+@@ -1679,7 +1679,7 @@ def samples_slurm(
+     threads: int = typer.Option(8, help="--cpus-per-task, and mmseqs threads."),
+     kmer: int = typer.Option(12, "--kmer", "-k", help="MMseqs2 -k (the memory knob)."),
+     min_score: float = typer.Option(75.0, "--min-score", help="Min bit score to keep a read."),
+-    reconstruct: bool = typer.Option(False, "--reconstruct", help="Merge overlapping mates."),
++    reconstruct: Optional[bool] = typer.Option(None, "--reconstruct/--no-reconstruct", help="Merge observed overlaps (default in RNA mode)."),
+     assemble: bool = typer.Option(True, "--assemble/--no-assemble", help="Stage 3."),
+     complete_only: bool = typer.Option(
+         True, "--complete-only/--all-junctions", help="Keep only complete junctions."),
+diff --git a/src/arda/cluster.py b/src/arda/cluster.py
+index d1799c9..ab173bb 100644
+--- a/src/arda/cluster.py
++++ b/src/arda/cluster.py
+@@ -48,7 +48,7 @@
+ 
+ 
+ def regime_flags(regime: str, *, organism: str = "human", threads: int = 8, kmer: int = 12,
+-                 min_score: float = 75.0, reconstruct: bool = False, map_d: bool = True,
++                 min_score: float = 75.0, reconstruct: bool | None = None, map_d: bool = True,
+                  assemble: bool = True, complete_only: bool = True,
+                  ec_mode: str | None = None, cell_from: str = "", map_dd: bool = True) -> tuple[str, str]:
+     """The ``arda map`` and ``arda cluster reduce`` flags one regime implies. Returns both.
+@@ -80,7 +80,7 @@ def regime_flags(regime: str, *, organism: str = "human", threads: int = 8, kmer
+     # if Stage 1 was asked to write it.
+     if ec_mode != "fast":
+         m.append("--junction-quality")
+-    if reconstruct:
++    if reconstruct is True or (reconstruct is None and regime == "rnaseq"):
+         m.append("--reconstruct")
+     if not map_d:
+         m.append("--no-map-d")
+@@ -355,7 +355,7 @@ def render_rnaseq_submit_script(
+     threads: int = 8,
+     kmer: int = 12,
+     min_score: float = 75.0,
+-    reconstruct: bool = False,
++    reconstruct: bool | None = None,
+     assemble: bool = True,
+     complete_only: bool = True,
+     map_d: bool = True,
+@@ -504,7 +504,7 @@ def render_samples_submit_script(
+     threads: int = 8,
+     kmer: int = 12,
+     min_score: float = 75.0,
+-    reconstruct: bool = False,
++    reconstruct: bool | None = None,
+     assemble: bool = True,
+     complete_only: bool = True,
+     map_d: bool = True,
+diff --git a/src/arda/rnaseq/map.py b/src/arda/rnaseq/map.py
+index 0f633bf..4dc835b 100644
+--- a/src/arda/rnaseq/map.py
++++ b/src/arda/rnaseq/map.py
+@@ -19,6 +19,7 @@
+ import json
+ import logging
+ from itertools import islice, zip_longest
++from collections import Counter, defaultdict
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Iterator
+@@ -283,26 +284,14 @@ def _apply_constant_rule(records: list[dict]) -> tuple[list[dict], int, int]:
+ _MIN_SCORE = 75.0
+ 
+ 
+-def _overlap_consensus(a: str, qa: str, b: str, qb: str) -> str:
+-    """Per-base consensus of two aligned overlap strings: keep the higher-Phred base on a mismatch
+-    (R1 wins a tie). Phred+33 is monotonic in the quality char, so compare the chars directly."""
+-    return "".join(a[i] if (a[i] == b[i] or qa[i] >= qb[i]) else b[i] for i in range(len(a)))
++def _merge_pair(s1: str, s2: str, *, q1: str | None = None, q2: str | None = None,
++                min_overlap: int = 12, max_mismatch_rate: float = 0.1
++                ) -> tuple[str, str] | None:
++    """Shared overlap decision, returning observed bases and their selected-input qualities.
+ 
+-
+-def merge_pair(s1: str, s2: str, *, q1: str | None = None, q2: str | None = None,
+-               min_overlap: int = 12, max_mismatch_rate: float = 0.1) -> str | None:
+-    """Overlap-merge a read pair into one fragment, or ``None`` if they don't overlap.
+-
+-    Aligns ``s1`` (R1) with ``reverse_complement(s2)`` (R2 flipped to the same strand)
+-    by finding an exact ``_MERGE_ANCHOR``-mer from the flipped R2's 5' end inside R1
+-    (C-level ``str.find`` → O(len), so non-overlapping pairs — the common RNA-seq case —
+-    cost almost nothing), then verifying the implied overlap; the mate provides the V/J
+-    context a short read lacks.
+-
+-    In the overlap the two mates may disagree. Given Phred qualities ``q1``/``q2`` the base
+-    with the higher quality wins per position (``rc(R2)``'s quality is ``q2`` reversed, not
+-    complemented); without them R2 wins the whole overlap (the historical behaviour). Outside
+-    the overlap, R1 supplies its 5' part and R2 its 3' tail.
++    Matching bases use the higher measured quality without increasing it. A disagreement
++    uses the same higher-quality base (R1 wins ties). If either mate lacks qualities, the
++    sequence-only legacy rule applies and quality stays unknown, never synthesized.
+     """
+     s1, s2 = seqio.normalize_nt(s1), seqio.normalize_nt(s2)
+     r2 = reverse_complement(s2)
+@@ -315,14 +304,55 @@ def merge_pair(s1: str, s2: str, *, q1: str | None = None, q2: str | None = None
+     if ov < min_overlap:
+         return None
+     a, b = s1[pos:pos + ov], r2[:ov]
+-    mism = sum(1 for x, y in zip(a, b) if x != y)
++    mism = sum(x != y for x, y in zip(a, b))
+     if mism > max_mismatch_rate * ov:
+         return None
++    tail = s1[pos + ov:] or r2[ov:]
+     if q1 is None or q2 is None:
+-        overlap = b                                   # no quality: R2 wins the overlap (legacy)
+-    else:
+-        overlap = _overlap_consensus(a, q1[pos:pos + ov], b, q2[::-1][:ov])
+-    return s1[:pos] + overlap + r2[ov:]
++        return s1[:pos] + b + tail, ""
++    if len(q1) != len(s1) or len(q2) != len(s2):
++        raise ValueError("mate quality length must match its sequence")
++    qb = q2[::-1]
++    qa = q1[pos:pos + ov]
++    use_r1 = [qa[i] >= qb[i] for i in range(ov)]
++    overlap = "".join(a[i] if use_r1[i] else b[i] for i in range(ov))
++    quality = (q1[:pos] + "".join(qa[i] if use_r1[i] else qb[i] for i in range(ov))
++               + (q1[pos + ov:] or qb[ov:]))
++    return s1[:pos] + overlap + tail, quality
++
++
++def merge_pair(s1: str, s2: str, *, q1: str | None = None, q2: str | None = None,
++               min_overlap: int = 12, max_mismatch_rate: float = 0.1) -> str | None:
++    """Merge an observed R1/rc(R2) overlap, or return ``None``.
++
++    Locate the existing exact12nt anchor and retain the established overlap/mismatch gates.
++    Higher-quality bases win disagreements (R1 wins ties); without qualities R2 wins.
++    Both non-overlapping observed tails are preserved, including a contained mate.
++    """
++    merged = _merge_pair(s1, s2, q1=q1, q2=q2, min_overlap=min_overlap,
++                         max_mismatch_rate=max_mismatch_rate)
++    return merged[0] if merged is not None else None
++
++def _reconstruct_batch(records: list) -> tuple[list, dict]:
++    """Merge adjacent observed pairs, retaining their original records for bounded fallback."""
++    merged_records, originals = [], {}
++    i = 0
++    while i < len(records):
++        a = records[i]
++        if i + 1 < len(records):
++            b = records[i + 1]
++            if frag_stem(a[0]) == frag_stem(b[0]):
++                merged = _merge_pair(a[1], b[1], q1=a[2] or None, q2=b[2] or None)
++                if merged is not None:
++                    sid = a[0][:-2]   # remove the suffix added by read_pairs
++                    merged_records.append((sid, *merged))
++                    originals[sid] = (a, b)
++                    i += 2
++                    continue
++        merged_records.append(a)
++        i += 1
++    return merged_records, originals
++
+ 
+ # Records per mmseqs invocation. Larger chunks amortise the fixed per-call cost; memory stays
+ # bounded because only one chunk is resident.
+@@ -402,9 +432,8 @@ def read_pairs(r1: str | Path, r2: str | Path | None = None,
+     """Stream ``(id, sequence)`` reads for single-end (``r1`` only) or paired input.
+ 
+     ``with_qual`` yields ``(id, sequence, quality)`` instead — the Phred+33 string, ``""`` for
+-    FASTA input. It is incompatible with ``reconstruct``: a merged fragment's bases come from two
+-    different reads, so no single input quality string describes it (:func:`map_rnaseq` refuses
+-    the combination rather than emitting a quality that does not belong to the sequence).
++    FASTA input. With ``reconstruct``, each merged base retains the quality of its selected
++    input observation; agreement does not boost quality. Missing mate qualities stay unknown.
+ 
+     For paired input the two mates carry the same id, so they are tagged ``<id>/1`` and
+     ``<id>/2`` to keep query ids unique (strip the suffix to recover the pair). With
+@@ -465,9 +494,9 @@ def read_pairs(r1: str | Path, r2: str | Path | None = None,
+                 f"R1/R2 mate mismatch at record {n}: {i1!r} vs {i2!r}. "
+                 f"The FASTQs are not in the same order.")
+         if reconstruct:
+-            merged = merge_pair(s1, s2, q1=q1, q2=q2)
++            merged = _merge_pair(s1, s2, q1=q1, q2=q2)
+             if merged is not None:
+-                yield i1, merged
++                yield (i1, *merged) if with_qual else (i1, merged[0])
+                 continue
+         if with_qual:
+             yield f"{i1}/1", s1, q1 or ""
+@@ -508,10 +537,9 @@ def _read_pairs_dnaio(r1, r2, *, reconstruct: bool,
+             for a, b in fh:
+                 s1, s2 = seqio.normalize_nt(a.sequence), seqio.normalize_nt(b.sequence)
+                 if reconstruct:
+-                    merged = merge_pair(s1, s2,
+-                                        q1=a.qualities, q2=b.qualities)
++                    merged = _merge_pair(s1, s2, q1=a.qualities, q2=b.qualities)
+                     if merged is not None:
+-                        yield a.id, merged
++                        yield (a.id, *merged) if with_qual else (a.id, merged[0])
+                         continue
+                 if with_qual:
+                     yield f"{a.id}/1", s1, a.qualities or ""
+@@ -557,8 +585,11 @@ class RnaseqReport:
+     read_length_min: int = 0
+     read_length_max: int = 0
+     read_length_mean: float = 0.0
++    read_length_sum: int = 0          # exact observation lengths before display rounding
+     total_reads: int = 0
+     mapped_reads: int = 0
++    merged_fragments: int = 0
++    paired_fallback_fragments: int = 0
+     per_locus: dict[str, int] = field(default_factory=dict)
+     # fragments whose every read lay wholly inside the constant region: receptor mRNA, no V(D)J
+     constant_only_fragments: int = 0
+@@ -657,8 +688,8 @@ def map_rnaseq(
+             :func:`junction_quality`). OFF by default: it appends a non-schema column, so the
+             default output stays byte-identical. This is the only place the FASTQ quality is
+             still in hand — Stage 1 otherwise discards it — and it is what
+-            ``correct --min-junction-q`` gates on. Refused with ``reconstruct`` (a merged
+-            fragment has no single input quality string).
++            ``correct --min-junction-q`` gates on. With ``reconstruct``, quality follows the
++            actual selected base from either mate without a confidence boost.
+         emit_reads: optional path — write the mapped reads' sequences as FASTA
+             (coding-strand oriented) for downstream handoff.
+         report_path: optional path — write the :class:`RnaseqReport` as JSON.
+@@ -697,15 +728,7 @@ def map_rnaseq(
+         The run :class:`RnaseqReport` (also printed by the CLI).
+     """
+     want_qual = with_junction_quality or with_mutation_quality
+-    if with_mutation_quality and reconstruct:
+-        raise ValueError("--mutation-quality cannot be combined with --reconstruct: a merged "
+-                         "fragment has no single input quality string")
+-    if with_junction_quality and reconstruct:
+-        # A merged fragment's bases come from two reads, so no input quality string describes it.
+-        # Emitting one of the two would put a quality beside bases it does not belong to -- the
+-        # exact silent-misalignment failure `junction_quality` verifies against. Refuse instead.
+-        raise ValueError("--junction-quality cannot be combined with --reconstruct: a merged "
+-                         "fragment has no single input quality string")
++    read_qual = want_qual or reconstruct
+     if shm not in SHM_MODES:
+         # Reject rather than fall through to the default: a mode that is accepted and silently
+         # does nothing is the failure this project keeps hitting.
+@@ -729,7 +752,7 @@ def map_rnaseq(
+     # The reader and native scan/search share this one allocation. Serial mode
+     # reads synchronously instead of quietly computing on a second core.
+     search_threads, read_ahead = streaming_threads(threads, mapper.pl.thread_pool_size())
+-    pairs = read_pairs(r1, r2, reconstruct=reconstruct, limit=limit, with_qual=want_qual)
++    pairs = read_pairs(r1, r2, reconstruct=False, limit=limit, with_qual=read_qual)
+     source = chunked_fragments(pairs, chunk_size)
+ 
+     report = RnaseqReport(input=str(r1), organism=organism, threads=threads, major_only=major_only,
+@@ -740,6 +763,7 @@ def map_rnaseq(
+     stage = Stage()
+     tick = Throttle()
+     _len_sum = 0
++    length_counts: Counter = Counter()
+     # Every extra goes at the END, in a fixed order, so a consumer reading the shipped set by
+     # position is unaffected whichever combination is on.
+     # Never: `cell_id` goes LAST, after `FULL_COLUMNS`, for the same reason: prepending it would move
+@@ -759,17 +783,19 @@ def map_rnaseq(
+         with seqio.prefetched(source, enabled=read_ahead) as chunks, open(output, "w") as fh:
+             fh.write(airr_header(extra_cols) + "\n")
+ 
+-            def flush(batch: list) -> None:
+-                """Search one batch and write its mapped reads."""
++            def flush(batch: list, originals: dict) -> None:
++                """Search one batch; a J+C union must not mask an original mate's junction."""
++                nonlocal _len_sum
+                 quals = {}
+-                if want_qual:
++                if read_qual:
+                     # Split the quality off HERE, not in the reader: `_annotate_chunk`,
+                     # `write_fasta` and `prefilter.keep_records` all take `(id, sequence)` pairs,
+                     # and a third element would reach every one of them.
+                     quals = {r[0]: r[2] for r in batch}
+                     batch = [(r[0], r[1]) for r in batch]
+-                keep = mapper._annotate_chunk(
+-                    batch, ref, target_db, seqtype, threads=search_threads,
++                def search(records, *, unmapped=None):
++                    return mapper._annotate_chunk(
++                        records, ref, target_db, seqtype, threads=search_threads,
+                     sensitivity=sens, mm_strand=mm_strand, map_d=map_d, map_dd=map_dd,
+                     d_max_evalue=d_max_evalue,
+                     mapped_only=True, max_seqs=max_seqs, kmer=kmer,
+@@ -779,7 +805,46 @@ def flush(batch: list) -> None:
+                     segment_only_v=segment_only_v, shm=shm,
+                     complete_junction_nt=complete_junction_nt,
+                     report=report.segment_search if segment_db else None,
+-                    unmapped=report.unmapped)
++                    unmapped=unmapped)
++                keep = search(batch, unmapped=report.unmapped)
++                # Only mapped unions lacking a junction are retried. The primary search's
++                # no-hit ledger therefore stays untouched. All original mates compete in
++                # one native batch; neither score gates nor junction criteria are weakened.
++                retry = {r["sequence_id"] for r in keep
++                         if r["sequence_id"] in originals and not r.get("junction")}
++                if retry:
++                    from .correct import _COMPLETE
++                    source_records = [rec for sid in originals if sid in retry
++                                      for rec in originals[sid]]
++                    owners = {rec[0]: sid for sid in retry for rec in originals[sid]}
++                    mate_rows = search([(rec[0], rec[1]) for rec in source_records])
++                    if mate_rows:
++                        accepted = mapper.pl.DataFrame(mate_rows).filter(
++                            _COMPLETE & (mapper.pl.col("mmseqs2_score").cast(mapper.pl.Float64)
++                                         >= min_score))
++                        restored = {owners[sid] for sid in accepted["sequence_id"]}
++                        replacements: dict[str, list] = defaultdict(list)
++                        for row in mate_rows:
++                            sid = owners[row["sequence_id"]]
++                            if sid in restored:
++                                replacements[sid].append(row)
++                        if restored:
++                            quals.update({rec[0]: rec[2] for rec in source_records})
++                            merged_lengths = dict(batch)
++                            for sid in restored:
++                                old_length = len(merged_lengths[sid])
++                                lengths = [len(rec[1]) for rec in originals[sid]]
++                                length_counts[old_length] -= 1
++                                length_counts.update(lengths)
++                                _len_sum += sum(lengths) - old_length
++                                report.total_reads += 1
++                                report.merged_fragments -= 1
++                            report.paired_fallback_fragments += len(restored)
++                            missing = sum(2 - len(replacements[sid]) for sid in restored)
++                            report.unmapped["paired_fallback_no_row"] = (
++                                report.unmapped.get("paired_fallback_no_row", 0) + missing)
++                            keep = [row for r in keep for row in
++                                    replacements.get(r["sequence_id"], [r])]
+                 if drop_constant_only:
+                     n_before = len(keep)
+                     keep, n_drop, n_iso = _apply_constant_rule(keep)
+@@ -844,7 +909,12 @@ def flush(batch: list) -> None:
+             # guarantees a fragment's mates land in the same chunk, and splitting them is a bug
+             # this pipeline has already shipped once under --reconstruct.
+             pending: list = []
++            pending_originals: dict = {}
+             for chunk in chunks:
++                originals = {}
++                if reconstruct and r2 is not None:
++                    chunk, originals = _reconstruct_batch(chunk)
++                    report.merged_fragments += len(originals)
+                 report.total_reads += len(chunk)
+                 # Read length, over the WHOLE library rather than the mapped subset -- the AIRR
+                 # only holds reads that mapped, so nothing downstream can recover this. One pass
+@@ -853,10 +923,7 @@ def flush(batch: list) -> None:
+                 lens = [len(r[1]) for r in chunk]
+                 if lens:
+                     _len_sum += sum(lens)
+-                    lo, hi = min(lens), max(lens)
+-                    report.read_length_min = lo if not report.read_length_min else min(
+-                        report.read_length_min, lo)
+-                    report.read_length_max = max(report.read_length_max, hi)
++                    length_counts.update(lens)
+                 if tick.ready():
+                     logger.info("map: %s reads read, %s mapped (%.2f %%), %.0f reads/s, %.0f MB",
+                                 f"{report.total_reads:,}", f"{report.mapped_reads:,}",
+@@ -864,7 +931,7 @@ def flush(batch: list) -> None:
+                                 report.total_reads / max(1e-9, stage.wall_seconds), peak_rss_mb())
+                 if prefilter and seqtype == "nt":
+                     from ..prefilter import keep_records  # noqa: PLC0415 — optional native ext
+-                    if want_qual:
++                    if read_qual:
+                         qmap = {r[0]: r[2] for r in chunk}
+                         survivors = [(i, s, qmap[i]) for i, s in
+                                      keep_records([(r[0], r[1]) for r in chunk],
+@@ -881,18 +948,26 @@ def flush(batch: list) -> None:
+                 else:
+                     survivors = chunk
+                 pending.extend(survivors)
++                surviving_ids = {rec[0] for rec in survivors} if originals else set()
++                pending_originals.update({sid: recs for sid, recs in originals.items()
++                                          if sid in surviving_ids})
+                 if len(pending) >= chunk_size:
+-                    flush(pending)
++                    flush(pending, pending_originals)
+                     pending = []
++                    pending_originals = {}
+             if pending:
+-                flush(pending)
++                flush(pending, pending_originals)
+     finally:
+         if reads_fh is not None:
+             reads_fh.close()
+ 
++    observed_lengths = [length for length, count in length_counts.items() if count > 0]
++    report.read_length_min = min(observed_lengths, default=0)
++    report.read_length_max = max(observed_lengths, default=0)
+     stage.finish(report)   # wall_seconds / peak_rss_mb / rss_gain_mb, same definition as Stages 2-3
+     report.reads_per_second = round(
+         report.total_reads / report.wall_seconds if report.wall_seconds else 0.0, 1)
++    report.read_length_sum = _len_sum
+     report.read_length_mean = round(_len_sum / report.total_reads, 1) if report.total_reads else 0.0
+     logger.info("map: %s/%s reads mapped (%.2f %%) in %.1f s (%.0f reads/s), peak %.0f MB; loci=%s",
+                 f"{report.mapped_reads:,}", f"{report.total_reads:,}",
+diff --git a/src/arda/rnaseq/pipeline.py b/src/arda/rnaseq/pipeline.py
+index 39c29db..84c3d69 100644
+--- a/src/arda/rnaseq/pipeline.py
++++ b/src/arda/rnaseq/pipeline.py
+@@ -227,7 +227,7 @@ def _map_read_groups(pairs: list, airr: Path, parts_dir: Path, *, say, **map_kw)
+ 
+ def run(pairs, out_dir: str | Path, out_prefix: str, *,
+         organism: str = "human", threads: int = 0,
+-        reconstruct: bool = False, min_score: float = 75.0, kmer: int | None = 12,
++        reconstruct: bool = True, min_score: float = 75.0, kmer: int | None = 12,
+         assemble: bool = True, complete_only: bool = True, map_d: bool = True,
+         d_max_evalue: float | None = None,
+         limit: int | None = None, two_pass: bool = False, adaptive: bool = False,
+@@ -246,6 +246,9 @@ def run(pairs, out_dir: str | Path, out_prefix: str, *,
+         pairs: ``[(r1, r2 | None), ...]`` for this sample, **in the order they were declared**.
+             One pair is the ordinary case; several are the lanes or chunks one sample was
+             delivered in, and they are concatenated after Stage 1, never before.
++        reconstruct: merge established observed overlaps by default. Each selected base
++            retains its measured input quality; False keeps the historical independent mates.
++            Merged overlaps count as one fragment record, not two separate mate records.
+ 
+     Stages 2-3 stay global over the sample, exactly as they are for a single file. Nothing below
+     Stage 1 knows read groups exist.
+@@ -328,6 +331,8 @@ def _merge_map_reports(shards: list[dict]) -> dict:
+     sized = [s for s in shards if int(s.get("total_reads", 0)) > 0
+              and float(s.get("read_length_max", 0)) > 0]
+     weights = [int(s["total_reads"]) for s in sized]
++    exact_lengths = all("read_length_sum" in s for s in shards)
++    length_sum = sum(int(s.get("read_length_sum", 0)) for s in shards)
+     wall_sum = round(sum(float(s.get("wall_seconds", 0.0)) for s in shards), 3)
+     return {
+         "major_only": modes.pop(),
+@@ -339,11 +344,15 @@ def _merge_map_reports(shards: list[dict]) -> dict:
+         "input_bytes": sum(int(s.get("input_bytes", 0)) for s in shards),
+         "read_length_min": min((int(s["read_length_min"]) for s in sized), default=0),
+         "read_length_max": max((int(s["read_length_max"]) for s in sized), default=0),
++        **({"read_length_sum": length_sum} if exact_lengths else {}),
+         "read_length_mean": (
++            round(length_sum / total, 1) if total else 0.0) if exact_lengths else (
+             round(sum(float(s["read_length_mean"]) * w for s, w in zip(sized, weights))
+                   / sum(weights), 3) if weights else 0.0),
+         "total_reads": total,
+         "mapped_reads": mapped,
++        "merged_fragments": sum(int(s.get("merged_fragments", 0)) for s in shards),
++        "paired_fallback_fragments": sum(int(s.get("paired_fallback_fragments", 0)) for s in shards),
+         "mapped_fraction": (mapped / total) if total else 0.0,
+         "per_locus": dict(sorted(per_locus.items())),
+         "constant_only_fragments": sum(int(s.get("constant_only_fragments", 0)) for s in shards),
+diff --git a/tests/synthetic/test_read_groups.py b/tests/synthetic/test_read_groups.py
+index 90d2ca3..7108364 100644
+--- a/tests/synthetic/test_read_groups.py
++++ b/tests/synthetic/test_read_groups.py
+@@ -86,25 +86,27 @@ def test_the_parts_directory_does_not_outlive_a_successful_run(regrouped):
+     assert not (many / "S.parts").exists()
+ 
+ 
+-def test_the_read_group_reports_are_summed_not_lost(regrouped, chunks):
++def test_the_read_group_reports_are_summed_not_lost(whole, regrouped, chunks):
+     """`reduce` used to drop the library shape, so a sharded run wrote no `sample` stats scope."""
+     _, rep = regrouped
+     m = rep["map"]
+     assert m["read_groups"] == 4
+     assert m["paired"] is True
+     assert m["input_bytes"] == sum(p.stat().st_size for pair in chunks for p in pair)
+-    assert m["read_length_min"] == m["read_length_max"] == m["read_length_mean"] == 100
++    for key in ("read_length_min", "read_length_max", "read_length_mean", "read_length_sum", "total_reads"):
++        assert m[key] == whole[1]["map"][key]
++    assert m["read_length_min"] == 100 and m["read_length_max"] > 100
+ 
+ 
+-def test_the_library_shape_reaches_the_stats_table(regrouped):
++def test_the_library_shape_reaches_the_stats_table(whole, regrouped):
+     """These `run`/`map` rows exist only if Stage 1's own fields survived the merge."""
+     many, _ = regrouped
+     rows = [r.split("\t") for r in (many / "S.stats.tsv").read_text().splitlines()[1:]]
+     m = {r[2]: r[3] for r in rows if r[0] == "run" and r[1] == "map"}
+     assert m["paired"] == "1"
+     assert m["read_groups"] == "4"
+-    assert int(m["read_length_min"]) == int(m["read_length_max"]) == 100
+-    assert int(m["total_reads"]) == 1320
++    for key in ("read_length_min", "read_length_max", "total_reads"):
++        assert int(m[key]) == whole[1]["map"][key]
+ 
+ 
+ # --------------------------------------------------------- why a sample may not simply be split
+diff --git a/tests/unit/test_junction_quality.py b/tests/unit/test_junction_quality.py
+index 8adb22a..06d8d0f 100644
+--- a/tests/unit/test_junction_quality.py
++++ b/tests/unit/test_junction_quality.py
+@@ -25,7 +25,7 @@
+ from arda.annotate.airr_out import airr_header, format_rows, _format_rows_py, _format_rows_cpp
+ from arda.annotate.transfer import AIRR_COLUMNS
+ from arda.rnaseq.correct import EC_MODES, correct_airr
+-from arda.rnaseq.map import JUNCTION_QUALITY, junction_quality, map_rnaseq, read_pairs
++from arda.rnaseq.map import JUNCTION_QUALITY, junction_quality, read_pairs
+ from arda.refbuild.translate import reverse_complement
+ 
+ # ---------------------------------------------------------------------------------------------
+@@ -142,12 +142,13 @@ def test_read_pairs_with_qual_yields_the_quality_paired(tmp_path):
+         ("a/1", "ACGT", "IIII"), ("a/2", "TTTT", "!!!!")]
+ 
+ 
+-def test_junction_quality_refuses_reconstruct(tmp_path):
+-    """A merged fragment's bases come from two reads, so no input quality describes it."""
+-    f = tmp_path / "r.fq"
+-    _fastq(f, [("a", "ACGT", "IIII")])
+-    with pytest.raises(ValueError, match="reconstruct"):
+-        map_rnaseq(f, tmp_path / "o.tsv", r2=f, reconstruct=True, with_junction_quality=True)
++def test_reconstructed_junction_uses_selected_observation_quality(tmp_path):
++    r1, r2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
++    _fastq(r1, [("a", _SEQ, _QUAL)])
++    _fastq(r2, [("a", reverse_complement(_SEQ), "!" * len(_SEQ))])
++    [(sid, sequence, quality)] = read_pairs(r1, r2, reconstruct=True, with_qual=True)
++    assert sequence == _SEQ and quality == _QUAL
++    assert junction_quality(_rec(sequence=sequence), quality) == _QUAL[len(_LEAD):len(_LEAD)+len(_JUNC)]
+ 
+ 
+ # ------------------------------------------------------------------------------- the Stage-2 gate
+diff --git a/tests/unit/test_mutation_quality.py b/tests/unit/test_mutation_quality.py
+index 0ccdb1b..7601f10 100644
+--- a/tests/unit/test_mutation_quality.py
++++ b/tests/unit/test_mutation_quality.py
+@@ -106,10 +106,12 @@ def test_a_quality_string_of_the_wrong_length_is_refused():
+     assert mutation_quality(_rec(), _QUAL[:-2]) == {_VQ: "", _JQ: ""}
+ 
+ 
+-def test_reconstruct_is_refused_rather_than_given_one_mates_quality(tmp_path):
+-    """A merged fragment's bases come from two reads, so no input quality string describes it."""
+-    from arda.rnaseq.map import map_rnaseq
+-
+-    with pytest.raises(ValueError, match="mutation-quality"):
+-        map_rnaseq(tmp_path / "r1.fq", tmp_path / "out.tsv", r2=tmp_path / "r2.fq",
+-                   reconstruct=True, with_mutation_quality=True)
++def test_reconstructed_mutations_use_selected_observation_quality(tmp_path):
++    from arda.rnaseq.map import read_pairs
++
++    r1, r2 = tmp_path / "r1.fq", tmp_path / "r2.fq"
++    r1.write_text(f"@a\n{_QUERY}\n+\n{_QUAL}\n")
++    r2.write_text(f"@a\n{reverse_complement(_QUERY)}\n+\n{'!' * len(_QUERY)}\n")
++    [(sid, sequence, quality)] = read_pairs(r1, r2, reconstruct=True, with_qual=True)
++    assert sequence == _QUERY and quality == _QUAL
++    assert mutation_quality(_rec(sequence=sequence), quality) == mutation_quality(_rec(), _QUAL)
+diff --git a/tests/unit/test_paired_merge_quality.py b/tests/unit/test_paired_merge_quality.py
+new file mode 100644
+index 0000000..5ab7ca9
+--- /dev/null
++++ b/tests/unit/test_paired_merge_quality.py
+@@ -0,0 +1,76 @@
++"""Observed pair unions retain selected-base qualities and both observed tails."""
++from __future__ import annotations
++
++import random
++import pytest
++
++from arda.refbuild.translate import reverse_complement
++from arda.rnaseq.map import read_pairs
++
++
++def _fastq(path, sequence, quality):
++    path.write_text(f'@pair\n{sequence}\n+\n{quality}\n')
++    return path
++
++
++@pytest.mark.parametrize('limit', [None, 1])
++def test_overlap_merge_retains_the_quality_of_each_selected_base(tmp_path, limit):
++    rng = random.Random(19)
++    fragment = ''.join(rng.choices('ACGT', k=80))
++    left, right = fragment[:55], fragment[30:]
++    # Two disagreements outside the exact anchor: choose R1 at one, R2 at the other.
++    right = right[:15] + next(b for b in 'ACGT' if b != right[15]) + right[16:]
++    left = left[:48] + next(b for b in 'ACGT' if b != left[48]) + left[49:]
++    q1 = '5' * 55
++    q2_forward = 'I' * 15 + '!' + 'I' * (len(right) - 16)
++    r1 = _fastq(tmp_path/'r1.fq', left, q1)
++    r2 = _fastq(tmp_path/'r2.fq', reverse_complement(right), q2_forward[::-1])
++    records = list(read_pairs(r1, r2, reconstruct=True, with_qual=True, limit=limit))
++    expected_quality = q1[:30] + 'I' * 15 + '5' + 'I' * (len(right) - 16)
++    assert records == [('pair', fragment, expected_quality)]
++
++
++@pytest.mark.parametrize('limit', [None, 1])
++def test_contained_mate_does_not_truncate_the_observed_r1_tail(tmp_path, limit):
++    rng = random.Random(29)
++    fragment = ''.join(rng.choices('ACGT', k=90))
++    r1 = _fastq(tmp_path/'r1.fq', fragment, '5'*90)
++    r2 = _fastq(tmp_path/'r2.fq', reverse_complement(fragment[20:70]), 'I'*50)
++    assert list(read_pairs(r1, r2, reconstruct=True, with_qual=True, limit=limit)) == [
++        ('pair', fragment, '5'*20 + 'I'*50 + '5'*20)]
++
++
++def test_rna_defaults_and_scheduled_regime_preserve_independent_mate_opt_out():
++    import inspect
++    from typer.main import get_command
++    from arda.cli import app
++    from arda.cluster import regime_flags
++    from arda.rnaseq.pipeline import run
++
++    assert inspect.signature(run).parameters['reconstruct'].default is True
++    commands = get_command(app).commands
++    param = next(p for p in commands['rnaseq'].params if p.name == 'reconstruct')
++    assert param.default is True and '--no-reconstruct' in param.secondary_opts
++    assert '--reconstruct' in regime_flags('rnaseq')[0]
++    assert '--reconstruct' not in regime_flags('rnaseq', reconstruct=False)[0]
++    assert '--reconstruct' not in regime_flags('amplicon')[0]
++
++
++def test_reconstruct_fasta_keeps_unknown_quality_unknown(tmp_path):
++    fragment = 'ACGTACGTACGTTTGGCCAATTGGCCAAGGTTCCAAGGTTCCAAGATCGATCGATCG'
++    r1, r2 = tmp_path/'r1.fa', tmp_path/'r2.fa'
++    r1.write_text('>pair\n'+fragment[:40]+'\n')
++    r2.write_text('>pair\n'+reverse_complement(fragment[-40:])+'\n')
++    assert list(read_pairs(r1, r2, reconstruct=True, with_qual=True)) == [('pair', fragment, '')]
++
++
++def test_read_group_mean_uses_exact_lengths_before_rounding():
++    from arda.rnaseq.pipeline import _merge_map_reports
++
++    parts = [dict(major_only=True, total_reads=3, read_length_min=100,
++                  read_length_max=101, read_length_mean=100.3, read_length_sum=301),
++             dict(major_only=True, total_reads=2, read_length_min=105,
++                  read_length_max=106, read_length_mean=105.5, read_length_sum=211)]
++    merged = _merge_map_reports(parts)
++    assert merged['read_length_mean'] == 102.4
++    assert merged['read_length_sum'] == 512
+diff --git a/tests/unit/test_rnaseq_real_reads.py b/tests/unit/test_rnaseq_real_reads.py
+index 93b3a8e..76f6643 100644
+--- a/tests/unit/test_rnaseq_real_reads.py
++++ b/tests/unit/test_rnaseq_real_reads.py
+@@ -112,20 +112,21 @@ def test_repeated_runs_are_byte_identical(tmp_path):
+         assert outs[0][name] == outs[1][name], f"{name} differs between two identical runs"
+ 
+ 
+-def test_sharded_run_matches_single_node_on_real_reads(tmp_path):
++@pytest.mark.parametrize("reconstruct", [False, True])
++def test_sharded_run_matches_single_node_on_real_reads(tmp_path, reconstruct):
+     """The mode-equivalence guarantee, on real data rather than a hand-built AIRR."""
+     from arda.cluster import split_pairs
+     from arda.rnaseq import pipeline
+     from arda.rnaseq.map import map_rnaseq
+ 
+     single = tmp_path / "single"
+-    pipeline.run([(READS_1, READS_2)], single, "R", threads=2)
++    pipeline.run([(READS_1, READS_2)], single, "R", threads=2, reconstruct=reconstruct)
+ 
+     shards = split_pairs(READS_1, tmp_path / "sh", shards=4, r2=READS_2)
+     mapdir = tmp_path / "map"
+     mapdir.mkdir()
+     for i, (s1, s2) in enumerate(shards):
+-        map_rnaseq(s1, mapdir / f"shard_{i:05d}.airr.tsv", r2=s2, threads=2,
++        map_rnaseq(s1, mapdir / f"shard_{i:05d}.airr.tsv", r2=s2, threads=2, reconstruct=reconstruct,
+                    report_path=mapdir / f"shard_{i:05d}.map.json")
+     sharded = tmp_path / "sharded"
+     pipeline.reduce(mapdir, sharded, "R", threads=2)
+@@ -395,3 +396,25 @@ def test_v_mutations_agree_with_the_alignment_strings_on_real_reads(mapped):
+     # The scope has to REMOVE something on this fixture or it is untested: a bound that excludes
+     # nothing passes every assertion above.
+     assert past_anchor > 0, "no junction-internal entries in the fixture -- the scope is untested"
++
++
++def test_pair_union_preserves_junctions_masked_by_a_long_constant_hit(tmp_path):
++    """A longer J+C match must not discard a junction observed by an original mate."""
++    from arda.annotate.airr_out import read_airr
++    from arda.rnaseq.map import map_rnaseq
++
++    output = tmp_path / 'paired.airr.tsv'
++    report = map_rnaseq(READS_1, output, r2=READS_2, reconstruct=True,
++                        with_junction_quality=True, threads=2)
++    from arda.rnaseq.map import read_pairs
++    original_records = sum(1 for _ in read_pairs(READS_1, READS_2))
++    assert report.total_reads + report.merged_fragments == original_records
++    assert report.as_dict()['unmapped']['accounted'] == report.total_reads
++    assert report.paired_fallback_fragments >= 4
++    expected = {
++        'TGCAGCTCATATACAACCAGCAGCACTCTTGTGGTATTC',
++        'TGCGGAACATGGGATAGCAGCCTGAGTGTTTGGGTGTTC',
++        'TGTACCACCCCCCGCGATTATAGTGGGAGCTCAACTAATGACTACTGG',
++        'TGTGCTTCATGGGATGACAGTCTGAGTGGTTTTTGTGTCTTC',
++    }
++    assert expected <= set(read_airr(output)['junction'].drop_nulls())

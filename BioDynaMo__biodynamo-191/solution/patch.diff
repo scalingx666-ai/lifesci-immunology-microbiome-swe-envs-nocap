@@ -1,0 +1,848 @@
+diff --git a/src/core/agent/agent.cc b/src/core/agent/agent.cc
+index 14549d41a..d158e4be3 100644
+--- a/src/core/agent/agent.cc
++++ b/src/core/agent/agent.cc
+@@ -85,16 +85,22 @@ void Agent::PropagateStaticness() {
+   }
+   propagate_staticness_neighborhood_ = false;
+   is_static_next_ts_ = false;
+-  auto* ctxt = Simulation::GetActive()->GetExecutionContext();
+   auto* env = Simulation::GetActive()->GetEnvironment();
+   auto set_staticness = L2F([this](Agent* neighbor, double squared_distance) {
++    // TODO(all) generalize to axis-aligned bounding box
+     double distance = this->GetDiameter() + neighbor->GetDiameter();
+     if (squared_distance < distance * distance) {
+       neighbor->SetStaticnessNextTimestep(false);
+     }
+   });
+-  ctxt->ForEachNeighbor(set_staticness, *this,
+-                        env->GetLargestAgentSizeSquared());
++  env->ForEachNeighbor(set_staticness, *this,
++                       env->GetLargestAgentSizeSquared());
++}
++
++void Agent::UpdateStaticness() {
++  auto* param = Simulation::GetActive()->GetParam();
++  is_static_ = is_static_next_ts_;
++  is_static_next_ts_ = param->detect_static_agents;
+ }
+ 
+ void Agent::RunDiscretization() {}
+diff --git a/src/core/agent/agent.h b/src/core/agent/agent.h
+index fd6de839c..0fe450047 100644
+--- a/src/core/agent/agent.h
++++ b/src/core/agent/agent.h
+@@ -175,10 +175,7 @@ class Agent {
+ 
+   void PropagateStaticness();
+ 
+-  void UpdateStaticness() {
+-    is_static_ = is_static_next_ts_;
+-    is_static_next_ts_ = true;
+-  }
++  void UpdateStaticness();
+ 
+   bool IsStatic() const { return is_static_; }
+ 
+diff --git a/src/core/operation/default_ops.cc b/src/core/operation/default_ops.cc
+index 75851bcf3..6bfcfffb5 100644
+--- a/src/core/operation/default_ops.cc
++++ b/src/core/operation/default_ops.cc
+@@ -53,14 +53,6 @@ struct UpdateStaticnessOp : public AgentOperationImpl {
+ 
+ BDM_REGISTER_OP(UpdateStaticnessOp, "update staticness", kCpu);
+ 
+-struct PropagateStaticnessOp : public AgentOperationImpl {
+-  BDM_OP_HEADER(PropagateStaticnessOp);
+-
+-  void operator()(Agent* agent) override { agent->PropagateStaticness(); }
+-};
+-
+-BDM_REGISTER_OP(PropagateStaticnessOp, "propagate staticness", kCpu);
+-
+ struct BehaviorOp : public AgentOperationImpl {
+   BDM_OP_HEADER(BehaviorOp);
+ 
+@@ -125,4 +117,19 @@ BDM_REGISTER_OP(UpdateEnvironmentOp, "update environment", kCpu);
+ 
+ BDM_REGISTER_OP(VisualizationOp, "visualize", kCpu);
+ 
++struct PropagateStaticnessOp : public StandaloneOperationImpl {
++  BDM_OP_HEADER(PropagateStaticnessOp);
++
++  void operator()() override {
++    if (!Simulation::GetActive()->GetParam()->detect_static_agents) {
++      return;
++    }
++    auto function = L2F([](Agent* agent) { agent->PropagateStaticness(); });
++    auto* rm = Simulation::GetActive()->GetResourceManager();
++    rm->ForEachAgentParallel(function);
++  }
++};
++
++BDM_REGISTER_OP(PropagateStaticnessOp, "propagate staticness", kCpu);
++
+ }  // namespace bdm
+diff --git a/src/core/scheduler.cc b/src/core/scheduler.cc
+index 19e23b93c..d750d9eaf 100644
+--- a/src/core/scheduler.cc
++++ b/src/core/scheduler.cc
+@@ -44,11 +44,10 @@ Scheduler::Scheduler() {
+   // operation implementation type, so that actual order may vary)
+   std::vector<std::string> default_op_names = {
+       "update staticness", "bound space",    "behavior",
+-      "mechanical forces", "discretization", "propagate staticness",
+-      "diffusion"};
++      "mechanical forces", "discretization", "diffusion"};
+ 
+-  std::vector<std::string> pre_scheduled_ops_names = {"set up iteration",
+-                                                      "update environment"};
++  std::vector<std::string> pre_scheduled_ops_names = {
++      "set up iteration", "update environment", "propagate staticness"};
+   // We cannot put sort and balance in the list of scheduled_standalone_ops_,
+   // because numa-aware data structures would be invalidated:
+   // ```
+diff --git a/src/neuroscience/neurite_element.h b/src/neuroscience/neurite_element.h
+index 1f0913f34..7ed149b8a 100644
+--- a/src/neuroscience/neurite_element.h
++++ b/src/neuroscience/neurite_element.h
+@@ -200,7 +200,10 @@ class NeuriteElement : public Agent, public NeuronOrNeurite {
+     SetMassLocation(position + spring_axis_ * 0.5);
+   }
+ 
+-  void UpdatePosition() { position_ = mass_location_ - (spring_axis_ * 0.5); }
++  void UpdatePosition() {
++    position_ = mass_location_ - (spring_axis_ * 0.5);
++    SetPropagateStaticness();
++  }
+ 
+   /// return end of neurite element position
+   const Double3& GetMassLocation() const { return mass_location_; }
+diff --git a/test/unit/core/agent/agent_test.cc b/test/unit/core/agent/agent_test.cc
+index f877d6013..4ce5d3e30 100644
+--- a/test/unit/core/agent/agent_test.cc
++++ b/test/unit/core/agent/agent_test.cc
+@@ -13,6 +13,7 @@
+ // -----------------------------------------------------------------------------
+ 
+ #include "unit/core/agent/agent_test.h"
++#include "core/behavior/stateless_behavior.h"
+ #include "core/resource_manager.h"
+ #include "unit/test_util/test_agent.h"
+ #include "unit/test_util/test_util.h"
+@@ -103,6 +104,17 @@ TEST(AgentTest, BehaviorUpdate) {
+   EXPECT_TRUE(dynamic_cast<Growth*>(copy_behaviors[0]) != nullptr);
+ }
+ 
++TEST(AgentTest, RemoveSingleBehavior) {
++  Simulation simulation(TEST_NAME);
++
++  TestAgent cell;
++
++  cell.AddBehavior(new Growth());
++  ASSERT_EQ(1u, cell.GetAllBehaviors().size());
++  cell.RemoveBehavior(cell.GetAllBehaviors()[0]);
++  ASSERT_EQ(0u, cell.GetAllBehaviors().size());
++}
++
+ TEST(AgentTest, RemoveBehavior) {
+   Simulation simulation(TEST_NAME);
+ 
+@@ -153,5 +165,313 @@ TEST(AgentTest, GetAgentPtr) {
+   }
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(AgentTest, StaticnessOff) {
++  // Agent::IsStatic should always be false
++  auto set_param = [](Param* param) { param->detect_static_agents = false; };
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* scheduler = simulation.GetScheduler();
++
++  std::unordered_map<AgentUid, bool> static_agents_map;
++
++  auto* agent = new Cell();
++  agent->SetDiameter(10);
++  agent->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr = agent->GetAgentPtr<Cell>();
++  auto auid = agent->GetUid();
++
++  EXPECT_FALSE(agent->IsStatic());
++
++  rm->AddAgent(agent);
++
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  StatelessBehavior grow(
++      [](Agent* agent) { agent->SetDiameter(agent->GetDiameter() + 5); });
++  aptr->AddBehavior(grow.NewCopy());
++
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  aptr->RemoveBehavior(aptr->GetAllBehaviors()[1]);
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  aptr->SetDiameter(20);
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  StatelessBehavior shrink(
++      [](Agent* agent) { agent->SetDiameter(agent->GetDiameter() - 1); });
++  aptr->AddBehavior(shrink.NewCopy());
++
++  // should be true because the diameter was not growing
++  scheduler->Simulate(2);
++  EXPECT_FALSE(static_agents_map[auid]);
++}
++
++// -----------------------------------------------------------------------------
++TEST(AgentTest, StaticnessBasic) {
++  auto set_param = [](Param* param) { param->detect_static_agents = true; };
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* scheduler = simulation.GetScheduler();
++
++  std::unordered_map<AgentUid, bool> static_agents_map;
++
++  auto* agent = new Cell();
++  agent->SetDiameter(10);
++  agent->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr = agent->GetAgentPtr<Cell>();
++  auto auid = agent->GetUid();
++
++  // should be false right after creation
++  EXPECT_FALSE(agent->IsStatic());
++
++  rm->AddAgent(agent);
++
++  // should be false in the first iteration
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  // should be true in its second iteration since it hasn't been moved
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid]);
++
++  StatelessBehavior grow(
++      [](Agent* agent) { agent->SetDiameter(agent->GetDiameter() + 5); });
++  aptr->AddBehavior(grow.NewCopy());
++
++  // should be true because the diameter is growing in the same iteration
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid]);
++
++  aptr->RemoveBehavior(aptr->GetAllBehaviors()[1]);
++  // should be false because the diameter was growing in the previous iteration
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  // should be true because the diameter was not growing in the previous
++  // iteration
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid]);
++
++  // simulate modification from neighbor -> should be false
++  aptr->SetDiameter(20);
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++
++  StatelessBehavior shrink(
++      [](Agent* agent) { agent->SetDiameter(agent->GetDiameter() - 1); });
++  aptr->AddBehavior(shrink.NewCopy());
++
++  // should be true because the diameter was not growing
++  scheduler->Simulate(2);
++  EXPECT_TRUE(static_agents_map[auid]);
++}
++
++// -----------------------------------------------------------------------------
++TEST(AgentTest, StaticnessNeighbors) {
++  auto set_param = [](Param* param) { param->detect_static_agents = true; };
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* scheduler = simulation.GetScheduler();
++
++  std::unordered_map<AgentUid, bool> static_agents_map;
++
++  auto* agent = new Cell({0, 0, 0});
++  agent->SetDiameter(10);
++  agent->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr = agent->GetAgentPtr<Cell>();
++  auto auid = agent->GetUid();
++
++  auto* neighbor = new Cell({10, 0, 0});
++  neighbor->SetDiameter(10);
++  neighbor->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto nptr = neighbor->GetAgentPtr<Cell>();
++  auto nuid = neighbor->GetUid();
++
++  // should be false right after creation
++  EXPECT_FALSE(agent->IsStatic());
++  EXPECT_FALSE(neighbor->IsStatic());
++
++  rm->AddAgent(agent);
++  rm->AddAgent(neighbor);
++
++  // should be false in the first iteration
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++  EXPECT_FALSE(static_agents_map[nuid]);
++
++  // should be true in its second iteration since it hasn't been moved
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid]);
++  EXPECT_TRUE(static_agents_map[nuid]);
++
++  // simulate modification from neighbor -> should be false
++  aptr->SetDiameter(20);
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid]);
++  EXPECT_FALSE(static_agents_map[nuid]);
++}
++
++// -----------------------------------------------------------------------------
++TEST(AgentTest, StaticnessNewAgent) {
++  auto set_param = [](Param* param) { param->detect_static_agents = true; };
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* scheduler = simulation.GetScheduler();
++
++  std::unordered_map<AgentUid, bool> static_agents_map;
++
++  auto* agent1 = new Cell({0, 0, 0});
++  agent1->SetDiameter(10);
++  agent1->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr1 = agent1->GetAgentPtr<Cell>();
++  auto auid1 = agent1->GetUid();
++
++  auto* agent2 = new Cell({10, 0, 0});
++  agent2->SetDiameter(10);
++  agent2->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr2 = agent2->GetAgentPtr<Cell>();
++  auto auid2 = agent2->GetUid();
++
++  auto* agent3 = new Cell({30, 0, 0});
++  agent3->SetDiameter(10);
++  agent3->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto auid3 = agent3->GetUid();
++
++  auto* agent4 = new Cell({40, 0, 0});
++  agent4->SetDiameter(10);
++  agent4->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto auid4 = agent4->GetUid();
++
++  // should be false right after creation
++  EXPECT_FALSE(agent1->IsStatic());
++  EXPECT_FALSE(agent2->IsStatic());
++  EXPECT_FALSE(agent3->IsStatic());
++  EXPECT_FALSE(agent4->IsStatic());
++
++  rm->AddAgent(agent1);
++  rm->AddAgent(agent2);
++  rm->AddAgent(agent3);
++  rm->AddAgent(agent4);
++
++  // should be false in the first iteration
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid1]);
++  EXPECT_FALSE(static_agents_map[auid2]);
++  EXPECT_FALSE(static_agents_map[auid3]);
++  EXPECT_FALSE(static_agents_map[auid4]);
++
++  // should be true in its second iteration since it hasn't been moved
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid1]);
++  EXPECT_TRUE(static_agents_map[auid2]);
++  EXPECT_TRUE(static_agents_map[auid3]);
++  EXPECT_TRUE(static_agents_map[auid4]);
++
++  // create new agent
++  auto* new_agent = new Cell({20, 0, 0});
++  //   big enough to overlap with agent1 and agent2
++  new_agent->SetDiameter(12);
++  new_agent->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto naptr = new_agent->GetAgentPtr<Cell>();
++  auto nauid = new_agent->GetUid();
++  rm->AddAgent(new_agent);
++
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid1]);
++  EXPECT_TRUE(static_agents_map[auid4]);
++  EXPECT_FALSE(static_agents_map[auid2]);
++  EXPECT_FALSE(static_agents_map[auid3]);
++  EXPECT_FALSE(static_agents_map[nauid]);
++}
++
++// -----------------------------------------------------------------------------
++TEST(AgentTest, StaticnessNewAgentLargetThanAllOthers) {
++  // This test tests if static agent detection works even
++  // if an agent is created that is larger than all others.
++  // This could be problematic if implemented incorrectly,
++  // because the uniform grid environment can only return
++  // agents within its box length.
++  auto set_param = [](Param* param) { param->detect_static_agents = true; };
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* scheduler = simulation.GetScheduler();
++
++  std::unordered_map<AgentUid, bool> static_agents_map;
++
++  auto* agent1 = new Cell({0, 0, 0});
++  agent1->SetDiameter(10);
++  agent1->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr1 = agent1->GetAgentPtr<Cell>();
++  auto auid1 = agent1->GetUid();
++
++  auto* agent2 = new Cell({10, 0, 0});
++  agent2->SetDiameter(10);
++  agent2->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto aptr2 = agent2->GetAgentPtr<Cell>();
++  auto auid2 = agent2->GetUid();
++
++  auto* agent3 = new Cell({30, 0, 0});
++  agent3->SetDiameter(10);
++  agent3->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto auid3 = agent3->GetUid();
++
++  auto* agent4 = new Cell({40, 0, 0});
++  agent4->SetDiameter(10);
++  agent4->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto auid4 = agent4->GetUid();
++
++  // should be false right after creation
++  EXPECT_FALSE(agent1->IsStatic());
++  EXPECT_FALSE(agent2->IsStatic());
++  EXPECT_FALSE(agent3->IsStatic());
++  EXPECT_FALSE(agent4->IsStatic());
++
++  rm->AddAgent(agent1);
++  rm->AddAgent(agent2);
++  rm->AddAgent(agent3);
++  rm->AddAgent(agent4);
++
++  // should be false in the first iteration
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid1]);
++  EXPECT_FALSE(static_agents_map[auid2]);
++  EXPECT_FALSE(static_agents_map[auid3]);
++  EXPECT_FALSE(static_agents_map[auid4]);
++
++  // should be true in its second iteration since it hasn't been moved
++  scheduler->Simulate(1);
++  EXPECT_TRUE(static_agents_map[auid1]);
++  EXPECT_TRUE(static_agents_map[auid2]);
++  EXPECT_TRUE(static_agents_map[auid3]);
++  EXPECT_TRUE(static_agents_map[auid4]);
++
++  // create new agent
++  auto* new_agent = new Cell({20, 0, 0});
++  //   big enough to overlap with all agents
++  new_agent->SetDiameter(22);
++  new_agent->AddBehavior(new CaptureStaticness(&static_agents_map));
++  auto nauid = new_agent->GetUid();
++  rm->AddAgent(new_agent);
++
++  scheduler->Simulate(1);
++  EXPECT_FALSE(static_agents_map[auid1]);
++  EXPECT_FALSE(static_agents_map[auid2]);
++  EXPECT_FALSE(static_agents_map[auid3]);
++  EXPECT_FALSE(static_agents_map[auid4]);
++  EXPECT_FALSE(static_agents_map[nauid]);
++}
++
+ }  // namespace agent_test_internal
+ }  // namespace bdm
+diff --git a/test/unit/core/agent/agent_test.h b/test/unit/core/agent/agent_test.h
+index 9c5636f0f..0c40991a5 100644
+--- a/test/unit/core/agent/agent_test.h
++++ b/test/unit/core/agent/agent_test.h
+@@ -90,6 +90,24 @@ struct Removal : public Behavior {
+ 
+ }  // namespace agent_test_internal
+ 
++// -----------------------------------------------------------------------------
++struct CaptureStaticness : public Behavior {
++  BDM_BEHAVIOR_HEADER(CaptureStaticness, Behavior, 1);
++
++  CaptureStaticness() {}
++  CaptureStaticness(std::unordered_map<AgentUid, bool>* static_agents_map)
++      : static_agents_map_(static_agents_map) {}
++  virtual ~CaptureStaticness() {}
++
++  void Run(Agent* agent) override {
++#pragma omp critical
++    (*static_agents_map_)[agent->GetUid()] = agent->IsStatic();
++  }
++
++ private:
++  std::unordered_map<AgentUid, bool>* static_agents_map_;
++};
++
+ #ifdef __ROOTCLING__
+ static AgentPointer<Agent> dummy_ptr;
+ #endif
+diff --git a/test/unit/core/scheduler_test.cc b/test/unit/core/scheduler_test.cc
+index 74bb1d4f2..5a10148ca 100644
+--- a/test/unit/core/scheduler_test.cc
++++ b/test/unit/core/scheduler_test.cc
+@@ -448,9 +448,9 @@ TEST_F(SchedulerTest, ScheduleOrder) {
+   scheduler_ = sim.GetScheduler();
+   sim.Simulate(1);
+ 
+-  std::vector<std::string> agent_ops = {
+-      "update staticness", "bound space",    "behavior",
+-      "mechanical forces", "discretization", "propagate staticness"};
++  std::vector<std::string> agent_ops = {"update staticness", "bound space",
++                                        "behavior", "mechanical forces",
++                                        "discretization"};
+   std::vector<std::string> sa_ops = {"diffusion"};
+ 
+   int i = 0;
+diff --git a/test/unit/neuroscience/mechanical_interaction_test.cc b/test/unit/neuroscience/mechanical_interaction_test.cc
+index 09659b69a..8cee77219 100644
+--- a/test/unit/neuroscience/mechanical_interaction_test.cc
++++ b/test/unit/neuroscience/mechanical_interaction_test.cc
+@@ -24,10 +24,16 @@
+ 
+ namespace bdm {
+ namespace neuroscience {
++namespace mechanical_interaction_test_detail {
+ 
+-TEST(MechanicalInteraction, StraightxCylinderGrowth) {
++// -----------------------------------------------------------------------------
++void RunStraightCylinderGrowthTest(const char* test_name,
++                                   bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -61,13 +67,25 @@ TEST(MechanicalInteraction, StraightxCylinderGrowth) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, StraightxCylinderGrowthNoMechanical) {
+-  auto set_param = [](bdm::Param* param) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightxCylinderGrowth) {
++  RunStraightCylinderGrowthTest(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightxCylinderGrowth_Static) {
++  RunStraightCylinderGrowthTest(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest2(const char* test_name, bool detect_static_agents) {
++  auto set_param = [&](bdm::Param* param) {
+     param->unschedule_default_operations = {"mechanical forces"};
+     param->Get<Param>()->neurite_max_length = 2;
++    param->detect_static_agents = detect_static_agents;
+   };
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME, set_param);
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -102,9 +120,23 @@ TEST(MechanicalInteraction, StraightxCylinderGrowthNoMechanical) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, DiagonalxyCylinderGrowth) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightxCylinderGrowthNoMechanical) {
++  RunTest2(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightxCylinderGrowthNoMechanical_Static) {
++  RunTest2(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest3(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -136,9 +168,23 @@ TEST(MechanicalInteraction, DiagonalxyCylinderGrowth) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, DiagonalxyzCylinderGrowth) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalxyCylinderGrowth) {
++  RunTest3(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalxyCylinderGrowth_Static) {
++  RunTest3(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest4(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -171,9 +217,23 @@ TEST(MechanicalInteraction, DiagonalxyzCylinderGrowth) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, DiagonalSpecialDirectionCylinderGrowth) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalxyzCylinderGrowth) {
++  RunTest4(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalxyzCylinderGrowth_Static) {
++  RunTest4(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest5(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -206,12 +266,26 @@ TEST(MechanicalInteraction, DiagonalSpecialDirectionCylinderGrowth) {
+   }
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalSpecialDirectionCylinderGrowth) {
++  RunTest5(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, DiagonalSpecialDirectionCylinderGrowth_Static) {
++  RunTest5(TEST_NAME, true);
++}
++
+ // as the dendrite grows exactly at the center of the second cells
+ // growth force/direction and repulsive force/direction are equal
+ // so the dendrite stop growing
+-TEST(MechanicalInteraction, StraightCylinderGrowthObstacle) {
++// -----------------------------------------------------------------------------
++void RunTest6(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -253,9 +327,24 @@ TEST(MechanicalInteraction, StraightCylinderGrowthObstacle) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, NotStraightCylinderGrowthObstacle) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightCylinderGrowthObstacle) {
++  RunTest6(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, StraightCylinderGrowthObstacle_Static) {
++  RunTest6(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunNotStraightCylinderGrowthObstacleTest(const char* test_name,
++                                              bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -297,9 +386,23 @@ TEST(MechanicalInteraction, NotStraightCylinderGrowthObstacle) {
+   EXPECT_NEAR(ne_axis[1], 0, abs_error<double>::value);
+ }
+ 
+-TEST(MechanicalInteraction, BifurcationCylinderGrowth) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, NotStraightCylinderGrowthObstacle) {
++  RunNotStraightCylinderGrowthObstacleTest(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, NotStraightCylinderGrowthObstacle_Static) {
++  RunNotStraightCylinderGrowthObstacleTest(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest7(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -346,9 +449,23 @@ TEST(MechanicalInteraction, BifurcationCylinderGrowth) {
+   EXPECT_NEAR(ne_axis[2], ne_axis_2[2], abs_error<double>::value);
+ }
+ 
+-TEST(MechanicalInteraction, BranchCylinderGrowth) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BifurcationCylinderGrowth) {
++  RunTest7(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BifurcationCylinderGrowth_Static) {
++  RunTest7(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest8(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron = new NeuronSoma();
+@@ -393,12 +510,24 @@ TEST(MechanicalInteraction, BranchCylinderGrowth) {
+   EXPECT_NEAR(ne_axis_2[1], 0, abs_error<double>::value);
+ }
+ 
+-TEST(MechanicalInteraction, BifurcateCylinderRandomGrowth) {
+-  auto set_param = [](bdm::Param* param) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BranchCylinderGrowth) {
++  RunTest8(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BranchCylinderGrowth_Static) {
++  RunTest8(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest9(const char* test_name, bool detect_static_agents) {
++  auto set_param = [&](bdm::Param* param) {
+     param->Get<Param>()->neurite_max_length = 2;
++    param->detect_static_agents = detect_static_agents;
+   };
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME, set_param);
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+   auto* random = simulation.GetRandom();
+ 
+@@ -456,13 +585,25 @@ TEST(MechanicalInteraction, BifurcateCylinderRandomGrowth) {
+   EXPECT_GT(ne2->GetMassLocation()[2], 15);
+ }
+ 
+-TEST(MechanicalInteraction, TwoDistinctCylinderEncounter) {
+-  auto set_param = [](bdm::Param* param) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BifurcateCylinderRandomGrowth) {
++  RunTest9(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, BifurcateCylinderRandomGrowth_Static) {
++  RunTest9(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest10(const char* test_name, bool detect_static_agents) {
++  auto set_param = [&](bdm::Param* param) {
+     param->Get<Param>()->neurite_max_length = 2;
++    param->detect_static_agents = detect_static_agents;
+   };
+ 
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME, set_param);
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron1 = new NeuronSoma();
+@@ -519,9 +660,23 @@ TEST(MechanicalInteraction, TwoDistinctCylinderEncounter) {
+   }
+ }
+ 
+-TEST(MechanicalInteraction, TwoCylinderGrowthObstacle) {
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, TwoDistinctCylinderEncounter) {
++  RunTest10(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, TwoDistinctCylinderEncounter_Static) {
++  RunTest10(TEST_NAME, true);
++}
++
++// -----------------------------------------------------------------------------
++void RunTest11(const char* test_name, bool detect_static_agents) {
+   neuroscience::InitModule();
+-  Simulation simulation(TEST_NAME);
++  auto set_param = [&](bdm::Param* param) {
++    param->detect_static_agents = detect_static_agents;
++  };
++  Simulation simulation(test_name, set_param);
+   auto* rm = simulation.GetResourceManager();
+ 
+   NeuronSoma* neuron1 = new NeuronSoma();
+@@ -574,5 +729,16 @@ TEST(MechanicalInteraction, TwoCylinderGrowthObstacle) {
+   EXPECT_GT(ne2_position[2], 11);
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, TwoCylinderGrowthObstacle) {
++  RunTest11(TEST_NAME, false);
++}
++
++// -----------------------------------------------------------------------------
++TEST(MechanicalInteraction, TwoCylinderGrowthObstacle_Static) {
++  RunTest11(TEST_NAME, true);
++}
++
++}  // end namespace mechanical_interaction_test_detail
+ }  // end namespace neuroscience
+ }  // end namespace bdm

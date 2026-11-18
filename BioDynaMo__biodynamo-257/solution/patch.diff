@@ -1,0 +1,209 @@
+diff --git a/src/core/container/math_array.h b/src/core/container/math_array.h
+index 562ed863d..3ad04b8d5 100644
+--- a/src/core/container/math_array.h
++++ b/src/core/container/math_array.h
+@@ -336,6 +336,16 @@ class MathArray {  // NOLINT
+   /// \return sum of the array's content.
+   T Sum() const { return std::accumulate(begin(), end(), 0); }
+ 
++  /// Checks if vector is a zero vector, e.g. if all entries are zero.
++  bool IsZero() const {
++    for (size_t i = 0; i < N; i++) {
++      if (data_[i] != 0) {
++        return false;
++      }
++    }
++    return true;
++  }
++
+   /// Compute the norm of the array's content.
+   /// \return array's norm.
+   T Norm() const {
+diff --git a/src/core/diffusion/diffusion_grid.cc b/src/core/diffusion/diffusion_grid.cc
+index 777ff2798..898b7bd4e 100644
+--- a/src/core/diffusion/diffusion_grid.cc
++++ b/src/core/diffusion/diffusion_grid.cc
+@@ -327,9 +327,8 @@ double DiffusionGrid::GetConcentration(const Double3& position) const {
+   return c1_[idx];
+ }
+ 
+-/// Get the (normalized) gradient at specified position
+-void DiffusionGrid::GetGradient(const Double3& position,
+-                                Double3* gradient) const {
++void DiffusionGrid::GetGradient(const Double3& position, Double3* gradient,
++                                bool normalize) const {
+   auto idx = GetBoxIndex(position);
+   if (idx >= total_num_boxes_) {
+     Log::Error("DiffusionGrid::GetGradient",
+@@ -338,8 +337,7 @@ void DiffusionGrid::GetGradient(const Double3& position,
+     return;
+   }
+   *gradient = gradients_[idx];
+-  auto norm = gradient->Norm();
+-  if (norm > 1e-10) {
++  if (normalize && !gradient->IsZero()) {
+     gradient->Normalize();
+   }
+ }
+diff --git a/src/core/diffusion/diffusion_grid.h b/src/core/diffusion/diffusion_grid.h
+index 89cb355d8..9a254b44b 100644
+--- a/src/core/diffusion/diffusion_grid.h
++++ b/src/core/diffusion/diffusion_grid.h
+@@ -76,9 +76,15 @@ class DiffusionGrid {
+   /// Get the concentration at specified position
+   double GetConcentration(const Double3& position) const;
+ 
+-  /// Get the (normalized) gradient at specified position
+-  // TODO: virtual because of test
+-  virtual void GetGradient(const Double3& position, Double3* gradient) const;
++  // NOTE: virtual because of test
++  /// Get the gradient at a specified position. By default, the obtained
++  /// gradient is scaled to norm 1, but with `normalize = false` one can obtain
++  /// the full gradient information (e.g. the un-normalized gradient). If the
++  /// gradient is zero and `normalize = true`, this method returns a zero
++  /// vector. Note that the gradient is computed via a central difference scheme
++  /// on the underlying spatial discretization.
++  virtual void GetGradient(const Double3& position, Double3* gradient,
++                           bool normalize = true) const;
+ 
+   std::array<uint32_t, 3> GetBoxCoordinates(const Double3& position) const;
+ 
+diff --git a/test/unit/core/behavior/chemotaxis_test.cc b/test/unit/core/behavior/chemotaxis_test.cc
+index b66a6fe73..2576a2ead 100644
+--- a/test/unit/core/behavior/chemotaxis_test.cc
++++ b/test/unit/core/behavior/chemotaxis_test.cc
+@@ -25,7 +25,8 @@ struct TestDiffusionGrid : public EulerGrid {
+       : EulerGrid(0, "TestSubstance", 1, 1),
+         normalized_gradient_(normalized_gradient) {}
+ 
+-  void GetGradient(const Double3& position, Double3* gradient) const override {
++  void GetGradient(const Double3& position, Double3* gradient,
++                   bool normalize = true) const override {
+     (*gradient) = normalized_gradient_;
+   }
+ 
+diff --git a/test/unit/core/container/math_array_test.cc b/test/unit/core/container/math_array_test.cc
+index 6f9be6475..e03cc3ad8 100644
+--- a/test/unit/core/container/math_array_test.cc
++++ b/test/unit/core/container/math_array_test.cc
+@@ -165,6 +165,13 @@ TEST(MathArray, GetNormalizedArray) {
+   EXPECT_DOUBLE_EQ(d[2], a[2]);
+ }
+ 
++TEST(MathArray, IsZero) {
++  Double3 x = {0, 0, 0};
++  Double3 y = {0, 0, 0.01};
++  EXPECT_TRUE(x.IsZero());
++  EXPECT_FALSE(y.IsZero());
++}
++
+ TEST(MathArray, NormalizeZeroVectorDeath) {
+   EXPECT_DEATH_IF_SUPPORTED(
+       {
+diff --git a/test/unit/core/diffusion_test.cc b/test/unit/core/diffusion_test.cc
+index 49f4977b3..357a9cdbf 100644
+--- a/test/unit/core/diffusion_test.cc
++++ b/test/unit/core/diffusion_test.cc
+@@ -708,6 +708,87 @@ TEST(DISABLED_DiffusionTest, RungeKuttaConvergence) {
+   delete dgrid8;
+ }
+ 
++TEST(DiffusionTest, GradientComputation) {
++  // Define closed space with bounds
++  auto set_param = [](auto* param) {
++    param->bound_space = Param::BoundSpaceMode::kClosed;
++    param->min_bound = 0;
++    param->max_bound = 250;
++  };
++
++  // Standard simulation objects
++  Simulation simulation(TEST_NAME, set_param);
++  auto* rm = simulation.GetResourceManager();
++  auto* param = simulation.GetParam();
++
++  // Create a number of cells at a random position
++  uint64_t num_cells = 30;
++  auto construct = [](const Double3& position) {
++    Cell* cell = new Cell(position);
++    cell->SetDiameter(10);
++    return cell;
++  };
++  ModelInitializer::CreateAgentsRandom(param->min_bound, param->max_bound,
++                                       num_cells, construct);
++
++  // Define the substance for our simulation
++  DiffusionGrid* d_grid = nullptr;
++  d_grid = new EulerGrid(0, "Substance", 0.0, 0.0, 100);
++  rm->AddDiffusionGrid(d_grid);
++
++  // Define scalar field for initialization
++  auto scalar_field = [&](double x, double y, double z) {
++    return 2 * x / param->max_bound + 4 * std::pow((y / param->max_bound), 2) +
++           std::sin(2 * Math::kPi * z / param->max_bound);
++  };
++
++  // Define the analytic gradient as a reference solution
++  auto gradient_field = [&](const Double3& pos) {
++    double y = pos[1];
++    double z = pos[2];
++    Double3 gradient;
++    gradient[0] = 2 / param->max_bound;
++    gradient[1] = 8 * y / std::pow(param->max_bound, 2);
++    gradient[2] = (2 * Math::kPi / param->max_bound) *
++                  std::cos(2 * Math::kPi * z / param->max_bound);
++    return gradient;
++  };
++
++  // Compute the gradient the scalar field.
++  ModelInitializer::InitializeSubstance(0, scalar_field);
++  simulation.GetScheduler()->Simulate(1);
++  d_grid->CalculateGradient();
++
++  // Define a few dummy positions where to evaluate the gradient
++  Double3 pos1{20, 50, 230};
++  Double3 pos2{100, 200, 150};
++  Double3 pos3{200, 100, 20};
++
++  // Get analytic and numerical gradients
++  Double3 grad1, grad2, grad3;
++  Double3 expected_grad1 = gradient_field(pos1);
++  Double3 expected_grad2 = gradient_field(pos2);
++  Double3 expected_grad3 = gradient_field(pos3);
++  d_grid->GetGradient(pos1, &grad1, false);
++  d_grid->GetGradient(pos2, &grad2, false);
++  d_grid->GetGradient(pos3, &grad3, false);
++  Double3 err1 = grad1 - expected_grad1;
++  Double3 err2 = grad2 - expected_grad2;
++  Double3 err3 = grad3 - expected_grad3;
++  std::vector<Double3> results{err1, err2, err3};
++  std::vector<Double3> expected_gradients{expected_grad1, expected_grad2,
++                                          expected_grad3};
++
++  // Compare analytic and numeric gradient
++  for (size_t i = 0; i < results.size(); i++) {
++    auto res = results[i];
++    auto grad = expected_gradients[i];
++    EXPECT_LT(abs(res[0] / grad[0]), 1e-5);  // This gradient is very easy
++    EXPECT_LT(abs(res[1] / grad[1]), 0.05);  // Require 5 precent accuracy
++    EXPECT_LT(abs(res[2] / grad[2]), 0.03);  // Require 3 precent accuracy
++  }
++}
++
+ #ifdef USE_PARAVIEW
+ 
+ // Github Actions does not support OpenGL 3.3.
+diff --git a/util/installation/osx/prerequisites.sh b/util/installation/osx/prerequisites.sh
+index 629a16c72..61a504482 100755
+--- a/util/installation/osx/prerequisites.sh
++++ b/util/installation/osx/prerequisites.sh
+@@ -56,7 +56,9 @@ brew install \
+ 
+ # Install the optional packages
+ if [ $1 == "all" ]; then
+-    PIP_PACKAGES="nbformat jupyter metakernel jupyterlab"
++    # Fix jinja2 version because of failing build target `notebooks` on 
++    # macOS System CI.
++    PIP_PACKAGES="nbformat jupyter metakernel jupyterlab jinja2==3.0"
+     # Don't install --user: the packages should end up in the PYENV_ROOT directory
+     python3.9 -m pip install $PIP_PACKAGES
+     brew install \

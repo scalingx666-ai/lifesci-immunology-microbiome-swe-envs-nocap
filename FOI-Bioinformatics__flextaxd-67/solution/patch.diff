@@ -1,0 +1,241 @@
+diff --git a/flextaxd/create_databases.py b/flextaxd/create_databases.py
+index 782e293..263fd76 100644
+--- a/flextaxd/create_databases.py
++++ b/flextaxd/create_databases.py
+@@ -220,10 +220,13 @@ def __init__(self,  message,expression=""):
+ 		download_prompted = False
+ 		if missing and not (args.download or args.representative or args.download_file):
+ 			print('There is a discrepancy of genomes found in the database and the specified genome-folder, {numFound} genomes were found and {numMissing} genomes are missing.'.format(numFound=len(genomes),numMissing=len(missing)))
++			print('You may want to purge your database from missing genomes using "flextaxd --purge_database"')
+ 			if not args.download: # Dont ask to download if the user already specified via flag to download
+-				ans = input('Do you want to download these genomes from NCBI? (y/n) ')
++				ans = input('Do you want to download these genomes from NCBI? (y)es, (n)o, (c)ancel: ')
+ 				if ans in ["y","Y","yes", "Yes"]:
+ 					download_prompted = True
++				elif type(ans) == str and not ans.isdigit() and ans.lower() in ('c','cancel',):
++					exit('Terminated.')
+ 				else:
+ 					print('Will naivly proceed to construct database. Genomes may be missing.')
+ 		#/
+@@ -248,6 +251,9 @@ def __init__(self,  message,expression=""):
+ 			elif args.download_file:
+ 				download_obj.download_from_file(args.download_file)
+ 			else:
++				ans = input('Will attempt to get genomes from '+str(args.rep_path+'. Proceed? (y/n)'))
++				if not ans in ["yes","Yes","y","Y"]:
++					exit("Terminated.")
+ 				new_genome_path, missing = download_obj.run(missing,args.rep_path)
+ 				if not new_genome_path:
+ 					still_missing = missing
+diff --git a/flextaxd/custom_taxonomy_databases.py b/flextaxd/custom_taxonomy_databases.py
+index 3cae136..70458b4 100644
+--- a/flextaxd/custom_taxonomy_databases.py
++++ b/flextaxd/custom_taxonomy_databases.py
+@@ -129,6 +129,8 @@ def __init__(self,  message,expression=""):
+     mod_opts.add_argument('--clean_database',	action='store_true',                    help="Clean up database from unannotated nodes")
+     mod_opts.add_argument('--skip_annotation',	action='store_true',                    help="Do not automatically add annotation when creating GTDB database")
+     mod_opts.add_argument('--refdatabase', metavar="", default=False,                   help="For download command, give value of expected source, default (refseq)")
++    mod_opts.add_argument('--purge_database',metavar='',default=False,                  help="Used to purge the FlexTaxD-database from entries that lack a downloaded genome (such as when creating a GTDB-database using all taxonomy but using just the representative dataset)\nProvide the directory path of the downloaded genomes (default = FALSE)")
++    mod_opts.add_argument('--purge_database_force',action='store_true',default=False,   help="If specified, will remove all genomes that are missing from the FlexTaxD-database, regardless if they are distinct nodes or not in the tree (default = FALSE)")
+ 
+ 
+     out_opts = parser.add_argument_group('output_opts', "Output options")
+@@ -266,6 +268,30 @@ def __init__(self,  message,expression=""):
+         modify_module = dynamic_import("modules", "ModifyTree")
+         modify_obj = modify_module(database=args.database,clean_database=args.clean_database,taxid_base=args.taxid_base)
+         modify_obj.clean_database(ncbi=ncbi)
++    
++    '''Purge database from entries that do not exist in --genomes_path [as known in flextaxd-create] directory'''
++    if args.purge_database:
++        # Check if genomes-folder provided by user exists
++        if not os.path.exists(args.purge_database):
++            exit("Could not locate directory of genomes: "+args.purge_database)
++        #/
++        # Scan directory for downloaded genomes
++        genomes_path = args.purge_database
++        process_directory = dynamic_import("modules", "ProcessDirectory")
++        logger.info("Processing files; create kraken seq.map")
++        process_directory_obj = process_directory(args.database)
++        genomes, missing = process_directory_obj.process_folder(genomes_path)
++        
++        missing_genomes = set()
++        for entry in missing:
++            missing_genomes.add(entry['genome_id'])
++        #/
++        # Send genomes to have their nodes (and parents, when loosing all their childs) removes
++        if missing:
++            modify_module = dynamic_import("modules", "ModifyTree")
++            modify_obj = modify_module(database=args.database,purge_database=True,taxid_base=args.taxid_base)
++            modify_obj.purge_database(missing_genomes,force_genome_delete=args.purge_database_force)
++        #/
+ 
+     '''Dump option, export list of genomes, added in flextaxd version 0.4.2'''
+     if args.dump_genomes:
+@@ -275,7 +301,7 @@ def __init__(self,  message,expression=""):
+         if args.dump_genome_annotations:
+             write_obj.dump_genome_annotations()
+         else:
+-            write_obj.dump_genomes()
++            write_obj.dump_genomes(genomes_list = genomes)
+ 
+     ''' 0. Create taxonomy database (if it does not exist)'''
+     if args.taxonomy_file:
+diff --git a/flextaxd/modules/ModifyTree.py b/flextaxd/modules/ModifyTree.py
+index 33f27c8..3170b0c 100644
+--- a/flextaxd/modules/ModifyTree.py
++++ b/flextaxd/modules/ModifyTree.py
+@@ -55,7 +55,7 @@ def __init__(self, message):
+ 
+ class ModifyTree(object):
+ 	"""docstring for ModifyTree."""
+-	def __init__(self, database=".taxonomydb", mod_database=False, mod_file=False, clean_database=False,update_genomes=False, update_node_names=False,rename_node=False,separator="\t",verbose=False,parent=False,replace=False,**kwargs):
++	def __init__(self, database=".taxonomydb", mod_database=False, mod_file=False, clean_database=False, purge_database=False,update_genomes=False, update_node_names=False,rename_node=False,separator="\t",verbose=False,parent=False,replace=False,**kwargs):
+ 		super(ModifyTree, self).__init__()
+ 		self.verbose = verbose
+ 		logger.info("Modify Tree")
+@@ -94,7 +94,7 @@ def __init__(self, database=".taxonomydb", mod_database=False, mod_file=False, c
+ 			self.modsource = self.parse_modification(self.moddb,"database")
+ 		elif mod_file:
+ 			self.modsource = self.parse_modification(mod_file,"file")
+-		elif update_genomes or clean_database or update_node_names or rename_node:
++		elif update_genomes or clean_database or update_node_names or rename_node or purge_database:
+ 			pass
+ 		else:
+ 			raise InputError("No modification source could be found both mod_database and mod_file file are empty!")
+@@ -488,6 +488,70 @@ def clean_database(self, ncbi=False):
+ 			self.taxonomydb.query("vacuum")
+ 		logger.info("Database is cleaned!")
+ 
++	def purge_database(self, genomes_list = None, force_genome_delete = False):
++		''' This function takes as input a list of genomes that are missing in the genomes directory specified as --genomes_path in flextaxd-create.
++            It gets the nodes for these genomes and then traverses the tables of the FlexTaxD-database, removing entries (e.g. parent-relations)
++            that are exclusive to such nodes. It tests so that any parent node is not a parent for a node that is not deleted.
++            Optionally, missing genomes that have no distinct nodes in the tree can be removed (force_genome_delete)
++                This occurs when using GTDB taxonomy (full GTDB-database) but only using the representative genomes.
++                The nodes of such datasets have multiple children, of which one is the representative genome and the other children can be removed.
++                When this flag is applied, the function will remove missing entries from all tables wherever possible ("truly missing" datasets)
++                in addition to naively removing all missing genomes (datasets that are missing due to exhaustive import of taxonomy information)
++        '''
++		logger.info('Entered purge_database')
++		if not type(genomes_list) == set:
++			genomes_list = set(genomes_list) # Convert input list to hashmap for lookup speed
++		if genomes_list:
++			print('Have '+str(len(genomes_list))+' missing genomes, looking them up in the database...')
++			# Get nodes and genomes from database
++			logger.info('Fetching id,genome from database')
++			genomes_nodes = self.taxonomydb.get_genomes(table='genomes',cols='id,genome') # get_gnomes returns dict of "genome"->"id"
++			#/
++			# Determine which nodes to keep (We have to do it this way. If using GTDB, one node ID may carry multiple genomes. Thus we must decide which nodes to keep as opposed which to delete.
++			nodes_keep = set()
++			for genome,node in genomes_nodes.items():
++				if not genome in genomes_list:
++					nodes_keep.add(node)
++			#/
++			# Determine which nodes to delete (leaf-nodes [e.g. those that can hold a genome] in database) minus those that we decided to keep
++			nodes_delete = set(genomes_nodes.values()).difference(nodes_keep)
++			
++			logger.info('Number of genome-nodes from table "genomes": '+str(len(genomes_nodes)))
++			logger.info('Number of genome-nodes to keep: '+str(len(nodes_keep)))
++			logger.info('Number of genome-nodes to delete: '+str(len(nodes_delete)))
++			#/
++			# Get parents for leaf-nodes (to-keep and to-delete). Determine which parents are delete-only
++			## NOTE: for some reason the input child is also returned here. Its not intuitive, but it does not matter.
++			parents_keep = set(self.taxonomydb.get_parents(nodes_keep,find_all=True))#,only_parents=True))
++			parents_delete = set(self.taxonomydb.get_parents(nodes_delete,find_all=True))#,only_parents=True))
++			parents_deleteOnly = parents_delete.difference(parents_keep)
++			#/
++			# Perform node deletion (leaf-nodes and exclusive parent-nodes)
++			logger.info('Number of nodes to be deleted: '+str(len(parents_deleteOnly)))
++			#@ delete links from table TREE (parent in _list_ and child in _list_)
++			logger.info("Attempting delete of nodes in table 'tree'")
++			self.taxonomydb.ambigious_delete_links(parents_deleteOnly)
++			#@/
++			#@ delete nodes from table NODES
++			logger.info("Attempting delete of nodes in table 'nodes'")
++			self.taxonomydb.delete_nodes(parents_deleteOnly)
++			#@/
++			#@ delete nodes from table GENOMES
++			logger.info("Attempting delete of nodes in table 'genomes'")
++			num_rows_before = self.taxonomydb.num_rows('genomes')
++			self.taxonomydb.delete_genomes(parents_deleteOnly,genomes=list(genomes_nodes))
++			num_rows_after = self.taxonomydb.num_rows('genomes')
++			num_rows_deleted = num_rows_before - num_rows_after
++			print('Removed '+str(num_rows_deleted)+' node genomes')
++			if num_rows_deleted != len(genomes_list) and not force_genome_delete:
++				print('WARNING: Some nodes were not removed as they did not have exclusive nodes in the tree. This occurs for instance when building from GTDB taxonomy (that has taxonomy for their full database) but downloading only their representative set of genomes')
++				print('To force the removal of these genomes, apply the flag --purge_database_force')
++			if force_genome_delete: # if force delete specified, then remove all missing genomes
++				logger.info("Force-deleting missing genomes from table 'genomes' N="+str(len(genomes_list)))
++				self.taxonomydb.delete_genomes('',genomes=genomes_list,match_genome_only=True)
++				print('Removed '+str(len(genomes_list)-num_rows_deleted)+' genomes by force')
++			#/
++
+ 	def keep_levels(self, links):
+ 		parent_levels = {}
+ 		for c,p,l in links:
+diff --git a/flextaxd/modules/database/DatabaseConnection.py b/flextaxd/modules/database/DatabaseConnection.py
+index 2e3281b..8a919f2 100644
+--- a/flextaxd/modules/database/DatabaseConnection.py
++++ b/flextaxd/modules/database/DatabaseConnection.py
+@@ -609,6 +609,22 @@ def fast_delete_links(self,links,table="tree",hold=False):
+ 			self.commit()
+ 		return True
+ 
++	def ambigious_delete_links(self,nodes,hold=False):
++		'''This funtion takes as input a list of nodes. It will search the "tree" table for rows that return on "parent in list_of_nodes" and "child in list_of_nodes"
++		Returns
++		------
++			boolean
++		'''
++		logger.info("Entered ambigious_delete_links")
++		QUERY = "DELETE FROM {table} WHERE parent in ({parents}) AND child in ({children})"
++		logger.info("Attempting delete where parent&child in: "+str(nodes))
++		res = self.query(QUERY.format(table='tree', parents=",".join(list(map(str,nodes))), children=",".join(list(map(str,nodes)))))
++		## Commit changes
++		if not hold:
++			logger.debug("Commit changes!")
++			self.commit()
++		return True
++
+ 	def delete_nodes(self, nodes, table="nodes",hold=False):
+ 		'''This function deletes all nodes given in nodes
+ 
+@@ -626,19 +642,34 @@ def delete_nodes(self, nodes, table="nodes",hold=False):
+ 			self.commit()
+ 		return True
+ 
+-	def delete_genomes(self,nodes,table="genomes",hold=False):
++	def delete_genomes(self,nodes,genomes='',match_genome_only=False,table="genomes",hold=False):
+ 		'''This function clean up genomes from given nodes
+ 
+ 		Returns
+ 		------
+ 			boolean
+ 		'''
+-		QUERY = "DELETE FROM {table} WHERE id in({nodes})"
++		if genomes: # check if genomes were specified for targeted deletion (sometimes a node can hold multiple genomes)
++			if not match_genome_only:
++				QUERY = "DELETE FROM {table} WHERE id in({nodes}) AND genome in({genomes})"
++			else:
++				QUERY = "DELETE FROM {table} WHERE genome in({genomes})"
++		else:
++			QUERY = "DELETE FROM {table} WHERE id in({nodes})"
++
+ 		logger.info("Deleting {nnodes} annotations!".format(nnodes=len(nodes)))
+-		logger.debug(QUERY.format(table=table,nodes=""))
+ 		#for node in nodes:
+ 			#logger.info("Delete genomes from: {node}".format(node=node))
+-		res = self.query(QUERY.format(table=table, nodes=",".join(list(map(str,nodes)))))
++		if genomes:
++			if not match_genome_only:
++				logger.debug(QUERY.format(table=table,nodes="",genomes=""))
++				res = self.query(QUERY.format(table=table, nodes=",".join(list(map(str,nodes))), genomes='"'+'","'.join(list(map(str,genomes)))+'"'))
++			else:
++				res = self.query(QUERY.format(table=table, genomes='"'+'","'.join(list(map(str,genomes)))+'"'))
++		else:
++			logger.debug(QUERY.format(table=table,nodes=""))
++			res = self.query(QUERY.format(table=table, nodes=",".join(list(map(str,nodes)))))
++		
+ 		## Commit changes
+ 		if not hold:
+ 			logger.debug("Commit changes!")

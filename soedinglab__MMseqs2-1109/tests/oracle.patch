@@ -1,0 +1,171 @@
+diff --git a/src/commons/DBReader.cpp b/src/commons/DBReader.cpp
+index 6771eb4cd..540b7e0f0 100644
+--- a/src/commons/DBReader.cpp
++++ b/src/commons/DBReader.cpp
+@@ -1125,14 +1125,10 @@ int DBReader<T>::isCompressed(int dbtype) {
+ 
+ template<typename T>
+ void DBReader<T>::setSequentialAdvice() {
+-#ifdef HAVE_POSIX_MADVISE
+     for(size_t i = 0; i < dataFileCnt; i++){
+         size_t dataSize = dataSizeOffset[i+1] - dataSizeOffset[i];
+-        if (dataSize > 0 && posix_madvise (dataFiles[i], dataSize, POSIX_MADV_SEQUENTIAL) != 0){
+-            Debug(Debug::ERROR) << "posix_madvise returned an error " << dataFileName << "\n";
+-        }
++        Util::madviseLogged(dataFiles[i], dataSize, POSIX_MADV_SEQUENTIAL, dataFileName);
+     }
+-#endif
+ }
+ 
+ template<typename T>
+diff --git a/src/commons/Util.cpp b/src/commons/Util.cpp
+index 1a3420056..6bdf5eee8 100644
+--- a/src/commons/Util.cpp
++++ b/src/commons/Util.cpp
+@@ -18,6 +18,8 @@
+ #include "MemoryMapped.h"
+ #include "MemoryTracker.h"
+ #include <algorithm>
++#include <cerrno>
++#include <cstring>
+ #include <sys/mman.h>
+ #include <fstream>      // std::ifstream
+ 
+@@ -331,12 +333,39 @@ uint64_t Util::getL2CacheSize() {
+     return 262144;
+ }
+ 
+-char Util::touchMemory(const char *memory, size_t size) {
++int Util::madviseLogged(void* addr, size_t len, int advice, const char* context) {
+ #ifdef HAVE_POSIX_MADVISE
+-    if (size > 0 && posix_madvise ((void*)memory, size, POSIX_MADV_WILLNEED) != 0){
+-        Debug(Debug::ERROR) << "posix_madvise returned an error (touchMemory)\n";
++    if (len == 0) {
++        return 0;
++    }
++    int rc = posix_madvise(addr, len, advice);
++    if (rc == 0) {
++        return 0;
+     }
++    // SEQUENTIAL is a pure readahead hint; failure is never functional.
++    // WILLNEED with EINVAL is also benign: unaligned tail on large-page
++    // kernels (e.g. ARM64 64K pages) or advice unsupported for the VMA
++    // type (HugeTLB, certain filesystems). Other WILLNEED errnos
++    // (EIO/EBADF/ENOMEM) indicate real problems.
++    const char* adviceName = (advice == POSIX_MADV_WILLNEED)   ? "WILLNEED"
++                           : (advice == POSIX_MADV_SEQUENTIAL) ? "SEQUENTIAL"
++                           : (advice == POSIX_MADV_RANDOM)     ? "RANDOM"
++                           : (advice == POSIX_MADV_NORMAL)     ? "NORMAL"
++                           : (advice == POSIX_MADV_DONTNEED)   ? "DONTNEED"
++                                                               : "?";
++    bool benign = (advice == POSIX_MADV_SEQUENTIAL) || (rc == EINVAL);
++    Debug(benign ? Debug::WARNING : Debug::ERROR)
++        << "posix_madvise(" << adviceName << ") failed for " << context
++        << ": " << strerror(rc) << "\n";
++    return rc;
++#else
++    (void)addr; (void)len; (void)advice; (void)context;
++    return 0;
+ #endif
++}
++
++char Util::touchMemory(const char *memory, size_t size) {
++    Util::madviseLogged((void*)memory, size, POSIX_MADV_WILLNEED, "touchMemory");
+     if(size > Util::getTotalSystemMemory()){
+         Debug(Debug::WARNING) << "Can not touch " << size << " into main memory\n";
+         return 0;
+diff --git a/src/commons/Util.h b/src/commons/Util.h
+index 8b62dd6e0..cc4311eea 100644
+--- a/src/commons/Util.h
++++ b/src/commons/Util.h
+@@ -97,6 +97,28 @@ class Util {
+ 
+     static char touchMemory(const char* memory, size_t size);
+ 
++    // Wrap posix_madvise with errno-aware logging. Returns posix_madvise's
++    // return value (errno-valued, 0 on success). Severity is WARNING for
++    // benign cases (advisory SEQUENTIAL hint failures, or EINVAL on
++    // WILLNEED — typically tail-page alignment on large-page kernels or
++    // VMA types that reject the advice) and ERROR for real failures
++    // (EIO/EBADF/ENOMEM on WILLNEED). A no-op when len == 0 or
++    // HAVE_POSIX_MADVISE is undefined. `context` annotates the log line.
++    //
++    // Fallback POSIX_MADV_* constants so call sites compile even on
++    // platforms without posix_madvise; madviseLogged is a no-op there,
++    // so the literal values are unused.
++#ifndef HAVE_POSIX_MADVISE
++#  ifndef POSIX_MADV_NORMAL
++#    define POSIX_MADV_NORMAL     0
++#    define POSIX_MADV_RANDOM     1
++#    define POSIX_MADV_SEQUENTIAL 2
++#    define POSIX_MADV_WILLNEED   3
++#    define POSIX_MADV_DONTNEED   4
++#  endif
++#endif
++    static int madviseLogged(void* addr, size_t len, int advice, const char* context);
++
+     static size_t countLines(const char *data, size_t length);
+ 
+     static size_t ompCountLines(const char *data, size_t length, unsigned int threads);
+diff --git a/src/linclust/KmerIndex.h b/src/linclust/KmerIndex.h
+index 67a732924..47d40cd5c 100644
+--- a/src/linclust/KmerIndex.h
++++ b/src/linclust/KmerIndex.h
+@@ -4,6 +4,7 @@
+ // Written by Martin Steinegger martin.steinegger@snu.ac.kr
+ // storage for k-mers
+ #include "MathUtil.h"
++#include "Util.h"
+ #include <string>
+ #include <algorithm>
+ #include <fcntl.h>
+@@ -182,11 +183,8 @@ class KmerIndex{
+         this->entryCount = entryCount;
+         this->indexGridSize = MathUtil::ceilIntDivision( MathUtil::ipow<size_t>(alphabetSize, kmerSize), gridResolution );
+         this->entryOffsets = (size_t *) entriesOffetData;
+-#if HAVE_POSIX_MADVISE
+-        if (entryCount > 0 && posix_madvise (entriesData, entryCount* sizeof(KmerEntryRelative), POSIX_MADV_SEQUENTIAL) != 0){
+-            Debug(Debug::ERROR) << "KmerIndex posix_madvise returned an error\n";
+-        }
+-#endif
++        Util::madviseLogged(entriesData, entryCount * sizeof(KmerEntryRelative),
++                            POSIX_MADV_SEQUENTIAL, "KmerIndex");
+ 
+         this->prevKmerStartRange = 0;
+         this->iteratorPos = -1;
+diff --git a/src/linclust/kmermatcher.cpp b/src/linclust/kmermatcher.cpp
+index 99ed070d5..112c63db1 100644
+--- a/src/linclust/kmermatcher.cpp
++++ b/src/linclust/kmermatcher.cpp
+@@ -1669,11 +1669,8 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
+ 
+             if (fstat(fileno(files[file]), &sb) == 0 && sb.st_size > 0) {
+                 entries[file] = (T *)FileUtil::mmapFile(files[file], &dataSize);
+-#if HAVE_POSIX_MADVISE
+-                if (posix_madvise(entries[file], dataSize, POSIX_MADV_SEQUENTIAL) != 0) {
+-                    Debug(Debug::ERROR) << "posix_madvise returned an error for file " << threadedFiles[threadIdx][file] << "\n";
+-                }
+-#endif
++                Util::madviseLogged(entries[file], dataSize, POSIX_MADV_SEQUENTIAL,
++                                    threadedFiles[threadIdx][file].c_str());
+             } else {
+                 entries[file] = nullptr;
+                 dataSize = 0;
+diff --git a/src/prefiltering/Prefiltering.cpp b/src/prefiltering/Prefiltering.cpp
+index 92d957f34..6654c199c 100644
+--- a/src/prefiltering/Prefiltering.cpp
++++ b/src/prefiltering/Prefiltering.cpp
+@@ -434,11 +434,8 @@ void Prefiltering::mergeTargetSplits(const std::string &outDB, const std::string
+     for (size_t i = 0; i < splits; ++i) {
+         files[i] = FileUtil::openFileOrDie(fileNames[i].first.c_str(), "r", true);
+         dataFile[i] = static_cast<char*>(FileUtil::mmapFile(files[i], &dataFileSize[i]));
+-#ifdef HAVE_POSIX_MADVISE
+-        if (dataFileSize[i] > 0 && posix_madvise (dataFile[i], dataFileSize[i], POSIX_MADV_SEQUENTIAL) != 0){
+-            Debug(Debug::ERROR) << "posix_madvise returned an error " << fileNames[i].first << "\n";
+-        }
+-#endif
++        Util::madviseLogged(dataFile[i], dataFileSize[i], POSIX_MADV_SEQUENTIAL,
++                            fileNames[i].first.c_str());
+ 
+     }
+     Debug(Debug::INFO) << "Preparing offsets for merging: " << timer.lap() << "\n";

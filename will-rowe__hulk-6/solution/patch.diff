@@ -1,0 +1,735 @@
+diff --git a/cmd/index.go b/cmd/index.go
+index 4b2f0f8..cf4ca7b 100644
+--- a/cmd/index.go
++++ b/cmd/index.go
+@@ -79,7 +79,7 @@ func indexParamCheck() error {
+ 	if filePath != "." {
+ 		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+ 			if err := os.MkdirAll(filePath, 0700); err != nil {
+-				return fmt.Errorf("can't create specified output directory: ", err)
++				return fmt.Errorf("can't create specified output directory: %v", err)
+ 			}
+ 		}
+ 	}
+diff --git a/cmd/sketch.go b/cmd/sketch.go
+index cbef3fe..e299cfd 100644
+--- a/cmd/sketch.go
++++ b/cmd/sketch.go
+@@ -21,14 +21,14 @@ import (
+ // the command line arguments
+ var (
+ 	fastq      *[]string // list of FASTQ files to sketch
+-	epsilon    *float64  // relative accuracy for countmin sketching
+-	delta      *float64  // relative probability for countmin sketching
++	sizeMB	*uint // maximum memory (MB) used by each CMS to store counts
+ 	kSize      *int      // size of k-mer
+ 	minCount   *int      // minimum count number for a kmer to be added to the histosketch from this interval
+ 	interval   *int      // size of read sampling interval (0 == no interval)
+ 	sketchSize *uint     // size of sketch
+ 	decayRatio *float64  // the decay ratio used for concept drift (1.00 = concept drift disabled)
+ 	streaming  *bool     // writes the sketches to STDOUT (as well as to disk)
++	fasta      *bool     // tells HULK that the input file is in FASTA format
+ )
+ 
+ // the sketchCmd
+@@ -47,20 +47,34 @@ var sketchCmd = &cobra.Command{
+ // a function to initialise the command line arguments
+ func init() {
+ 	fastq = sketchCmd.Flags().StringSliceP("fastq", "f", []string{}, "FASTQ file(s) to sketch (can also pipe in STDIN)")
+-	epsilon = sketchCmd.Flags().Float64P("epsilon", "e", 0.0001, "relative accuracy factor for countmin sketching")
+-	delta = sketchCmd.Flags().Float64P("delta", "d", 0.99, "relative accuracy probability for countmin sketching")
++	sizeMB = sketchCmd.Flags().UintP("cmsMem", "c", 10, "maximum memory (MB) used by each CMS to store counts")
+ 	kSize = sketchCmd.Flags().IntP("kmerSize", "k", 11, "size of k-mer")
+ 	minCount = sketchCmd.Flags().IntP("minCount", "m", 1, "minimum k-mer count for it to be histosketched for a given interval")
+ 	interval = sketchCmd.Flags().IntP("interval", "i", 0, "size of read sampling interval (default 0 (= no interval))")
+ 	sketchSize = sketchCmd.Flags().UintP("sketchSize", "s", 256, "size of sketch")
+ 	decayRatio = sketchCmd.Flags().Float64P("decayRatio", "x", 1.0, "decay ratio used for concept drift (1.0 = concept drift disabled)")
+ 	streaming = sketchCmd.Flags().Bool("stream", false, "prints the sketches to STDOUT after every interval is reached (sketches also written to disk)")
++	fasta = sketchCmd.Flags().Bool("fasta", false, "tells HULK that the input file is actually FASTA format (.fna/.fasta), not FASTQ (experimental feature)")
+ 	RootCmd.AddCommand(sketchCmd)
+ }
+ 
+ //  a function to check user supplied parameters
+ func sketchParamCheck() error {
+-	// check the supplied FASTQ file(s)
++	// setup the outFile
++	filePath := filepath.Dir(*outFile)
++	if filePath != "." {
++		if _, err := os.Stat(filePath); os.IsNotExist(err) {
++			if err := os.MkdirAll(filePath, 0700); err != nil {
++				return fmt.Errorf("can't create specified output directory: %v", err)
++			}
++		}
++	}
++	// set number of processors to use
++	if *proc <= 0 || *proc > runtime.NumCPU() {
++		*proc = runtime.NumCPU()
++	}
++	runtime.GOMAXPROCS(*proc)
++	// check if using STDIN or file(s)
+ 	if len(*fastq) == 0 {
+ 		stat, err := os.Stdin.Stat()
+ 		if err != nil {
+@@ -72,42 +86,41 @@ func sketchParamCheck() error {
+ 			return fmt.Errorf("no STDIN found")
+ 		}
+ 		log.Printf("\tinput file: using STDIN")
+-	} else {
+-		for _, fastqFile := range *fastq {
+-			if _, err := os.Stat(fastqFile); err != nil {
+-				if os.IsNotExist(err) {
+-					return fmt.Errorf("FASTQ file does not exist: %v", fastqFile)
+-				} else {
+-					return fmt.Errorf("can't access FASTQ file (check permissions): %v", fastqFile)
+-				}
+-			}
+-			splitFilename := strings.Split(fastqFile, ".")
+-			if splitFilename[len(splitFilename)-1] == "gz" {
+-				if splitFilename[len(splitFilename)-2] == "fastq" || splitFilename[len(splitFilename)-2] == "fq" {
+-					continue
+-				}
++		return nil
++	}
++	// check the supplied file(s)
++	return checkInputFiles()
++}
++
++// if files are being read, check they exist and are FASTQ/FASTA
++func checkInputFiles() error {
++	for _, fastqFile := range *fastq {
++		if _, err := os.Stat(fastqFile); err != nil {
++			if os.IsNotExist(err) {
++				return fmt.Errorf("file does not exist: %v", fastqFile)
+ 			} else {
+-				if splitFilename[len(splitFilename)-1] == "fastq" || splitFilename[len(splitFilename)-1] == "fq" {
+-					continue
+-				}
++				return fmt.Errorf("can't access file (check permissions): %v", fastqFile)
+ 			}
+-			return fmt.Errorf("does not look like a FASTQ file: %v", fastqFile)
+ 		}
+-	}
+-	// setup the outFile
+-	filePath := filepath.Dir(*outFile)
+-	if filePath != "." {
+-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+-			if err := os.MkdirAll(filePath, 0700); err != nil {
+-				return fmt.Errorf("can't create specified output directory: ", err)
++		suffix1, suffix2 := "fastq", "fq"
++		if *fasta == true {
++			suffix1, suffix2 = "fasta", "fna"
++		}
++		splitFilename := strings.Split(fastqFile, ".")
++		if splitFilename[len(splitFilename)-1] == "gz" {
++			if splitFilename[len(splitFilename)-2] == suffix1 || splitFilename[len(splitFilename)-2] == suffix2 {
++				continue
++			}
++		} else {
++			if splitFilename[len(splitFilename)-1] == suffix1 || splitFilename[len(splitFilename)-1] == suffix2 {
++				continue
+ 			}
+ 		}
++		if *fasta == true {
++			return fmt.Errorf("does not look like a FASTA file: %v", fastqFile)
++		}
++		return fmt.Errorf("does not look like a FASTQ file: %v", fastqFile)
+ 	}
+-	// set number of processors to use
+-	if *proc <= 0 || *proc > runtime.NumCPU() {
+-		*proc = runtime.NumCPU()
+-	}
+-	runtime.GOMAXPROCS(*proc)
+ 	return nil
+ }
+ 
+@@ -132,8 +145,7 @@ func runSketch() {
+ 	log.Printf("\tno. processors: %d", *proc)
+ 	log.Printf("\tk-mer size: %d", *kSize)
+ 	log.Printf("\tmin. k-mer count: %d", *minCount)
+-	log.Printf("\tepsilon value: %.4f", *epsilon)
+-	log.Printf("\tdelta value: %.2f", *delta)
++	log.Printf("\tCMS memory: %d MB", *sizeMB)
+ 	log.Printf("\tsketch size: %d", *sketchSize)
+ 	if *decayRatio == 1 {
+ 		log.Printf("\tconcept drift: disabled")
+@@ -149,7 +161,7 @@ func runSketch() {
+ 	// create the base countmin sketch for recording the k-mer spectrum
+ 	log.Printf("creating the base countmin sketch for kmer counting...")
+ 	// TODO: epsilon and delta values need some checking
+-	spectrum := histosketch.NewCountMinSketch(*epsilon, *delta, 1.0)
++	spectrum := histosketch.NewCountMinSketch(*sizeMB, 1.0)
+ 	log.Printf("\tnumber of tables: %d", spectrum.Tables())
+ 	log.Printf("\tnumber of counters per table: %d", spectrum.Counters())
+ 	// create the pipeline
+@@ -163,6 +175,7 @@ func runSketch() {
+ 	sketcher := stream.NewSketcher()
+ 	// add in the process parameters TODO: consolidate and remove some of these
+ 	dataStream.InputFile = *fastq
++	fastqHandler.Fasta = *fasta
+ 	fastqChecker.Ksize, counter.Ksize = *kSize, *kSize
+ 	counter.Interval = *interval / *proc
+ 	counter.Spectrum, sketcher.Spectrum = spectrum.Copy(), spectrum.Copy()
+diff --git a/paper/analysis-notebooks/README.md b/paper/analysis-notebooks/README.md
+index a803cc5..b1c487d 100644
+--- a/paper/analysis-notebooks/README.md
++++ b/paper/analysis-notebooks/README.md
+@@ -1,5 +1,15 @@
+ # Analysis Notebooks
+ 
++>IMPORTANT: these notebooks use HULK v0.0.2
++
++>subsequent releases of HULK use a different hashing function (and also have some
++other changes), so results generated in these notebooks will not match if you
++use a version != v0.0.2.
++
++>Check out the documentation and tutorial for some more up to date examples.
++
++***
++
+ This directory contains all the code to generate the analysis and figures as found in the paper.
+ 
+ From this directory, start a notebook (`jupyter notebook`) and run the code for yourself.
+diff --git a/src/histosketch/countmin.go b/src/histosketch/countmin.go
+index b6347b7..73f3db4 100644
+--- a/src/histosketch/countmin.go
++++ b/src/histosketch/countmin.go
+@@ -3,48 +3,40 @@ package histosketch
+ 
+ import (
+ 	"math"
+-	"math/big"
++	"unsafe"
++
++	jump "github.com/dgryski/go-jump"
+ )
+ 
+ // Sketch is a count-min sketcher, including a decay weight for uniform scaling of counts
+ type CountMinSketch struct {
+ 	q           [][]float64 // matrix of d x g
+-	d           uint64      // matrix depth (number of hash tables)
+-	g           uint64      // matrix width (number of counters per table)
+-	epsilon     float64     // relative-accuracy factor
+-	delta       float64     // relative-accuracy probability
++	d           uint32      // matrix depth (number of hash tables)
++	g           uint32      // matrix width (number of counters per table)
++	sizeMB      uint        // the size (in MB) of the CMS
+ 	scaling     bool        // if true, uniform scaling will be applied to the counters using the decay weight
+ 	weightDecay float64
+ }
+ 
+ // NewCountMinSketch creates a new Count-Min Sketch with a relative accuracy that is within a factor of epsilon with probability delta
+-func NewCountMinSketch(epsilon, delta, decayRatio float64) *CountMinSketch {
+-	// calculate the dimensions of q using epsilon and delta
+-	g := uint64(math.Ceil(2 / epsilon))
+-	d := uint64(math.Ceil(math.Log(1-delta) / math.Log(0.5)))
+-	// set g to nearest lower prime
+-	primeCheck := big.NewInt(int64(g))
+-	if primeCheck.ProbablyPrime(4) == false {
+-		for {
+-			g--
+-			primeCheck = big.NewInt(int64(g))
+-			if primeCheck.ProbablyPrime(4) == true {
+-				break
+-			}
+-		}
+-	}
++func NewCountMinSketch(sizeMB uint, decayRatio float64) *CountMinSketch {
++	// calculate the dimensions of q using the CMS size specified
++	var a float64
++	sizeOfCellFloat64 := unsafe.Sizeof(a)
++	width := uint64(uint64(sizeMB*1000000) / uint64(2*8*sizeOfCellFloat64))
++	depth := (uint64(sizeMB) * 1000000) / (width * uint64(sizeOfCellFloat64))
++	g, d := uint32(width), uint32(depth)
+ 	// make the matrix
+ 	q := make([][]float64, d)
+-	for i := uint64(0); i < d; i++ {
++	for i := uint32(0); i < d; i++ {
+ 		q[i] = make([]float64, g)
+ 	}
+ 	// create the CMS
+ 	s := &CountMinSketch{
+-		q:       q,
+-		d:       d,
+-		g:       g,
+-		epsilon: epsilon,
+-		delta:   delta,
++		q:      q,
++		d:      d,
++		g:      g,
++		sizeMB: sizeMB,
+ 	}
+ 	// set the decay weight
+ 	if decayRatio != 1 {
+@@ -55,29 +47,24 @@ func NewCountMinSketch(epsilon, delta, decayRatio float64) *CountMinSketch {
+ }
+ 
+ // Tables is a method to return the number of hash tables (d) used in the CMS
+-func (CountMinSketch *CountMinSketch) Tables() uint64 {
++func (CountMinSketch *CountMinSketch) Tables() uint32 {
+ 	return CountMinSketch.d
+ }
+ 
+ // Counters is a method to return the number of counters (g) used in each table of the CMS
+-func (CountMinSketch *CountMinSketch) Counters() uint64 {
++func (CountMinSketch *CountMinSketch) Counters() uint32 {
+ 	return CountMinSketch.g
+ }
+ 
+-// Epsilon is a method to return the epsilon value of the CMS
+-func (CountMinSketch *CountMinSketch) Epsilon() float64 {
+-	return CountMinSketch.epsilon
+-}
+-
+-// Delta is a method to return the epsilon value of the CMS
+-func (CountMinSketch *CountMinSketch) Delta() float64 {
+-	return CountMinSketch.delta
++// Size is a method to return the size (in MB) of the CMS
++func (CountMinSketch *CountMinSketch) SizeMB() uint {
++	return CountMinSketch.sizeMB
+ }
+ 
+ // Wipe is a method to clear the kmer from a CountMinSketch
+ func (CountMinSketch *CountMinSketch) Wipe() {
+ 	q := make([][]float64, CountMinSketch.d)
+-	for i := uint64(0); i < CountMinSketch.d; i++ {
++	for i := uint32(0); i < CountMinSketch.d; i++ {
+ 		q[i] = make([]float64, CountMinSketch.g)
+ 	}
+ 	CountMinSketch.q = q
+@@ -86,15 +73,14 @@ func (CountMinSketch *CountMinSketch) Wipe() {
+ // Copy is a method to return an empty copy of a CountMinSketch
+ func (cms *CountMinSketch) Copy() *CountMinSketch {
+ 	q := make([][]float64, cms.d)
+-	for i := uint64(0); i < cms.d; i++ {
++	for i := uint32(0); i < cms.d; i++ {
+ 		q[i] = make([]float64, cms.g)
+ 	}
+ 	return &CountMinSketch{
+-		q:       q,
+-		d:       cms.d,
+-		g:       cms.g,
+-		epsilon: cms.epsilon,
+-		delta:   cms.delta,
++		q:      q,
++		d:      cms.d,
++		g:      cms.g,
++		sizeMB: cms.sizeMB,
+ 	}
+ }
+ 
+@@ -114,8 +100,8 @@ func (CountMinSketch *CountMinSketch) Add(kmer uint64, increment float64) float6
+ 
+ // Merge is a method that merges the current sketch with another TODO: adds some checks and error return
+ func (CountMinSketch *CountMinSketch) Merge(sketch2 *CountMinSketch) error {
+-	for d := uint64(0); d < CountMinSketch.d; d++ {
+-		for g := uint64(0); g < CountMinSketch.g; g++ {
++	for d := uint32(0); d < CountMinSketch.d; d++ {
++		for g := uint32(0); g < CountMinSketch.g; g++ {
+ 			CountMinSketch.q[d][g] += sketch2.q[d][g]
+ 		}
+ 	}
+@@ -126,8 +112,8 @@ func (CountMinSketch *CountMinSketch) Merge(sketch2 *CountMinSketch) error {
+ func (CountMinSketch *CountMinSketch) Dump() <-chan float64 {
+ 	dumper := make(chan float64)
+ 	go func() {
+-		for d := uint64(0); d < CountMinSketch.d; d++ {
+-			for g := uint64(0); g < CountMinSketch.g; g++ {
++		for d := uint32(0); d < CountMinSketch.d; d++ {
++			for g := uint32(0); g < CountMinSketch.g; g++ {
+ 				dumper <- CountMinSketch.q[d][g]
+ 			}
+ 		}
+@@ -141,8 +127,11 @@ func (CountMinSketch *CountMinSketch) traverse(kmer uint64, increment float64) f
+ 	// set the counter minimum to a max value
+ 	minimum := math.MaxFloat64
+ 	// use the hashed kmer to look up the counter for this kmer in each row (d)
+-	for d := uint64(0); d < CountMinSketch.d; d++ {
+-		pos := (kmer * (d + 1)) % CountMinSketch.g
++	for d := uint32(0); d < CountMinSketch.d; d++ {
++		// split the hashed k-mer (uint64) into two uint32
++		h1, h2 := uint32(kmer), uint32(kmer>>32)
++		// use consistent jump hash to get counter position
++		pos := jump.Hash(uint64(h1+(h2*d)), int(CountMinSketch.g))
+ 		// increment the counter count if we are adding an element
+ 		if increment != 0.0 {
+ 			CountMinSketch.q[d][pos] += increment
+@@ -157,8 +146,8 @@ func (CountMinSketch *CountMinSketch) traverse(kmer uint64, increment float64) f
+ 
+ // scale is a method that adjusts each counter in q using a decay weight
+ func (CountMinSketch *CountMinSketch) scale() {
+-	for d := uint64(0); d < CountMinSketch.d; d++ {
+-		for g := uint64(0); g < CountMinSketch.g; g++ {
++	for d := uint32(0); d < CountMinSketch.d; d++ {
++		for g := uint32(0); g < CountMinSketch.g; g++ {
+ 			CountMinSketch.q[d][g] = CountMinSketch.q[d][g] * CountMinSketch.weightDecay
+ 		}
+ 	}
+diff --git a/src/histosketch/countmin_test.go b/src/histosketch/countmin_test.go
+index a7807f6..786b3b9 100644
+--- a/src/histosketch/countmin_test.go
++++ b/src/histosketch/countmin_test.go
+@@ -5,20 +5,16 @@ import (
+ )
+ 
+ var (
+-	EPSILON = 0.001
+-	DELTA   = 0.99
+-	DR      = 1.0
++	SIZE = uint(10)
++	DR = 1.0
+ )
+ 
+ // test the count-min sketch constructor
+ func Test_NewCountMinSketch(t *testing.T) {
+-	cms := NewCountMinSketch(EPSILON, DELTA, DR)
++	cms := NewCountMinSketch(SIZE, DR)
+ 	t.Log(cms.Tables())
+ 	t.Log(cms.Counters())
+-	if cms.Epsilon() != EPSILON {
+-		t.Fatal("epsilon error in CMS constructor")
+-	}
+-	if cms.Delta() != DELTA {
+-		t.Fatal("delta error in CMS constructor")
++	if cms.SizeMB() != SIZE {
++		t.Fatal("size error in CMS constructor")
+ 	}
+ }
+diff --git a/src/histosketch/histosketch.go b/src/histosketch/histosketch.go
+index 33bbb4d..5b5c510 100644
+--- a/src/histosketch/histosketch.go
++++ b/src/histosketch/histosketch.go
+@@ -70,7 +70,7 @@ func (HistoSketch *HistoSketch) newCWS() {
+ }
+ 
+ // NewHistoSketch is a HistoSketch constructor. It creates a sketch of length (l) from a histogram
+-func NewHistoSketch(l uint, h *histogram, epsilon, delta, dr float64) *HistoSketch {
++func NewHistoSketch(l uint, h *histogram, sizeMB uint, dr float64) *HistoSketch {
+ 	// create a new base histosketch
+ 	hs := HistoSketch{
+ 		length:     l,
+@@ -79,7 +79,7 @@ func NewHistoSketch(l uint, h *histogram, epsilon, delta, dr float64) *HistoSket
+ 		decayRatio: dr,
+ 	}
+ 	// create the empty sketches
+-	hs.createSketches(epsilon, delta)
++	hs.createSketches(sizeMB)
+ 	// create the CWS samples
+ 	hs.newCWS()
+ 	// zero the HistoSketch
+@@ -98,11 +98,11 @@ func (CWS *CWS) getSample(i uint, j int, freq float64) float64 {
+ }
+ 
+ // createSketches creates the histosketch, as well the countmin sketch
+-func (HistoSketch *HistoSketch) createSketches(epsilon, delta float64) {
++func (HistoSketch *HistoSketch) createSketches(sizeMB uint) {
+ 	HistoSketch.sketch = make([]uint, HistoSketch.length)
+ 	HistoSketch.sketchWeights = make([]float64, HistoSketch.length)
+ 	// create the empty count min sketch
+-	HistoSketch.cmSketch = NewCountMinSketch(epsilon, delta, HistoSketch.decayRatio)
++	HistoSketch.cmSketch = NewCountMinSketch(sizeMB, HistoSketch.decayRatio)
+ }
+ 
+ // Update method is used to update the HistoSketch with a new element
+@@ -238,7 +238,7 @@ func (SketchStore *SketchStore) GetWeightedJaccard(SketchStore2 *SketchStore) (f
+ 	for i := uint(0); i < SketchStore.Length; i++ {
+ 		// get the weight pair and select the largest value
+ 		weightA := math.Max(math.Max(SketchStore.SketchWeights[i], 0), math.Max(-SketchStore.SketchWeights[i], 0))
+-		weightB := math.Max(math.Max(SketchStore.SketchWeights[i], 0), math.Max(-SketchStore.SketchWeights[i], 0))
++		weightB := math.Max(math.Max(SketchStore2.SketchWeights[i], 0), math.Max(-SketchStore2.SketchWeights[i], 0))
+ 		// get the intersection and union values
+ 		if SketchStore.Sketch[i] == SketchStore2.Sketch[i] {
+ 			if weightA < weightB {
+diff --git a/src/histosketch/histosketch_test.go b/src/histosketch/histosketch_test.go
+index 2cc4af4..e7444e2 100644
+--- a/src/histosketch/histosketch_test.go
++++ b/src/histosketch/histosketch_test.go
+@@ -22,7 +22,7 @@ func createHistogram() *histogram {
+ func Test_NewHistoSketch(t *testing.T) {
+ 	h := createHistogram()
+ 	// histoSketch of 24 minimums
+-	hs := NewHistoSketch(24, h, EPSILON, DELTA, DR)
++	hs := NewHistoSketch(24, h, SIZE, DR)
+ 	// print the sketch and the hash values
+ 	t.Log(hs.GetSketch())
+ }
+@@ -31,7 +31,7 @@ func Test_NewHistoSketch(t *testing.T) {
+ func Test_Update(t *testing.T) {
+ 	h := createHistogram()
+ 	// histoSketch of 24 minimums
+-	hs := NewHistoSketch(24, h, EPSILON, DELTA, DR)
++	hs := NewHistoSketch(24, h, SIZE, DR)
+ 	t.Log(hs.GetSketch())
+ 	// update the histoSketch
+ 	hs.Update(2, 5.3434)
+diff --git a/src/kmer/kmer.go b/src/kmer/kmer.go
+deleted file mode 100644
+index 5016a34..0000000
+--- a/src/kmer/kmer.go
++++ /dev/null
+@@ -1,71 +0,0 @@
+-// kmer contains the functions to encode sequences ([]byte) to integers (uint64)
+-package kmer
+-
+-import (
+-	"bytes"
+-	"fmt"
+-)
+-
+-// EncodeSeq converts a sequence (slice of bytes) to an integer (Uint64). Ns are stored as As. If canonical is true, the func will return the canonical encoded kmer
+-func EncodeSeq(seq []byte, canonical bool) (uint64, error) {
+-	k := len(seq)
+-	// can only store a max K of 31 as a Uint64 encoded kmer
+-	if k < 1 || k > 31 {
+-		return 0, fmt.Errorf("sequences must be < 32 bases, yours was %d!\n", k)
+-	}
+-	// send the seq to lower case
+-	bytes.ToLower(seq)
+-	// encode the sequence
+-	var encoded uint64
+-	for _, base := range seq {
+-		encoded = (encoded << 2) | uint64(base2int(base))
+-	}
+-	// if canonical requested, encode the RC and keep the lexicographically smallest value
+-	if canonical == true {
+-		rcEncoded := rcEncode(encoded, k)
+-		if rcEncoded < encoded {
+-			encoded = rcEncoded
+-		}
+-	}
+-	return encoded, nil
+-}
+-
+-// DecodeSeq converts an integer encoded sequence back to a byte slice
+-func DecodeSeq(seq uint64, kSize int) []byte {
+-	decodedSeq := make([]byte, kSize)
+-	for i := 0; i < kSize; i++ {
+-		decodedSeq[kSize-i-1] = "ACGT"[(byte(seq & 0x3))]
+-		seq >>= 2
+-	}
+-	return decodedSeq
+-}
+-
+-// base2int converts a base to an index (0-3)
+-func base2int(base byte) byte {
+-	switch base {
+-	case 'A':
+-		return 0
+-	case 'C':
+-		return 1
+-	case 'G':
+-		return 2
+-	case 'T':
+-		return 3
+-	case 'N':
+-		return 0
+-	default:
+-		//panic(fmt.Errorf("non a/c/t/g/n base: %c", b))
+-		return 0
+-	}
+-}
+-
+-// rcEncode returns the reverse complement of a uint64 encoded sequence
+-func rcEncode(seq uint64, k int) uint64 {
+-	var rc uint64
+-	for i := 0; i < k; i++ {
+-		rc <<= 2
+-		rc |= 3 &^ seq
+-		seq >>= 2
+-	}
+-	return rc
+-}
+diff --git a/src/kmer/kmer_test.go b/src/kmer/kmer_test.go
+deleted file mode 100644
+index 2ce3d99..0000000
+--- a/src/kmer/kmer_test.go
++++ /dev/null
+@@ -1,44 +0,0 @@
+-package kmer
+-
+-import (
+-	"testing"
+-)
+-
+-var (
+-	k4seq  = []byte("TTTT")
+-	k8seq  = []byte("TCGATGCA")
+-	k32seq = []byte("TCGATGCATCGATGCATCGATGCATCGATGCA")
+-)
+-
+-// test encoding a canonical 4-mer
+-func Test_encodeSeq(t *testing.T) {
+-	encodedSeq, err := EncodeSeq(k4seq, true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if encodedSeq != 0 {
+-		t.Fatal("encoding failed")
+-	}
+-}
+-
+-// test encoding a sequence greater than k31
+-func Test_overflow(t *testing.T) {
+-	_, err := EncodeSeq(k32seq, true)
+-	t.Log(err)
+-	if err == nil {
+-		t.Fatal("kmer encoder should overflow due to k>31")
+-	}
+-}
+-
+-// test decoding an ecoded k8 sequence
+-func Test_decodeSeq(t *testing.T) {
+-	encodedSeq, err := EncodeSeq(k8seq, true)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	t.Log(encodedSeq)
+-	decodedSeq := DecodeSeq(encodedSeq, 8)
+-	if string(decodedSeq) != string(k8seq) {
+-		t.Fatal("decoded sequence does not match input sequence")
+-	}
+-}
+diff --git a/src/stream/stream.go b/src/stream/stream.go
+index 719b9ec..f0f2c9a 100644
+--- a/src/stream/stream.go
++++ b/src/stream/stream.go
+@@ -15,9 +15,9 @@ import (
+ 	"sync"
+ 
+ 	"github.com/will-rowe/hulk/src/histosketch"
+-	"github.com/will-rowe/hulk/src/kmer"
+ 	"github.com/will-rowe/hulk/src/misc"
+ 	"github.com/will-rowe/hulk/src/seqio"
++	"github.com/will-rowe/ntHash"
+ )
+ 
+ const (
+@@ -120,6 +120,7 @@ type FastqHandler struct {
+ 	process
+ 	Input  chan []byte
+ 	Output chan seqio.FASTQread
++	Fasta  bool
+ }
+ 
+ func NewFastqHandler() *FastqHandler {
+@@ -129,24 +130,45 @@ func NewFastqHandler() *FastqHandler {
+ func (proc *FastqHandler) Run() {
+ 	defer close(proc.Output)
+ 	var l1, l2, l3, l4 []byte
+-	// grab four lines and create a new FASTQread struct from them - perform some format checks and trim low quality bases
+-	for line := range proc.Input {
+-		if l1 == nil {
+-			l1 = line
+-		} else if l2 == nil {
+-			l2 = line
+-		} else if l3 == nil {
+-			l3 = line
+-		} else if l4 == nil {
+-			l4 = line
+-			// create fastq read
+-			newRead, err := seqio.NewFASTQread(l1, l2, l3, l4)
+-			if err != nil {
+-				log.Fatal(err)
++	// get the FASTQ/FASTA data from the file
++	if proc.Fasta == false {
++		for line := range proc.Input {
++			if l1 == nil {
++				l1 = line
++			} else if l2 == nil {
++				l2 = line
++			} else if l3 == nil {
++				l3 = line
++			} else if l4 == nil {
++				l4 = line
++				// create fastq read
++				newRead, err := seqio.NewFASTQread(l1, l2, l3, l4)
++				if err != nil {
++					log.Fatal(err)
++				}
++				// send on the new read and reset the line stores
++				proc.Output <- newRead
++				l1, l2, l3, l4 = nil, nil, nil, nil
++			}
++		}
++	} else {
++		for line := range proc.Input {
++			// check for chevron
++			if line[0] == 62 && l1 == nil {
++				l1 = line
++			} else if line[0] != 62 {
++				l2 = append(l2, line...)
++			} else {
++				// create fastq read from fasta data
++				l1[0] = 64
++				newRead, err := seqio.NewFASTQread(l1, l2, l3, l2)
++				if err != nil {
++					log.Fatal(err)
++				}
++				// send on the new read and reset the line stores
++				proc.Output <- newRead
++				l1, l2, l3, l4 = line, nil, nil, nil
+ 			}
+-			// send on the new read and reset the line stores
+-			proc.Output <- newRead
+-			l1, l2, l3, l4 = nil, nil, nil, nil
+ 		}
+ 	}
+ }
+@@ -183,7 +205,7 @@ func (proc *FastqChecker) Run() {
+ 	}
+ 	// check we have received reads & print stats
+ 	if rawCount == 0 {
+-		misc.ErrorCheck(errors.New("no FASTQ reads received"))
++		misc.ErrorCheck(errors.New("no data received"))
+ 	}
+ 	log.Printf("\tnumber of reads received from input: %d\n", rawCount)
+ 	meanRL := float64(lengthTotal) / float64(rawCount)
+@@ -221,13 +243,12 @@ func (proc *Counter) Run() {
+ 		readCount := 0
+ 		// collect the reads
+ 		for read := range jobs {
+-			// get read kmers
+-			for i := 0; i <= (len(read.Seq) - proc.Ksize); i = i + proc.Ksize {
+-				// encode and get the canonical kmer
+-				eKmer, err := kmer.EncodeSeq(read.Seq[i:i+proc.Ksize], true)
+-				misc.ErrorCheck(err)
++			// get hashed kmers from read
++			hasher, err := ntHash.New(&read.Seq, proc.Ksize)
++			misc.ErrorCheck(err)
++			for hash := range hasher.Hash() {
+ 				// add the kmer to the spectrum, (this will return the minimum in the CMS for the eKmer)
+-				_ = minionSpectrum.Add(eKmer, 1.0)
++				_ = minionSpectrum.Add(hash, 1.0)
+ 			}
+ 			// increment the read counter and send minionSpectrum on if interval reached
+ 			readCount++
+@@ -282,24 +303,25 @@ func NewSketcher() *Sketcher {
+ func (proc *Sketcher) Run() {
+ 	// create an initial empty histogram, where each bin is a counter position in the CMS (+ an initial 0 bin so we can zero the histosketch)
+ 	emptyHistogram := histosketch.NewHistogram()
+-	for i := uint64(0); i <= proc.Spectrum.Counters(); i++ {
++	for i := uint32(0); i <= proc.Spectrum.Counters(); i++ {
+ 		_ = emptyHistogram.Add(strconv.Itoa(int(i)), 0)
+ 	}
+ 	// create the empty histoSketch
+-	hulkSketch := histosketch.NewHistoSketch(proc.SketchSize, emptyHistogram, proc.Spectrum.Epsilon(), proc.Spectrum.Delta(), proc.DecayRatio)
++	hulkSketch := histosketch.NewHistoSketch(proc.SketchSize, emptyHistogram, proc.Spectrum.SizeMB(), proc.DecayRatio)
+ 	// function to histosketch the spectrum
+ 	updateHulk := func() {
+-		i := uint64(1)
++		i := uint32(1)
+ 		for cmsCounter := range proc.Spectrum.Dump() {
+ 			// only process counters that have been incremented
+ 			if cmsCounter >= proc.MinCount {
+ 				// each counter position corresponds to a bin in the underlying histogram of the histosketch
+-				hulkSketch.Update(i, cmsCounter)
++				hulkSketch.Update(uint64(i), cmsCounter)
+ 			}
+ 			i++
+ 			// once we have processed all the counters in one hash table, reset the iterator
+ 			if i == (proc.Spectrum.Counters() + 1) {
+-				i = uint64(1)
++				//i = uint32(1)
++				break
+ 			}
+ 		}
+ 	}

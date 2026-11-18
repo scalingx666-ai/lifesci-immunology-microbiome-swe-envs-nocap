@@ -1,0 +1,279 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index 276780ee..a3aa903e 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -91,8 +91,8 @@ All Circuitscape configuration is done through an `.ini` file. Below is a comple
+ | `cholmod_batch_size` | Integer | `1000` | Number of pairs to solve simultaneously when using CHOLMOD in pairwise mode. |
+ | `parallelize` | Boolean | `False` | If `True`, run iterations in parallel using Julia threads. Start Julia with `julia -t N` for N threads. |
+ 
+-| `low_memory_mode` | Boolean | `False` | If `True`, reduce memory usage at the cost of computation time. |
+-| `preemptive_memory_release` | Boolean | `False` | If `True`, release memory more aggressively during computation. |
++| `low_memory_mode` | Boolean | `False` | Circuitscape 4 option, not implemented in Circuitscape.jl. Setting it to `True` is an error so that it cannot be relied on silently. |
++| `preemptive_memory_release` | Boolean | `False` | Circuitscape 4 option, not implemented in Circuitscape.jl. Setting it to `True` is an error. |
+ 
+ ### Reclassification
+ 
+@@ -106,7 +106,7 @@ All Circuitscape configuration is done through an `.ini` file. Below is a comple
+ | Argument | Type | Default | Description |
+ |----------|------|---------|-------------|
+ | `log_file` | Path | `None` | Path to log file. If `None`, no file logging. |
+-| `log_level` | String | `INFO` | Logging level. Values: `DEBUG`, `INFO`. When set to `DEBUG`, prints detailed timing summary and per-pair solve progress. |
++| `log_level` | String | `INFO` | Logging level. Values: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`CRITICAL` is accepted as `ERROR`). When set to `DEBUG`, prints detailed timing summary and per-pair solve progress. |
+ | `suppress_messages` | Boolean | `False` | If `True`, suppress all informational messages. |
+ | `profiler_log_file` | Path | `None` | Path to profiler log file. |
+ 
+diff --git a/src/config.jl b/src/config.jl
+index e60e413a..3c457a71 100644
+--- a/src/config.jl
++++ b/src/config.jl
+@@ -52,39 +52,70 @@ Base.@kwdef struct CSConfig
+     suppress_messages::Bool = false
+ end
+ 
++# Every parser below rejects values it does not recognise. Falling back to a
++# default silently turned typos into different runs: `solver = cholmodd` ran
++# cg+amg, `scenario = pairwsie` ran pairwise, `write_cur_maps = Ture` wrote
++# nothing (issues #246, #341, #436).
++_bad_value(key, val, valid) =
++    throw(ArgumentError("$key = \"$val\" is not recognised; expected one of: $(join(valid, ", "))"))
++
+ function _parse_bool(dict, key, default="false")
+-    get(dict, key, default) in ("True", "true", "1")
++    v = get(dict, key, default)
++    v in TRUELIST && return true
++    v in FALSELIST && return false
++    _bad_value(key, v, ["True", "False"])
+ end
+ 
+-_parse_data_type(s) = s in RASTER ? dt_raster : dt_network
++function _parse_data_type(s)
++    s in RASTER ? dt_raster :
++    s in NETWORK ? dt_network : _bad_value("data_type", s, ["raster", "network"])
++end
+ 
+ function _parse_scenario(s)
++    s == "not entered" && throw(ArgumentError("scenario is not set; expected one of: pairwise, advanced, one-to-all, all-to-one"))
+     s in PAIRWISE ? sc_pairwise :
+     s in ADVANCED ? sc_advanced :
+     s in ONETOALL ? sc_onetoall :
+-    s in ALLTOONE ? sc_alltoone : sc_pairwise
++    s in ALLTOONE ? sc_alltoone :
++    _bad_value("scenario", s, ["pairwise", "advanced", "one-to-all", "all-to-one"])
+ end
+ 
+ function _parse_solver(s)
+     s in AMG ? st_cg_amg :
+     s in CHOLMOD ? st_cholmod :
+     s in PARDISO ? st_pardiso :
+-    s in ACCELERATE ? st_accelerate : st_cg_amg
++    s in ACCELERATE ? st_accelerate :
++    _bad_value("solver", s, ["cg+amg", "cholmod", "pardiso", "accelerate"])
+ end
+ 
+-_parse_precision(s) = s in SINGLE ? pr_single : pr_double
++function _parse_precision(s)
++    s in SINGLE ? pr_single :
++    s in DOUBLE ? pr_double : _bad_value("precision", s, ["single", "double"])
++end
+ 
+ function _parse_log_level(s)
+-    s in DEBUG ? Logging.Debug : Logging.Info
++    # Circuitscape 4 accepted Python's level names; keep reading them.
++    l = lowercase(s)
++    l == "debug" ? Logging.Debug :
++    l == "info" ? Logging.Info :
++    l in ("warn", "warning") ? Logging.Warn :
++    l in ("error", "critical") ? Logging.Error :
++    _bad_value("log_level", s, ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+ end
+ 
+ function _parse_remove_policy(s)
++    # Circuitscape 4 wrote "not entered" for the default policy
++    s in ("keepall", "not entered") ? rp_keepall :
+     s == "rmvsrc" ? rp_rmvsrc :
+     s == "rmvgnd" ? rp_rmvgnd :
+-    s == "rmvall" ? rp_rmvall : rp_keepall
++    s == "rmvall" ? rp_rmvall :
++    _bad_value("remove_src_or_gnd", s, ["keepall", "rmvsrc", "rmvgnd", "rmvall"])
+ end
+ 
+ function CSConfig(dict::Dict{String,String})
++    unknown = setdiff(keys(dict), keys(init_config()))
++    isempty(unknown) ||
++        @warn("Ignoring unrecognised configuration keys: $(join(sort!(collect(unknown)), ", "))")
+     CSConfig(
+         version = get(dict, "version", "unknown"),
+         data_type = _parse_data_type(get(dict, "data_type", "raster")),
+@@ -134,6 +165,60 @@ function CSConfig(dict::Dict{String,String})
+     )
+ end
+ 
++"""
++    validate(cfg::CSConfig)
++
++Fail fast, before any data is read, on configurations that cannot run:
++input files that do not exist, an output directory that does not exist, and
++options that Circuitscape.jl parses for compatibility with the Python version
++but has never implemented. Each message names the INI key so the user knows
++what to change.
++"""
++function validate(cfg::CSConfig)
++    problems = String[]
++
++    # A "(Browse for ...)" value is the INI Builder placeholder, i.e. unset.
++    unset(path) = path == "" || path == "None" || startswith(path, "(")
++    function need(key, path)
++        if unset(path)
++            push!(problems, "$key is not set")
++        elseif !isfile(path)
++            push!(problems, "$key = \"$path\" does not exist")
++        end
++    end
++
++    is_advanced = cfg.scenario == sc_advanced
++    need("habitat_file", cfg.habitat_file)
++    is_advanced || need("point_file", cfg.point_file)
++    if is_advanced
++        need("source_file", cfg.source_file)
++        need("ground_file", cfg.ground_file)
++    end
++    cfg.use_polygons && need("polygon_file", cfg.polygon_file)
++    cfg.use_mask && need("mask_file", cfg.mask_file)
++    cfg.use_included_pairs && need("included_pairs_file", cfg.included_pairs_file)
++    cfg.use_variable_source_strengths && need("variable_source_file", cfg.variable_source_file)
++    cfg.use_reclass_table && need("reclass_file", cfg.reclass_file)
++
++    if unset(cfg.output_file)
++        push!(problems, "output_file is not set")
++    else
++        outdir = dirname(cfg.output_file)
++        outdir == "" || isdir(outdir) ||
++            push!(problems, "output directory \"$outdir\" (from output_file) does not exist")
++    end
++
++    # Parsed for INI compatibility with Circuitscape 4 but not implemented.
++    cfg.low_memory_mode &&
++        push!(problems, "low_memory_mode is not implemented in Circuitscape.jl; remove it or set it to False")
++    cfg.preemptive_memory_release &&
++        push!(problems, "preemptive_memory_release is not implemented in Circuitscape.jl; remove it or set it to False")
++
++    isempty(problems) ||
++        throw(ArgumentError("Invalid configuration:\n  - " * join(problems, "\n  - ")))
++    cfg
++end
++
+ # String converters for CSConfig fields
+ _bool_str(v::Bool) = v ? "True" : "False"
+ 
+@@ -158,7 +243,9 @@ end
+ _precision_str(v::Precision) = v == pr_single ? "single" : "double"
+ 
+ function _log_level_str(v::Logging.LogLevel)
+-    v == Logging.Debug ? "DEBUG" : "INFO"
++    v == Logging.Debug ? "DEBUG" :
++    v == Logging.Warn ? "WARNING" :
++    v == Logging.Error ? "ERROR" : "INFO"
+ end
+ 
+ function _remove_policy_str(v::RemovePolicy)
+diff --git a/src/consts.jl b/src/consts.jl
+index 025c5bcc..d1345cab 100644
+--- a/src/consts.jl
++++ b/src/consts.jl
+@@ -1,6 +1,7 @@
+ # Various constants used to determine problem type
+ 
+ const RASTER = ["raster", "Raster"]
++const NETWORK = ["network", "Network"]
+ const PAIRWISE = ["pairwise", "Pairwise"]
+ const ADVANCED = ["advanced", "Advanced"]
+ const ONETOALL = ["one-to-all", "one_to_all"]
+@@ -20,6 +21,7 @@ const TXTLIST = 3
+ const PAIRS_AAGRID = 4
+ const PAIRS_LIST = 5
+ const TRUELIST = ["True", "true", "1"]
++const FALSELIST = ["False", "false", "0"]
+ 
+ const FILE_TYPE_NPY = 1
+ const FILE_TYPE_AAGRID = 2
+diff --git a/src/run.jl b/src/run.jl
+index 1bfb68bd..31d2e95f 100644
+--- a/src/run.jl
++++ b/src/run.jl
+@@ -25,6 +25,7 @@ end
+ 
+ function _run(cfg)
+     update_logging!(cfg)
++    validate(cfg)
+     write_config(cfg)
+     T = cfg.precision == pr_single ? Float32 : Float64
+     if T == Float32 && cfg.solver == st_pardiso
+diff --git a/test/internal.jl b/test/internal.jl
+index 5f4dfb7e..8ca0c016 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -219,3 +219,64 @@ let
+     compute("input/raster/pairwise/12/sgVerify12.ini")
+     @test !isfile(cum_file)
+ end
++
++# Configuration parsing and validation: typos and missing files must fail
++# before any data is read, naming the INI key (#246, #341, #436).
++@testset "Config validation" begin
++    base = Circuitscape.init_config()
++    base["scenario"] = "pairwise"
++
++    # Unrecognised enum values are errors, not silent defaults
++    for (k, v) in [("solver", "cholmodd"), ("scenario", "pairwsie"),
++                   ("precision", "half"), ("write_cur_maps", "Ture"),
++                   ("remove_src_or_gnd", "rmvboth"), ("log_level", "VERBOSE"),
++                   ("data_type", "vector")]
++        d = copy(base); d[k] = v
++        @test_throws ArgumentError Circuitscape.CSConfig(d)
++    end
++    d = copy(base); d["scenario"] = "not entered"
++    @test_throws ArgumentError Circuitscape.CSConfig(d)
++
++    # Placeholders from init_config count as unset
++    err = try Circuitscape.validate(Circuitscape.CSConfig(base)); nothing catch e; e end
++    @test err isa ArgumentError
++    @test occursin("habitat_file is not set", err.msg)
++    @test occursin("point_file is not set", err.msg)
++    @test occursin("output_file is not set", err.msg)
++
++    good = copy(base)
++    good["habitat_file"] = "input/raster/pairwise/1/cellmap.asc"
++    good["point_file"] = "input/raster/pairwise/1/points.asc"
++    good["output_file"] = "output/validate.out"
++    @test Circuitscape.validate(Circuitscape.CSConfig(good)) isa Circuitscape.CSConfig
++
++    d = copy(good); d["habitat_file"] = "missing.asc"
++    err = try Circuitscape.validate(Circuitscape.CSConfig(d)); nothing catch e; e end
++    @test occursin("habitat_file = \"missing.asc\" does not exist", err.msg)
++
++    d = copy(good); d["output_file"] = "no_such_dir/x.out"
++    @test_throws ArgumentError Circuitscape.validate(Circuitscape.CSConfig(d))
++
++    # Only files that the run will use are checked
++    d = copy(good); d["polygon_file"] = "missing.asc"; d["use_polygons"] = "False"
++    @test Circuitscape.validate(Circuitscape.CSConfig(d)) isa Circuitscape.CSConfig
++    d["use_polygons"] = "True"
++    @test_throws ArgumentError Circuitscape.validate(Circuitscape.CSConfig(d))
++
++    # Advanced mode needs sources and grounds, not a point file
++    d = copy(good); d["scenario"] = "advanced"; d["point_file"] = "missing.asc"
++    d["source_file"] = "input/raster/advanced/1/sources5x5.asc"
++    d["ground_file"] = "input/raster/advanced/1/grounds5x5.asc"
++    @test Circuitscape.validate(Circuitscape.CSConfig(d)) isa Circuitscape.CSConfig
++
++    # Options accepted for INI compatibility but never implemented
++    for k in ("low_memory_mode", "preemptive_memory_release")
++        d = copy(good); d[k] = "True"
++        err = try Circuitscape.validate(Circuitscape.CSConfig(d)); nothing catch e; e end
++        @test occursin("$k is not implemented", err.msg)
++    end
++
++    # Unknown keys are ignored (with a warning), not fatal
++    d = copy(good); d["max_parallel"] = "4"
++    @test Circuitscape.CSConfig(d) isa Circuitscape.CSConfig
++end

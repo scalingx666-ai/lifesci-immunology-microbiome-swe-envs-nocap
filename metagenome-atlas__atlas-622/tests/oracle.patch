@@ -1,0 +1,923 @@
+diff --git a/atlas/workflow/Snakefile b/atlas/workflow/Snakefile
+index fd6b6604..89e20182 100644
+--- a/atlas/workflow/Snakefile
++++ b/atlas/workflow/Snakefile
+@@ -221,6 +221,10 @@ def get_quality_controlled_reads(wildcards, include_se=False):
+         )
+ 
+ 
++wildcard_constraints:
++    binner="[A-Za-z]+"
++
++
+ include: "rules/download.smk"  # contains hard coded variables
+ include: "rules/qc.smk"
+ include: "rules/assemble.smk"
+@@ -343,7 +347,7 @@ rule binning:
+             binner=config["final_binner"],
+             sample=SAMPLES,
+         ),
+-        expand("reports/bin_report_{binner}.html", binner=config["final_binner"]),
++        expand("Binning/{binner}/report.html", binner=config["final_binner"]),
+         "finished_assembly",
+     output:
+         temp(touch("finished_binning")),
+diff --git a/atlas/workflow/config/default_config.yaml b/atlas/workflow/config/default_config.yaml
+index 9040725a..8ac50c2b 100644
+--- a/atlas/workflow/config/default_config.yaml
++++ b/atlas/workflow/config/default_config.yaml
+@@ -21,4 +21,7 @@ genome_dereplication:
+ 
+ genome_aligner: "minimap"
+ 
+-bin_quality_asesser: checkm2          #[ checkm2, busco, cehckm]
+\ No newline at end of file
++bin_quality_asesser: checkm2          #[ checkm2, busco, cehckm]
++gunc_database: "progenomes"  # progenomes or gtdb
++
++semibin_train_extra: ""
+\ No newline at end of file
+diff --git a/atlas/workflow/envs/fasta.yaml b/atlas/workflow/envs/fasta.yaml
+index 264f602a..6e8f9899 100644
+--- a/atlas/workflow/envs/fasta.yaml
++++ b/atlas/workflow/envs/fasta.yaml
+@@ -6,3 +6,4 @@ dependencies:
+     - pyfastx=0.8
+     - pandas=1.2
+     - pyarrow
++    - biopython
+diff --git a/atlas/workflow/envs/semibin.yaml b/atlas/workflow/envs/semibin.yaml
+index 55531af8..aac90999 100644
+--- a/atlas/workflow/envs/semibin.yaml
++++ b/atlas/workflow/envs/semibin.yaml
+@@ -4,5 +4,5 @@ channels:
+   - defaults
+ dependencies:
+   - python>=3.8, <3.11
+-  - semibin=1.3
++  - semibin=1.5
+   - biopython
+diff --git a/atlas/workflow/rules/bin_quality.smk b/atlas/workflow/rules/bin_quality.smk
+index d6f7af76..cffc7c86 100644
+--- a/atlas/workflow/rules/bin_quality.smk
++++ b/atlas/workflow/rules/bin_quality.smk
+@@ -1,6 +1,70 @@
+ bin_quality_input_folder = "{sample}/binning/{binner}/bins"
+ 
+ 
++
++
++rule calculate_stats:
++    input:
++        bin_quality_input_folder,
++    output:
++        "{sample}/binning/{binner}/genome_stats.tsv",
++    threads: config["threads"]
++    params:
++        extension=".fasta"
++    run:
++        from utils.genome_stats import get_many_genome_stats
++
++        filenames = list(Path(input[0]).glob("*"+params.extension))
++
++        get_many_genome_stats(filenames, output[0], threads)
++
++
++
++rule combine_bin_stats:
++    input:
++        expand(
++            "{sample}/binning/{{binner}}/genome_stats.tsv",
++            sample=SAMPLES,
++        ),
++    output:
++        "Binning/{binner}/genome_stats.tsv"
++    params:
++        samples=SAMPLES,
++    log:
++        "logs/binning/{binner}/combine_stats.log",
++    run:
++
++        try:
++            from utils.io import pandas_concat
++
++            pandas_concat(
++            input,
++            output[0]
++            )
++
++        except Exception as e:
++
++            import traceback
++            with open(log[0],"w") as logfile:
++                traceback.print_exc(file=logfile)
++
++            raise e
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+ ### Checkm2 ###
+ 
+ 
+@@ -11,19 +75,17 @@ rule run_checkm2:
+         fasta_dir=bin_quality_input_folder,
+         db=rules.checkm2_download_db.output,
+     output:
+-        "{sample}/binning/{binner}/bin_quality/checkm2/quality_report.tsv",
+-        #faa=temp(directory("{sample}/binning/{binner}/bin_quality/checkm2/protein_files")),
++        table = "{sample}/binning/{binner}/checkm2_report.tsv",
++        faa=directory("{sample}/binning/{binner}/faa"),
+     params:
+-        outdir=lambda wc, output: Path(output[0]).parent,
+         lowmem=" --lowmem " if config["mem"] < 10 else "",
++        dir = lambda wc, output: Path(output.table).parent/"checkm2"
+     conda:
+         "../envs/checkm2.yaml"
+-    shadow:
+-        "minimal"
+     threads: config["threads"]
+     log:
+         "{sample}/logs/binning/{binner}/checkm2.log",
+-        "{sample}/binning/{binner}/bin_quality/checkm2/checkm2.log",
++        "{sample}/binning/{binner}/checkm2/checkm2.log",
+     benchmark:
+         "logs/benchmarks/checkm2/{sample}_{binner}.tsv"
+     resources:
+@@ -38,8 +100,14 @@ rule run_checkm2:
+         " -x .fasta "
+         " --tmpdir {resources.tmpdir} "
+         " --input {input.fasta_dir} "
+-        " --output-directory {params.outdir} "
++        " --output-directory {params.dir} "
+         " &> {log[0]} "
++        ";\n"
++        " cp {params.dir}/quality_report.tsv {output.table} 2>> {log[0]} ; "
++        " mv {params.dir}/protein_files {output.faa} 2>> {log[0]} ; "
++
++
++
+ 
+ 
+ ## GUNC ###
+@@ -48,35 +116,38 @@ rule run_checkm2:
+ rule run_gunc:
+     input:
+         db=rules.download_gunc.output[0].format(**config),
+-        fasta_dir=bin_quality_input_folder,
++        fasta_dir= "{sample}/binning/{binner}/faa"
+     output:
+-        "{sample}/binning/{binner}/bin_quality/gunc.tsv",
++        table="{sample}/binning/{binner}/gunc_output.tsv",
++        folder=directory("{sample}/binning/{binner}/gunc"),
+     params:
+-        tmpdir=lambda wc: f"{config['tmpdir']}/gunc/{wc.sample}",
++        extension=".faa"
+     conda:
+         "../envs/gunc.yaml"
+     threads: config["threads"]
+     log:
+         "{sample}/logs/binning/{binner}/gunc.log",
+-    benchmark:
+-        "logs/benchmarks/gunc/{sample}_{binner}.tsv"
+     resources:
+         time=int(config["runtime"]["default"]),
+         mem_mb=config["mem"],
+     shell:
+-        " mkdir -p {params.tmpdir}/ 2> {log} "
+-        " ; "
++        " mkdir {output.folder} 2> {log}"
++        " ;\n"
+         " gunc run "
+         " --threads {threads} "
++        " --gene_calls "
+         " --db_file {input.db} "
+         " --input_dir {input.fasta_dir} "
+-        " --file_suffix .fasta "
+-        " --out_dir {params.tmpdir} &>> {log} "
+-        " ; "
+-        " mv {params.tmpdir}/*.tsv {output} 2>> {log}"
++        " --temp_dir {resources.tmpdir} "
++        " --file_suffix {params.extension} "
++        " --out_dir {output.folder} &>> {log} "
++        " ;\n "
++        " cp {output.folder}/*.tsv {output.table} 2>> {log}"
+ 
+ 
+ ##### BUSCO  #########
++'''
++
+ 
+ 
+ rule run_busco:
+@@ -109,127 +180,178 @@ rule run_busco:
+         " ; "
+         " mv {params.tmpdir}/output/batch_summary.txt {output} 2>> {log}"
+ 
+-
++'''
+ # fetch also output/logs/busco.log
+ 
+ 
+-##### checkM  #########
+-rule run_checkm:
++## Combine bin stats
++localrules:
++    build_bin_report,
++    combine_checkm2,
++    combine_gunc
++
++
++
++
++
++rule combine_gunc:
+     input:
+-        touched_output="logs/checkm_init.txt",
+-        bins=bin_quality_input_folder,  # actualy path to fastas
++        expand(
++            "{sample}/binning/{{binner}}/gunc_output.tsv",
++            sample=SAMPLES,
++        ),
+     output:
+-        completeness="{sample}/binning/{binner}/bin_quality/checkm.tsv",
+-        taxonomy="{sample}/binning/{binner}/bin_quality/checkm_taxonomy.tsv",
++        bin_table="Binning/{binner}/gunc_report.tsv",
+     params:
+-        tmp_output_dir=lambda wc: f"{config['tmpdir']}/checkm/{wc.sample}_{wc.binner}",
+-        extension="fasta",
+-    conda:
+-        "../envs/checkm.yaml"
+-    threads: config["threads"]
++        samples=SAMPLES,
+     log:
+-        "{sample}/logs/binning/{binner}/checkm.log",
+-    benchmark:
+-        "logs/benchmarks/checkm_lineage_wf/{sample}_{binner}.tsv"
+-    resources:
+-        time=config["runtime"]["long"],
+-        mem=config["large_mem"],
+-    shell:
+-        " checkm lineage_wf "
+-        " --file {params.completeness} "
+-        " --tab_table "
+-        " --extension {params.extension} "
+-        " --threads {threads} "
+-        " {input.bins} "
+-        " {params.tmp_output_dir} &> {log} "
+-        " ;\n"
+-        " checkm tree_qa "
+-        " {params.tmp_output_dir} "
+-        " --out_format 2 "
+-        " --file {output.taxonomy} "
+-        " --tab_table "
+-        " &>> {log}"
++        "logs/binning/{binner}/combine_gunc.log",
++    run:
+ 
++        try:
++            from utils.io import pandas_concat
+ 
+-## Combine bin stats
+-localrules:
+-    build_bin_report,
+-    combine_bin_stats,
+-
+-
+-if config["bin_quality_asesser"].lower() == "checkm2":
+-
+-    rule combine_bin_stats:
+-        input:
+-            completeness_files=expand(
+-                "{sample}/binning/{{binner}}/bin_quality/checkm2/quality_report.tsv",
+-                sample=SAMPLES,
+-            ),
+-        output:
+-            bin_table="reports/genomic_bins_{binner}.tsv",
+-        params:
+-            samples=SAMPLES,
+-        log:
+-            "logs/binning/combine_stats_{binner}.log",
+-        script:
+-            "../scripts/combine_checkm2.py"
+-
+-
+-elif config["bin_quality_asesser"].lower() == "busco":
+-
+-    rule combine_bin_stats:
+-        input:
+-            completeness_files=expand(
+-                "{sample}/binning/{{binner}}/bin_quality/busco.tsv", sample=SAMPLES
+-            ),
+-        output:
+-            bin_table="reports/genomic_bins_{binner}.tsv",
+-        params:
+-            samples=SAMPLES,
+-        log:
+-            "logs/binning/combine_stats_{binner}.log",
+-        script:
+-            "../scripts/combine_busco.py"
+-
+-
+-elif config["bin_quality_asesser"].lower() == "checkm":
+-
+-    rule combine_bin_stats:
+-        input:
+-            completeness_files=expand(
+-                "{sample}/binning/{{binner}}/bin_quality/checkm.tsv", sample=SAMPLES
+-            ),
+-            taxonomy_files=expand(
+-                "{sample}/binning/{{binner}}/bin_quality/checkm_taxonomy.tsv",
+-                sample=SAMPLES,
+-            ),
+-        output:
+-            bin_table="reports/genomic_bins_{binner}.tsv",
+-        params:
+-            samples=SAMPLES,
+-        log:
+-            "logs/binning/combine_stats_{binner}.log",
+-        script:
+-            "../scripts/combine_checkm.py"
+-
+-
+-else:
+-
+-    raise Exception(
+-        "'bin_quality_asesser' should be 'checkm2','busco' or 'checkm' got {bin_quality_asesser}".format(
+-            **config
++            pandas_concat(
++            input,
++            output[0]
++            )
++
++        except Exception as e:
++
++            import traceback
++            with open(log[0],"w") as logfile:
++                traceback.print_exc(file=logfile)
++
++            raise e
++
++
++
++
++rule combine_checkm2:
++    input:
++        completeness_files=expand(
++            "{sample}/binning/{{binner}}/checkm2_report.tsv",
++            sample=SAMPLES,
+         )
+-    )
++    output:
++        bin_table="Binning/{binner}/checkm2_quality_report.tsv",
++    params:
++        samples=SAMPLES,
++    log:
++        "logs/binning/combine_stats_{binner}.log",
++    script:
++        "../scripts/combine_checkm2.py"
++
++
++localrules:
++    get_bin_filenames,
++
++rule get_bin_filenames:
++    input:
++        dirs=expand(
++            "{sample}/binning/{{binner}}/bins",
++            sample=SAMPLES,
++        ),
++        protein_dirs=expand(
++            "{sample}/binning/{{binner}}/faa",
++            sample=SAMPLES,
++        ),
++    output:
++        filenames="Binning/{binner}/paths.tsv",
++    run:
++        import pandas as pd
++        from pathlib import Path
++        from utils import io
++
++
++        def get_list_of_files(dirs,pattern):
++
++            fasta_files = []
++
++            # searh for fasta files (.f*) in all bin folders
++            for dir in dirs:
++                dir = Path(dir)
++                fasta_files += list(dir.glob(pattern))
++
++            filenames = pd.DataFrame(fasta_files, columns=["Filename"])
++            filenames.index = filenames.Filename.apply(io.simplify_path)
++            filenames.index.name = "Bin"
+ 
++            filenames.sort_index(inplace=True)
++
++            return(filenames)
++
++        fasta_filenames= get_list_of_files(input.dirs,"*.f*")
++        faa_filenames= get_list_of_files(input.protein_dirs,"*.faa")
++
++        assert all(faa_filenames.index == fasta_filenames.index), "faa index and faa index are nt the same"
++
++        faa_filenames.columns= ["Proteins"]
++
++        filenames= pd.concat((fasta_filenames,faa_filenames),axis=1)
++
++        filenames.to_csv(output.filenames, sep="\t")
++
++'''
++rule merge_bin_info:
++    input:
++        stats ="Binning/{binner}/genome_stats.tsv",
++        gunc= "Binning/{binner}/gunc_report.tsv",
++        quality= "Binning/{binner}/checkm2_quality_report.tsv"
++    output:
++        "Binning/{binner}/combined_bin_info.tsv"
++
++'''
+ 
+ rule build_bin_report:
+     input:
+-        bin_table="reports/genomic_bins_{binner}.tsv",
++        bin_table = "Binning/{binner}/checkm2_quality_report.tsv"
+     output:
+-        report="reports/bin_report_{binner}.html",
++        report="Binning/{binner}/report.html",
+     conda:
+-        "%s/report.yaml" % CONDAENV
++        "../envs/report.yaml"
+     log:
+         "logs/binning/report_{binner}.log",
+     script:
+         "../report/bin_report.py"
++
++
++
++localrules:
++    all_contigs2bins,
++
++
++rule all_contigs2bins:
++    input:
++        expand(
++            "{sample}/binning/{{binner}}/cluster_attribution.tsv",
++            sample=SAMPLES,
++        ),
++    output:
++        temp("Binning/{binner}/contigs2bins.tsv.gz"),
++    run:
++        from utils.io import cat_files
++
++        cat_files(input, output[0], gzip=True)
++
++
++
++
++
++rule quality_filter_bins:
++    input:
++        paths=rules.get_bin_filenames.output.filenames,
++        stats ="Binning/{binner}/genome_stats.tsv",
++        gunc= "Binning/{binner}/gunc_report.tsv",
++        quality= "Binning/{binner}/checkm2_quality_report.tsv"
++    output:
++        info="Binning/{binner}/filtered_bin_info.tsv",
++        paths=temp("Binning/{binner}/filtered_bins_paths.txt"),
++        quality_for_derep=temp("Binning/{binner}/filtered_quality.csv"),
++    threads: 1
++    log:
++        "logs/Binning/{binner}/filter_bins.log",
++    params:
++        filter_criteria=config["genome_filter_criteria"],
++    script:
++        "../scripts/filter_genomes.py"
+diff --git a/atlas/workflow/rules/cobinning.smk b/atlas/workflow/rules/cobinning.smk
+index 2c866949..5197f60c 100644
+--- a/atlas/workflow/rules/cobinning.smk
++++ b/atlas/workflow/rules/cobinning.smk
+@@ -225,6 +225,8 @@ rule parse_vamb_output:
+         fasta_extension=".fna",
+         output_path=lambda wc: vamb_cluster_attribution_path,
+         samples=SAMPLES,
++    conda:
++        "../envs/fasta.yaml"
+     script:
+         "../scripts/parse_vamb.py"
+ 
+diff --git a/atlas/workflow/rules/download.smk b/atlas/workflow/rules/download.smk
+index 8fcf4c02..f7159051 100644
+--- a/atlas/workflow/rules/download.smk
++++ b/atlas/workflow/rules/download.smk
+@@ -129,6 +129,8 @@ rule download_atlas_files:
+     output:
+         f"{DBDIR}/{{filename}}",
+     threads: 1
++    wildcard_constraints:
++        filename="[A-Za-z0-9_.]+"
+     run:
+         shell(
+             "wget -O {output} 'https://zenodo.org/record/{ZENODO_ARCHIVE}/files/{wildcards.filename}' "
+diff --git a/atlas/workflow/rules/genomes.smk b/atlas/workflow/rules/genomes.smk
+index 67a0d7a0..97ebe2d0 100644
+--- a/atlas/workflow/rules/genomes.smk
++++ b/atlas/workflow/rules/genomes.smk
+@@ -1,90 +1,5 @@
+ 
+-localrules:
+-    all_contigs2bins,
+-
+-
+-rule all_contigs2bins:
+-    input:
+-        expand(
+-            "{sample}/binning/{binner}/cluster_attribution.tsv",
+-            sample=SAMPLES,
+-            binner=config["final_binner"],
+-        ),
+-    output:
+-        temp("genomes/clustering/all_contigs2bins.tsv.gz"),
+-    run:
+-        from utils.io import cat_files
+-
+-        cat_files(input, output[0], gzip=True)
+-
+-
+-localrules:
+-    filter_bins,
+-
+-
+-localrules:
+-    get_bin_filenames,
+-
+-
+-rule get_bin_filenames:
+-    input:
+-        dirs=expand(
+-            "{sample}/binning/{binner}/bins",
+-            sample=SAMPLES,
+-            binner=config["final_binner"],
+-        ),
+-    output:
+-        filenames="genomes/filter/paths.tsv",
+-    run:
+-        import pandas as pd
+-        from pathlib import Path
+-        from utils import io
+ 
+-        fasta_files = []
+-
+-
+-        # searh for fasta files (.f*) in all bin folders
+-        for dir in input.dirs:
+-            dir = Path(dir)
+-            fasta_files += list(dir.glob("*.f*"))
+-
+-        filenames = pd.DataFrame(fasta_files, columns=["Filename"])
+-        filenames.index = filenames.Filename.apply(io.simplify_path)
+-        filenames.index.name = "Bin"
+-
+-        filenames.to_csv(output.filenames, sep="\t")
+-
+-
+-rule calculate_stats:
+-    input:
+-        rules.get_bin_filenames.output.filenames,
+-    output:
+-        "genomes/all_bins/genome_stats.tsv",
+-    threads: config["threads"]
+-    run:
+-        from utils.genome_stats import get_many_genome_stats
+-        import pandas as pd
+-
+-        filenames = pd.read_csv(input[0], sep="\t", index_col=0).squeeze()
+-        get_many_genome_stats(filenames, output[0], threads)
+-
+-
+-rule filter_bins:
+-    input:
+-        paths=rules.get_bin_filenames.output.filenames,
+-        quality="reports/genomic_bins_{binner}.tsv".format(binner = config["final_binner"]),
+-        stats="genomes/all_bins/genome_stats.tsv",
+-    output:
+-        quality="genomes/all_bins/filtered_quality.tsv",
+-        paths=temp("genomes/all_bins/filtered_bins.txt"),
+-        quality_for_derep=temp("genomes/all_bins/filtered_quality.csv"),
+-    threads: 1
+-    log:
+-        "logs/genomes/filter_bins.log",
+-    params:
+-        filter_criteria=config["genome_filter_criteria"],
+-    script:
+-        "../scripts/filter_genomes.py"
+ 
+ 
+ def get_greedy_drep_Arguments(wildcards):
+@@ -94,7 +9,7 @@ def get_greedy_drep_Arguments(wildcards):
+     if (type(use_greedy) == str) and use_greedy.strip().lower() == "auto":
+ 
+         # count number of bins in file
+-        bin_list = rules.filter_bins.output.paths
++        bin_list = "Binning/{binner}/filtered_bins_paths.txt".format(binner=config["final_binner"])
+ 
+         n_bins = 0
+         with open(bin_list) as f:
+@@ -165,8 +80,8 @@ rule drep_compare:
+ 
+ rule dereplicate:
+     input:
+-        paths="genomes/all_bins/filtered_bins.txt",
+-        quality="genomes/all_bins/filtered_quality.csv",
++        paths="Binning/{binner}/filtered_bins_paths.txt".format(binner = config["final_binner"]),
++        quality="Binning/{binner}/filtered_quality.csv".format(binner = config["final_binner"]),
+     output:
+         genomes=temp(directory("genomes/Dereplication/dereplicated_genomes")),
+         wdb="genomes/Dereplication/data_tables/Wdb.csv",
+@@ -257,13 +172,13 @@ checkpoint rename_genomes:
+     input:
+         genomes="genomes/Dereplication/dereplicated_genomes",
+         mapping_file="genomes/clustering/allbins2genome_oldname.tsv",
+-        genome_quality=f"reports/genomic_bins_{config['final_binner']}.tsv",
++        genome_info=f"Binning/{config['final_binner']}/filtered_bin_info.tsv",
+     output:
+         dir=directory("genomes/genomes"),
+         mapfile_contigs="genomes/clustering/contig2genome.tsv",
+         mapfile_old2mag="genomes/clustering/old2newID.tsv",
+         mapfile_allbins2mag="genomes/clustering/allbins2genome.tsv",
+-        genome_quality="genomes/genome_quality.tsv",
++        genome_info="genomes/genome_quality.tsv",
+     params:
+         rename_contigs=config["rename_mags_contigs"],
+     shadow:
+@@ -434,7 +349,7 @@ rule concat_genomes:
+     input:
+         genome_dir,
+     output:
+-        "genomes/all_contigs.fasta",
++        temp("genomes/all_contigs.fasta"),
+     params:
+         ext="fasta",
+     shell:
+@@ -445,7 +360,8 @@ if config["genome_aligner"] == "minimap":
+ 
+     rule index_genomes:
+         input:
+-            target="genomes/all_contigs.fasta",
++            target=ancient("genomes/all_contigs.fasta"),
++            timestamp= genome_dir,
+         output:
+             "ref/genomes.mmi",
+         log:
+@@ -481,7 +397,8 @@ elif config["genome_aligner"] == "bwa":
+ 
+     rule index_genomes:
+         input:
+-            "genomes/all_contigs.fasta",
++            ancient("genomes/all_contigs.fasta"),
++            timestamp= genome_dir,
+         output:
+             multiext("ref/genomes", ".amb", ".ann", ".bwt.2bit.64", ".pac"),
+         log:
+diff --git a/atlas/workflow/rules/semibin.smk b/atlas/workflow/rules/semibin.smk
+index 0fd72868..59106929 100644
+--- a/atlas/workflow/rules/semibin.smk
++++ b/atlas/workflow/rules/semibin.smk
+@@ -53,7 +53,7 @@ rule semibin_train:
+         "logs/benchmarks/semibin/train/{sample}.tsv"
+     params:
+         output_dir=lambda wc, output: os.path.dirname(output[0]),
+-        extra=" --epochs 20 --mode single ",
++        extra=config["semibin_train_extra"],
+     shell:
+         "SemiBin train_self "
+         " --output {params.output_dir} "
+diff --git a/atlas/workflow/scripts/filter_genomes.py b/atlas/workflow/scripts/filter_genomes.py
+index ebd8ef72..06190aa9 100644
+--- a/atlas/workflow/scripts/filter_genomes.py
++++ b/atlas/workflow/scripts/filter_genomes.py
+@@ -58,6 +58,17 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ logging.info(f"Retain {Q.shape[0]} genomes from {n_all_bins}")
+ 
+ 
++## GUNC
++
++gunc = pd.read_table(snakemake.input.gunc,index_col=0)
++gunc= gunc.loc[Q.index]
++
++bad_genomes= gunc.index[gunc["pass.GUNC"]==False]
++logging.info( f"{len(bad_genomes)} Don't pass gunc filtering" )
++
++Q.drop(bad_genomes, inplace=True)
++
++
+ if Q.shape[0] == 0:
+ 
+     logging.error(
+@@ -65,8 +76,8 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+     )
+     exit(1)
+ 
+-
+-Q.to_csv(snakemake.output.quality, sep="\t")
++#output Q together with quality
++Q.to_csv(snakemake.output.info, sep="\t")
+ 
+ 
+ # output quality for derepliation
+@@ -84,5 +95,5 @@ def handle_exception(exc_type, exc_value, exc_traceback):
+ 
+ F = pd.read_table(snakemake.input.paths, index_col=0).squeeze()
+ 
+-F = F.loc[Q.index]
++F = F.loc[Q.index].iloc[:,0]
+ F.to_csv(snakemake.output.paths, index=False, header=False)
+diff --git a/atlas/workflow/scripts/rename_genomes.py b/atlas/workflow/scripts/rename_genomes.py
+index 66cb533a..b6c3f6d3 100644
+--- a/atlas/workflow/scripts/rename_genomes.py
++++ b/atlas/workflow/scripts/rename_genomes.py
+@@ -126,7 +126,7 @@ def rename_quality(quality_in, quality_out, old2new_name):
+ 
+ 
+ rename_quality(
+-    quality_in=snakemake.input.genome_quality,
+-    quality_out=snakemake.output.genome_quality,
++    quality_in=snakemake.input.genome_info,
++    quality_out=snakemake.output.genome_info,
+     old2new_name=old2new_name,
+ )
+diff --git a/atlas/workflow/scripts/utils/genome_stats.py b/atlas/workflow/scripts/utils/genome_stats.py
+index d98add84..84f69cbd 100644
+--- a/atlas/workflow/scripts/utils/genome_stats.py
++++ b/atlas/workflow/scripts/utils/genome_stats.py
+@@ -5,7 +5,9 @@
+ from itertools import groupby
+ import numpy as np
+ import gzip as gz
++import logging
+ 
++logger = logging.getLogger(__file__)
+ 
+ def verify_dna(sequence, is_upper):
+ 
+@@ -84,6 +86,8 @@ def genome_stats(fasta_file, number_of_n_for_split=10):
+         Length_contigs, N_contigs, _ = get_stats_from_lengths(contig_lengths)
+ 
+     except Exception as e:
++        logger.critical(f"Error in calculating stats of {fasta_file}")
++        logger.critical(e)
+         raise Exception(f"Error in calculating stats of {fasta_file}") from e
+ 
+     return {
+diff --git a/atlas/workflow/scripts/utils/io.py b/atlas/workflow/scripts/utils/io.py
+index 8681b911..2b0a2215 100644
+--- a/atlas/workflow/scripts/utils/io.py
++++ b/atlas/workflow/scripts/utils/io.py
+@@ -1,7 +1,9 @@
+-import os
++
+ import gzip as gz
+ 
+ import logging
++import os
++from pathlib import Path
+ 
+ logger = logging.getLogger("io")
+ 
+@@ -10,10 +12,14 @@ def simplify_path(path, remove_gz=True):
+     """Removes dir and extension from a filepath.
+     checks if file has an e
+     """
+-    name, ext = os.path.splitext(os.path.basename(path))
++
++    path = Path(path)
++
++    name = path.stem
++    ext = path.suffix
+ 
+     if remove_gz & (ext == ".gz"):
+-        name = os.path.splitext(name)[0]
++        name = Path(name).stem
+ 
+     return name
+ 
+@@ -21,7 +27,9 @@ def simplify_path(path, remove_gz=True):
+ def simply_open(filename, mode="r", *args, **kwargs):
+     """open file irrespective if gz compressed or not"""
+ 
+-    if filename.endswith(".gz"):
++    filename = Path(filename)
++
++    if filename.suffix==".gz":
+ 
+         # To read file in textmode
+         if mode in ["r", "a", "w", "x"]:
+@@ -64,6 +72,7 @@ def convert_percentages(df):
+ def symlink_relative(files, input_dir, output_dir):
+     """create symlink with and adjust for relative path"""
+ 
++
+     input_dir_rel = os.path.relpath(input_dir, output_dir)
+ 
+     for f in files:
+@@ -102,10 +111,10 @@ def _pandas_concat_disck_based(
+     index_col,
+     read_arguments,
+     save_arguments,
+-    headers=None,
++    selected_headers=None,
+ ):
+ 
+-    """combine different tables but one after the other in disck based"""
++    """combine different tables but one after the other in disk based"""
+ 
+     import pandas as pd
+ 
+@@ -114,25 +123,25 @@ def _pandas_concat_disck_based(
+     except ImportError:
+         tqdm = tuple
+ 
+-    if headers is not None:
++    if selected_headers is not None:
+         try:
+-            headers = list(headers)
++            selected_headers = list(selected_headers)
+         except Exception as e:
+-            raise Exception("headers should be a list-like") from e
++            raise Exception("selected_headers should be a list-like") from e
+ 
+     else:
+         # read all_headers
+-        headers = set()
++        selected_headers = set()
+         for file in input_tables:
+ 
+-            head = pd.read_csv(
++            headers_of_file = pd.read_csv(
+                 file, index_col=index_col, sep=sep, nrows=2, dtype=str, **read_arguments
+             )
+ 
+-            headers.update(list(head.columns))
++            selected_headers.update(list(headers_of_file.columns))
+ 
+-        headers = list(headers)
+-        logger.info(f"Infered folowing list of headers {headers}")
++        selected_headers = list(selected_headers)
++        logger.info(f"Infered folowing list of headers {selected_headers}")
+ 
+     # parse one file after another
+ 
+@@ -141,10 +150,10 @@ def _pandas_concat_disck_based(
+ 
+         # read full table
+         table = pd.read_csv(
+-            file, index_col=index_col, sep=sep, dtype=str, **read_arguments
++            file, index_col=index_col, sep=sep, dtype=str,**read_arguments
+         )
+         # set to common header
+-        table = table.reindex(headers, axis=1)
++        table = table.reindex(selected_headers, axis=1)
+ 
+         if file == input_tables[0]:
+             mode = "w"
+@@ -168,7 +177,7 @@ def pandas_concat(
+     save_arguments=None,
+     concat_arguments=None,
+     disk_based=False,
+-    headers=None,
++    selected_headers=None, # only used in disk based, not passed to usecols
+ ):
+     """
+     Uses pandas to read,concatenate and save tables using pandas.concat
+@@ -200,13 +209,18 @@ def pandas_concat(
+ 
+         assert axis == 0, "Can only append on axis= 0"
+ 
+-        _pandas_concat_disck_based(headers=headers, **common_arrguments)
++        _pandas_concat_disck_based(selected_headers=selected_headers, **common_arrguments)
+ 
+     else:
+         # in memory concat
+         if concat_arguments is None:
+             concat_arguments = {}
+ 
++        if selected_headers is not None:
++            raise Exception("argument 'selected_headers' is not used in 'in memory' concat. Use read_arguments=dict(usecols=selected_headers) instead ")
++            
++
++
+         _pandas_concat_in_memory(
+             axis=axis, concat_arguments=concat_arguments, **common_arrguments
+         )

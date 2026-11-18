@@ -1,0 +1,448 @@
+diff --git a/R/emuFit.R b/R/emuFit.R
+index e8e9a57..51a982e 100644
+--- a/R/emuFit.R
++++ b/R/emuFit.R
+@@ -4,6 +4,9 @@
+ #' @param X an n x p matrix or dataframe of covariates (optional)
+ #' @param formula a one-sided formula specifying the form of the mean model to be fit
+ #' @param data an n x p data frame containing variables given in \code{formula}
++#' @param cluster a numeric vector giving cluster membership for each row of Y to 
++#' be used in computing GEE test statistics. Default is NULL, in which case rows of 
++#' Y are treated as independent.
+ #' @param penalize logical: should Firth penalty be used in fitting model? Default is TRUE.
+ #' @param B starting value of coefficient matrix (p x J). If not provided,
+ #' B will be initiated as a zero matrix.
+@@ -93,6 +96,7 @@ emuFit <- function(Y,
+                    X = NULL,
+                    formula = NULL,
+                    data = NULL,
++                   cluster = NULL,
+                    penalize = TRUE,
+                    B = NULL,
+                    fitted_model = NULL,
+@@ -169,6 +173,22 @@ covariates in formula must be provided.")
+ have no observations. These samples must be excluded before fitting model.")
+   }
+   
++  #check that cluster is correctly type if provided
++  if(!is.null(cluster)){
++    if(!is.numeric(cluster)){
++      stop("If provided, argument 'cluster' must be a numeric vector.")
++    }
++    if(length(cluster)!=nrow(Y)){
++      stop("If provided, argument 'cluster' must be a numeric vector with 
++length equal to n (the number of rows in Y).")
++    }
++    if(length(unique(cluster)) == nrow(Y)){
++      warning("Number of unique values in 'cluster' equal to number of rows of Y; 
++ignoring argument 'cluster'.")
++      cluster <- NULL
++    }
++  }
++  
+   n <- nrow(Y)
+   J <- ncol(Y)
+   p <- ncol(X)
+@@ -278,7 +298,8 @@ and the corresponding gradient function to constraint_grad_fn.")
+                                     constraint_grad_fn = constraint_grad_fn,
+                                     nominal_coverage = 1 - alpha,
+                                     verbose = verbose,
+-                                    j_ref = j_ref)
++                                    j_ref = j_ref,
++                                    cluster = cluster)
+     
+     coefficients <- just_wald_things$coefficients
+     if (use_fullmodel_cov) {
+@@ -370,7 +391,8 @@ and the corresponding gradient function to constraint_grad_fn.")
+                                 trackB = trackB,
+                                 I_inv = I_inv,
+                                 Dy = Dy,
+-                                return_both_score_pvals = return_both_score_pvals)
++                                return_both_score_pvals = return_both_score_pvals,
++                                cluster = cluster)
+       
+       which_row <- which((as.numeric(coefficients$k) == as.numeric(test_kj$k[test_ind]))&
+                            (as.numeric(coefficients$j) == as.numeric(test_kj$j[test_ind])))
+@@ -387,6 +409,7 @@ and the corresponding gradient function to constraint_grad_fn.")
+       
+       if (use_both_cov) {
+         
++        #adjustment factor from guo GEE paper (https://doi.org/10.1002/sim.2161)
+         alt_score_stat <- get_score_stat(Y = Y_test,
+                                          X_cup = X_cup,
+                                          X = X,
+@@ -400,7 +423,8 @@ and the corresponding gradient function to constraint_grad_fn.")
+                                          n = n,
+                                          p = p, 
+                                          I_inv=I_inv,
+-                                         Dy = just_wald_things$Dy)*(n/(n - 1))
++                                         Dy = just_wald_things$Dy,
++                                         cluster = cluster)
+         
+         
+         which_row <- which((as.numeric(coefficients$k) == as.numeric(test_kj$k[test_ind]))&
+@@ -528,7 +552,8 @@ and the corresponding gradient function to constraint_grad_fn.")
+                         "penalized" = penalize,
+                         "Y_augmented" = Y_augmented,
+                         "I" = I,
+-                        "Dy" = Dy), class = "emuFit"))
++                        "Dy" = Dy,
++                        "cluster" = cluster), class = "emuFit"))
+ }
+ 
+ 
+diff --git a/R/get_score_stat.R b/R/get_score_stat.R
+index abb9bad..6e9234b 100644
+--- a/R/get_score_stat.R
++++ b/R/get_score_stat.R
+@@ -14,7 +14,8 @@ get_score_stat <- function(Y,
+                            n,
+                            p,
+                            I_inv = NULL, #previously computed I_inv, if desired
+-                           Dy = NULL #previously computed estimate of score covariance, if desired
++                           Dy = NULL, #previously computed estimate of score covariance, if desired
++                           cluster = NULL #numeric vector giving cluster membership for GEE
+                            ){
+   scores <- vector(n,mode = "list")
+   
+@@ -40,6 +41,12 @@ get_score_stat <- function(Y,
+     
+   }
+   
++  if(!is.null(cluster)){
++    scores <- lapply(unique(cluster),
++                     function(i) 
++                       Reduce("+",scores[cluster == i]))
++  }
++  
+   #compute derivative of constraint wrt (long/vector format) B 
+   H <- matrix(0,nrow = p, ncol = J)
+   
+@@ -85,10 +92,18 @@ get_score_stat <- function(Y,
+   #remove indexes corresponding to convenience constraint
+   score <- score[-indexes_to_remove, , drop =FALSE]
+   
++  #adjustment factor from Guo et al. GEE paper (https://doi.org/10.1002/sim.2161)
++  if(is.null(cluster)){
++    score_adj <- n/(n - 1)
++  } else{
++    nclust <- length(unique(cluster))
++    score_adj <- nclust/(nclust - 1)
++  }
++  
+   #slightly fancy calculation of numerator and denominator of score stat:
+   outside <- Matrix::crossprod(score, I_inv_H)
+   inside <- Matrix::crossprod(I_inv_H, Dy) %*% I_inv_H
+-  score_stat <- as.numeric(as.matrix(outside^2/inside))
++  score_stat <- as.numeric(as.matrix(outside^2/inside))*score_adj
+   
+   return(as.numeric(score_stat))
+ }
+diff --git a/R/micro_wald.R b/R/micro_wald.R
+index a05b4fb..f146f32 100644
+--- a/R/micro_wald.R
++++ b/R/micro_wald.R
+@@ -12,7 +12,8 @@ micro_wald <- function(Y,
+                        return_info = TRUE,
+                        return_Dy = TRUE,
+                        return_sandwich = FALSE,
+-                       j_ref = NULL){
++                       j_ref = NULL,
++                       cluster = NULL){
+   n <- nrow(Y)
+   J <- ncol(Y)
+   p <- ncol(X)
+@@ -55,6 +56,13 @@ micro_wald <- function(Y,
+                      Y_diff[i,,drop = FALSE]%*%
+                        X_cup[(i - 1)*J + 1:J,]})
+   
++  if(!is.null(cluster)){
++    scores <- lapply(unique(cluster),
++                     function(i) 
++                       Reduce("+",scores[cluster == i]))
++  }
++
++  
+   score_mat <- do.call(rbind,scores)
+   score_mat <- methods::as(score_mat,"sparseMatrix")
+   #empirical score covariance
+diff --git a/R/score_test.R b/R/score_test.R
+index bb5a032..7a586d5 100644
+--- a/R/score_test.R
++++ b/R/score_test.R
+@@ -65,7 +65,10 @@
+ #' information matrix computed from full model fit and from null model fits? Default is
+ #' FALSE. This parameter is used for simulations - in any applied analysis, type of
+ #' p-value to be used should be chosen before conducting tests.
+-#' 
++#' @param cluster a numeric vector giving cluster membership for each row of Y to 
++#' be used in computing GEE test statistics. Default is NULL, in which case rows of 
++#' Y are treated as independent.
++#'
+ #' @return A list containing elements 'score_stat', 'pval', 'log_pval','niter',
+ #' 'convergence', 'gap', 'u', 'rho', 'null_B', and 'Bs'. 'score_stat' gives the 
+ #' value of the robust score statistic for H_0: B_{k_constr,j_constr} = g(B_{k_constr}).
+@@ -108,7 +111,8 @@ score_test <- function(B, #B (MPLE)
+                        trackB = FALSE,
+                        I_inv = NULL,
+                        Dy = NULL,
+-                       return_both_score_pvals = FALSE){
++                       return_both_score_pvals = FALSE,
++                       cluster = NULL){
+   n <- nrow(Y)
+   J <- ncol(Y)
+   p <- ncol(X)
+@@ -192,11 +196,8 @@ retrying with smaller penalty scaling parameter tau and larger inner_maxit.")
+                  n = n,
+                  p = p,
+                  I_inv = I_inv,
+-                 Dy = Dy)
+-
+-
+-  score_stat <- score_stat*(n/(n - 1))
+-
++                 Dy = Dy,
++                 cluster = cluster)
+  
+   if(!return_both_score_pvals){ #typically we want only one score p-value
+                                 #(using only one version of information matrix)
+@@ -232,7 +233,7 @@ retrying with smaller penalty scaling parameter tau and larger inner_maxit.")
+                        I_inv = NULL,
+                        Dy = Dy)
+ 
+-      score_stat_with_null_info <- score_stat_with_null_info*(n/(n - 1))
++      score_stat_with_null_info <- score_stat_with_null_info
+ 
+       return(list("score_stat" = score_stat,
+                   "pval" = pchisq(score_stat,1,lower.tail = FALSE),
+diff --git a/man/emuFit.Rd b/man/emuFit.Rd
+index 04a18f7..8cd0d04 100644
+--- a/man/emuFit.Rd
++++ b/man/emuFit.Rd
+@@ -9,6 +9,7 @@ emuFit(
+   X = NULL,
+   formula = NULL,
+   data = NULL,
++  cluster = NULL,
+   penalize = TRUE,
+   B = NULL,
+   fitted_model = NULL,
+@@ -50,6 +51,10 @@ emuFit(
+ 
+ \item{data}{an n x p data frame containing variables given in \code{formula}}
+ 
++\item{cluster}{a numeric vector giving cluster membership for each row of Y to
++be used in computing GEE test statistics. Default is NULL, in which case rows of
++Y are treated as independent.}
++
+ \item{penalize}{logical: should Firth penalty be used in fitting model? Default is TRUE.}
+ 
+ \item{B}{starting value of coefficient matrix (p x J). If not provided,
+diff --git a/man/score_test.Rd b/man/score_test.Rd
+index 60d0ca7..91921bd 100644
+--- a/man/score_test.Rd
++++ b/man/score_test.Rd
+@@ -28,7 +28,8 @@ score_test(
+   trackB = FALSE,
+   I_inv = NULL,
+   Dy = NULL,
+-  return_both_score_pvals = FALSE
++  return_both_score_pvals = FALSE,
++  cluster = NULL
+ )
+ }
+ \arguments{
+@@ -107,6 +108,10 @@ under null, which we recommend.}
+ information matrix computed from full model fit and from null model fits? Default is
+ FALSE. This parameter is used for simulations - in any applied analysis, type of
+ p-value to be used should be chosen before conducting tests.}
++
++\item{cluster}{a numeric vector giving cluster membership for each row of Y to
++be used in computing GEE test statistics. Default is NULL, in which case rows of
++Y are treated as independent.}
+ }
+ \value{
+ A list containing elements 'score_stat', 'pval', 'log_pval','niter',
+diff --git a/tests/testthat/test-emuFit.R b/tests/testthat/test-emuFit.R
+index 55eb874..2fff496 100644
+--- a/tests/testthat/test-emuFit.R
++++ b/tests/testthat/test-emuFit.R
+@@ -164,6 +164,163 @@ test_that("emuFit takes formulas and actually fits a model", {
+   
+ })
+ 
++test_that("emuFit takes cluster argument without breaking ",{
++          expect_silent({
++            fitted_model_cluster <- emuFit(Y = Y,
++                                   X = X,
++                                   formula = ~group,
++                                   data = covariates,
++                                   verbose = FALSE,
++                                   B_null_tol = 1e-2,
++                                   tolerance = 0.01,
++                                   tau = 2,
++                                   return_wald_p = FALSE,
++                                   compute_cis = TRUE,
++                                   run_score_tests = TRUE, 
++                                   use_fullmodel_info = FALSE,
++                                   use_fullmodel_cov = FALSE,
++                                   return_both_score_pvals = FALSE,
++                                   cluster = rep(1:3,each = 4))
++          })
++  
++  expect_silent({
++    fitted_model_nocluster <- emuFit(Y = Y,
++                                   X = X,
++                                   formula = ~group,
++                                   data = covariates,
++                                   verbose = FALSE,
++                                   B_null_tol = 1e-2,
++                                   tolerance = 0.01,
++                                   tau = 2,
++                                   return_wald_p = FALSE,
++                                   compute_cis = TRUE,
++                                   run_score_tests = TRUE, 
++                                   use_fullmodel_info = FALSE,
++                                   use_fullmodel_cov = FALSE,
++                                   return_both_score_pvals = FALSE)
++  })
++  
++  expect_true(all(fitted_model_nocluster$coef$estimate == fitted_model_cluster$coef$estimate))
++  
++  expect_true(all(fitted_model_nocluster$coef$se != fitted_model_cluster$coef$se))
++  
++  expect_true(all(fitted_model_cluster$coef$se != fitted_model_nocluster$coef$se))
++  
++          
++          
++          
++          ## emuFit takes formulas and actually fits a model (with score tests)
++          
++          expect_true(all(fitted_model_cluster$coef$wald_p>0 & fitted_model_cluster$coef$wald_p<1))
++          expect_true(all(fitted_model_cluster$coef$pval>0 & fitted_model_cluster$coef$pval<1))
++          expect_true(inherits(fitted_model_cluster$B,"matrix"))
++          expect_true(inherits(fitted_model_cluster$Y_augmented,"matrix"))
++          expect_true(cor(fitted_model_cluster$B[2,],b[2, ]) > 0.85)
++          
++})
++
++b0 <- rnorm(J)
++b1 <- seq(1,5,length.out = J)
++b1 <- b1 - mean(b1)
++b1[3:4] <- 0
++b <- rbind(b0,b1)
++
++test_that("GEE with cluster covariance gives plausible type 1 error ",{
++  skip("Skipping -- test requires fitting models to 100 simulated datasets.")
++  set.seed(44022)
++  nsim <- 100
++  cluster <- rep(1:4, each = 3)
++  results <- data.frame(sim = rep(1:nsim,each = 2),
++                        category_num = rep(3:4,nsim),
++                        estimate = numeric(2*nsim),
++                        score_stat = numeric(2*nsim),
++                        pval = numeric(2*nsim))[-(1:(2*nsim)),]
++  results_noGEE <- results
++  for(sim in 1:nsim){
++    print(sim)
++    X <- cbind(1,rnorm(n))
++    covariates <- data.frame(group = X[,2])
++    Y <- matrix(NA,ncol = J, nrow = n)
++  
++  cluster_effs <- lapply(1:4,
++                         function(i)
++                           log(matrix(rexp(2*J),nrow= 2)))
++  
++  for(i in 1:n){
++    Y[i,] <- 0
++    while(sum(Y[i,])==0){
++    for(j in 1:J){
++      temp_mean <- exp(X[i,,drop = FALSE]%*%(b[,j,drop = FALSE] + 
++                                               cluster_effs[[ cluster[i] ]][,j]) + z[i])
++      Y[i,j] <- rnbinom(1, mu= temp_mean,size = 5)*rbinom(1,1,0.8)
++    }}
++  }
++  
++  # expect_silent({
++    fitted_model_cluster <- emuFit(Y = Y,
++                                   X = X,
++                                   formula = ~group,
++                                   data = covariates,
++                                   verbose = FALSE,
++                                   B_null_tol = 1e-2,
++                                   tolerance = 0.01,
++                                   tau = 1.2,
++                                   return_wald_p = FALSE,
++                                   compute_cis = TRUE,
++                                   run_score_tests = TRUE, 
++                                   use_fullmodel_info = FALSE,
++                                   use_fullmodel_cov = FALSE,
++                                   return_both_score_pvals = FALSE,
++                                   test_kj = data.frame(k = c(2,2),
++                                                        j = c(3,4)),
++                                   cluster = cluster)
++    
++    fitted_model_nocluster <- emuFit(Y = Y,
++                                   X = X,
++                                   formula = ~group,
++                                   data = covariates,
++                                   verbose = FALSE,
++                                   B_null_tol = 1e-2,
++                                   tolerance = 0.01,
++                                   tau = 1.2,
++                                   return_wald_p = FALSE,
++                                   compute_cis = TRUE,
++                                   run_score_tests = TRUE, 
++                                   use_fullmodel_info = FALSE,
++                                   use_fullmodel_cov = FALSE,
++                                   return_both_score_pvals = FALSE,
++                                   test_kj = data.frame(k = c(2,2),
++                                                        j = c(3,4)))
++  # })
++  
++  filtered_coef <- fitted_model_cluster$coef[!is.na(fitted_model_cluster$coef$pval),
++                                             c("category_num",
++                                               "estimate",
++                                               "score_stat",
++                                               "pval")]
++  results <- rbind(results,
++                   cbind(data.frame("sim" = rep(sim,2)),
++                         filtered_coef))
++  
++  filtered_coef_noGEE <- fitted_model_nocluster$coef[!is.na(fitted_model_nocluster$coef$pval),
++                                             c("category_num",
++                                               "estimate",
++                                               "score_stat",
++                                               "pval")]
++  results_noGEE <- rbind(results_noGEE,
++                   cbind(data.frame("sim" = rep(sim,2)),
++                         filtered_coef_noGEE))
++  
++  
++  }
++  
++  #expect somewhat conservative inference for score test with correct clustering
++  expect_true(mean(results$pval<=0.05) <= 0.05)
++  #expect fairly anti-conservative inference for score test without clustering
++  expect_true(mean(results_noGEE$pval<=0.05) >= 0.10)
++  
++})
++
+ # test_that("emuFit takes formulas and actually fits a model (no score tests) when J is large", {
+ #   
+ #   b1 <- 1:10
+diff --git a/tests/testthat/test-score_test.R b/tests/testthat/test-score_test.R
+index 94ae77e..27f88ef 100644
+--- a/tests/testthat/test-score_test.R
++++ b/tests/testthat/test-score_test.R
+@@ -104,8 +104,8 @@ we do *not* get same results if we use incorrect info", {
+                      p = p,
+                      I_inv = diag(rep(1,18)))
+ 
+-    expect_equal((n/(n - 1))*score_stat_with_I_inv,score_test_as_is$score_stat)
+-    expect_true((n/(n - 1))*score_stat_with_other_mat !=score_test_as_is$score_stat)
++    expect_equal(score_stat_with_I_inv,score_test_as_is$score_stat)
++    expect_true(score_stat_with_other_mat !=score_test_as_is$score_stat)
+ 
+ })
+ # test_that("simple negative binomial example fits reasonably fast and returns reasonable output", {

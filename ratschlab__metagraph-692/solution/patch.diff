@@ -1,0 +1,280 @@
+diff --git a/metagraph/src/cli/align.cpp b/metagraph/src/cli/align.cpp
+index 7f8ed5e1ad..97a98e6328 100644
+--- a/metagraph/src/cli/align.cpp
++++ b/metagraph/src/cli/align.cpp
+@@ -309,6 +309,24 @@ std::string format_alignment(const std::string &header,
+     return sout;
+ }
+ 
++// header, strand, labels, number of query characters covered by their seeds,
++// and the query range they span
++static std::string format_mapping(const std::string &header,
++                                  const std::optional<LabeledAligner<>::LabelMapping> &mapping,
++                                  const annot::LabelEncoder<> &encoder) {
++    if (!mapping)
++        return fmt::format("{}\t*\t*\t0\t*\t*\n", header);
++
++    std::vector<std::string> labels;
++    labels.reserve(mapping->labels.size());
++    for (auto column : mapping->labels) {
++        labels.emplace_back(encoder.decode(column));
++    }
++    return fmt::format("{}\t{}\t{}\t{}\t{}\t{}\n", header,
++                       mapping->orientation ? '-' : '+', fmt::join(labels, ";"),
++                       mapping->num_matches, mapping->query_begin, mapping->query_end);
++}
++
+ int align_to_graph(Config *config) {
+     assert(config);
+ 
+@@ -480,6 +498,19 @@ int align_to_graph(Config *config) {
+                     cth = anno_dbg->get_coord_to_header();
+                 }
+ 
++                if (config->align_map_only) {
++                    assert(anno_dbg);
++                    dynamic_cast<const LabeledAligner<>&>(*aligner).map_batch(batch,
++                        [&](const std::string &header,
++                            std::optional<LabeledAligner<>::LabelMapping>&& mapping) {
++                            auto res = format_mapping(header, mapping, *encoder);
++                            std::lock_guard<std::mutex> lock(print_mutex);
++                            *out << res;
++                        }
++                    );
++                    return;
++                }
++
+                 aligner->align_batch(batch,
+                     [&](const std::string &header, AlignmentResults&& paths) {
+                         auto res = format_alignment(header, paths, *graph, *config, encoder, cth);
+diff --git a/metagraph/src/cli/config/config.cpp b/metagraph/src/cli/config/config.cpp
+index d460fde0ce..4804c3956b 100644
+--- a/metagraph/src/cli/config/config.cpp
++++ b/metagraph/src/cli/config/config.cpp
+@@ -248,6 +248,8 @@ Config::Config(int argc, char *argv[]) {
+             map_sequences = true;
+         } else if (!strcmp(argv[i], "--align")) {
+             align_sequences = true;
++        } else if (!strcmp(argv[i], "--align-map-only")) {
++            align_map_only = true;
+         } else if (!strcmp(argv[i], "--align-only-forwards")) {
+             align_only_forwards = true;
+         } else if (!strcmp(argv[i], "--align-output-path")) {
+@@ -691,6 +693,12 @@ Config::Config(int argc, char *argv[]) {
+         print_usage(argv[0], identity);
+     }
+ 
++    if (identity == ALIGN && align_map_only
++            && (infbase_annotators.empty() || output_json)) {
++        std::cerr << "Error: --align-map-only requires an annotation (-a) and TSV output" << std::endl;
++        print_usage_and_exit = true;
++    }
++
+     if (alignment_max_seed_length < alignment_min_seed_length) {
+         std::cerr << "Error: align-max-seed-length has to be at least align-min-seed-length" << std::endl;
+         print_usage_and_exit = true;
+@@ -1113,6 +1121,7 @@ if (advanced) {
+             fprintf(stderr, "\t-a --annotator [STR] \t\t\t\tannotator to load for label/trace-consistent alignment []\n");
+             fprintf(stderr, "\t-o --outfile-base [STR]\t\t\t\tbasename of output file []\n");
+             fprintf(stderr, "\t   --json \t\t\t\t\toutput alignment in JSON format [off]\n");
++            fprintf(stderr, "\t   --align-map-only \t\t\t\treport the labels best supported by seeds, without extending them into alignments (requires -a) [off]\n");
+ if (advanced) {
+             fprintf(stderr, "\t   --align-only-forwards \t\t\tdo not align backwards from a seed on basic-mode graphs [off]\n");
+             fprintf(stderr, "\t   --align-no-seed-complexity-filter \t\t\t\tdisable the filter for low-complexity seeds. [off]\n");
+diff --git a/metagraph/src/cli/config/config.hpp b/metagraph/src/cli/config/config.hpp
+index 1b6e0fa909..18cff74623 100644
+--- a/metagraph/src/cli/config/config.hpp
++++ b/metagraph/src/cli/config/config.hpp
+@@ -66,6 +66,7 @@ class Config {
+     // `metagraph align --json` output. Off by default since nothing in-tree
+     // consumes it and it dominates the JSON size for long alignments.
+     bool align_output_path = false;
++    bool align_map_only = false;
+     bool advanced = false;
+ 
+     unsigned int k = 3;
+diff --git a/metagraph/src/graph/alignment/aligner_labeled.cpp b/metagraph/src/graph/alignment/aligner_labeled.cpp
+index 100522df59..66bbae3760 100644
+--- a/metagraph/src/graph/alignment/aligner_labeled.cpp
++++ b/metagraph/src/graph/alignment/aligner_labeled.cpp
+@@ -1,5 +1,7 @@
+ #include "aligner_labeled.hpp"
+ 
++#include <map>
++
+ #include "graph/representation/rc_dbg.hpp"
+ #include "common/algorithms.hpp"
+ #include "common/unix_tools.hpp"
+@@ -695,6 +697,77 @@ ::filter_seeds(std::vector<Seed> &seeds) const {
+     return get_num_char_matches_in_seeds(seeds.begin(), seeds.end());
+ }
+ 
++template <class Seeder, class Extender, class AlignmentCompare>
++void LabeledAligner<Seeder, Extender, AlignmentCompare>
++::map_batch(const std::vector<IDBGAligner::Query> &seq_batch,
++            const MappingCallback &callback) const {
++    std::vector<AlignmentResults> wrapped_seqs;
++    wrapped_seqs.reserve(seq_batch.size());
++    for (const auto &[header, query] : seq_batch) {
++        wrapped_seqs.emplace_back(query);
++    }
++
++    auto seeders = build_seeders(seq_batch, wrapped_seqs);
++    assert(seeders.size() == seq_batch.size());
++
++    // the labels whose seeds cover the most query characters on one strand
++    auto map_seeds = [&](const ISeeder &seeder, bool orientation, size_t query_size) {
++        std::map<Column, std::vector<std::pair<size_t, size_t>>> label_ranges;
++        for (const Seed &seed : seeder.get_seeds()) {
++            size_t begin = seed.get_clipping();
++            size_t end = begin + seed.get_query_view().size();
++            for (Column label : seed.label_columns) {
++                label_ranges[label].emplace_back(begin, end);
++            }
++        }
++
++        std::optional<LabelMapping> best;
++        for (auto &[label, ranges] : label_ranges) {
++            std::sort(ranges.begin(), ranges.end());
++            size_t covered = 0;
++            size_t last_end = 0;
++            for (const auto &[begin, end] : ranges) {
++                if (end > last_end) {
++                    covered += end - std::max(begin, last_end);
++                    last_end = end;
++                }
++            }
++
++            if (!best || covered > best->num_matches) {
++                best = LabelMapping{ orientation, {}, covered, ranges.front().first, last_end };
++            } else if (covered < best->num_matches) {
++                continue;
++            }
++
++            best->labels.push_back(label);
++            best->query_begin = std::min(best->query_begin, ranges.front().first);
++            best->query_end = std::max(best->query_end, last_end);
++        }
++
++        if (best && orientation) {
++            // report the range on the forward query
++            std::tie(best->query_begin, best->query_end)
++                = std::make_pair(query_size - best->query_end, query_size - best->query_begin);
++        }
++
++        return best;
++    };
++
++    for (size_t i = 0; i < seq_batch.size(); ++i) {
++        const auto &[header, query] = seq_batch[i];
++        const auto &[seeder, seeder_rc] = seeders[i];
++
++        std::optional<LabelMapping> best = map_seeds(*seeder, false, query.size());
++        if (seeder_rc) {
++            auto best_rc = map_seeds(*seeder_rc, true, query.size());
++            if (best_rc && (!best || best_rc->num_matches > best->num_matches))
++                best = std::move(best_rc);
++        }
++
++        callback(header, std::move(best));
++    }
++}
++
+ template class LabeledAligner<>;
+ 
+ } // namespace align
+diff --git a/metagraph/src/graph/alignment/aligner_labeled.hpp b/metagraph/src/graph/alignment/aligner_labeled.hpp
+index a35675fe7b..9ab85f52c2 100644
+--- a/metagraph/src/graph/alignment/aligner_labeled.hpp
++++ b/metagraph/src/graph/alignment/aligner_labeled.hpp
+@@ -2,6 +2,8 @@
+ #define __LABELED_ALIGNER_HPP__
+ 
+ #include "dbg_aligner.hpp"
++#include <optional>
++
+ #include "annotation_buffer.hpp"
+ #include "graph/annotated_dbg.hpp"
+ 
+@@ -136,6 +138,26 @@ class LabeledAligner : public DBGAligner<Seeder, Extender, AlignmentCompare>, pu
+         return annotation_buffer_.has_coordinates();
+     }
+ 
++    // The labels supported by the most query characters in seeds, without
++    // extending the seeds into alignments. Seeds are found and filtered by
++    // label exactly as for alignment (including min_exact_match).
++    struct LabelMapping {
++        bool orientation = false;
++        // all labels covering |num_matches| query characters
++        Alignment::Columns labels;
++        // query characters covered by seeds of each of these labels
++        size_t num_matches = 0;
++        // the query range spanned by these seeds, on the forward query
++        size_t query_begin = 0;
++        size_t query_end = 0;
++    };
++
++    typedef std::function<void(const std::string& /* header */,
++                               std::optional<LabelMapping>&& /* best mapping */)> MappingCallback;
++
++    void map_batch(const std::vector<IDBGAligner::Query> &seq_batch,
++                   const MappingCallback &callback) const;
++
+   private:
+     mutable AnnotationBuffer annotation_buffer_;
+     size_t max_seed_length_;
+diff --git a/metagraph/tests/annotation/test_aligner_labeled.cpp b/metagraph/tests/annotation/test_aligner_labeled.cpp
+index 9427487157..b418fa9870 100644
+--- a/metagraph/tests/annotation/test_aligner_labeled.cpp
++++ b/metagraph/tests/annotation/test_aligner_labeled.cpp
+@@ -182,6 +182,50 @@ TYPED_TEST(LabeledAlignerTest, SimpleLinearGraph) {
+     }
+ }
+ 
++TYPED_TEST(LabeledAlignerTest, MapWithoutExtension) {
++    size_t k = 4;
++    /*
++        A    A    B    B    B    B
++        GCAA-CAAT-AATG-ATGC-TGCT-GCTT
++    */
++    const std::vector<std::string> sequences { "GCAAT", "AATGCTT" };
++    const std::vector<std::string> labels { "A", "B" };
++
++    auto anno_graph = build_anno_graph<typename TypeParam::first_type,
++                                       typename TypeParam::second_type>(k, sequences, labels);
++
++    DBGAlignerConfig config;
++    config.score_matrix = DBGAlignerConfig::dna_scoring_matrix(2, -1, -1);
++    config.min_exact_match = 0.5;
++    LabeledAligner<> aligner(anno_graph->get_graph(), config, anno_graph->get_annotator());
++    const auto &label_encoder = anno_graph->get_annotator().get_label_encoder();
++
++    std::vector<std::optional<LabeledAligner<>::LabelMapping>> mappings;
++    aligner.map_batch({ { "B", "TAATGCTTA" }, { "AB", "GCAATGCTT" }, { "none", "CCCCCCCC" } },
++        [&](const std::string &, auto&& mapping) { mappings.push_back(std::move(mapping)); }
++    );
++    ASSERT_EQ(3u, mappings.size());
++
++    // AATGCTT is B's, covered in full
++    ASSERT_TRUE(mappings[0]);
++    EXPECT_FALSE(mappings[0]->orientation);
++    ASSERT_EQ(1u, mappings[0]->labels.size());
++    EXPECT_EQ("B", label_encoder.decode(mappings[0]->labels[0]));
++    EXPECT_EQ(7u, mappings[0]->num_matches);
++    EXPECT_EQ(1u, mappings[0]->query_begin);
++    EXPECT_EQ(8u, mappings[0]->query_end);
++
++    // GCAAT (A) covers 5 characters, AATGCTT (B) covers 7
++    ASSERT_TRUE(mappings[1]);
++    ASSERT_EQ(1u, mappings[1]->labels.size());
++    EXPECT_EQ("B", label_encoder.decode(mappings[1]->labels[0]));
++    EXPECT_EQ(7u, mappings[1]->num_matches);
++    EXPECT_EQ(2u, mappings[1]->query_begin);
++    EXPECT_EQ(9u, mappings[1]->query_end);
++
++    EXPECT_FALSE(mappings[2]);
++}
++
+ TYPED_TEST(LabeledAlignerTest, SimpleTangleGraph) {
+     size_t k = 3;
+     /*  B                  AB  AB

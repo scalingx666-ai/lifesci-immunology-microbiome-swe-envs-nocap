@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** update "emuFit.Rd" based on fix to documentation to note that `verbose = FALSE` not `TRUE` by default
+
+## Description
+
+thanks to Isaac from STAMPS for pointing this out to me!
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `33443d3b6045`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,178 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 165c46d5..afa98d28 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -96,6 +96,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ ### 🐛 Bug Fixes
+ 
+ * {func}`ep.pp.explicit_impute <ehrapy.preprocessing.explicit_impute>` no longer warns for every variable missing from a `replacement` mapping, because leaving variables out of it is the intended way to impute only some of them ([#1178](https://github.com/theislab/ehrapy/pull/1178)) @Zethson
++* {func}`ep.tl.rank_features_groups <ehrapy.tools.rank_features_groups>` reports the log2 ratio of the fractions of observations with value 1 as log fold change of binary categorical features and NaN for categorical features with more levels, instead of 1 regardless of direction, and orders features with equal adjusted p-values by their p-values (PRLINK) @Zethson
++* {func}`ep.tl.rank_features_groups <ehrapy.tools.rank_features_groups>` reports the log2 ratio of the fractions of observations with value 1 as log fold change of binary categorical features and NaN for categorical features with more levels, instead of 1 regardless of direction, and orders features with equal adjusted p-values by their p-values ([#1180](https://github.com/theislab/ehrapy/pull/1180)) @Zethson
+ * {func}`ep.ml.calibrate <ehrapy.ml.calibrate>` defaults to `method="platt"` instead of `"isotonic"`, because isotonic regression overfits tuning sets of typical size, such as on PhysioNet 2012 with a calibration slope of 0.54 against 0.95 with Platt scaling ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+ * {func}`ep.ml.evaluate <ehrapy.ml.evaluate>` and {func}`ep.pl.subgroup_performance <ehrapy.plot.subgroup_performance>` keep the subgroups of `groupby` in the order of its categories, or of their appearance, instead of sorting them ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+ * {func}`ep.pp.summarize_measurements <ehrapy.preprocessing.summarize_measurements>` returns NaN without RuntimeWarnings for variables without values in a window of longitudinal data ([#1169](https://github.com/theislab/ehrapy/pull/1169)) @Zethson
+diff --git a/ehrapy/tools/feature_ranking/_rank_features_groups.py b/ehrapy/tools/feature_ranking/_rank_features_groups.py
+index a0552e54..7ce76c0c 100644
+--- a/ehrapy/tools/feature_ranking/_rank_features_groups.py
++++ b/ehrapy/tools/feature_ranking/_rank_features_groups.py
+@@ -71,7 +71,7 @@ def _adjust_pvalues(pvals: np.recarray, corr_method: _method_options._correction
+ 
+ 
+ def _sort_features(edata: EHRData, key_added: str = "rank_features_groups") -> None:
+-    """Sort results of :func:`~ehrapy.tools.rank_features_groups` by adjusted p-value.
++    """Sort results of :func:`~ehrapy.tools.rank_features_groups` by adjusted p-value and then p-value.
+ 
+     Args:
+         edata: Central data object after running :func:`~ehrapy.tools.rank_features_groups`
+@@ -81,10 +81,10 @@ def _sort_features(edata: EHRData, key_added: str = "rank_features_groups") -> N
+         return
+ 
+     pvals_adj = edata.uns[key_added]["pvals_adj"]
++    pvals = edata.uns[key_added]["pvals"]
+ 
+     for group in pvals_adj.dtype.names:
+-        group_pvals = pvals_adj[group]
+-        sorted_indexes = np.argsort(group_pvals)
++        sorted_indexes = np.lexsort((pvals[group], pvals_adj[group]))
+ 
+         for key in edata.uns[key_added].keys():
+             if key in _UNRANKED_KEYS:
+@@ -195,7 +195,7 @@ def _evaluate_categorical_features(
+                   Array to be indexed by group id storing the statistic underlying
+                   the computation of a p-value for each feature for each group.
+         *logfoldchanges*: `np.array`
+-                          Always equal to 1 for this function
++                          log2 ratios of the fractions of observations with value 1 for binary features, NaN otherwise
+         *pvals*: `np.array`
+                  p-values of a statistical test
+         *pts*: `np.array`
+@@ -232,30 +232,35 @@ def _evaluate_categorical_features(
+ 
+         pvals = []
+         scores = []
++        logfoldchanges = []
++        observed = ~pd.isna(feature_values)
++        binary = np.isin(feature_values[observed], (0, 1)).all()
+ 
+         for group in groups_order:
+             if group == reference:
+                 continue
+ 
+-            if reference == "rest":
+-                contingency_table = pd.crosstab(feature_values, groups_values != group)
+-            else:
+-                obs_to_take = np.isin(groups_values, [group, reference])
+-                reference_mask = groups_values[obs_to_take] == reference
+-                contingency_table = pd.crosstab(feature_values[obs_to_take], reference_mask)
++            in_group = groups_values == group
++            rest = ~in_group if reference == "rest" else groups_values == reference
++            compared = in_group | rest
++            contingency_table = pd.crosstab(feature_values[compared], rest[compared])
+ 
+             score, p_value, _, _ = chi2_contingency(
+                 contingency_table.values, lambda_=tests_to_lambdas[categorical_method]
+             )
+             scores.append(score)
+             pvals.append(p_value)
++            if binary:
++                logfoldchanges.append(
++                    _log2_ratio(*(feature_values[mask & observed].astype(float).mean() for mask in (in_group, rest)))
++                )
++            else:
++                logfoldchanges.append(np.nan)
+ 
+         categorical_names.append([feature] * len(scores))
+         categorical_scores.append(scores)
+         categorical_pvals.append(pvals)
+-        # It is not clear, how to interpret logFC or percentages for categorical data
+-        # For now, leave some values so that plotting and sorting methods work
+-        categorical_logfoldchanges.append(np.ones(len(scores)))
++        categorical_logfoldchanges.append(logfoldchanges)
+         if pts:
+             categorical_pts.append(np.ones(len(scores)))
+ 
+@@ -289,6 +294,12 @@ def _nonzero_fractions(
+     return fractions
+ 
+ 
++def _log2_ratio(means: np.ndarray | float, rest_means: np.ndarray | float) -> np.ndarray:
++    """log2 ratios of `means` to `rest_means`, NaN where either is not positive."""
++    with np.errstate(divide="ignore", invalid="ignore"):
++        return np.where((means > 0) & (rest_means > 0), np.log2(means) - np.log2(rest_means), np.nan)
++
++
+ def _log2_fold_changes(
+     edata: EHRData, names: np.recarray, *, groupby: str, groups_order: Sequence[str], reference: str
+ ) -> np.recarray:
+@@ -296,9 +307,7 @@ def _log2_fold_changes(
+     means, rest_means = _group_means(edata.X, edata.obs[groupby].astype(str).to_numpy(), groups_order)
+     if reference != "rest":
+         rest_means = means[list(groups_order).index(reference)]
+-    with np.errstate(divide="ignore", invalid="ignore"):
+-        log2_ratios = np.where((means > 0) & (rest_means > 0), np.log2(means) - np.log2(rest_means), np.nan)
+-    log2_ratios = pd.DataFrame(log2_ratios.T, index=edata.var_names, columns=groups_order)
++    log2_ratios = pd.DataFrame(_log2_ratio(means, rest_means).T, index=edata.var_names, columns=groups_order)
+     return pd.DataFrame(
+         {group: log2_ratios.loc[names[group], group].to_numpy() for group in names.dtype.names}
+     ).to_records(index=False)
+@@ -381,6 +390,8 @@ def rank_features_groups(
+ ) -> EHRData | None:  # pragma: no cover
+     """Rank features for characterizing groups.
+ 
++    Numeric and categorical features are ranked together by their adjusted p-values, and by their p-values among equal adjusted p-values, because the scores of their tests are not comparable.
++
+     Args:
+         edata: Central data object.
+         groupby: The key of the observations grouping to consider.
+@@ -428,6 +439,7 @@ def rank_features_groups(
+           Ordered according to adjusted p-values.
+         - logfoldchanges (:class:`numpy.ndarray`): Structured array to be indexed by group id storing the log2 fold change for each feature for each group.
+           For numeric features, this is the log2 ratio of the mean in the group to the mean in the `reference` group, or in all other observations if `reference='rest'`, and `NaN` where either mean is not positive.
++          For binary categorical features, this is the log2 ratio of the fractions of observations with value 1, and `NaN` for categorical features with more than two levels.
+           Ordered according to adjusted p-values.
+           Only provided if method is ‘t-test’ like.
+         - pvals (:class:`numpy.ndarray`): p-values.
+diff --git a/tests/tools/feature_ranking/test_rank_features_groups.py b/tests/tools/feature_ranking/test_rank_features_groups.py
+index 5c2b9f0a..7fce99f5 100644
+--- a/tests/tools/feature_ranking/test_rank_features_groups.py
++++ b/tests/tools/feature_ranking/test_rank_features_groups.py
+@@ -608,6 +608,39 @@ def test_rank_features_groups_logfoldchanges(method, reference, standardize, rng
+     assert np.isnan(expected).any() == standardize
+ 
+ 
++@pytest.mark.parametrize("reference", ["rest", "b"])
++def test_rank_features_groups_categorical_logfoldchanges(reference, rng):
++    flag = (rng.random(40) < np.repeat([0.9, 0.3, 0.1, 0.6], 10)).astype(float)
++    edata = ed.EHRData(
++        X=np.column_stack([_ranking_data(rng), flag]),
++        obs=_ranking_edata(_ranking_data(rng)).obs,
++        var=pd.DataFrame(
++            {FEATURE_TYPE_KEY: [NUMERIC_TAG] * 3 + [CATEGORICAL_TAG] * 2}, index=["n0", "n1", "n2", "c", "flag"]
++        ),
++    )
++    ep.tl.rank_features_groups(edata, "group", reference=reference)
++
++    result = edata.uns["rank_features_groups"]
++    groups = edata.obs["group"].to_numpy()
++    logfoldchanges = {
++        group: pd.Series(result["logfoldchanges"][group], index=result["names"][group])
++        for group in result["names"].dtype.names
++    }
++    for group, values in logfoldchanges.items():
++        rest = groups != group if reference == "rest" else groups == reference
++        assert values["flag"] == pytest.approx(np.log2(flag[groups == group].mean() / flag[rest].mean()))
++        assert np.isnan(values["c"])
++    assert logfoldchanges["a"]["flag"] > 0 > logfoldchanges["c"]["flag"]
++
++
++def test_rank_features_groups_df_orders_by_pvals(mimic_2_encoded):
++    ep.tl.rank_features_groups(mimic_2_encoded, groupby="service_unit")
++
++    for group, df in ep.get.rank_features_groups_df(mimic_2_encoded, group=None).groupby("group", observed=True):
++        order = df.sort_values(["pvals_adj", "pvals"], kind="stable")
++        assert df.index.equals(order.index), group
++
++
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu)
+ def test_filter_rank_features_groups_array_types(array_type, rng):
+     X = _ranking_data(rng)

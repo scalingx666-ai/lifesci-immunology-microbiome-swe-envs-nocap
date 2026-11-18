@@ -1,0 +1,122 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7484ccac..6c1783d2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,22 @@
+ Notable changes per release. Earlier releases are described by their git tags
+ (`git tag --sort=-v:refname`); this file starts at 2.5.0.
+ 
++## 2.11.1
++
++### Changed — `transfer_hit` no longer scans the junction anchor twice
++
++`_anchored_vj_bounds` computes the longest prefix of the junction that the called V's germline
++templates, and `v_anchor_prefix` then recomputed **the same scan over the same slice** to feed the
++Cys104 junction gate (`_junction_nt` cuts `query_seq[cs-3-1 : f4+2]`, byte-identical to the window
++`_anchored_vj_bounds` already built). It now returns that number and the gate reuses it, so a read
++with an ambiguous V call no longer walks every called allele a second time.
++
++Amplicon 100 k reads, 8 threads: **5.55 s -> 5.35 s**. Output byte-identical on an amplicon and a
++bulk library; 624 tests pass.
++
++Cumulative over 2.11.0 + 2.11.1, same workload: **5.96 s -> 5.35 s (10.2 %)**, against MiXCR's
++5.90 s — 1.10x faster on wall at 12.7 s of CPU versus 45.2 s, and 631 MB versus 3,027 MB.
++
+ ## 2.11.0
+ 
+ ### Fixed — a junction was emitted even when the V was trimmed past its own Cys104
+diff --git a/pyproject.toml b/pyproject.toml
+index 7c5e0e13..ca14b38b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
+ 
+ [project]
+ name = "arda-mapper"  # PyPI distribution name (`arda` is taken); imports as `arda`
+-version = "2.11.0"
++version = "2.11.1"
+ description = "Antigen Receptor Domain Annotation — fast TCR/BCR FR/CDR region annotation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+diff --git a/src/arda/__init__.py b/src/arda/__init__.py
+index b582c1b0..01929bdf 100644
+--- a/src/arda/__init__.py
++++ b/src/arda/__init__.py
+@@ -6,7 +6,7 @@
+ 
+ from __future__ import annotations
+ 
+-__version__ = "2.11.0"
++__version__ = "2.11.1"
+ 
+ from .adapter import annotate_sequences  # noqa: E402
+ 
+diff --git a/src/arda/annotate/transfer.py b/src/arda/annotate/transfer.py
+index f25b1229..a82b8e97 100644
+--- a/src/arda/annotate/transfer.py
++++ b/src/arda/annotate/transfer.py
+@@ -436,13 +436,13 @@ def _anchored_vj_bounds(query_seq, cs, f4, v_call, j_call, anchors, seqtype="nt"
+     residues rather than codons.
+     """
+     if not anchors or cs is None or f4 is None:
+-        return 0, 0
++        return 0, 0, 0
+     if seqtype == "aa":
+         js0, je, field = cs - 1, f4, "templated_aa"   # junction = Cys104 .. [FW]118 residues
+     else:
+         js0, je, field = cs - 3, f4 + 2, "germline_nt"  # .. the same, as codons
+     if js0 < 1 or je > len(query_seq):
+-        return 0, 0
++        return 0, 0, 0
+     junction = query_seq[js0 - 1 : je]
+ 
+     def best(calls, segment, fn):
+@@ -458,9 +458,12 @@ def best(calls, segment, fn):
+ 
+     p = best(v_call, "V", _common_prefix)
+     s = best(j_call, "J", _common_suffix)
++    # `p` IS `v_anchor_prefix(junction, v_call, anchors)` -- the same scan over the same slice
++    # (`_junction_nt` cuts `query_seq[cs-3-1 : f4+2]`, identical to `junction` above). Returning it
++    # saves the caller a second pass over every called V allele per read.
+     if not p or not s:
+-        return 0, 0
+-    return js0 + p - 1, je - s + 1
++        return 0, 0, p
++    return js0 + p - 1, je - s + 1, p
+ 
+ 
+ def _map_d(rec, query_seq, v_end_q, j_start_q, d_germlines, j_call: str = "",
+@@ -628,6 +631,7 @@ def _num(v):
+     rec.update(segment_cigars(hit["qaln"], hit["taln"], int(hit["qstart"]), ts,
+                               len(query_seq), t_vend, t_jstart, t_vjend))
+ 
++    v_prefix: int | None = None      # set by `_anchored_vj_bounds`; reused by the junction gate
+     region_q: dict[str, tuple[int, int]] = {}
+     for name, (qs, qe) in zip(REGIONS, coords):
+         if qs < 0:
+@@ -648,8 +652,9 @@ def _num(v):
+     # collapses the V..J interior (see `_anchored_vj_bounds`).
+     v_end_q, j_start_q = v_end_pt, j_start_pt      # from the single walk above
+     if "cdr3" in region_q and "fwr4" in region_q:
+-        av, aj = _anchored_vj_bounds(query_seq, region_q["cdr3"][0], region_q["fwr4"][0],
+-                                     ref.v_call, ref.j_call, anchors, seqtype)
++        av, aj, v_prefix = _anchored_vj_bounds(
++            query_seq, region_q["cdr3"][0], region_q["fwr4"][0],
++            ref.v_call, ref.j_call, anchors, seqtype)
+         if av and aj and aj > av:
+             v_end_q, j_start_q = av, aj
+     if "fwr1" in region_q:
+@@ -701,8 +706,11 @@ def _num(v):
+                 # Refuse a junction whose opening codon the called V's germline does not template:
+                 # the read's V was trimmed past Cys104, so this window is 5'-over-extended.
+                 # Declining is what IgBLAST and MiXCR both do here (see `v_anchor_prefix`).
+-                if jaa and anchors and v_anchor_prefix(jnt, ref.v_call, anchors) \
+-                        < MIN_V_ANCHOR_PREFIX:
++                # `_anchored_vj_bounds` already scanned this exact slice, so reuse its answer
++                # rather than walking every called V allele a second time.
++                prefix = (v_prefix if v_prefix is not None
++                          else v_anchor_prefix(jnt, ref.v_call, anchors))
++                if jaa and anchors and prefix < MIN_V_ANCHOR_PREFIX:
+                     jaa, phase = "", None
+                 if jaa:
+                     rec["junction"], rec["junction_aa"], rec["cdr3_aa"] = jnt, jaa, c3aa

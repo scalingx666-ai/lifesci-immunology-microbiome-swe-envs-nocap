@@ -1,0 +1,304 @@
+diff --git a/metagraph/src/common/vectors/bitmap_builder.cpp b/metagraph/src/common/vectors/bitmap_builder.cpp
+index 9d460d5181..333d7a7964 100644
+--- a/metagraph/src/common/vectors/bitmap_builder.cpp
++++ b/metagraph/src/common/vectors/bitmap_builder.cpp
+@@ -1,6 +1,7 @@
+ #include "bitmap_builder.hpp"
+ 
+ #include <iostream>
++#include <tuple>
+ 
+ #include "common/elias_fano/elias_fano.hpp"
+ #include "common/utils/file_utils.hpp"
+@@ -14,12 +15,17 @@ bitmap_builder_set_disk::bitmap_builder_set_disk(uint64_t size,
+                                                  uint64_t buffer_size,
+                                                  const std::string &swap_dir)
+       : size_(size),
+-        tmp_dir_(utils::create_temp_dir(swap_dir, "bitmap")),
+-        set_bit_positions_(num_threads, buffer_size, tmp_dir_, -1, 16) {}
++        num_threads_(num_threads),
++        buffer_size_(buffer_size),
++        swap_dir_(swap_dir),
++        in_memory_(num_threads) {}
+ 
+ bitmap_builder_set_disk::~bitmap_builder_set_disk() {
++    if (!on_disk_)
++        return;
++
+     try {
+-        set_bit_positions_.clear();
++        on_disk_->clear();
+         utils::remove_temp_dir(tmp_dir_);
+ 
+     } catch (const std::exception &e) {
+@@ -30,14 +36,74 @@ bitmap_builder_set_disk::~bitmap_builder_set_disk() {
+     }
+ }
+ 
++void bitmap_builder_set_disk::add_ones(const uint64_t *begin, const uint64_t *end) {
++    {
++        std::shared_lock<std::shared_mutex> lock(mutex_);
++        if (on_disk_) {
++            on_disk_->insert(begin, end);
++            return;
++        }
++    }
++
++    std::unique_lock<std::shared_mutex> lock(mutex_);
++    if (!on_disk_) {
++        const uint64_t batch_size = end - begin;
++        if (num_in_memory_ + batch_size > buffer_size_) {
++            // the buffer is full, drop the duplicates
++            num_in_memory_ = in_memory_.data().size();
++            // go to disk if the batch still does not fit, or if less than half
++            // of the buffer got free. Otherwise, a nearly full buffer would
++            // drop the duplicates again on every insert.
++            if (num_in_memory_ > buffer_size_ / 2
++                    || num_in_memory_ + batch_size > buffer_size_) {
++                spill();
++            }
++        }
++        if (!on_disk_) {
++            in_memory_.insert(begin, end);
++            num_in_memory_ += batch_size;
++            return;
++        }
++    }
++    on_disk_->insert(begin, end);
++}
++
++void bitmap_builder_set_disk::spill() {
++    assert(!on_disk_);
++
++    tmp_dir_ = utils::create_temp_dir(swap_dir_, "bitmap");
++    on_disk_ = std::make_unique<mtg::common::SortedSetDisk<uint64_t>>(
++            num_threads_, buffer_size_, tmp_dir_, -1, 16);
++
++    auto &positions = in_memory_.data();
++    on_disk_->insert(positions.begin(), positions.end());
++    in_memory_.clear();
++    num_in_memory_ = 0;
++}
++
+ bitmap_builder_set_disk::InitializationData
+ bitmap_builder_set_disk::get_initialization_data() {
+     if (merged_)
+         throw std::runtime_error("ERROR: Trying to flush the bitmap twice");
+ 
++    merged_ = true;
++
++    if (!on_disk_) {
++        // everything fitted in the buffer
++        auto &positions = in_memory_.data();
++        auto call_positions = [&positions, size = size_](auto callback) {
++            std::ignore = size;
++            for (uint64_t pos : positions) {
++                assert(pos < size && "Indexes cannot be greater than bitmap's size");
++                callback(pos);
++            }
++        };
++        return { size_, positions.size(), call_positions };
++    }
++
+     mtg::elias_fano::EliasFanoEncoderBuffered<uint64_t> encoder(tmp_dir_/"merged",
+                                                                 kStreamBufferSize);
+-    auto &merged = set_bit_positions_.data();
++    auto &merged = on_disk_->data();
+     uint64_t num_set_bits = 0;
+     for (auto &it = merged.begin(); it != merged.end(); ++it) {
+         assert(*it < size_ && "Indexes cannot be greater than bitmap's size");
+@@ -46,7 +112,7 @@ bitmap_builder_set_disk::get_initialization_data() {
+     }
+     encoder.finish();
+ 
+-    set_bit_positions_.clear();
++    on_disk_->clear();
+ 
+     auto call_indexes = [&](auto callback) {
+         mtg::elias_fano::EliasFanoDecoder<uint64_t> decoder(tmp_dir_/"merged", true);
+@@ -55,7 +121,5 @@ bitmap_builder_set_disk::get_initialization_data() {
+         }
+     };
+ 
+-    merged_ = true;
+-
+     return { size_, num_set_bits, call_indexes };
+ }
+diff --git a/metagraph/src/common/vectors/bitmap_builder.hpp b/metagraph/src/common/vectors/bitmap_builder.hpp
+index f0fe2f21f7..b2de6e23bc 100644
+--- a/metagraph/src/common/vectors/bitmap_builder.hpp
++++ b/metagraph/src/common/vectors/bitmap_builder.hpp
+@@ -4,6 +4,9 @@
+ #include <cassert>
+ #include <functional>
+ #include <filesystem>
++#include <memory>
++#include <shared_mutex>
++#include <string>
+ 
+ #include "common/sorted_sets/sorted_set.hpp"
+ #include "common/sorted_sets/sorted_set_disk.hpp"
+@@ -85,6 +88,9 @@ class bitmap_builder_set : public bitmap_builder {
+  * A class for building a bitmap from positions of its set bits (ones).
+  * The positions may be not distinct and can be passed in arbitrary order.
+  * Keeps a buffer of a fixed size and writes temporary data to disk.
++ * The temporary directory and the disk-backed set are created only when
++ * the buffer is full and its distinct positions take more than half of it,
++ * or leave no room for the next batch. Small bitmaps never touch the disk.
+  */
+ class bitmap_builder_set_disk : public bitmap_builder {
+   public:
+@@ -95,19 +101,28 @@ class bitmap_builder_set_disk : public bitmap_builder {
+ 
+     ~bitmap_builder_set_disk();
+ 
+-    virtual void add_one(uint64_t pos) { set_bit_positions_.insert(&pos, &pos + 1); }
+-    virtual void add_ones(const uint64_t *begin, const uint64_t *end) {
+-        set_bit_positions_.insert(begin, end);
+-    }
++    virtual void add_one(uint64_t pos) { add_ones(&pos, &pos + 1); }
++    virtual void add_ones(const uint64_t *begin, const uint64_t *end);
+ 
+     // Can only be called once. The returned InitializationData becomes
+     // invalid after the bitmap_builder_set_disk object is destroyed.
+     virtual InitializationData get_initialization_data();
+ 
+   private:
++    // moves the in-memory positions to a disk-backed set
++    void spill();
++
+     const uint64_t size_;
+-    const std::filesystem::path tmp_dir_;
+-    mtg::common::SortedSetDisk<uint64_t> set_bit_positions_;
++    const size_t num_threads_;
++    const uint64_t buffer_size_;
++    const std::string swap_dir_;
++    // guards the switch from |in_memory_| to |on_disk_|
++    std::shared_mutex mutex_;
++    // number of positions in |in_memory_|, possibly with duplicates
++    uint64_t num_in_memory_ = 0;
++    mtg::common::SortedSet<uint64_t> in_memory_;
++    std::filesystem::path tmp_dir_;
++    std::unique_ptr<mtg::common::SortedSetDisk<uint64_t>> on_disk_;
+     bool merged_ = false;
+ };
+ 
+diff --git a/metagraph/tests/common/test_bitmap_builder.cpp b/metagraph/tests/common/test_bitmap_builder.cpp
+new file mode 100644
+index 0000000000..bd98cc9d4d
+--- /dev/null
++++ b/metagraph/tests/common/test_bitmap_builder.cpp
+@@ -0,0 +1,113 @@
++#include "common/vectors/bitmap_builder.hpp"
++#include "common/utils/file_utils.hpp"
++
++#include <gtest/gtest.h>
++
++#include <filesystem>
++#include <vector>
++
++
++namespace {
++
++size_t count_entries(const std::filesystem::path &dir) {
++    return std::distance(std::filesystem::directory_iterator(dir),
++                         std::filesystem::directory_iterator());
++}
++
++std::vector<uint64_t> get_ones(bitmap_builder &builder, uint64_t size) {
++    auto data = builder.get_initialization_data();
++    EXPECT_EQ(size, data.size);
++    std::vector<uint64_t> ones;
++    data.call_ones([&](uint64_t i) { ones.push_back(i); });
++    EXPECT_EQ(ones.size(), data.num_set_bits);
++    return ones;
++}
++
++class BitmapBuilderSetDisk : public ::testing::Test {
++  protected:
++    void SetUp() override {
++        swap_dir_ = utils::create_temp_dir(std::filesystem::temp_directory_path(),
++                                           "test_bitmap_builder");
++    }
++    void TearDown() override { utils::remove_temp_dir(swap_dir_); }
++
++    std::filesystem::path swap_dir_;
++};
++
++TEST_F(BitmapBuilderSetDisk, Empty) {
++    bitmap_builder_set_disk builder(100, 1, 8, swap_dir_);
++    EXPECT_EQ(std::vector<uint64_t>(), get_ones(builder, 100));
++    EXPECT_EQ(0u, count_entries(swap_dir_));
++}
++
++TEST_F(BitmapBuilderSetDisk, FitsInBufferWithoutDisk) {
++    for (size_t num_threads : { 1, 4 }) {
++        bitmap_builder_set_disk builder(1000, num_threads, 100, swap_dir_);
++        // unsorted and with duplicates
++        std::vector<uint64_t> positions { 999, 7, 42, 7, 0, 42, 500 };
++        builder.add_ones(positions.data(), positions.data() + positions.size());
++        builder.add_one(3);
++        builder.add_one(999);
++
++        EXPECT_EQ(0u, count_entries(swap_dir_));
++        EXPECT_EQ(std::vector<uint64_t>({ 0, 3, 7, 42, 500, 999 }),
++                  get_ones(builder, 1000));
++        EXPECT_EQ(0u, count_entries(swap_dir_));
++    }
++}
++
++TEST_F(BitmapBuilderSetDisk, NearlyFullBufferStaysInMemory) {
++    bitmap_builder_set_disk builder(1000, 1, 100, swap_dir_);
++    std::vector<uint64_t> expected;
++    // 90 distinct positions inserted one by one into a buffer of 100
++    for (uint64_t i = 0; i < 90; ++i) {
++        builder.add_one(i * 3);
++        expected.push_back(i * 3);
++    }
++    EXPECT_EQ(0u, count_entries(swap_dir_));
++    EXPECT_EQ(expected, get_ones(builder, 1000));
++}
++
++TEST_F(BitmapBuilderSetDisk, DuplicatesDoNotForceDisk) {
++    bitmap_builder_set_disk builder(1000, 1, 100, swap_dir_);
++    // many more insertions than the buffer holds, but only 10 distinct positions
++    for (size_t i = 0; i < 5000; ++i) {
++        builder.add_one(i % 10);
++    }
++    EXPECT_EQ(0u, count_entries(swap_dir_));
++    EXPECT_EQ(std::vector<uint64_t>({ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }),
++              get_ones(builder, 1000));
++}
++
++TEST_F(BitmapBuilderSetDisk, OverflowGoesToDisk) {
++    for (size_t num_threads : { 1, 4 }) {
++        for (size_t batch_size : { 1, 3, 1000 }) {
++            const uint64_t size = 100'000;
++            std::vector<uint64_t> expected;
++            {
++                bitmap_builder_set_disk builder(size, num_threads, 64, swap_dir_);
++                std::vector<uint64_t> batch;
++                // descending order, every position inserted twice
++                for (uint64_t i = 3000; i-- > 0;) {
++                    batch.push_back(i * 7);
++                    batch.push_back(i * 7);
++                    if (batch.size() >= batch_size) {
++                        builder.add_ones(batch.data(), batch.data() + batch.size());
++                        batch.clear();
++                    }
++                }
++                builder.add_ones(batch.data(), batch.data() + batch.size());
++                EXPECT_EQ(1u, count_entries(swap_dir_));
++
++                for (uint64_t i = 0; i < 3000; ++i) {
++                    expected.push_back(i * 7);
++                }
++                EXPECT_EQ(expected, get_ones(builder, size));
++            }
++            // the temporary directory is removed with the builder
++            EXPECT_EQ(0u, count_entries(swap_dir_));
++        }
++    }
++}
++
++} // namespace

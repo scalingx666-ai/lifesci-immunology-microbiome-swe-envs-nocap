@@ -1,0 +1,188 @@
+diff --git a/doc/sourmash-commands.md b/doc/sourmash-commands.md
+index 59f97bb6..0980a9b8 100644
+--- a/doc/sourmash-commands.md
++++ b/doc/sourmash-commands.md
+@@ -10,20 +10,20 @@ If you want to take a `.fa` file and build a MinHash signature, use
+ and sourmash will put the MinHash signature for all the contents of
+ `acido-chunk1.fa.gz` in `acido-chunk1.fa.gz.sig`.  This `.sig` file
+ can then be passed in to most sourmash routines as well as
+-`search-catlas-with-minhash.py`.
++`search.search_catlas_with_minhash`.
+ 
+ ## Example: search leaf minhashes only.
+ 
+-The catlas minhashes are built by `make-catlas-minhashes.py`, and by
++The catlas minhashes are built by `search.make_catlas_minhashes`, and by
+ default are built and output to `name.minhashes/node*.pickle`.  This
+-is convenient for `search-catlas-with-minhash.py`, but there are some
++is convenient for `search.search_catlas_with_minhash`, but there are some
+ alternative approaches that let you output sourmash-compatible
+ files.
+ 
+ If you want to build a fast search tree for all the leaf signatures, do:
+ 
+-    make-catlas-minhashes.py -k 31 --scaled 1000 acido --sbt --leaves-only
+-    
++    python -m search.make_catlas_minhashes -k 31 --scaled 1000 acido --sbt --leaves-only
++
+ You can turn off the default output with `--no-pickles`, which will
+ speed things up and also not overwrite existing minhashes, and you can
+ specify a different location/name for the SBT file with `-o newname`.
+@@ -38,3 +38,14 @@ You should be able to find the guaranteed best match in the tree with `--best-on
+     
+ although at the moment this only finds the match with the most shared hashes.
+ 
++# Collect optimal (?) set of leaf nodes through sbt_gather
++
++You can collect all of the leaf nodes that disjointly match your query like so:
++
++First, build an SBT of only the leaves:
++
++    python -m search.make_catlas_minhashes -k 31 --scaled 1000 acido --sbt --leaves-only
++
++then, run `sbt_gather`:
++
++    sourmash sbt_gather acido/acido.sbt.json acido/acido-chunk1.fa.gz.sig
+diff --git a/search/frontier_search.py b/search/frontier_search.py
+index be12c35c..2d5386fe 100755
+--- a/search/frontier_search.py
++++ b/search/frontier_search.py
+@@ -69,6 +69,8 @@ def add_to_frontier(node_id: int):
+ 
+         # check whether the node has more than x% overhead
+         minhash = load_minhash(node_id, minhash_dir)
++        if not minhash:
++            return
+ 
+         query_mh = query_sig.minhash.downsample_max_hash(minhash)
+         against_mh = minhash.downsample_max_hash(query_sig.minhash)
+@@ -91,6 +93,8 @@ def add_to_frontier(node_id: int):
+ 
+             for child in children_ids:
+                 child_mh = load_minhash(child, minhash_dir)
++                if not child_mh:
++                    continue
+ 
+                 child_mh = child_mh.downsample_max_hash(query_mh)
+                 query_mh = query_mh.downsample_max_hash(child_mh)
+diff --git a/search/make_catlas_minhashes.py b/search/make_catlas_minhashes.py
+index bba3b8f6..b8eb2e5b 100755
+--- a/search/make_catlas_minhashes.py
++++ b/search/make_catlas_minhashes.py
+@@ -30,13 +30,21 @@ def make_contig_minhashes(contigfile, factory):
+     watermark = 1e7
+     for record in screed.open(contigfile):
+         if total_bp >= watermark:
+-            print('... {:5.0e} bp thru contigs'.format(int(watermark)),
++            print('... {:5.2e} bp thru contigs'.format(int(watermark)),
+                   file=sys.stderr)
+             watermark += 1e7
+ 
++        # the FASTA header/record name is the cDBG node ID output by
++        # build_contracted_dbg.
++        cdbg_id = int(record.name)
++
++        # make a minhash!
+         mh = factory()
+         mh.add_sequence(record.sequence)
+-        d[int(record.name)] = mh
++        if not mh.get_mins():
++            mh = None
++
++        d[cdbg_id] = mh
+ 
+         total_bp += len(record.sequence)
+ 
+@@ -94,7 +102,12 @@ def build_dag(catlas_file, leaf_minhashes, factory):
+ 
+         for subnode in beneath:
+             mh = leaf_minhashes[subnode]
+-            merged_mh.add_many(mh.get_mins())
++            if mh:
++                merged_mh.add_many(mh.get_mins())
++
++        if not merged_mh.get_mins():
++            merged_mh = None
++
+         leaf_minhashes[catlas_node] = merged_mh
+ 
+ 
+@@ -106,7 +119,8 @@ def merge_nodes(child_dict, child_node_list, factory):
+     for graph_node in child_node_list:
+         if graph_node in child_dict:
+             mh = child_dict[graph_node]
+-            merged_mh.merge(mh)
++            if mh:
++                merged_mh.merge(mh)
+ 
+     # add into merged minhashes table.
+     return merged_mh
+@@ -130,10 +144,12 @@ def main():
+     ksize = args.ksize
+     scaled = args.scaled
+ 
++    # build a factory to produce new MinHash objects.
+     factory = MinHashFactory(n=0, ksize=ksize,
+                              max_hash=sourmash_lib.scaled_to_max_hash(scaled),
+                              track_abundance=args.track_abundance)
+-    
++
++    # put together the basic catlas info --
+     basename = os.path.basename(args.catlas_prefix)
+     contigfile = '%s.gxt.contigs' % (basename,)
+     contigfile = os.path.join(args.catlas_prefix, contigfile)
+@@ -182,11 +198,18 @@ def main():
+             pass
+ 
+         print('saving individual minhashes in {}/node*.pickle'.format(path))
++        empty_mh = 0
+         for node_id, mh in leaf_minhashes.items():
+-            name = 'node{}.pickle'.format(node_id)
+-            name = os.path.join(path, name)
+-            with open(name, 'wb') as fp:
+-                pickle.dump(mh, fp)
++            if mh:
++                name = 'node{}.pickle'.format(node_id)
++                name = os.path.join(path, name)
++                with open(name, 'wb') as fp:
++                    pickle.dump(mh, fp)
++            else:
++                empty_mh += 1
++        total_mh = len(leaf_minhashes)
++        print('saved {} minhashes ({} empty)'.format(total_mh - empty_mh,
++                                                     empty_mh))
+ 
+     if args.sbt or args.sigs:
+         print('')
+@@ -194,9 +217,10 @@ def main():
+ 
+         sigs = []
+         for node_id, mh in leaf_minhashes.items():
+-            ss = signature.SourmashSignature('', mh,
+-                                             name='node{}'.format(node_id))
+-            sigs.append(ss)
++            if mh:
++                ss = signature.SourmashSignature('', mh,
++                                                 name='node{}'.format(node_id))
++                sigs.append(ss)
+ 
+         # shall we output an SBT or just a file full of signatures?
+         if args.sigs:
+diff --git a/search/search_catlas_with_minhash.py b/search/search_catlas_with_minhash.py
+index b605fe93..a8263502 100755
+--- a/search/search_catlas_with_minhash.py
++++ b/search/search_catlas_with_minhash.py
+@@ -55,8 +55,11 @@ def load_minhash(node_id, minhash_dir):
+     filename = 'node{}.pickle'.format(node_id)
+     filename = os.path.join(minhash_dir, filename)
+ 
+-    with open(filename, 'rb') as fp:
+-        node_mh = pickle.load(fp)
++    try:
++        with open(filename, 'rb') as fp:
++            node_mh = pickle.load(fp)
++    except FileNotFoundError:
++        return None
+ 
+     return node_mh
+ 

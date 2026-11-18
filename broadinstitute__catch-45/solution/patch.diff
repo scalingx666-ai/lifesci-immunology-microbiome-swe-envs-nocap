@@ -1,0 +1,172 @@
+diff --git a/catch/filter/near_duplicate_filter.py b/catch/filter/near_duplicate_filter.py
+index b587d503..7c946ed6 100644
+--- a/catch/filter/near_duplicate_filter.py
++++ b/catch/filter/near_duplicate_filter.py
+@@ -156,7 +156,8 @@ def __init__(self, dist_thres, kmer_size=10):
+                 that this is *not* the same as self.k
+         """
+         super().__init__(k=3)
+-        self.lsh_family = lsh.MinHashFamily(kmer_size)
++        self.lsh_family = lsh.MinHashFamily(kmer_size,
++                use_fast_str_hash=True) # safe as long as not parallelized
+         self.dist_thres = dist_thres
+ 
+         def jaccard_dist(a, b):
+diff --git a/catch/utils/lsh.py b/catch/utils/lsh.py
+index ce98a9fd..6548b7f1 100644
+--- a/catch/utils/lsh.py
++++ b/catch/utils/lsh.py
+@@ -2,11 +2,11 @@
+ """
+ 
+ from collections import defaultdict
++import hashlib
+ import heapq
+ import logging
+ import math
+ import random
+-import zlib
+ 
+ __author__ = 'Hayden Metsky <hayden@mit.edu>'
+ 
+@@ -55,16 +55,21 @@ class MinHashFamily:
+     2016).
+     """
+ 
+-    def __init__(self, kmer_size, N=1):
++    def __init__(self, kmer_size, N=1, use_fast_str_hash=False):
+         """
+         Args:
+             kmer_size: length of each k-mer to hash
+             N: represent the signature of a sequence using hash values of
+                 the N k-mers in the sequence that have the smallest hash
+                 values
++            use_fast_str_hash: if True, use a faster (~10x faster) inner
++                hash function for strings (k-mers) that is not deterministic
++                and varies across Python processes; this may not be
++                appropriate if the family is shared across processes
+         """
+         self.kmer_size = kmer_size
+         self.N = N
++        self.use_fast_str_hash = use_fast_str_hash
+ 
+     def make_h(self):
+         """Construct a random hash function for this family.
+@@ -89,13 +94,24 @@ def make_h(self):
+         # for random integers a, b (a in [1, p] and b in [0, p])
+         a = random.randint(1, p)
+         b = random.randint(0, p)
+-        def kmer_hash(x):
+-            # Hash a k-mer x with the random hash function
+-            # hash(..) uses a random seed in Python 3.3+, so its output
+-            # varies across Python processes; use zlib.adler32(..) for a
+-            # deterministic hash value of the k-mer
+-            x_hash = zlib.adler32(x.encode('utf-8'))
+-            return (a * x_hash + b) % p
++        if self.use_fast_str_hash:
++            def kmer_hash(x):
++                # Hash a k-mer x with the random hash function
++                # hash(..) uses a random seed in Python 3.3+, so its output
++                #   varies across Python processes; thus, this may not be
++                #   suitable if used across processes
++                x_hash = abs(hash(x))
++                return (a * x_hash + b) % p
++        else:
++            def kmer_hash(x):
++                # Hash a k-mer x with the random hash function
++                # hashlib.md5(..) gives a deterministic hash value of the k-mer
++                #   but is ~10x slower than hash(..)
++                x_hash = int(hashlib.md5(x.encode('utf-8')).hexdigest(), 16)
++                return (a * x_hash + b) % p
++
++        # TODO Consider only allowing fully unambiguous k-mers to be
++        #   in the signature, as a check below in kmer_hashes()
+ 
+         def h(s):
+             # For a string/sequence s, have the MinHash function be the minimum
+@@ -108,15 +124,27 @@ def h(s):
+                     "sequence"), self.kmer_size, len(s))
+             num_kmers = len(s) - self.kmer_size + 1
+             if num_kmers < self.N:
+-                raise ValueError(("The number of k-mers (%d) in the given "
++                logger.warning(("The number of k-mers (%d) in a given "
+                     "sequence is too small to produce a signature of "
+-                    "size %d; try setting --small-seq-skip") %
+-                    (num_kmers, self.N))
++                    "size %d; the MinHash family might provide unreliable "
++                    "distances against the sequence. This might be fine, or "
++                    "specify --small-seq-skip to skip the sequence."),
++                    num_kmers, self.N)
++
+             def kmer_hashes():
+-                for i in range(num_kmers):
+-                    kmer = s[i:(i + self.kmer_size)]
+-                    yield kmer_hash(kmer)
+-            return tuple(sorted(heapq.nsmallest(self.N, kmer_hashes())))
++                num_yielded = 0
++                # Keep yielding k-mers until at least self.N
++                #   have been yielded (helpful when s is short)
++                while num_yielded < self.N:
++                    for i in range(num_kmers):
++                        kmer = s[i:(i + self.kmer_size)]
++                        num_yielded += 1
++                        yield kmer_hash(kmer)
++            if self.N == 1:
++                # Speed the special case where self.N == 1
++                return tuple([min(kmer_hashes())])
++            else:
++                return tuple(sorted(heapq.nsmallest(self.N, kmer_hashes())))
+         return h
+ 
+     def P1(self, dist):
+diff --git a/catch/utils/tests/test_lsh.py b/catch/utils/tests/test_lsh.py
+index 582a28a1..15c9a780 100644
+--- a/catch/utils/tests/test_lsh.py
++++ b/catch/utils/tests/test_lsh.py
+@@ -1,6 +1,7 @@
+ """Tests for lsh module.
+ """
+ 
++import logging
+ import random
+ import unittest
+ 
+@@ -118,6 +119,9 @@ class TestMinHashFamilySignatures(unittest.TestCase):
+     """
+     
+     def setUp(self):
++        # Disable logging
++        logging.disable(logging.WARNING)
++
+         # Set a random seed so hash functions are always the same
+         random.seed(0)
+ 
+@@ -134,6 +138,17 @@ def test_identical(self):
+             self.assertEqual(h(a), h(b))
+             self.assertEqual(self.family.estimate_jaccard_dist(h(a), h(b)), 0.0)
+ 
++    def test_identical_with_short_sequences(self):
++        a = 'ATCGA'
++        b = str(a)
++
++        # Identical strings should yield the same signature, for the same
++        # hash function
++        for i in range(10):
++            h = self.family.make_h()
++            self.assertEqual(h(a), h(b))
++            self.assertEqual(self.family.estimate_jaccard_dist(h(a), h(b)), 0.0)
++
+     def test_jaccard_dist_similar(self):
+         a = 'ATCGATATGGGCACTGCTATGTAGCGCAAATACGATCGCTAATGCGGATCGGATCGAATG'
+         b = 'ATCGACATGGGCACTGGTATGTAGCGCAAATACGATCGCTATTGCGGATCGGATCGAATG'
+@@ -162,6 +177,10 @@ def test_jaccard_dist_not_similar(self):
+                 num_far += 1
+         self.assertGreaterEqual(num_far, 80)
+ 
++    def tearDown(self):
++        # Re-enable logging
++        logging.disable(logging.NOTSET)
++
+ 
+ class TestHammingHashConcatenation(unittest.TestCase):
+     """Tests concatenations of hash functions with Hamming distance.

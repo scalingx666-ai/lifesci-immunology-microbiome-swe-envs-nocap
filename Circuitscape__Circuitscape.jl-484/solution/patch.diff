@@ -1,0 +1,107 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index d6b406e6..6413796a 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -99,8 +99,8 @@ All Circuitscape configuration is done through an `.ini` file. Below is a comple
+ 
+ | Argument | Type | Default | Description |
+ |----------|------|---------|-------------|
+-| `use_reclass_table` | Boolean | `False` | If `True`, reclassify resistance values using a lookup table. *Note: not yet implemented in Circuitscape 5.* |
+-| `reclass_file` | Path | — | Path to file with reclassification data. |
++| `use_reclass_table` | Boolean | `False` | If `True`, replace values in the habitat raster using the lookup table in `reclass_file` before the run. Raster mode only. |
++| `reclass_file` | Path | — | Text file with two whitespace-separated columns, `old new`, one pair per line. Every cell whose value equals `old` is set to `new`; other cells, including NODATA, are left alone. Values are replaced in a single pass, so `1 2` followed by `2 3` sends 1 to 2, not to 3. Lets one large raster be reused with many resistance assignments without exporting a new file each time. |
+ 
+ ### Logging
+ 
+diff --git a/src/io.jl b/src/io.jl
+index 635115fb..7714327d 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -104,9 +104,32 @@ function read_point_strengths(T, path::String, starts_from_zero)
+ 	str
+ end
+ 
+-function read_cellmap(habitat_file::String, is_res::Bool, ::Type{T}) where {T}
++"""
++    read_reclass_table(T, path)
++
++Two whitespace-separated columns, `old new`, one pair per line. Applied to the
++habitat raster's values as read from the file, i.e. before any conversion
++between resistance and conductance (issue #231).
++"""
++function read_reclass_table(::Type{T}, path::String) where {T}
++    table = readdlm(path, T)
++    size(table, 2) == 2 ||
++        throw(ArgumentError("reclass_file = \"$path\" must have exactly two columns (old value, new value); found $(size(table, 2))"))
++    table
++end
++
++function reclassify!(cell_map::Matrix{T}, table::Matrix{T}) where {T}
++    # A single lookup so that chained rows (1 -> 2, 2 -> 3) do not compound:
++    # applying them one after the other would send 1 to 3.
++    lookup = Dict{T,T}(table[i,1] => table[i,2] for i in axes(table, 1))
++    map!(x -> get(lookup, x, x), cell_map, cell_map)
++end
++
++function read_cellmap(habitat_file::String, is_res::Bool, ::Type{T};
++                      reclass_table::Union{Nothing,Matrix{T}} = nothing) where {T}
+ 
+     cell_map, rastermeta = _grid_reader(T, habitat_file)
++    reclass_table === nothing || reclassify!(cell_map, reclass_table)
+ 
+     gmap = similar(cell_map)
+     ind = findall(x -> x == -9999, cell_map)
+@@ -480,8 +503,9 @@ function load_raster_data(T, V, cfg)::RasterData{T,V}
+ 
+     @info("Reading maps")
+ 
+-    # Read cell map
+-    cellmap, hbmeta = read_cellmap(hab_file, hab_is_res, T)
++    # Read cell map, reclassifying its values first if asked to
++    reclass_table = cfg.use_reclass_table ? read_reclass_table(T, cfg.reclass_file) : nothing
++    cellmap, hbmeta = read_cellmap(hab_file, hab_is_res, T; reclass_table)
+     c = count(x -> x > 0, cellmap)
+     ncells = length(cellmap)
+     if ncells > 5_000_000 && cfg.solver == st_cholmod
+diff --git a/test/internal.jl b/test/internal.jl
+index 66d3dbf5..9a687588 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -358,3 +358,37 @@ end
+     @test err isa ErrorException
+     @test occursin("after 3 attempts", err.msg)
+ end
++
++# Issue 231: reclassify habitat raster values through a lookup table
++@testset "Reclass table (#231)" begin
++    # One pass: chained rows must not compound (1 -> 2 -> 3)
++    m = [1.0 2.0; 2.0 3.0]
++    Circuitscape.reclassify!(m, [1.0 2.0; 2.0 3.0])
++    @test m == [2.0 3.0; 3.0 3.0]
++
++    # A table that is not two columns is rejected by name
++    dir = mktempdir()
++    write(joinpath(dir, "bad.txt"), "1 2 3\n")
++    @test_throws ArgumentError Circuitscape.read_reclass_table(Float64, joinpath(dir, "bad.txt"))
++
++    # End to end: doubling every resistance doubles every effective resistance
++    hdr = "ncols 5\nnrows 5\nxllcorner 0\nyllcorner 0\ncellsize 1\nNODATA_value -9999\n"
++    write(joinpath(dir, "cell.asc"), hdr * join(fill(join(fill("2", 5), " "), 5), "\n") * "\n")
++    write(joinpath(dir, "pts.asc"), hdr *
++          "1 0 0 0 2\n0 0 0 0 0\n0 0 0 0 0\n0 0 0 0 0\n3 0 0 0 0\n")
++    write(joinpath(dir, "reclass.txt"), "2\t4\n")
++    d = Circuitscape.init_config()
++    d["data_type"] = "raster"; d["scenario"] = "pairwise"
++    d["habitat_file"] = joinpath(dir, "cell.asc")
++    d["point_file"] = joinpath(dir, "pts.asc")
++    d["output_file"] = joinpath(dir, "out.out")
++    d["connect_four_neighbors_only"] = "True"
++    base = compute(d)
++    d["use_reclass_table"] = "True"
++    d["reclass_file"] = joinpath(dir, "reclass.txt")
++    reclassed = compute(d)
++    @test reclassed[2:end, 2:end] ≈ 2 .* base[2:end, 2:end]
++    # Cells the table does not mention are untouched: no-op table gives base back
++    write(joinpath(dir, "reclass.txt"), "7\t9\n")
++    @test compute(d) ≈ base
++end

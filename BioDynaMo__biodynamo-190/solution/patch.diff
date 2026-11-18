@@ -1,0 +1,905 @@
+diff --git a/cmake/selection-libbiodynamo.xml b/cmake/selection-libbiodynamo.xml
+index ef73fdcc5..da8bc25d1 100644
+--- a/cmake/selection-libbiodynamo.xml
++++ b/cmake/selection-libbiodynamo.xml
+@@ -64,6 +64,13 @@
+     <class name="bdm::VectorTypeWrapper<bdm::Behavior*>" />
+     <class name="bdm::experimental::TimeSeries" />
+     <class name="bdm::experimental::TimeSeries::Data" noStreamer="true" />
++    <class name="bdm::experimental::Reducer<uint64_t>" />
++    <class name="bdm::experimental::Reducer<double>" />
++    <class name="bdm::experimental::GenericReducer<uint64_t>" noStreamer="true" />
++    <class name="bdm::experimental::GenericReducer<double>" noStreamer="true" />
++    <class name="bdm::experimental::GenericReducer<uint64_t, double>" noStreamer="true" />
++    <class name="bdm::experimental::Counter<>" noStreamer="true" />
++    <class name="bdm::experimental::Counter<double>" noStreamer="true" />
+     <class name="unordered_map<std::string, bdm::experimental::TimeSeries::Data>" />
+     <class name="bdm::experimental::Style" />
+   </selection>
+diff --git a/cmake/selection.xml b/cmake/selection.xml
+index 214210290..e4a1c1a9f 100644
+--- a/cmake/selection.xml
++++ b/cmake/selection.xml
+@@ -74,6 +74,13 @@
+     <class name="bdm::experimental::TimeSeries" />
+     <class name="bdm::experimental::TimeSeries::Data" />
+     <class name="unordered_map<std::string, bdm::experimental::TimeSeries::Data>" />
++    <class name="bdm::experimental::Reducer<uint64_t>" />
++    <class name="bdm::experimental::Reducer<double>" />
++    <class name="bdm::experimental::GenericReducer<uint64_t>" />
++    <class name="bdm::experimental::GenericReducer<double>" />
++    <class name="bdm::experimental::GenericReducer<uint64_t, double>" />
++    <class name="bdm::experimental::Counter<>" />
++    <class name="bdm::experimental::Counter<double>" />
+     <class name="bdm::experimental::Style" />
+     <!-- list of biodynamo classes that should be ignored  -->
+     <class pattern="bdm::memory_manager_detail::*" />
+diff --git a/demo/epidemiology/src/evaluate.h b/demo/epidemiology/src/evaluate.h
+index 0c87ac6c0..87097e5d3 100644
+--- a/demo/epidemiology/src/evaluate.h
++++ b/demo/epidemiology/src/evaluate.h
+@@ -23,36 +23,24 @@ namespace bdm {
+ // ---------------------------------------------------------------------------
+ inline void SetupResultCollection(Simulation* sim) {
+   auto* ts = sim->GetTimeSeries();
+-  // susceptible
+-  auto susceptible = [](Simulation* sim) {
+-    auto condition = L2F([](Agent* a) {
+-      return bdm_static_cast<Person*>(a)->state_ == State::kSusceptible;
+-    });
+-    auto result = static_cast<double>(bdm::experimental::Count(sim, condition));
+-    auto num_agents = sim->GetResourceManager()->GetNumAgents() - 1;
+-    return result / static_cast<double>(num_agents);
++  auto susceptible = [](Agent* a) {
++    return bdm_static_cast<Person*>(a)->state_ == State::kSusceptible;
+   };
+-  ts->AddCollector("susceptible", susceptible);
+-  // infected
+-  auto infected = [](Simulation* sim) {
+-    auto condition = L2F([](Agent* a) {
+-      return bdm_static_cast<Person*>(a)->state_ == State::kInfected;
+-    });
+-    auto result = static_cast<double>(bdm::experimental::Count(sim, condition));
+-    auto num_agents = sim->GetResourceManager()->GetNumAgents() - 1;
+-    return result / static_cast<double>(num_agents);
++  auto infected = [](Agent* a) {
++    return bdm_static_cast<Person*>(a)->state_ == State::kInfected;
+   };
+-  ts->AddCollector("infected", infected);
+-  // recovered
+-  auto recovered = [](Simulation* sim) {
+-    auto condition = L2F([](Agent* a) {
+-      return bdm_static_cast<Person*>(a)->state_ == State::kRecovered;
+-    });
+-    auto result = static_cast<double>(bdm::experimental::Count(sim, condition));
+-    auto num_agents = sim->GetResourceManager()->GetNumAgents() - 1;
+-    return result / static_cast<double>(num_agents);
++  auto recovered = [](Agent* a) {
++    return bdm_static_cast<Person*>(a)->state_ == State::kRecovered;
+   };
+-  ts->AddCollector("recovered", recovered);
++  auto post_process = [](double count) {
++    auto* rm = Simulation::GetActive()->GetResourceManager();
++    auto num_agents = rm->GetNumAgents();
++    return count / static_cast<double>(num_agents);
++  };
++  ts->AddCollector("susceptible",
++                   new Counter<double>(susceptible, post_process));
++  ts->AddCollector("infected", new Counter<double>(infected, post_process));
++  ts->AddCollector("recovered", new Counter<double>(recovered, post_process));
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/core/analysis/reduce.h b/src/core/analysis/reduce.h
+index 70e7f5797..8713cc015 100644
+--- a/src/core/analysis/reduce.h
++++ b/src/core/analysis/reduce.h
+@@ -29,6 +29,130 @@ namespace bdm {
+ namespace experimental {
+ 
+ // -----------------------------------------------------------------------------
++/// An interface for any type of implementation that wishes to
++/// calculate a reduction over all agents
++/// (e.g. counting, averaging, finding minimum and maximum values, etc.).\n
++/// The benefit of this interface is that multiple reduction operations
++/// can be combined to avoid iterating over all agents multiple times.\n
++template <typename TResult>
++struct Reducer : public Functor<void, Agent*> {
++  virtual ~Reducer() {}
++  virtual TResult GetResult() = 0;
++  /// Resets the internal state between calculations.
++  virtual void Reset() = 0;
++  virtual Reducer* NewCopy() const = 0;
++  BDM_CLASS_DEF(Reducer, 1)
++};
++
++// -----------------------------------------------------------------------------
++/// Generic implementation of a reduction.\n
++/// Provides the functions to iterates over all agents executing the
++/// `agent_function_` and updating a thread-local and therefore partial result.
++/// The `reduce_partial_results_` attribute specifies how these partial results
++/// should be combined into a single value.
++/// Let's assume we want to sum up the `data` attribute of all agents.
++/// \code
++/// auto sum_data = [](Agent* agent, uint64_t* tl_result) {
++///   *tl_result += bdm_static_cast<TestAgent*>(agent)->GetData();
++/// };
++/// auto combine_tl_results = [](const SharedData<uint64_t>& tl_results) {
++///   uint64_t result = 0;
++///   for (auto& el : tl_results) {
++///     result += el;
++///   }
++///   return result;
++/// };
++/// GenericReducer<uint64_t> reducer(sum_data, combine_tl_results);
++/// rm->ForEachAgentParallel(reducer);
++/// auto result = reducer.GetResult();
++/// \endcode
++/// The benefit in comparison with `bdm::experimental::Reduce` is that
++/// multiple counters can be combined and processed in one sweep over
++/// all agents.
++/// \see bdm::experimental::Reducer`
++template <typename T, typename TResult = T>
++class GenericReducer : public Reducer<TResult> {
++ public:
++  GenericReducer() { Reset(); }
++
++  GenericReducer(void(agent_function)(Agent*, T*),
++                 T (*reduce_partial_results)(const SharedData<T>&),
++                 TResult (*post_process)(TResult) = nullptr)
++      : agent_function_(agent_function),
++        reduce_partial_results_(reduce_partial_results),
++        post_process_(post_process) {
++    Reset();
++    tl_results_.resize(ThreadInfo::GetInstance()->GetMaxThreads());
++    for (auto& el : tl_results_) {
++      el = T();
++    }
++  }
++
++  virtual ~GenericReducer() {}
++
++  void operator()(Agent* agent) override {
++    auto tid = ThreadInfo::GetInstance()->GetMyThreadId();
++    agent_function_(agent, &(tl_results_[tid]));
++  }
++
++  void Reset() override {
++    tl_results_.resize(ThreadInfo::GetInstance()->GetMaxThreads());
++    for (auto& el : tl_results_) {
++      el = T();
++    }
++  }
++
++  TResult GetResult() override {
++    auto combined = static_cast<TResult>(reduce_partial_results_(tl_results_));
++    if (post_process_) {
++      return post_process_(combined);
++    }
++    return combined;
++  }
++
++  Reducer<TResult>* NewCopy() const override {
++    return new GenericReducer(*this);
++  }
++
++ private:
++  SharedData<T> tl_results_;                                     //!
++  void (*agent_function_)(Agent*, T*) = nullptr;                 //!
++  T (*reduce_partial_results_)(const SharedData<T>&) = nullptr;  //!
++  TResult (*post_process_)(TResult) = nullptr;                   //!
++  BDM_CLASS_DEF_OVERRIDE(GenericReducer, 1)
++};
++
++// The following custom streamer should be visible to rootcling for dictionary
++// generation, but not to the interpreter!
++#if (!defined(__CLING__) || defined(__ROOTCLING__)) && defined(USE_DICT)
++
++// The custom streamer is needed because ROOT can't stream function pointers
++// by default.
++template <typename T, typename TResult>
++inline void GenericReducer<T, TResult>::Streamer(TBuffer& R__b) {
++  if (R__b.IsReading()) {
++    R__b.ReadClassBuffer(GenericReducer::Class(), this);
++    Long64_t l;
++    R__b.ReadLong64(l);
++    this->agent_function_ = reinterpret_cast<void (*)(Agent*, T*)>(l);
++    R__b.ReadLong64(l);
++    this->reduce_partial_results_ =
++        reinterpret_cast<T (*)(const SharedData<T>&)>(l);
++    R__b.ReadLong64(l);
++    this->post_process_ = reinterpret_cast<TResult (*)(TResult)>(l);
++  } else {
++    R__b.WriteClassBuffer(GenericReducer::Class(), this);
++    Long64_t l = reinterpret_cast<Long64_t>(this->agent_function_);
++    R__b.WriteLong64(l);
++    l = reinterpret_cast<Long64_t>(this->reduce_partial_results_);
++    R__b.WriteLong64(l);
++    l = reinterpret_cast<Long64_t>(this->post_process_);
++    R__b.WriteLong64(l);
++  }
++}
++
++#endif  // !defined(__CLING__) || defined(__ROOTCLING__)
++
+ /// Iterates over all agents executing the `agent_functor` and updating a
+ /// a thread-local and therefore partial result.
+ /// The second parameter specifies how these partial results should be combined
+@@ -68,6 +192,104 @@ inline T Reduce(Simulation* sim, Functor<void, Agent*, T*>& agent_functor,
+ }
+ 
+ // -----------------------------------------------------------------------------
++/// Provides functions to count the number of agents for which the given
++/// condition is true.\n
++/// The following code example demonstrates how to count all agents
++/// with `diameter < 5`.
++/// \code
++/// auto diam_lt_5 = [](Agent* agent) {
++///   return agent->GetDiameter() < 5;
++/// };
++/// Counter<> counter(diam_lt_5);
++/// rm->ForEachAgentParallel(counter);
++/// auto result = counter.GetResult();
++/// \endcode
++/// The counting result can be post processed. Let's assume we want
++/// to divide the counting result by two:
++/// \code
++/// auto diam_lt_5 = [](Agent* agent) {
++///   return agent->GetDiameter() < 5;
++/// };
++/// auto post_process = [](uint64_t result) { return result / 2; };
++/// Counter<> counter(diam_lt_5, post_process);
++/// rm->ForEachAgentParallel(counter);
++/// auto result = counter.GetResult();
++/// \endcode
++/// The benefit in comparison with `bdm::experimental::Count` is that
++/// multiple counters can be combined and processed in one sweep over
++/// all agents.
++/// \see bdm::experimental::Reducer`
++template <typename TResult = uint64_t>
++struct Counter : public Reducer<TResult> {
++ public:
++  /// Required for IO
++  Counter() { Reset(); }
++
++  Counter(bool (*condition)(Agent*), TResult (*post_process)(TResult) = nullptr)
++      : condition_(condition), post_process_(post_process) {
++    Reset();
++  }
++
++  virtual ~Counter() {}
++
++  void Reset() override {
++    tl_results_.resize(ThreadInfo::GetInstance()->GetMaxThreads());
++    for (auto& el : tl_results_) {
++      el = 0u;
++    }
++  }
++
++  void operator()(Agent* agent) override {
++    if (condition_(agent)) {
++      auto tid = ThreadInfo::GetInstance()->GetMyThreadId();
++      this->tl_results_[tid]++;
++    }
++  }
++
++  TResult GetResult() override {
++    SumReduction<uint64_t> sum;
++    auto combined = static_cast<TResult>(sum(this->tl_results_));
++    if (post_process_) {
++      return post_process_(combined);
++    }
++    return combined;
++  }
++
++  Reducer<TResult>* NewCopy() const override { return new Counter(*this); }
++
++ private:
++  SharedData<uint64_t> tl_results_;             //!
++  bool (*condition_)(Agent*) = nullptr;         //!
++  TResult (*post_process_)(TResult) = nullptr;  //!
++  BDM_CLASS_DEF_OVERRIDE(Counter, 1)
++};
++
++// The following custom streamer should be visible to rootcling for dictionary
++// generation, but not to the interpreter!
++#if (!defined(__CLING__) || defined(__ROOTCLING__)) && defined(USE_DICT)
++
++// The custom streamer is needed because ROOT can't stream function pointers
++// by default.
++template <typename TResult>
++inline void Counter<TResult>::Streamer(TBuffer& R__b) {
++  if (R__b.IsReading()) {
++    R__b.ReadClassBuffer(Counter::Class(), this);
++    Long64_t l;
++    R__b.ReadLong64(l);
++    this->condition_ = reinterpret_cast<bool (*)(Agent*)>(l);
++    R__b.ReadLong64(l);
++    this->post_process_ = reinterpret_cast<TResult (*)(TResult)>(l);
++  } else {
++    R__b.WriteClassBuffer(Counter::Class(), this);
++    Long64_t l = reinterpret_cast<Long64_t>(this->condition_);
++    R__b.WriteLong64(l);
++    l = reinterpret_cast<Long64_t>(this->post_process_);
++    R__b.WriteLong64(l);
++  }
++}
++
++#endif  // !defined(__CLING__) || defined(__ROOTCLING__)
++
+ /// Counts the number of agents for which `condition` evaluates to true.
+ /// Let's assume we want to count all infected agents in a virus spreading
+ /// simulation.
+diff --git a/src/core/analysis/time_series.cc b/src/core/analysis/time_series.cc
+index d242a43e5..c8b1ebdb6 100644
+--- a/src/core/analysis/time_series.cc
++++ b/src/core/analysis/time_series.cc
+@@ -15,6 +15,7 @@
+ #include "core/analysis/time_series.h"
+ #include <TBufferJSON.h>
+ #include <iostream>
++#include "core/analysis/reduce.h"
+ #include "core/scheduler.h"
+ #include "core/simulation.h"
+ #include "core/util/io.h"
+@@ -23,6 +24,56 @@
+ namespace bdm {
+ namespace experimental {
+ 
++// -----------------------------------------------------------------------------
++TimeSeries::Data::Data() {}
++
++// -----------------------------------------------------------------------------
++TimeSeries::Data::Data(double (*ycollector)(Simulation*),
++                       double (*xcollector)(Simulation*))
++    : ycollector(ycollector), xcollector(xcollector) {}
++
++// -----------------------------------------------------------------------------
++TimeSeries::Data::Data(Reducer<double>* y_reducer_collector,
++                       double (*xcollector)(Simulation*))
++    : y_reducer_collector(y_reducer_collector), xcollector(xcollector) {}
++
++// -----------------------------------------------------------------------------
++TimeSeries::Data::Data(const Data& other)
++    : ycollector(other.ycollector),
++      xcollector(other.xcollector),
++      x_values(other.x_values),
++      y_values(other.y_values),
++      y_error_low(other.y_error_low),
++      y_error_high(other.y_error_high) {
++  if (other.y_reducer_collector) {
++    y_reducer_collector = other.y_reducer_collector->NewCopy();
++  }
++}
++
++// -----------------------------------------------------------------------------
++TimeSeries::Data& TimeSeries::Data::operator=(const Data& other) {
++  if (this == &other) {
++    return *this;
++  }
++  if (other.y_reducer_collector) {
++    y_reducer_collector = other.y_reducer_collector->NewCopy();
++  }
++  ycollector = other.ycollector;
++  xcollector = other.xcollector;
++  x_values = other.x_values;
++  y_values = other.y_values;
++  y_error_low = other.y_error_low;
++  y_error_high = other.y_error_high;
++  return *this;
++}
++
++// -----------------------------------------------------------------------------
++TimeSeries::Data::~Data() {
++  if (y_reducer_collector) {
++    delete y_reducer_collector;
++  }
++}
++
+ // -----------------------------------------------------------------------------
+ void TimeSeries::Load(const std::string& full_filepath, TimeSeries** restored) {
+   GetPersistentObject(full_filepath.c_str(), "TimeSeries", *restored);
+@@ -99,7 +150,7 @@ void TimeSeries::Merge(
+ 
+     // merge
+     //  initialize
+-    merged->data_[key] = {};
++    merged->data_.emplace(key, Data());
+     auto& mdata = merged->data_[key];
+     mdata.x_values.resize(xref.size());
+     mdata.y_values.resize(xref.size());
+@@ -149,7 +200,19 @@ void TimeSeries::AddCollector(const std::string& id,
+     Log::Warning("TimeSeries::Add", "TimeSeries with id (", id,
+                  ") exists already. Operation aborted.");
+   }
+-  data_[id] = {ycollector, xcollector};
++  data_.emplace(id, Data(ycollector, xcollector));
++}
++
++// -----------------------------------------------------------------------------
++void TimeSeries::AddCollector(const std::string& id,
++                              Reducer<double>* y_reducer_collector,
++                              double (*xcollector)(Simulation*)) {
++  auto it = data_.find(id);
++  if (it != data_.end()) {
++    Log::Warning("TimeSeries::Add", "TimeSeries with id (", id,
++                 ") exists already. Operation aborted.");
++  }
++  data_.emplace(id, Data(y_reducer_collector, xcollector));
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -157,17 +220,34 @@ void TimeSeries::Update() {
+   auto* sim = Simulation::GetActive();
+   auto* scheduler = sim->GetScheduler();
+   auto* param = sim->GetParam();
++  std::vector<std::pair<Reducer<double>*, const std::string>> reducers;
+   for (auto& entry : data_) {
+     auto& result_data = entry.second;
+     if (result_data.ycollector != nullptr) {
+-      if (result_data.xcollector == nullptr) {
+-        result_data.x_values.push_back(scheduler->GetSimulatedSteps() *
+-                                       param->simulation_time_step);
+-      } else {
+-        result_data.x_values.push_back(result_data.xcollector(sim));
+-      }
+       result_data.y_values.push_back(result_data.ycollector(sim));
+     }
++    if (result_data.y_reducer_collector != nullptr) {
++      result_data.y_reducer_collector->Reset();
++      reducers.push_back(
++          std::make_pair(result_data.y_reducer_collector, entry.first));
++    }
++    if (result_data.xcollector == nullptr) {
++      result_data.x_values.push_back(scheduler->GetSimulatedSteps() *
++                                     param->simulation_time_step);
++    } else {
++      result_data.x_values.push_back(result_data.xcollector(sim));
++    }
++  }
++
++  // execute reducers
++  auto execute_reducers = L2F([&](Agent* agent) {
++    for (auto& el : reducers) {
++      (*el.first)(agent);
++    }
++  });
++  sim->GetResourceManager()->ForEachAgentParallel(execute_reducers);
++  for (auto& el : reducers) {
++    data_[el.second].y_values.push_back(el.first->GetResult());
+   }
+ }
+ 
+@@ -189,7 +269,7 @@ void TimeSeries::Add(const TimeSeries& ts, const std::string& suffix) {
+       return;
+     }
+ 
+-    data_[id] = p.second;
++    data_.emplace(id, p.second);
+   }
+ }
+ 
+@@ -203,7 +283,10 @@ void TimeSeries::Add(const std::string& id, const std::vector<double>& x_values,
+     return;
+   }
+ 
+-  data_[id] = {nullptr, nullptr, x_values, y_values};
++  Data data;
++  data.x_values = x_values;
++  data.y_values = y_values;
++  data_.emplace(id, data);
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -218,7 +301,12 @@ void TimeSeries::Add(const std::string& id, const std::vector<double>& x_values,
+     return;
+   }
+ 
+-  data_[id] = {nullptr, nullptr, x_values, y_values, y_error_low, y_error_high};
++  Data data;
++  data.x_values = x_values;
++  data.y_values = y_values;
++  data.y_error_low = y_error_low;
++  data.y_error_high = y_error_high;
++  data_.emplace(id, data);
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -231,7 +319,12 @@ void TimeSeries::Add(const std::string& id, const std::vector<double>& x_values,
+                  "make it unique. Operation aborted.");
+     return;
+   }
+-  data_[id] = {nullptr, nullptr, x_values, y_values, y_error, y_error};
++  Data data;
++  data.x_values = x_values;
++  data.y_values = y_values;
++  data.y_error_low = y_error;
++  data.y_error_high = y_error;
++  data_.emplace(id, data);
+ }
+ 
+ // -----------------------------------------------------------------------------
+diff --git a/src/core/analysis/time_series.h b/src/core/analysis/time_series.h
+index 4d94286de..d44dd782c 100644
+--- a/src/core/analysis/time_series.h
++++ b/src/core/analysis/time_series.h
+@@ -17,6 +17,7 @@
+ #include <functional>
+ #include <unordered_map>
+ #include <vector>
++#include "core/analysis/reduce.h"
+ #include "core/util/root.h"
+ 
+ namespace bdm {
+@@ -31,6 +32,16 @@ namespace experimental {
+ class TimeSeries {
+  public:
+   struct Data {
++    Data();
++    Data(double (*ycollector)(Simulation*), double (*xcollector)(Simulation*));
++    Data(Reducer<double>* y_reducer_collector,
++         double (*xcollector)(Simulation*));
++    Data(const Data&);
++    ~Data();
++
++    Data& operator=(const Data& other);
++
++    Reducer<double>* y_reducer_collector = nullptr;
+     double (*ycollector)(Simulation*) = nullptr;  //!
+     double (*xcollector)(Simulation*) = nullptr;  //!
+     std::vector<double> x_values;
+@@ -107,6 +118,27 @@ class TimeSeries {
+   void AddCollector(const std::string& id, double (*ycollector)(Simulation*),
+                     double (*xcollector)(Simulation*) = nullptr);
+ 
++  /// Adds a reducer collector which is executed at each iteration.\n
++  /// The benefit (in comparison with `AddCollector` using a function pointer
++  /// to collect y-values) is that multiple reducers can be combined.
++  /// Thus the result can be calculated faster.\n
++  /// Let's assume we want to track the fraction of infected agents in an
++  /// epidemiological simulation.
++  /// \code
++  /// auto is_infected = [](Agent* a) {
++  ///   return bdm_static_cast<Person*>(a)->state_ == State::kInfected;
++  /// };
++  /// auto post_process = [](double count) {
++  ///   auto* rm = Simulation::GetActive()->GetResourceManager();
++  ///   auto num_agents = rm->GetNumAgents();
++  ///   return count / static_cast<double>(num_agents);
++  /// };
++  /// ts->AddCollector("infected", new Counter<double>(is_infected,
++  ///                                                  post_process));
++  /// \endcode
++  void AddCollector(const std::string& id, Reducer<double>* y_reducer_collector,
++                    double (*xcollector)(Simulation*) = nullptr);
++
+   /// Add new entry with data that is not collected during a simulation.
+   /// This function can for example be used to add experimental data
+   /// which can be later plotted together with the simulation results
+diff --git a/test/unit/core/analysis/reduce_test.cc b/test/unit/core/analysis/reduce_test.cc
+index 360ad1c69..ff0c8be29 100644
+--- a/test/unit/core/analysis/reduce_test.cc
++++ b/test/unit/core/analysis/reduce_test.cc
+@@ -17,6 +17,7 @@
+ #include "core/resource_manager.h"
+ #include "core/scheduler.h"
+ #include "core/simulation.h"
++#include "unit/test_util/io_test.h"
+ #include "unit/test_util/test_agent.h"
+ #include "unit/test_util/test_util.h"
+ 
+@@ -28,7 +29,7 @@ TEST(Reduce, Reduce) {
+   Simulation sim(TEST_NAME);
+   auto* rm = sim.GetResourceManager();
+ 
+-  for (uint64_t i = 0; i < 10; ++i) {
++  for (uint64_t i = 0; i < 2000; ++i) {
+     auto* a = new TestAgent();
+     a->SetData(i);
+     rm->AddAgent(a);
+@@ -39,7 +40,65 @@ TEST(Reduce, Reduce) {
+   });
+   SumReduction<uint64_t> combine_tl_results;
+   auto result = Reduce(&sim, sum_data, combine_tl_results);
+-  EXPECT_EQ(45u, result);
++  EXPECT_EQ(1999000u, result);
++}
++
++// -----------------------------------------------------------------------------
++TEST(Reduce, GenericReducer) {
++  Simulation sim(TEST_NAME);
++  auto* rm = sim.GetResourceManager();
++
++  for (uint64_t i = 0; i < 2000; ++i) {
++    auto* a = new TestAgent();
++    a->SetData(i);
++    rm->AddAgent(a);
++  }
++
++  auto sum_data = [](Agent* agent, uint64_t* tl_result) {
++    *tl_result += bdm_static_cast<TestAgent*>(agent)->GetData();
++  };
++  auto combine_tl_results = [](const SharedData<uint64_t>& tl_results) {
++    uint64_t result = 0;
++    for (auto& el : tl_results) {
++      result += el;
++    }
++    return result;
++  };
++
++  // without post processing
++  {
++    GenericReducer<uint64_t> reducer(sum_data, combine_tl_results);
++    rm->ForEachAgentParallel(reducer);
++    auto result = reducer.GetResult();
++    EXPECT_EQ(1999000u, result);
++  }
++
++  // with post processing and reset
++  {
++    auto post_process = [](uint64_t result) { return result / 2; };
++    GenericReducer<uint64_t> reducer(sum_data, combine_tl_results,
++                                     post_process);
++    rm->ForEachAgentParallel(reducer);
++    auto result = reducer.GetResult();
++    EXPECT_EQ(999500u, result);
++
++    // calculate again
++    reducer.Reset();
++    rm->ForEachAgentParallel(reducer);
++    result = reducer.GetResult();
++    EXPECT_EQ(999500u, result);
++  }
++
++  // with different result data type and post processing
++  {
++    auto post_process = [](double result) { return result / 2.3; };
++    GenericReducer<uint64_t, double> reducer(sum_data, combine_tl_results,
++                                             post_process);
++    rm->ForEachAgentParallel(reducer);
++    auto result = reducer.GetResult();
++    EXPECT_EQ(typeid(result), typeid(double));
++    EXPECT_NEAR(869130.434782609, result, abs_error<double>::value);
++  }
+ }
+ 
+ // -----------------------------------------------------------------------------
+@@ -47,18 +106,127 @@ TEST(Reduce, Count) {
+   Simulation sim(TEST_NAME);
+   auto* rm = sim.GetResourceManager();
+ 
+-  for (uint64_t i = 0; i < 10; ++i) {
++  for (uint64_t i = 0; i < 2000; ++i) {
+     auto* a = new TestAgent();
+     a->SetData(i);
+     rm->AddAgent(a);
+   }
+ 
+-  auto data_lt_5 = L2F([](Agent* agent) {
+-    return bdm_static_cast<TestAgent*>(agent)->GetData() < 5;
++  auto data_lt_1000 = L2F([](Agent* agent) {
++    return bdm_static_cast<TestAgent*>(agent)->GetData() < 1000;
+   });
+-  auto result = Count(&sim, data_lt_5);
+-  EXPECT_EQ(5u, result);
++  auto result = Count(&sim, data_lt_1000);
++  EXPECT_EQ(1000u, result);
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(Reduce, Counter) {
++  Simulation sim(TEST_NAME);
++  auto* rm = sim.GetResourceManager();
++
++  for (uint64_t i = 0; i < 2000; ++i) {
++    auto* a = new TestAgent();
++    a->SetData(i);
++    rm->AddAgent(a);
++  }
++
++  auto data_lt_1000 = [](Agent* agent) {
++    return bdm_static_cast<TestAgent*>(agent)->GetData() < 1000;
++  };
++
++  // without post processing
++  {
++    Counter<> counter(data_lt_1000);
++    rm->ForEachAgentParallel(counter);
++    auto result = counter.GetResult();
++    EXPECT_EQ(1000u, result);
++  }
++
++  // with post processing and reset
++  {
++    auto post_process = [](uint64_t result) { return result / 2; };
++    Counter<> counter(data_lt_1000, post_process);
++    rm->ForEachAgentParallel(counter);
++    auto result = counter.GetResult();
++    EXPECT_EQ(500u, result);
++
++    // calculate again
++    counter.Reset();
++    rm->ForEachAgentParallel(counter);
++    result = counter.GetResult();
++    EXPECT_EQ(500u, result);
++  }
++
++  // with different result data type and post processing
++  {
++    auto post_process = [](double result) { return result / 2.3; };
++    Counter<double> counter(data_lt_1000, post_process);
++    rm->ForEachAgentParallel(counter);
++    auto result = counter.GetResult();
++    EXPECT_EQ(typeid(result), typeid(double));
++    EXPECT_NEAR(434.782608696, result, abs_error<double>::value);
++  }
++}
++
++#ifdef USE_DICT
++// -----------------------------------------------------------------------------
++TEST_F(IOTest, GenericReducer) {
++  Simulation sim(TEST_NAME);
++  auto* rm = sim.GetResourceManager();
++
++  for (uint64_t i = 0; i < 2000; ++i) {
++    auto* a = new TestAgent();
++    a->SetData(i);
++    rm->AddAgent(a);
++  }
++
++  auto sum_data = [](Agent* agent, uint64_t* tl_result) {
++    *tl_result += bdm_static_cast<TestAgent*>(agent)->GetData();
++  };
++  auto combine_tl_results = [](const SharedData<uint64_t>& tl_results) {
++    uint64_t result = 0;
++    for (auto& el : tl_results) {
++      result += el;
++    }
++    return result;
++  };
++  auto post_process = [](uint64_t result) { return result / 2; };
++  GenericReducer<uint64_t> reducer(sum_data, combine_tl_results, post_process);
++
++  GenericReducer<uint64_t>* restored;
++  BackupAndRestore(reducer, &restored);
++
++  rm->ForEachAgentParallel(*restored);
++  auto result = restored->GetResult();
++  EXPECT_EQ(999500u, result);
++}
++
++// -----------------------------------------------------------------------------
++TEST_F(IOTest, Counter) {
++  Simulation sim(TEST_NAME);
++  auto* rm = sim.GetResourceManager();
++
++  for (uint64_t i = 0; i < 2000; ++i) {
++    auto* a = new TestAgent();
++    a->SetData(i);
++    rm->AddAgent(a);
++  }
++
++  auto data_lt_1000 = [](Agent* agent) {
++    return bdm_static_cast<TestAgent*>(agent)->GetData() < 1000;
++  };
++  auto post_process = [](uint64_t result) { return result / 2; };
++  Counter<> counter(data_lt_1000, post_process);
++
++  Counter<>* restored;
++  BackupAndRestore(counter, &restored);
++
++  rm->ForEachAgentParallel(*restored);
++  auto result = restored->GetResult();
++  EXPECT_EQ(500u, result);
++}
++
++#endif  // USE_DICT
++
+ }  // namespace experimental
+ }  // namespace bdm
+diff --git a/test/unit/core/analysis/time_series_test.cc b/test/unit/core/analysis/time_series_test.cc
+index 31e2ceb5a..c96b29e80 100644
+--- a/test/unit/core/analysis/time_series_test.cc
++++ b/test/unit/core/analysis/time_series_test.cc
+@@ -227,15 +227,59 @@ TEST(TimeSeries, AddCollectorXYAndUpdate) {
+   EXPECT_NEAR(8.0, yvals[2], abs_error<double>::value);
+ }
+ 
++// -----------------------------------------------------------------------------
++TEST(TimeSeries, AddCollectorReducerAndUpdate) {
++  Simulation sim(TEST_NAME);
++
++  // cells will divide in every step -> the number of agents will double
++  // each iteration
++  StatelessBehavior rapid_division(
++      [](Agent* agent) { bdm_static_cast<Cell*>(agent)->Divide(0.5); });
++  rapid_division.AlwaysCopyToNew();
++  auto* cell = new Cell();
++  cell->AddBehavior(rapid_division.NewCopy());
++  sim.GetResourceManager()->AddAgent(cell);
++
++  auto* ts = sim.GetTimeSeries();
++  auto agent_diam_gt_0 = [](Agent* a) { return a->GetDiameter() > 0.; };
++  auto xcollector = [](Simulation* sim) {
++    return sim->GetScheduler()->GetSimulatedSteps() + 3.0;
++  };
++  auto* counter = new Counter<double>(agent_diam_gt_0);
++  ts->AddCollector("agents-diam-gt-0", counter, xcollector);
++  EXPECT_EQ(1u, ts->Size());
++  EXPECT_TRUE(ts->Contains("agents-diam-gt-0"));
++
++  sim.GetScheduler()->Simulate(3);
++
++  // check entries for my-entry
++  const auto& xvals = ts->GetXValues("agents-diam-gt-0");
++  EXPECT_EQ(3u, xvals.size());
++  for (uint64_t i = 0; i < 3; ++i) {
++    EXPECT_NEAR(i + 3, xvals[i], abs_error<double>::value);
++  }
++  const auto& yvals = ts->GetYValues("agents-diam-gt-0");
++  EXPECT_EQ(3u, yvals.size());
++  EXPECT_NEAR(2.0, yvals[0], abs_error<double>::value);
++  EXPECT_NEAR(4.0, yvals[1], abs_error<double>::value);
++  EXPECT_NEAR(8.0, yvals[2], abs_error<double>::value);
++}
++
+ // -----------------------------------------------------------------------------
+ TEST(TimeSeries, StoreAndLoad) {
+   Simulation sim(TEST_NAME);
+-  TimeSeries ts;
++  sim.GetResourceManager()->AddAgent(new Cell());
++  sim.GetResourceManager()->AddAgent(new Cell());
+ 
++  TimeSeries ts;
+   auto ycollector = [](Simulation* sim) { return 4.0; };
+   auto xcollector = [](Simulation* sim) { return 5.0; };
+   ts.AddCollector("collect", ycollector, xcollector);
+ 
++  auto d_gt_0 = [](Agent* a) { return a->GetDiameter() > 0; };
++  auto* counter = new Counter<double>(d_gt_0);
++  ts.AddCollector("collect1", counter, xcollector);
++
+   ts.Add("my-entry", {1, 2}, {3, 4});
+   ts.Save("ts.root");
+ 
+@@ -244,9 +288,10 @@ TEST(TimeSeries, StoreAndLoad) {
+   TimeSeries::Load("ts.root", &restored);
+   ASSERT_TRUE(restored != nullptr);
+ 
+-  EXPECT_EQ(2u, restored->Size());
++  EXPECT_EQ(3u, restored->Size());
+   EXPECT_TRUE(restored->Contains("my-entry"));
+   EXPECT_TRUE(restored->Contains("collect"));
++  EXPECT_TRUE(restored->Contains("collect1"));
+ 
+   const auto& xvals = restored->GetXValues("my-entry");
+   EXPECT_EQ(2u, xvals.size());
+@@ -259,12 +304,22 @@ TEST(TimeSeries, StoreAndLoad) {
+ 
+   // check if collector has been restored correctly.
+   restored->Update();
+-  const auto& xvals1 = restored->GetXValues("collect");
+-  EXPECT_EQ(1u, xvals1.size());
+-  EXPECT_NEAR(5.0, xvals1[0], abs_error<double>::value);
+-  const auto& yvals1 = restored->GetYValues("collect");
+-  EXPECT_EQ(1u, yvals1.size());
+-  EXPECT_NEAR(4.0, yvals1[0], abs_error<double>::value);
++  {
++    const auto& xvals1 = restored->GetXValues("collect");
++    EXPECT_EQ(1u, xvals1.size());
++    EXPECT_NEAR(5.0, xvals1[0], abs_error<double>::value);
++    const auto& yvals1 = restored->GetYValues("collect");
++    EXPECT_EQ(1u, yvals1.size());
++    EXPECT_NEAR(4.0, yvals1[0], abs_error<double>::value);
++  }
++  {
++    const auto& xvals1 = restored->GetXValues("collect1");
++    EXPECT_EQ(1u, xvals1.size());
++    EXPECT_NEAR(5.0, xvals1[0], abs_error<double>::value);
++    const auto& yvals1 = restored->GetYValues("collect1");
++    EXPECT_EQ(1u, yvals1.size());
++    EXPECT_NEAR(2.0, yvals1[0], abs_error<double>::value);
++  }
+   delete restored;
+ }
+ 

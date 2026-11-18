@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Feature/remove check lca
+
+## Description
+
+left overs from #119
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ce4ec79e1ad9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

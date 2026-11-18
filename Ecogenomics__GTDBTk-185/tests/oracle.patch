@@ -1,0 +1,350 @@
+diff --git a/README.md b/README.md
+index 0b6cf6de..524788df 100644
+--- a/README.md
++++ b/README.md
+@@ -35,15 +35,16 @@ Please visit the GTDB-Tk [github page](https://github.com/Ecogenomics/GTDBTk) fo
+ **Note (????)**:
+ * GTDB-Tk v0.3.3 has been released (**we recommend all users update to this version**)
+     * Genomes processed with Prodigal/HMMER will be skipped if an output file is found.
+-    * Translation table prediction is now done using a logistic classifier.
+-    * Logging output coloured in terminal window.
++    * Translation table prediction is now done using a logistic classifier (see [FAQ](docs/faq.md)).
++    * Updates to logging
++        * Severity is now coloured.
++        * Align, FastANI, pplacer progress displayed.
+     * `--debug` (`-d`) flag added to output debugging information.
+     * Genomes supplied with the `--genes` flag will be treated as called genes.
+         * Prodigal will be skipped.
+         * TIGR/PFAM markers will be run on the supplied genomes.
+         * Be sure to check the file extension `-x` is provided.
+     * Fixed an issue where the `root` command would fail when run independently.
+-    * pplacer progress is now displayed.
+     * Improved MSA masking performance from ~2min to ~12 seconds (23k bacterial genomes).
+     * # ????
+ 
+diff --git a/gtdbtk/external/fastani.py b/gtdbtk/external/fastani.py
+index 3d16aea1..e96f76c7 100644
+--- a/gtdbtk/external/fastani.py
++++ b/gtdbtk/external/fastani.py
+@@ -15,15 +15,15 @@
+ #                                                                             #
+ ###############################################################################
+ 
+-import multiprocessing
++import multiprocessing as mp
+ import os
+ import shutil
++import sys
+ import tempfile
+ 
+ import gtdbtk.config.config as Config
+ from gtdbtk.biolib_lite.common import make_sure_path_exists, remove_extension
+-from gtdbtk.exceptions import FastANIException
+-from gtdbtk.tools import splitchunks
++from gtdbtk.exceptions import FastANIException, GTDBTkException
+ 
+ 
+ class FastANI(object):
+@@ -43,42 +43,96 @@ def __init__(self, cpus):
+     def run(self, fastani_verification, genomes):
+         """Using the instance defined number of CPUs, run FastANI."""
+ 
+-        manager = multiprocessing.Manager()
+-        out_q = manager.dict()
+-        procs = []
+-        nprocs = self.cpus
++        q_worker = mp.Queue()
++        q_writer = mp.Queue()
+ 
+-        for item in splitchunks(fastani_verification, nprocs):
+-            p = multiprocessing.Process(
+-                target=self._fastaniWorker,
+-                args=(item, genomes, out_q))
+-            procs.append(p)
+-            p.start()
++        for userleaf, potential_nodes in fastani_verification.items():
++            q_worker.put((userleaf, potential_nodes))
++        [q_worker.put(None) for _ in range(self.cpus)]
+ 
+-        # Wait for all worker processes to finish
+-        for p in procs:
+-            p.join()
+-            if p.exitcode == 1:
+-                raise FastANIException("A process returned a non-zero exit code.")
++        manager = mp.Manager()
++        dict_out = manager.dict()
+ 
+-        all_fastani_dict = dict(out_q)
++        p_workers = [mp.Process(target=self._worker,
++                                args=(q_worker, q_writer, genomes, dict_out))
++                     for _ in range(self.cpus)]
+ 
+-        return all_fastani_dict
++        p_writer = mp.Process(target=self._writer,
++                              args=(q_writer, len(fastani_verification)))
+ 
+-    def _fastaniWorker(self, sublist_genomes, genomes, out_q):
+-        """Multi thread worker to calculate FastANI"""
+         try:
+-            for userleaf, potential_nodes in sublist_genomes.items():
+-                dict_parser_distance = self._calculate_fastani_distance(
+-                    userleaf, potential_nodes, genomes)
+-                for k, v in dict_parser_distance.items():
+-                    if k in out_q:
+-                        raise Exception("{} not in output.".format(k))
+-                    out_q[k] = v
+-            return True
+-        except Exception as error:
+-            print(error)
+-            FastANIException(error)
++            p_writer.start()
++            for p_worker in p_workers:
++                p_worker.start()
++
++            for p_worker in p_workers:
++                p_worker.join()
++
++                # Gracefully terminate the program.
++                if p_worker.exitcode != 0:
++                    raise GTDBTkException('FastANI returned a non-zero exit code.')
++
++            q_writer.put(None)
++            p_writer.join()
++
++        except Exception:
++            for p in p_workers:
++                p.terminate()
++
++            p_writer.terminate()
++            raise
++
++        return {k: v for k, v in dict_out.items()}
++
++    def _worker(self, q_worker, q_writer, genomes, dict_out):
++        """The worker function, invoked in a process.
++
++        Parameters
++        ----------
++        q_worker : multiprocessing.Queue
++            A queue of tuples containing the genome id, aa path, and marker.
++        q_writer : multiprocessing.Queue
++            A queue consumed by the writer, to track progress.
++        genomes : dict
++            The list of user genomes.
++        dict_out : dict
++            A thread-safe managed dictionary of results.
++        """
++        job = q_worker.get(block=True, timeout=None)
++        while job is not None:
++            userleaf, potential_nodes = job
++            dict_parser_distance = self._calculate_fastani_distance(
++                userleaf, potential_nodes, genomes)
++            for k, v in dict_parser_distance.items():
++                if k in dict_out:
++                    raise Exception("{} not in output.".format(k))
++                dict_out[k] = v
++            q_writer.put(True)
++            job = q_worker.get(block=True, timeout=None)
++        return True
++
++    def _writer(self, q_writer, n_total):
++        """The writer function, which reports the progress of the workers.
++
++        Parameters
++        ----------
++        q_writer : multiprocessing.Queue
++            A queue of genome ids which have been processed.
++        n_total : int
++            The total number of items to be processed.
++        """
++        processed_items = 0
++        result = q_writer.get(block=True, timeout=None)
++
++        while result is not None:
++            processed_items += 1
++            statusStr = '==> Processing %d of %d (%.1f%%) genomes.' % (processed_items,
++                                                                       n_total,
++                                                                       float(processed_items) * 100 / n_total)
++            sys.stdout.write('%s\r' % statusStr)
++            sys.stdout.flush()
++            result = q_writer.get(block=True, timeout=None)
++        sys.stdout.write('\n')
+ 
+     def _calculate_fastani_distance(self, user_leaf, list_leaf, genomes):
+         """ Calculate the FastANI distance between all user genomes and the reference to classfy them at the species level
+diff --git a/gtdbtk/external/hmm_aligner.py b/gtdbtk/external/hmm_aligner.py
+index 6c75ee61..0fc9a31d 100644
+--- a/gtdbtk/external/hmm_aligner.py
++++ b/gtdbtk/external/hmm_aligner.py
+@@ -17,16 +17,17 @@
+ 
+ from __future__ import print_function
+ 
+-import multiprocessing
++import logging
++import multiprocessing as mp
+ import os
+ import shutil
+ import subprocess
++import sys
+ import tempfile
+-import time
+ 
+ from gtdbtk.biolib_lite.execute import check_dependencies
+ from gtdbtk.biolib_lite.seq_io import read_fasta
+-from gtdbtk.tools import splitchunks
++from gtdbtk.exceptions import GTDBTkException
+ 
+ 
+ class HmmAligner(object):
+@@ -46,6 +47,8 @@ def __init__(self,
+ 
+         check_dependencies(['hmmalign'])
+ 
++        self.logger = logging.getLogger('timestamp')
++
+         self.threads = threads
+         self.pfam_top_hit_suffix = pfam_top_hit_suffix
+         self.tigrfam_top_hit_suffix = tigrfam_top_hit_suffix
+@@ -58,44 +61,107 @@ def __init__(self,
+         self.rps23_markers = rps23_markers
+ 
+     def align_marker_set(self, db_genome_ids, marker_set_id):
+-        manager = multiprocessing.Manager()
+-        out_q = manager.Queue()
+-        procs = []
+-        nprocs = self.threads
+-        for item in splitchunks(db_genome_ids, nprocs):
+-            p = multiprocessing.Process(
+-                target=self._worker,
+-                args=(item, out_q, marker_set_id))
+-            procs.append(p)
+-            p.start()
+-
+-        # Collect all results into a single result dict. We know how many dicts
+-        # with results to expect.
+-        while out_q.empty():
+-            time.sleep(1)
+-
+-        # Wait for all worker processes to finish
+-        results = {}
+-
+-        for i in range(len(db_genome_ids)):
+-            gid, sequence = out_q.get()
+-            results[gid] = sequence
+-
+-        return results
+-
+-    def _worker(self, subdict_genomes, out_q, marker_set_id):
++        """Threaded alignment using hmmalign for a given set of genomes.
++
++        Parameters
++        ----------
++        db_genome_ids : dict
++            A dictionary containing the genome ids and aa paths to process.
++        marker_set_id : str
++            The marker set of these genomes (bac120/ar122).
++
++        Returns
++        -------
++        dict
++            A dictionary of genome_ids -> aligned sequence.
+         """
+-        The worker function, invoked in a process.
+-        :param subdict_genomes: sub dictionary of genomes
+-        :param out_q: manager.Queue()
++        q_worker = mp.Queue()
++        q_writer = mp.Queue()
++
++        for gid, gid_dict in db_genome_ids.items():
++            q_worker.put((gid, gid_dict.get('aa_gene_path'), marker_set_id))
++        [q_worker.put(None) for _ in range(self.threads)]
++
++        manager = mp.Manager()
++        out_dict = manager.dict()
++
++        p_workers = [mp.Process(target=self._worker,
++                                args=(q_worker, q_writer, out_dict))
++                     for _ in range(self.threads)]
++
++        p_writer = mp.Process(target=self._writer,
++                              args=(q_writer, len(db_genome_ids)))
++
++        try:
++            p_writer.start()
++            for p_worker in p_workers:
++                p_worker.start()
++
++            for p_worker in p_workers:
++                p_worker.join()
++
++                # Gracefully terminate the program.
++                if p_worker.exitcode != 0:
++                    raise GTDBTkException('hmmalign returned a non-zero exit code.')
++
++            q_writer.put(None)
++            p_writer.join()
++
++        except Exception:
++            for p in p_workers:
++                p.terminate()
++
++            p_writer.terminate()
++            raise
++
++        return {k: v for k, v in out_dict.items()}
++
++    def _worker(self, q_worker, q_writer, out_dict):
++        """The worker function, invoked in a process.
++
++        Parameters
++        ----------
++        q_worker : multiprocessing.Queue
++            A queue of tuples containing the genome id, aa path, and marker.
++        q_writer : multiprocessing.Queue
++            A queue consumed by the writer, to track progress.
++        out_dict : dict
++            A thread-safe managed dictionary of results.
+         """
+-        for db_genome_id, info in subdict_genomes.items():
+-            sequence = self._run_multi_align(db_genome_id,
+-                                             info.get("aa_gene_path"),
+-                                             marker_set_id)
+-            out_q.put((db_genome_id, sequence))
++        job = q_worker.get(block=True, timeout=None)
++        while job is not None:
++            db_genome_id, aa_gene_path, marker_set_id = job
++            out_dict[db_genome_id] = self._run_multi_align(db_genome_id,
++                                                           aa_gene_path,
++                                                           marker_set_id)
++            q_writer.put(db_genome_id)
++            job = q_worker.get(block=True, timeout=None)
+         return True
+ 
++    def _writer(self, q_writer, n_genomes):
++        """The writer function, which reports the progress of the workers.
++
++        Parameters
++        ----------
++        q_writer : multiprocessing.Queue
++            A queue of genome ids which have been processed.
++        n_genomes : int
++            The total number of genomes to be processed.
++        """
++        processed_items = 0
++        result = q_writer.get(block=True, timeout=None)
++
++        while result is not None:
++            processed_items += 1
++            statusStr = '==> Finished aligning %d of %d (%.1f%%) genomes.' % (processed_items,
++                                                                              n_genomes,
++                                                                              float(processed_items) * 100 / n_genomes)
++            sys.stdout.write('%s\r' % statusStr)
++            sys.stdout.flush()
++            result = q_writer.get(block=True, timeout=None)
++
++        sys.stdout.write('\n')
++
+     def _run_multi_align(self, db_genome_id, path, marker_set_id):
+         """
+         Returns the concatenated marker sequence for a specific genome

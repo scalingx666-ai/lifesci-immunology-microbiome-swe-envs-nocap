@@ -1,0 +1,106 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index ece8e6f2..e6ce1a06 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -7,6 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ ### 🚀 Features
+ 
+ * {func}`ep.pl.trajectories <ehrapy.plot.trajectories>` plots the mean of longitudinal variables over time with a confidence band for every group of observations ([#1146](https://github.com/theislab/ehrapy/pull/1146)) @Zethson
++* {func}`ep.pp.locf_impute <ehrapy.preprocessing.locf_impute>` takes a `limit` on how many timepoints an observed value is carried forward, and its fallback only fills timepoints before a patient's first observation ([#1147](https://github.com/theislab/ehrapy/pull/1147)) @Zethson
+ * {func}`ep.pp.gradient_boosting_impute <ehrapy.preprocessing.gradient_boosting_impute>` imputes every variable with a gradient boosting model, which for longitudinal data also uses the closest observed values before and after each timepoint @Zethson
+ 
+   With every variable held out at 10% of the observed hours of all 11,988 PhysioNet 2012 patients, its RMSE on the standardized held-out values is 0.62 in 36 seconds, against 1.09 in 232 seconds for {func}`ep.pp.miss_forest_impute <ehrapy.preprocessing.miss_forest_impute>` and 0.82 for {func}`ep.pp.locf_impute <ehrapy.preprocessing.locf_impute>`.
+diff --git a/ehrapy/preprocessing/_imputation.py b/ehrapy/preprocessing/_imputation.py
+index 8e97f294..81a8dc82 100644
+--- a/ehrapy/preprocessing/_imputation.py
++++ b/ehrapy/preprocessing/_imputation.py
+@@ -998,6 +998,7 @@ def locf_impute(
+     var_names: Iterable[str] | None = None,
+     layer: str | None = None,
+     fallback_method: Literal["mean", "median", "most_frequent", "bfill"] | None = "mean",
++    limit: int | None = None,
+     copy: bool = False,
+ ) -> EHRData | None:
+     """Impute missing values by carrying forward the last observed value along the time axis.
+@@ -1006,6 +1007,7 @@ def locf_impute(
+     For each patient and feature, missing values are replaced with the most recent
+     non-missing value. Missing values that occur before any observation for a given
+     patient are filled using a fallback method.
++    With a `limit`, missing values further than `limit` timepoints after the last observation stay missing.
+ 
+     Args:
+         edata: Central data object.
+@@ -1018,6 +1020,8 @@ def locf_impute(
+                          filling), ``'bfill'`` fills with each patient's first observed
+                          value (backward fill), and ``None`` leaves remaining NaN values
+                          untouched.
++        limit: Maximum number of consecutive timepoints an observed value is carried forward to.
++            If `None`, values are carried forward without limit.
+         copy: Whether to return a copy of ``edata`` or modify it inplace.
+ 
+     Returns:
+@@ -1071,12 +1075,14 @@ def locf_impute(
+     if not np.issubdtype(original.dtype, np.floating):
+         original = original.astype(np.float64)
+ 
+-    filled = xr.DataArray(original, dims=["obs", "var", "time"]).ffill(dim="time")
++    xp = array_namespace(original)
++    series = xr.DataArray(original, dims=["obs", "var", "time"])
++    filled = series.ffill(dim="time", limit=limit).data
++    before_first = xp.cumulative_sum(xp.astype(~xp.isnan(original), xp.int32), axis=2) == 0
+     if fallback_method == "bfill":
+-        filled = filled.bfill(dim="time")
+-    filled = filled.data
+-    if fallback_method in ("mean", "median", "most_frequent"):
+-        filled = _fill_missing(filled, _impute_value(original, fallback_method))
++        filled = xp.where(before_first, series.bfill(dim="time").data, filled)
++    elif fallback_method is not None:
++        filled = xp.where(before_first, _fill_missing(filled, _impute_value(original, fallback_method)), filled)
+ 
+     X = _set_columns(X, var_indices, filled)
+     if layer is None:
+diff --git a/tests/preprocessing/test_imputation.py b/tests/preprocessing/test_imputation.py
+index 4a90256d..ce6bae6e 100644
+--- a/tests/preprocessing/test_imputation.py
++++ b/tests/preprocessing/test_imputation.py
+@@ -806,13 +806,14 @@ def locf_edata_3d():
+ 
+ @pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu | Flags.Sparse)
+ @pytest.mark.parametrize("fallback_method", ["mean", "median", "most_frequent", "bfill", None])
+-def test_locf_impute_array_types(array_type, fallback_method, rng):
++@pytest.mark.parametrize("limit", [None, 1])
++def test_locf_impute_array_types(array_type, fallback_method, limit, rng):
+     X = _array_types_data(rng, 3)
+-    expected = locf_impute(_numeric_edata(X), fallback_method=fallback_method, copy=True).X
++    expected = locf_impute(_numeric_edata(X), fallback_method=fallback_method, limit=limit, copy=True).X
+     edata = _numeric_edata(array_type(X))
+ 
+     with forbid_dask_compute():
+-        result = locf_impute(edata, fallback_method=fallback_method, copy=True).X
++        result = locf_impute(edata, fallback_method=fallback_method, limit=limit, copy=True).X
+ 
+     assert isinstance(result, array_type.cls)
+     np.testing.assert_allclose(to_dense(result, to_cpu_memory=True), expected, equal_nan=True)
+@@ -925,6 +926,22 @@ def test_locf_impute_no_fallback(locf_edata_3d):
+     assert np.isnan(imputed[1, 2, 0])
+ 
+ 
++@pytest.mark.parametrize(
++    ("fallback_method", "expected"),
++    [
++        ("mean", [[2.0, 1.0, 1.0, np.nan, 3.0, 3.0]]),
++        ("bfill", [[1.0, 1.0, 1.0, np.nan, 3.0, 3.0]]),
++        (None, [[np.nan, 1.0, 1.0, np.nan, 3.0, 3.0]]),
++    ],
++)
++def test_locf_impute_limit(fallback_method, expected):
++    edata = _numeric_edata(np.array([[[np.nan, 1.0, np.nan, np.nan, 3.0, np.nan]]]))
++
++    locf_impute(edata, fallback_method=fallback_method, limit=1)
++
++    np.testing.assert_array_equal(edata.X[0], expected)
++
++
+ def test_locf_impute_invalid_fallback(locf_edata_3d):
+     with pytest.raises(ValueError, match="Unsupported fallback method"):
+         locf_impute(locf_edata_3d, layer=DEFAULT_TEM_LAYER_NAME, fallback_method="invalid")

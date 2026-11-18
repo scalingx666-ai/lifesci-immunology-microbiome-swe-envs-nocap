@@ -1,0 +1,729 @@
+diff --git a/bin/gtdbtk b/bin/gtdbtk
+index 38b0b10e..e95a111b 100755
+--- a/bin/gtdbtk
++++ b/bin/gtdbtk
+@@ -99,7 +99,7 @@ if __name__ == '__main__':
+ 
+     optional_denovo_wf = denovo_wf_parser.add_argument_group('optional arguments')
+     optional_denovo_wf.add_argument('-x', '--extension', default='fna',
+-                                    help='extension of files to process')
++                                    help='extension of files to process, gz = gzipped')
+                                     
+     optional_denovo_wf.add_argument('--skip_gtdb_refs',
+                                     action="store_true",
+@@ -158,7 +158,7 @@ if __name__ == '__main__':
+ 
+     optional_classify_wf = classify_wf_parser.add_argument_group('optional arguments')
+     optional_classify_wf.add_argument('-x', '--extension', default='fna',
+-                                    help='extension of files to process')
++                                    help='extension of files to process, gz = gzipped')
+     optional_classify_wf.add_argument('--min_perc_aa', type=float, default=10,
+                                        help='filter genomes with an insufficient percentage of AA in the MSA')
+     optional_classify_wf.add_argument('--prefix', required=False, default='gtdbtk',
+@@ -191,7 +191,7 @@ if __name__ == '__main__':
+ 
+     optional_identify = identify_parser.add_argument_group('optional arguments')
+     optional_identify.add_argument('-x', '--extension', default='fna',
+-                                    help='extension of files to process')
++                                    help='extension of files to process, gz = gzipped')
+     optional_identify.add_argument('--prefix', default='gtdbtk',
+                                     help='desired prefix for output files')
+     optional_identify.add_argument('--cpus', default=1, type=int,
+@@ -288,7 +288,7 @@ if __name__ == '__main__':
+ 
+     optional_classify = classify_parser.add_argument_group('optional arguments')
+     optional_classify.add_argument('-x', '--extension', default='fna',
+-                                    help='extension of files to process')
++                                    help='extension of files to process, gz = gzipped')
+     optional_classify.add_argument('--prefix', required=False, default='gtdbtk',
+                                     help='desired prefix for output files')
+     optional_classify.add_argument('--cpus', default=1, type=int,
+diff --git a/gtdbtk/biolib_lite/prodigal_biolib.py b/gtdbtk/biolib_lite/prodigal_biolib.py
+index 4501b551..86df9438 100644
+--- a/gtdbtk/biolib_lite/prodigal_biolib.py
++++ b/gtdbtk/biolib_lite/prodigal_biolib.py
+@@ -26,14 +26,14 @@
+ import logging
+ import tempfile
+ import shutil
++import subprocess
+ import ntpath
+ from collections import defaultdict, namedtuple
+ 
+-from common import check_file_exists, remove_extension, make_sure_path_exists
++from common import remove_extension, make_sure_path_exists
+ from seq_io import read_fasta
+ from parallel import Parallel
+ from execute import check_on_path
+-
+ import numpy as np
+ 
+ 
+@@ -85,6 +85,14 @@ def _producer(self, genome_file):
+                 self.logger.warn('Cannot call Prodigal on an empty genome. Skipped: {}'.format(genome_file))
+                 return None
+ 
++            # Prepare the genome file as a wrapped (buffered) string prior for passing through stdin to prodigal
++            buffer_len = 80
++            genome_file_str = str()
++            for gid, gseq in seqs.items():
++                genome_file_str += '>%s\n' % gid
++                for i in range(0, len(gseq), buffer_len):
++                    genome_file_str += '%s\n' % gseq[i:i+buffer_len]
++
+             tmp_dir = tempfile.mkdtemp()
+ 
+             # determine number of bases
+@@ -98,14 +106,13 @@ def _producer(self, genome_file):
+             else:
+                 translation_tables = [4, 11]
+ 
++            translation_table_gffs = dict()
+             for translation_table in translation_tables:
+                 os.makedirs(os.path.join(tmp_dir, str(translation_table)))
+                 aa_gene_file_tmp = os.path.join(tmp_dir, str(
+                     translation_table), genome_id + '_genes.faa')
+                 nt_gene_file_tmp = os.path.join(tmp_dir, str(
+                     translation_table), genome_id + '_genes.fna')
+-                gff_file_tmp = os.path.join(tmp_dir, str(
+-                    translation_table), genome_id + '.gff')
+ 
+                 # check if there is sufficient bases to calculate prodigal
+                 # parameters
+@@ -114,21 +121,23 @@ def _producer(self, genome_file):
+                 else:
+                     proc_str = 'single'  # estimate parameters from data
+ 
+-                args = '-m'
++                args = ['prodigal', '-m', '-p', proc_str, '-q', '-f', 'gff', '-g', str(translation_table), '-a',
++                        aa_gene_file_tmp, '-d', nt_gene_file_tmp]
+                 if self.closed_ends:
+-                    args += ' -c'
++                    args.append('-c')
++
++                proc = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.STDOUT)
++                proc_out, proc_err = proc.communicate(input=genome_file_str)
++                gff_stdout = proc_out.decode().encode('utf-8')
+ 
+-                cmd = 'prodigal %s -p %s -q -f gff -g %d -a %s -d %s -i %s > %s 2> /dev/null' % (args,
+-                                                                                                 proc_str,
+-                                                                                                 translation_table,
+-                                                                                                 aa_gene_file_tmp,
+-                                                                                                 nt_gene_file_tmp,
+-                                                                                                 genome_file,
+-                                                                                                 gff_file_tmp)
+-                os.system(cmd)
++                translation_table_gffs[translation_table] = gff_stdout
++
++                if proc.returncode != 0:
++                    self.logger.warn('Prodigal returned a non-zero exit code while processing: {}'.format(genome_file))
++                    return None
+ 
+                 # determine coding density
+-                prodigalParser = ProdigalGeneFeatureParser(gff_file_tmp)
++                prodigalParser = ProdigalGeneFeatureParser(gff_stdout)
+ 
+                 # Skip if no genes were called.
+                 if prodigalParser.n_genes_found() == 0:
+@@ -156,12 +165,11 @@ def _producer(self, genome_file):
+                 best_translation_table), genome_id + '_genes.faa'), aa_gene_file)
+             shutil.copyfile(os.path.join(tmp_dir, str(
+                 best_translation_table), genome_id + '_genes.fna'), nt_gene_file)
+-            shutil.copyfile(os.path.join(tmp_dir, str(
+-                best_translation_table), genome_id + '.gff'), gff_file)
++            with open(gff_file, 'w') as f:
++                f.write(translation_table_gffs[best_translation_table])
+ 
+             # clean up temporary files
+             shutil.rmtree(tmp_dir)
+-
+         return (genome_id, aa_gene_file, nt_gene_file, gff_file, best_translation_table, table_coding_density[4], table_coding_density[11])
+ 
+     def _consumer(self, produced_data, consumer_data):
+@@ -294,20 +302,18 @@ def run(self,
+ class ProdigalGeneFeatureParser():
+     """Parses prodigal gene feature files (GFF) output."""
+ 
+-    def __init__(self, filename):
++    def __init__(self, file_contents):
+         """Initialization.
+ 
+         Parameters
+         ----------
+-        filename : str
+-            GFF file to parse.
++        file_contents : str
++            The contents of the GFF file to parse.
+         """
+-        check_file_exists(filename)
+-
+         self.genes = {}
+         self.last_coding_base = {}
+ 
+-        self.__parseGFF(filename)
++        self.__parseGFF(file_contents)
+ 
+         self.coding_base_masks = {}
+         for seq_id in self.genes:
+@@ -324,7 +330,7 @@ def n_genes_found(self):
+         """
+         return len(self.genes)
+ 
+-    def __parseGFF(self, filename):
++    def __parseGFF(self, file_contents):
+         """Parse genes from GFF file.
+ 
+         Parameters
+@@ -333,7 +339,7 @@ def __parseGFF(self, filename):
+             GFF file to parse.
+         """
+         bGetTranslationTable = True
+-        for line in open(filename):
++        for line in file_contents.splitlines():
+             if bGetTranslationTable and line.startswith('# Model Data'):
+                 data_model_info = line.split(':')[1].strip().split(';')
+                 dict_data_model = {}
+diff --git a/gtdbtk/classify.py b/gtdbtk/classify.py
+index a5d774f5..26ceb235 100644
+--- a/gtdbtk/classify.py
++++ b/gtdbtk/classify.py
+@@ -79,7 +79,7 @@ def place_genomes(self,
+         """Place genomes into reference tree using pplacer."""
+         # rename user MSA file for compatibility with pplacer
+         if not user_msa_file.endswith('.fasta'):
+-            t = os.path.join(out_dir, prefix + '.user_msa.fasta')
++            t = os.path.join(out_dir, Config.INTERMEDIATE_RESULTS, prefix + '.user_msa.fasta')
+             shutil.copyfile(user_msa_file, t)
+             user_msa_file = t
+ 
+@@ -113,7 +113,7 @@ def place_genomes(self,
+                 Config.PPLACER_DIR, Config.PPLACER_RPS23_REF_PKG)
+ 
+         # create pplacer output directory
+-        pplacer_out_dir = os.path.join(out_dir, 'pplacer')
++        pplacer_out_dir = os.path.join(out_dir, Config.INTERMEDIATE_RESULTS, 'pplacer')
+         if not os.path.exists(pplacer_out_dir):
+             os.makedirs(pplacer_out_dir)
+ 
+@@ -185,7 +185,7 @@ def _write_red_dict(self, out_dir, prefix, marker_set_id):
+         """
+ 
+         reddictfile = open(os.path.join(
+-            out_dir, prefix + '.{}.red_dictionary.tsv'.format(marker_set_id)), 'w')
++            out_dir, Config.INTERMEDIATE_RESULTS, prefix + '.{}.red_dictionary.tsv'.format(marker_set_id)), 'w')
+ 
+         marker_dict = {}
+         if marker_set_id == 'bac120':
+@@ -231,7 +231,7 @@ def run(self,
+ 
+             for marker_set_id in ('ar122', 'bac120'):
+                 user_msa_file = os.path.join(
+-                    align_dir, prefix + '.{}.user_msa.fasta'.format(marker_set_id))
++                    align_dir, Config.INTERMEDIATE_RESULTS, prefix + '.{}.user_msa.fasta'.format(marker_set_id))
+                 if not os.path.exists(user_msa_file):
+                         # file will not exist if there are no User genomes from a
+                         # given domain
+@@ -593,7 +593,7 @@ def _get_pplacer_taxonomy(self, out_dir, prefix, marker_set_id, user_msa_file, t
+ 
+         """
+         pplaceout = open(os.path.join(
+-            out_dir, prefix + '.{}.classification_pplacer.tsv'.format(marker_set_id)), 'w')
++            out_dir, Config.INTERMEDIATE_RESULTS, prefix + '.{}.classification_pplacer.tsv'.format(marker_set_id)), 'w')
+ 
+         # We get the pplacer taxonomy for comparison
+ 
+@@ -973,49 +973,45 @@ def _calculate_fastani_distance(self, user_leaf, list_leaf, genomes):
+             self.tmp_output_dir = tempfile.mkdtemp()
+             make_sure_path_exists(self.tmp_output_dir)
+ 
+-            # we write the two input files for fastani, the query file and
+-            # reference file
+-            query_list_file = open(os.path.join(
+-                self.tmp_output_dir, 'query_list.txt'), 'w')
+-            query_list_file.write('{0}\n'.format(
+-                genomes.get(user_leaf.taxon.label)))
+-            query_list_file.close()
+-
+-            ref_list_file = open(os.path.join(
+-                self.tmp_output_dir, 'ref_list.txt'), 'w')
+-            leafnodes = list_leaf.get("potential_g")
+-            for node in leafnodes:
+-                leafnode = node[0]
+-                shortleaf = leafnode.taxon.label
+-                if leafnode.taxon.label.startswith('GB_') or leafnode.taxon.label.startswith('RS_'):
+-                    shortleaf = leafnode.taxon.label[3:]
+-                ref_list_file.write('{}\n'.format(os.path.join(
+-                    Config.FASTANI_GENOMES, shortleaf + Config.FASTANI_GENOMES_EXT)))
+-            ref_list_file.close()
++            # we write the two input files for fastani, the query file and reference file
++            path_query_list = os.path.join(self.tmp_output_dir, 'query_list.txt')
++            with open(path_query_list, 'w') as f:
++                f.write('{0}\n'.format(genomes.get(user_leaf.taxon.label)))
++
++            path_ref_list = os.path.join(self.tmp_output_dir, 'ref_list.txt')
++            with open(path_ref_list, 'w') as f:
++                leafnodes = list_leaf.get("potential_g")
++                for node in leafnodes:
++                    leafnode = node[0]
++                    shortleaf = leafnode.taxon.label
++                    if leafnode.taxon.label.startswith('GB_') or leafnode.taxon.label.startswith('RS_'):
++                        shortleaf = leafnode.taxon.label[3:]
++                    f.write('{}\n'.format(os.path.join(
++                        Config.FASTANI_GENOMES, shortleaf + Config.FASTANI_GENOMES_EXT)))
+ 
+             # run fastANI
+-            if not os.path.isfile(os.path.join(self.tmp_output_dir, 'query_list.txt')) or not os.path.isfile(os.path.join(self.tmp_output_dir, 'ref_list.txt')):
++            if not os.path.isfile(path_query_list) or not os.path.isfile(path_ref_list):
+                 raise
+ 
+-            cmd = 'fastANI --ql {0} --rl {1} -o {2} > /dev/null 2>{3}'.format(os.path.join(self.tmp_output_dir, 'query_list.txt'),
+-                                                                              os.path.join(
+-                                                                                  self.tmp_output_dir, 'ref_list.txt'),
+-                                                                              os.path.join(
+-                                                                                  self.tmp_output_dir, 'results.tab'),
+-                                                                              os.path.join(self.tmp_output_dir, 'error.log'))
++            path_results = os.path.join(self.tmp_output_dir, 'results.tab')
++            path_error = os.path.join(self.tmp_output_dir, 'error.log')
++
++            cmd = 'fastANI --ql {0} --rl {1} -o {2} > /dev/null 2>{3}'.format(path_query_list,
++                                                                              path_ref_list,
++                                                                              path_results,
++                                                                              path_error)
+             os.system(cmd)
+ 
+-            if not os.path.isfile(os.path.join(self.tmp_output_dir, 'results.tab')):
++            if not os.path.isfile(path_results):
+                 errstr = 'FastANI has stopped:\n'
+-                if os.path.isfile(os.path.join(self.tmp_output_dir, 'error.log')):
+-                    with open(os.path.join(self.tmp_output_dir, 'error.log')) as debug:
++                if os.path.isfile(path_error):
++                    with open(path_error) as debug:
+                         for line in debug:
+                             finalline = line
+                         errstr += finalline
+                 raise ValueError(errstr)
+ 
+-            dict_parser_distance = self._parse_fastani_results(
+-                os.path.join(self.tmp_output_dir, 'results.tab'))
++            dict_parser_distance = self._parse_fastani_results(path_results)
+             shutil.rmtree(self.tmp_output_dir)
+             return dict_parser_distance
+ 
+diff --git a/gtdbtk/config/config.py b/gtdbtk/config/config.py
+index 650e8905..7460a32f 100644
+--- a/gtdbtk/config/config.py
++++ b/gtdbtk/config/config.py
+@@ -1,128 +1,131 @@
+-import os
+-import sys
+-import json
+-
+-try:
+-    GENERIC_PATH = os.environ['GTDBTK_DATA_PATH']
+-except KeyError, e:
+-    print "'GTDBTK_DATA_PATH' environment variable is not defined"
+-    sys.exit(1)
+-############################
+-# If all downloaded data is in the same folder
+-# There is no need of editing variable below this point
+-############################
+-
+-
+-TIGRFAM_HMMS = os.path.join(GENERIC_PATH, 'markers/tigrfam/tigrfam.hmm')
+-PFAM_HMM_DIR = os.path.join(GENERIC_PATH, 'markers/pfam/')
+-MSA_FOLDER = os.path.join(GENERIC_PATH, "msa/")
+-MASK_DIR = os.path.join(GENERIC_PATH, "masks/")
+-PPLACER_DIR = os.path.join(GENERIC_PATH, "pplacer/")
+-FASTANI_DIR = os.path.join(GENERIC_PATH, "fastani/")
+-TAX_FOLDER = os.path.join(GENERIC_PATH, "taxonomy/")
+-RADII_DIR = os.path.join(GENERIC_PATH, "radii/")
+-METADATA_DIR = os.path.join(GENERIC_PATH, "metadata/")
+-
+-
+-RED_DIST_BAC_DICT = ''
+-RED_DIST_ARC_DICT = ''
+-VERSION_DATA = ''
+-with open(os.path.join(METADATA_DIR, "metadata.txt")) as metadataData:
+-    for line in metadataData:
+-        try:
+-            line_infos = line.strip().split('=')
+-            if line_infos[0] == 'RED_DIST_BAC_DICT':
+-                RED_DIST_BAC_DICT = json.loads(line_infos[1])
+-            elif line_infos[0] == 'RED_DIST_ARC_DICT':
+-                RED_DIST_ARC_DICT = json.loads(line_infos[1])
+-            elif line_infos[0] == 'VERSION_DATA':
+-                VERSION_DATA = line_infos[1]
+-        except ValueError:
+-            print "Skipping invalid line {0}".format(repr(line))
+-
+-
+-# Relative Evolution Distance
+-RED_MIN_SUPPORT = 0.0
+-RED_MIN_CHILDREN = 2
+-
+-# Marker information
+-
+-
+-BAC120_MARKERS = {"PFAM": ["PF00380.14.hmm", "PF00410.14.hmm", "PF00466.15.hmm", "PF01025.14.hmm", "PF02576.12.hmm", "PF03726.9.hmm"],
+-                  "TIGRFAM": ["TIGR00006.HMM", "TIGR00019.HMM", "TIGR00020.HMM", "TIGR00029.HMM", "TIGR00043.HMM", "TIGR00054.HMM", "TIGR00059.HMM", "TIGR00061.HMM", "TIGR00064.HMM",
+-                              "TIGR00065.HMM", "TIGR00082.HMM", "TIGR00083.HMM", "TIGR00084.HMM", "TIGR00086.HMM", "TIGR00088.HMM", "TIGR00090.HMM", "TIGR00092.HMM", "TIGR00095.HMM",
+-                              "TIGR00115.HMM", "TIGR00116.HMM", "TIGR00138.HMM", "TIGR00158.HMM", "TIGR00166.HMM", "TIGR00168.HMM", "TIGR00186.HMM", "TIGR00194.HMM", "TIGR00250.HMM",
+-                              "TIGR00337.HMM", "TIGR00344.HMM", "TIGR00362.HMM", "TIGR00382.HMM", "TIGR00392.HMM", "TIGR00396.HMM", "TIGR00398.HMM", "TIGR00414.HMM", "TIGR00416.HMM",
+-                              "TIGR00420.HMM", "TIGR00431.HMM", "TIGR00435.HMM", "TIGR00436.HMM", "TIGR00442.HMM", "TIGR00445.HMM", "TIGR00456.HMM", "TIGR00459.HMM", "TIGR00460.HMM",
+-                              "TIGR00468.HMM", "TIGR00472.HMM", "TIGR00487.HMM", "TIGR00496.HMM", "TIGR00539.HMM", "TIGR00580.HMM", "TIGR00593.HMM", "TIGR00615.HMM", "TIGR00631.HMM",
+-                              "TIGR00634.HMM", "TIGR00635.HMM", "TIGR00643.HMM", "TIGR00663.HMM", "TIGR00717.HMM", "TIGR00755.HMM", "TIGR00810.HMM", "TIGR00922.HMM", "TIGR00928.HMM",
+-                              "TIGR00959.HMM", "TIGR00963.HMM", "TIGR00964.HMM", "TIGR00967.HMM", "TIGR01009.HMM", "TIGR01011.HMM", "TIGR01017.HMM", "TIGR01021.HMM", "TIGR01029.HMM",
+-                              "TIGR01032.HMM", "TIGR01039.HMM", "TIGR01044.HMM", "TIGR01059.HMM", "TIGR01063.HMM", "TIGR01066.HMM", "TIGR01071.HMM", "TIGR01079.HMM", "TIGR01082.HMM",
+-                              "TIGR01087.HMM", "TIGR01128.HMM", "TIGR01146.HMM", "TIGR01164.HMM", "TIGR01169.HMM", "TIGR01171.HMM", "TIGR01302.HMM", "TIGR01391.HMM", "TIGR01393.HMM",
+-                              "TIGR01394.HMM", "TIGR01510.HMM", "TIGR01632.HMM", "TIGR01951.HMM", "TIGR01953.HMM", "TIGR02012.HMM", "TIGR02013.HMM", "TIGR02027.HMM", "TIGR02075.HMM",
+-                              "TIGR02191.HMM", "TIGR02273.HMM", "TIGR02350.HMM", "TIGR02386.HMM", "TIGR02397.HMM", "TIGR02432.HMM", "TIGR02729.HMM", "TIGR03263.HMM", "TIGR03594.HMM",
+-                              "TIGR03625.HMM", "TIGR03632.HMM", "TIGR03654.HMM", "TIGR03723.HMM", "TIGR03725.HMM", "TIGR03953.HMM"]}
+-
+-AR122_MARKERS = {"PFAM": ["PF01868.11.hmm", "PF01282.14.hmm", "PF01655.13.hmm", "PF01092.14.hmm", "PF01000.21.hmm", "PF00368.13.hmm", "PF00827.12.hmm", "PF01269.12.hmm", "PF00466.15.hmm",
+-                          "PF01015.13.hmm", "PF13685.1.hmm", "PF02978.14.hmm", "PF04919.7.hmm", "PF01984.15.hmm", "PF04104.9.hmm", "PF00410.14.hmm", "PF01798.13.hmm", "PF01864.12.hmm",
+-                          "PF01990.12.hmm", "PF07541.7.hmm", "PF04019.7.hmm", "PF00900.15.hmm", "PF01090.14.hmm", "PF02006.11.hmm", "PF01157.13.hmm", "PF01191.14.hmm", "PF01866.12.hmm",
+-                          "PF01198.14.hmm", "PF01496.14.hmm", "PF00687.16.hmm", "PF03874.11.hmm", "PF01194.12.hmm", "PF01200.13.hmm", "PF13656.1.hmm", "PF01280.15.hmm"],
+-                 "TIGRFAM": ["TIGR00468.HMM", "TIGR01060.HMM", "TIGR03627.HMM", "TIGR01020.HMM", "TIGR02258.HMM", "TIGR00293.HMM", "TIGR00389.HMM", "TIGR01012.HMM", "TIGR00490.HMM", "TIGR03677.HMM",
+-                             "TIGR03636.HMM", "TIGR03722.HMM", "TIGR00458.HMM", "TIGR00291.HMM", "TIGR00670.HMM", "TIGR00064.HMM", "TIGR03629.HMM", "TIGR00021.HMM", "TIGR03672.HMM", "TIGR00111.HMM",
+-                             "TIGR03684.HMM", "TIGR01077.HMM", "TIGR01213.HMM", "TIGR01080.HMM", "TIGR00501.HMM", "TIGR00729.HMM", "TIGR01038.HMM", "TIGR00270.HMM", "TIGR03628.HMM", "TIGR01028.HMM",
+-                             "TIGR00521.HMM", "TIGR03671.HMM", "TIGR00240.HMM", "TIGR02390.HMM", "TIGR02338.HMM", "TIGR00037.HMM", "TIGR02076.HMM", "TIGR00335.HMM", "TIGR01025.HMM", "TIGR00471.HMM",
+-                             "TIGR00336.HMM", "TIGR00522.HMM", "TIGR02153.HMM", "TIGR02651.HMM", "TIGR03674.HMM", "TIGR00323.HMM", "TIGR00134.HMM", "TIGR02236.HMM", "TIGR03683.HMM", "TIGR00491.HMM",
+-                             "TIGR00658.HMM", "TIGR03680.HMM", "TIGR00392.HMM", "TIGR00422.HMM", "TIGR00279.HMM", "TIGR01052.HMM", "TIGR00442.HMM", "TIGR00308.HMM", "TIGR00398.HMM", "TIGR00456.HMM",
+-                             "TIGR00549.HMM", "TIGR00408.HMM", "TIGR00432.HMM", "TIGR00264.HMM", "TIGR00982.HMM", "TIGR00324.HMM", "TIGR01952.HMM", "TIGR03626.HMM", "TIGR03670.HMM", "TIGR00337.HMM",
+-                             "TIGR01046.HMM", "TIGR01018.HMM", "TIGR00936.HMM", "TIGR00463.HMM", "TIGR01309.HMM", "TIGR03653.HMM", "TIGR00042.HMM", "TIGR02389.HMM", "TIGR00307.HMM", "TIGR03673.HMM",
+-                             "TIGR00373.HMM", "TIGR01008.HMM", "TIGR00283.HMM", "TIGR00425.HMM", "TIGR00405.HMM", "TIGR03665.HMM", "TIGR00448.HMM"]}
+-
+-RPS23_MARKERS = {"PFAM": ["PF00687.16.hmm", "PF00466.15.hmm", "PF00298.14.hmm", "PF03946.9.hmm", "PF00238.14.hmm",
+-                          "PF00252.13.hmm", "PF00861.17.hmm", "PF00181.18.hmm", "PF00237.14.hmm",
+-                          "PF03947.13.hmm", "PF00297.17.hmm", "PF00573.17.hmm", "PF00281.14.hmm",
+-                          "PF00673.16.hmm", "PF00338.17.hmm", "PF00411.14.hmm", "PF00416.17.hmm",
+-                          "PF00312.17.hmm", "PF00366.15.hmm", "PF00203.16.hmm", "PF00189.15.hmm",
+-                          "PF00333.15.hmm", "PF03719.10.hmm", "PF00177.16.hmm", "PF00410.14.hmm",
+-                          "PF00380.14.hmm", "PF00164.20.hmm"],
+-                 "TIGRFAM": []}
+-
+-# Information for Multiple hits markers:
+-DEFAULT_MULTIHIT_THRESHOLD = 10.0
+-
+-# Information for aligning genomes
+-DEFAULT_DOMAIN_THRESHOLD = 10.0
+-AR_MARKER_COUNT = 122
+-BAC_MARKER_COUNT = 120
+-
+-# Annotation folder
+-MARKER_GENE_DIR = "marker_genes"
+-
+-
+-# MSA file names
+-CONCAT_BAC120 = os.path.join(
+-    MSA_FOLDER, "gtdb_" + VERSION_DATA + "_bac120.faa")
+-CONCAT_AR122 = os.path.join(MSA_FOLDER, "gtdb_" + VERSION_DATA + "_ar122.faa")
+-
+-# Taxonomy file name
+-TAXONOMY_FILE = os.path.join(TAX_FOLDER, "gtdb_taxonomy.tsv")
+-
+-# Type Strain radii file
+-RADII_FILE = os.path.join(RADII_DIR, "gtdb_radii.tsv")
+-
+-# Mask file names
+-MASK_BAC120 = "gtdb_" + VERSION_DATA + "_bac120.mask"
+-MASK_AR122 = "gtdb_" + VERSION_DATA + "_ar122.mask"
+-MASK_RPS23 = "gtdb_" + VERSION_DATA + "_rps23.mask"
+-
+-
+-# Pplacer configuration
+-PPLACER_OUT = "pplacer.out"
+-PPLACER_JSON_OUT = "pplacer.json"
+-PPLACER_BAC120_REF_PKG = "gtdb_" + VERSION_DATA + "_bac120.refpkg"
+-PPLACER_AR122_REF_PKG = "gtdb_" + VERSION_DATA + "_ar122.refpkg"
+-PPLACER_RPS23_REF_PKG = "gtdb_" + VERSION_DATA + "_rps23.refpkg"
+-
+-# Fastani configuration
+-FASTANI_SPECIES_THRESHOLD = 95.0
+-FASTANI_GENOMES = os.path.join(FASTANI_DIR, "database/")
+-FASTANI_GENOMES_EXT = "_genomic.fna.gz"
++import os
++import sys
++import json
++
++try:
++    GENERIC_PATH = os.environ['GTDBTK_DATA_PATH']
++except KeyError, e:
++    print "'GTDBTK_DATA_PATH' environment variable is not defined"
++    sys.exit(1)
++############################
++# If all downloaded data is in the same folder
++# There is no need of editing variable below this point
++############################
++
++
++TIGRFAM_HMMS = os.path.join(GENERIC_PATH, 'markers/tigrfam/tigrfam.hmm')
++PFAM_HMM_DIR = os.path.join(GENERIC_PATH, 'markers/pfam/')
++MSA_FOLDER = os.path.join(GENERIC_PATH, "msa/")
++MASK_DIR = os.path.join(GENERIC_PATH, "masks/")
++PPLACER_DIR = os.path.join(GENERIC_PATH, "pplacer/")
++FASTANI_DIR = os.path.join(GENERIC_PATH, "fastani/")
++TAX_FOLDER = os.path.join(GENERIC_PATH, "taxonomy/")
++RADII_DIR = os.path.join(GENERIC_PATH, "radii/")
++METADATA_DIR = os.path.join(GENERIC_PATH, "metadata/")
++
++
++RED_DIST_BAC_DICT = ''
++RED_DIST_ARC_DICT = ''
++VERSION_DATA = ''
++with open(os.path.join(METADATA_DIR, "metadata.txt")) as metadataData:
++    for line in metadataData:
++        try:
++            line_infos = line.strip().split('=')
++            if line_infos[0] == 'RED_DIST_BAC_DICT':
++                RED_DIST_BAC_DICT = json.loads(line_infos[1])
++            elif line_infos[0] == 'RED_DIST_ARC_DICT':
++                RED_DIST_ARC_DICT = json.loads(line_infos[1])
++            elif line_infos[0] == 'VERSION_DATA':
++                VERSION_DATA = line_infos[1]
++        except ValueError:
++            print "Skipping invalid line {0}".format(repr(line))
++
++
++# Relative Evolution Distance
++RED_MIN_SUPPORT = 0.0
++RED_MIN_CHILDREN = 2
++
++# Marker information
++
++
++BAC120_MARKERS = {"PFAM": ["PF00380.14.hmm", "PF00410.14.hmm", "PF00466.15.hmm", "PF01025.14.hmm", "PF02576.12.hmm", "PF03726.9.hmm"],
++                  "TIGRFAM": ["TIGR00006.HMM", "TIGR00019.HMM", "TIGR00020.HMM", "TIGR00029.HMM", "TIGR00043.HMM", "TIGR00054.HMM", "TIGR00059.HMM", "TIGR00061.HMM", "TIGR00064.HMM",
++                              "TIGR00065.HMM", "TIGR00082.HMM", "TIGR00083.HMM", "TIGR00084.HMM", "TIGR00086.HMM", "TIGR00088.HMM", "TIGR00090.HMM", "TIGR00092.HMM", "TIGR00095.HMM",
++                              "TIGR00115.HMM", "TIGR00116.HMM", "TIGR00138.HMM", "TIGR00158.HMM", "TIGR00166.HMM", "TIGR00168.HMM", "TIGR00186.HMM", "TIGR00194.HMM", "TIGR00250.HMM",
++                              "TIGR00337.HMM", "TIGR00344.HMM", "TIGR00362.HMM", "TIGR00382.HMM", "TIGR00392.HMM", "TIGR00396.HMM", "TIGR00398.HMM", "TIGR00414.HMM", "TIGR00416.HMM",
++                              "TIGR00420.HMM", "TIGR00431.HMM", "TIGR00435.HMM", "TIGR00436.HMM", "TIGR00442.HMM", "TIGR00445.HMM", "TIGR00456.HMM", "TIGR00459.HMM", "TIGR00460.HMM",
++                              "TIGR00468.HMM", "TIGR00472.HMM", "TIGR00487.HMM", "TIGR00496.HMM", "TIGR00539.HMM", "TIGR00580.HMM", "TIGR00593.HMM", "TIGR00615.HMM", "TIGR00631.HMM",
++                              "TIGR00634.HMM", "TIGR00635.HMM", "TIGR00643.HMM", "TIGR00663.HMM", "TIGR00717.HMM", "TIGR00755.HMM", "TIGR00810.HMM", "TIGR00922.HMM", "TIGR00928.HMM",
++                              "TIGR00959.HMM", "TIGR00963.HMM", "TIGR00964.HMM", "TIGR00967.HMM", "TIGR01009.HMM", "TIGR01011.HMM", "TIGR01017.HMM", "TIGR01021.HMM", "TIGR01029.HMM",
++                              "TIGR01032.HMM", "TIGR01039.HMM", "TIGR01044.HMM", "TIGR01059.HMM", "TIGR01063.HMM", "TIGR01066.HMM", "TIGR01071.HMM", "TIGR01079.HMM", "TIGR01082.HMM",
++                              "TIGR01087.HMM", "TIGR01128.HMM", "TIGR01146.HMM", "TIGR01164.HMM", "TIGR01169.HMM", "TIGR01171.HMM", "TIGR01302.HMM", "TIGR01391.HMM", "TIGR01393.HMM",
++                              "TIGR01394.HMM", "TIGR01510.HMM", "TIGR01632.HMM", "TIGR01951.HMM", "TIGR01953.HMM", "TIGR02012.HMM", "TIGR02013.HMM", "TIGR02027.HMM", "TIGR02075.HMM",
++                              "TIGR02191.HMM", "TIGR02273.HMM", "TIGR02350.HMM", "TIGR02386.HMM", "TIGR02397.HMM", "TIGR02432.HMM", "TIGR02729.HMM", "TIGR03263.HMM", "TIGR03594.HMM",
++                              "TIGR03625.HMM", "TIGR03632.HMM", "TIGR03654.HMM", "TIGR03723.HMM", "TIGR03725.HMM", "TIGR03953.HMM"]}
++
++AR122_MARKERS = {"PFAM": ["PF01868.11.hmm", "PF01282.14.hmm", "PF01655.13.hmm", "PF01092.14.hmm", "PF01000.21.hmm", "PF00368.13.hmm", "PF00827.12.hmm", "PF01269.12.hmm", "PF00466.15.hmm",
++                          "PF01015.13.hmm", "PF13685.1.hmm", "PF02978.14.hmm", "PF04919.7.hmm", "PF01984.15.hmm", "PF04104.9.hmm", "PF00410.14.hmm", "PF01798.13.hmm", "PF01864.12.hmm",
++                          "PF01990.12.hmm", "PF07541.7.hmm", "PF04019.7.hmm", "PF00900.15.hmm", "PF01090.14.hmm", "PF02006.11.hmm", "PF01157.13.hmm", "PF01191.14.hmm", "PF01866.12.hmm",
++                          "PF01198.14.hmm", "PF01496.14.hmm", "PF00687.16.hmm", "PF03874.11.hmm", "PF01194.12.hmm", "PF01200.13.hmm", "PF13656.1.hmm", "PF01280.15.hmm"],
++                 "TIGRFAM": ["TIGR00468.HMM", "TIGR01060.HMM", "TIGR03627.HMM", "TIGR01020.HMM", "TIGR02258.HMM", "TIGR00293.HMM", "TIGR00389.HMM", "TIGR01012.HMM", "TIGR00490.HMM", "TIGR03677.HMM",
++                             "TIGR03636.HMM", "TIGR03722.HMM", "TIGR00458.HMM", "TIGR00291.HMM", "TIGR00670.HMM", "TIGR00064.HMM", "TIGR03629.HMM", "TIGR00021.HMM", "TIGR03672.HMM", "TIGR00111.HMM",
++                             "TIGR03684.HMM", "TIGR01077.HMM", "TIGR01213.HMM", "TIGR01080.HMM", "TIGR00501.HMM", "TIGR00729.HMM", "TIGR01038.HMM", "TIGR00270.HMM", "TIGR03628.HMM", "TIGR01028.HMM",
++                             "TIGR00521.HMM", "TIGR03671.HMM", "TIGR00240.HMM", "TIGR02390.HMM", "TIGR02338.HMM", "TIGR00037.HMM", "TIGR02076.HMM", "TIGR00335.HMM", "TIGR01025.HMM", "TIGR00471.HMM",
++                             "TIGR00336.HMM", "TIGR00522.HMM", "TIGR02153.HMM", "TIGR02651.HMM", "TIGR03674.HMM", "TIGR00323.HMM", "TIGR00134.HMM", "TIGR02236.HMM", "TIGR03683.HMM", "TIGR00491.HMM",
++                             "TIGR00658.HMM", "TIGR03680.HMM", "TIGR00392.HMM", "TIGR00422.HMM", "TIGR00279.HMM", "TIGR01052.HMM", "TIGR00442.HMM", "TIGR00308.HMM", "TIGR00398.HMM", "TIGR00456.HMM",
++                             "TIGR00549.HMM", "TIGR00408.HMM", "TIGR00432.HMM", "TIGR00264.HMM", "TIGR00982.HMM", "TIGR00324.HMM", "TIGR01952.HMM", "TIGR03626.HMM", "TIGR03670.HMM", "TIGR00337.HMM",
++                             "TIGR01046.HMM", "TIGR01018.HMM", "TIGR00936.HMM", "TIGR00463.HMM", "TIGR01309.HMM", "TIGR03653.HMM", "TIGR00042.HMM", "TIGR02389.HMM", "TIGR00307.HMM", "TIGR03673.HMM",
++                             "TIGR00373.HMM", "TIGR01008.HMM", "TIGR00283.HMM", "TIGR00425.HMM", "TIGR00405.HMM", "TIGR03665.HMM", "TIGR00448.HMM"]}
++
++RPS23_MARKERS = {"PFAM": ["PF00687.16.hmm", "PF00466.15.hmm", "PF00298.14.hmm", "PF03946.9.hmm", "PF00238.14.hmm",
++                          "PF00252.13.hmm", "PF00861.17.hmm", "PF00181.18.hmm", "PF00237.14.hmm",
++                          "PF03947.13.hmm", "PF00297.17.hmm", "PF00573.17.hmm", "PF00281.14.hmm",
++                          "PF00673.16.hmm", "PF00338.17.hmm", "PF00411.14.hmm", "PF00416.17.hmm",
++                          "PF00312.17.hmm", "PF00366.15.hmm", "PF00203.16.hmm", "PF00189.15.hmm",
++                          "PF00333.15.hmm", "PF03719.10.hmm", "PF00177.16.hmm", "PF00410.14.hmm",
++                          "PF00380.14.hmm", "PF00164.20.hmm"],
++                 "TIGRFAM": []}
++
++# Information for Multiple hits markers:
++DEFAULT_MULTIHIT_THRESHOLD = 10.0
++
++# Information for aligning genomes
++DEFAULT_DOMAIN_THRESHOLD = 10.0
++AR_MARKER_COUNT = 122
++BAC_MARKER_COUNT = 120
++
++# Intermediate results folder
++INTERMEDIATE_RESULTS = 'intermediate_results'
++
++# Annotation folder
++MARKER_GENE_DIR = "marker_genes"
++
++
++# MSA file names
++CONCAT_BAC120 = os.path.join(
++    MSA_FOLDER, "gtdb_" + VERSION_DATA + "_bac120.faa")
++CONCAT_AR122 = os.path.join(MSA_FOLDER, "gtdb_" + VERSION_DATA + "_ar122.faa")
++
++# Taxonomy file name
++TAXONOMY_FILE = os.path.join(TAX_FOLDER, "gtdb_taxonomy.tsv")
++
++# Type Strain radii file
++RADII_FILE = os.path.join(RADII_DIR, "gtdb_radii.tsv")
++
++# Mask file names
++MASK_BAC120 = "gtdb_" + VERSION_DATA + "_bac120.mask"
++MASK_AR122 = "gtdb_" + VERSION_DATA + "_ar122.mask"
++MASK_RPS23 = "gtdb_" + VERSION_DATA + "_rps23.mask"
++
++
++# Pplacer configuration
++PPLACER_OUT = "pplacer.out"
++PPLACER_JSON_OUT = "pplacer.json"
++PPLACER_BAC120_REF_PKG = "gtdb_" + VERSION_DATA + "_bac120.refpkg"
++PPLACER_AR122_REF_PKG = "gtdb_" + VERSION_DATA + "_ar122.refpkg"
++PPLACER_RPS23_REF_PKG = "gtdb_" + VERSION_DATA + "_rps23.refpkg"
++
++# Fastani configuration
++FASTANI_SPECIES_THRESHOLD = 95.0
++FASTANI_GENOMES = os.path.join(FASTANI_DIR, "database/")
++FASTANI_GENOMES_EXT = "_genomic.fna.gz"
+diff --git a/gtdbtk/config/config_template.py b/gtdbtk/config/config_template.py
+index 7e5fe4c9..8e6bb9bc 100644
+--- a/gtdbtk/config/config_template.py
++++ b/gtdbtk/config/config_template.py
+@@ -68,6 +68,9 @@
+ AR_MARKER_COUNT = 122
+ BAC_MARKER_COUNT = 120
+ 
++# Intermediate results folder
++INTERMEDIATE_RESULTS = 'intermediate_results'
++
+ # Annotation folder
+ MARKER_GENE_DIR = "marker_genes"
+ 
+diff --git a/gtdbtk/external/pypfam/Scan/PfamScan.py b/gtdbtk/external/pypfam/Scan/PfamScan.py
+index 9ddbbb57..cf5893af 100755
+--- a/gtdbtk/external/pypfam/Scan/PfamScan.py
++++ b/gtdbtk/external/pypfam/Scan/PfamScan.py
+@@ -365,12 +365,15 @@ def search(self):
+             else:
+                 params = ['hmmsearch', '--notextw', ' '.join(hmmscan_cut_off), os.path.join(self._dir, hmmlib), self._fasta]
+ 
++            proc = subprocess.Popen(params, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++            proc_out, proc_err = proc.communicate()
++            proc_out_ascii = proc_out.decode().encode('utf-8')
+ 
+-            run = subprocess.check_output(' '.join(params), shell=True)
++            if proc_err:
++                sys.exit('An error was encountered while running hmmsearch: %s' % proc_err)
+ 
+             self._hmmresultIO = HMMResultsIO()
+-            self._all_results = self._hmmresultIO.parseMultiHMMER3(run)
+-
++            self._all_results = self._hmmresultIO.parseMultiHMMER3(proc_out_ascii)
+             self._all_results = self._convert_results_search_to_scan(self._all_results)
+ 
+             if not re_1.search(hmmlib):
+diff --git a/gtdbtk/main.py b/gtdbtk/main.py
+index f4bf6a8a..e48f9ec3 100644
+--- a/gtdbtk/main.py
++++ b/gtdbtk/main.py
+@@ -197,6 +197,7 @@ def infer(self, options):
+ 
+         if options.cpus > 1:
+             check_dependencies(['FastTreeMP'])
++            os.environ['OMP_NUM_THREADS'] = '%d' % options.cpus
+         else:
+             check_dependencies(['FastTree'])
+ 
+@@ -205,18 +206,18 @@ def infer(self, options):
+ 
+         if hasattr(options, 'suffix'):
+             output_tree = os.path.join(
+-                options.out_dir, options.prefix + options.suffix + '.unrooted.tree')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + options.suffix + '.unrooted.tree')
+             tree_log = os.path.join(
+-                options.out_dir, options.prefix + options.suffix + '.tree.log')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + options.suffix + '.tree.log')
+             fasttree_log = os.path.join(
+-                options.out_dir, options.prefix + options.suffix + '.fasttree.log')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + options.suffix + '.fasttree.log')
+         else:
+             output_tree = os.path.join(
+-                options.out_dir, options.prefix + '.unrooted.tree')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + '.unrooted.tree')
+             tree_log = os.path.join(
+-                options.out_dir, options.prefix + '.tree.log')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + '.tree.log')
+             fasttree_log = os.path.join(
+-                options.out_dir, options.prefix + '.fasttree.log')
++                options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + '.fasttree.log')
+ 
+         if options.prot_model == 'JTT':
+             model_str = ''
+@@ -371,13 +372,13 @@ def parse_options(self, options):
+ 
+             if options.skip_gtdb_refs:
+                 options.msa_file = os.path.join(
+-                    options.out_dir, options.prefix + options.suffix + ".user_msa.fasta")
++                    options.out_dir, Config.INTERMEDIATE_RESULTS, options.prefix + options.suffix + ".user_msa.fasta")
+             else:
+-                options.msa_file = os.path.join(options.out_dir,
++                options.msa_file = os.path.join(options.out_dir, Config.INTERMEDIATE_RESULTS,
+                                                 options.prefix + options.suffix + ".msa.fasta")
+             self.infer(options)
+ 
+-            options.input_tree = os.path.join(options.out_dir,
++            options.input_tree = os.path.join(options.out_dir, Config.INTERMEDIATE_RESULTS,
+                                               options.prefix + options.suffix + ".unrooted.tree")
+             options.output_tree = os.path.join(options.out_dir,
+                                                options.prefix + options.suffix + ".rooted.tree")
+diff --git a/gtdbtk/markers.py b/gtdbtk/markers.py
+index 91b86ed7..8d1f1945 100644
+--- a/gtdbtk/markers.py
++++ b/gtdbtk/markers.py
+@@ -211,7 +211,7 @@ def identify(self,
+ 
+             self.logger.info("Running Prodigal to identify genes.")
+             self.marker_gene_dir = os.path.join(
+-                out_dir, Config.MARKER_GENE_DIR)
++                out_dir, Config.INTERMEDIATE_RESULTS, Config.MARKER_GENE_DIR)
+             prodigal = Prodigal(self.cpus,
+                                 False,
+                                 self.marker_gene_dir,
+@@ -259,7 +259,7 @@ def identify(self,
+     def _path_to_identify_data(self, identity_dir):
+         """Get path to genome data produced by 'identify' command."""
+ 
+-        marker_gene_dir = os.path.join(identity_dir, Config.MARKER_GENE_DIR)
++        marker_gene_dir = os.path.join(identity_dir, Config.INTERMEDIATE_RESULTS, Config.MARKER_GENE_DIR)
+ 
+         genomic_files = {}
+         for gid in os.listdir(marker_gene_dir):
+@@ -427,11 +427,11 @@ def align(self,
+                     identify_dir, prefix + "_ar122_markers_summary.tsv"), out_dir)
+             # write out files with marker information
+             bac120_marker_info_file = os.path.join(
+-                out_dir, prefix + '.bac120.marker_info.tsv')
++                out_dir, Config.INTERMEDIATE_RESULTS, prefix + '.bac120.marker_info.tsv')
+             self._write_marker_info(
+                 Config.BAC120_MARKERS, bac120_marker_info_file)
+             ar122_marker_info_file = os.path.join(
+-                out_dir, prefix + '.ar122.marker_info.tsv')
++                out_dir, Config.INTERMEDIATE_RESULTS, prefix + '.ar122.marker_info.tsv')
+             self._write_marker_info(
+                 Config.AR122_MARKERS, ar122_marker_info_file)
+ 
+@@ -531,7 +531,7 @@ def align(self,
+                             min_perc_aa))
+ 
+                 # write out filtering information
+-                fout = open(os.path.join(out_dir, prefix +
++                fout = open(os.path.join(out_dir, Config.INTERMEDIATE_RESULTS, prefix +
+                                          ".%s.filtered.tsv" % marker_set_id), 'w')
+                 for pruned_seq_id, pruned_seq in pruned_seqs.items():
+                     if len(pruned_seq) == 0:
+@@ -549,7 +549,7 @@ def align(self,
+                     self.logger.info(
+                         'Creating concatenated alignment for %d GTDB and user genomes.' % len(trimmed_seqs))
+                     msa_file = os.path.join(
+-                        out_dir, prefix + ".%s.msa.fasta" % marker_set_id)
++                        out_dir, Config.INTERMEDIATE_RESULTS, prefix + ".%s.msa.fasta" % marker_set_id)
+                     self._write_msa(trimmed_seqs, msa_file, gtdb_taxonomy)
+ 
+                 trimmed_user_msa = {
+@@ -558,7 +558,7 @@ def align(self,
+                     self.logger.info(
+                         'Creating concatenated alignment for %d user genomes.' % len(trimmed_user_msa))
+                     user_msa_file = os.path.join(
+-                        out_dir, prefix + ".%s.user_msa.fasta" % marker_set_id)
++                        out_dir, Config.INTERMEDIATE_RESULTS, prefix + ".%s.user_msa.fasta" % marker_set_id)
+                     self._write_msa(trimmed_user_msa,
+                                     user_msa_file, gtdb_taxonomy)
+                 else:

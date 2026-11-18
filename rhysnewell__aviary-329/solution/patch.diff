@@ -1,0 +1,353 @@
+diff --git a/README.md b/README.md
+index 720533e0..a291e983 100644
+--- a/README.md
++++ b/README.md
+@@ -121,6 +121,57 @@ aviary repository. The advantage of this approach is that locations of the
+ databases are not tracked in the repository, which is advantageous as they are specific to the
+ computing cluster of the user.
+ 
++### Option 4: Apptainer
++
++This image bundles all of Aviary's tool dependencies, so make sure you have
++plenty of free disk space before pulling: Apptainer downloads the compressed
++layers, extracts them to a temporary uncompressed rootfs, and only then
++builds the final `.sif` — transient disk usage during that process can run
++to several tens of GB before it's cleaned up.
++
++```bash
++# 1. Point Apptainer's temp/build dir at real disk, not the default (often small/tmpfs)
++mkdir -p ~/apptainer-tmp
++export TMPDIR=~/apptainer-tmp
++
++# 2. Force HTTP/1.1 — avoids long-stream resets some networks/proxies do to HTTP/2
++export GODEBUG=http2client=0
++
++# 3. Pull the image (retry if it drops mid-transfer — Apptainer caches completed
++#    layers by digest, so a retry only re-fetches what failed)
++apptainer pull aviary_0.13.3.sif docker://ghcr.io/snh-star/aviary:v0.13.3
++
++# 4. Create a REAL, disk-backed overlay directory (not --writable-tmpfs —
++#    that one is RAM-backed, small, and will fail mid-run with "No space left
++#    on device" even with plenty of free disk). Apptainer's .sif filesystem
++#    is read-only, and pixi (Aviary's environment manager) needs somewhere
++#    writable at runtime.
++mkdir -p ~/apptainer-overlay
++
++# 5. Run aviary, attaching your real databases.
++#
++# The image bundles defaults for SINGLEM_METAPACKAGE_PATH, CHECKM2DB, and
++# CHECKM_DATA_PATH already. GTDBTK_DATA_PATH, EGGNOG_DATA_DIR, and
++# METABULI_DB_PATH are NOT bundled (those databases are too large) and must
++# always be supplied — Aviary reads them at startup even for steps you don't
++# run, so omitting them entirely causes a crash rather than a graceful
++# default. If you don't need one of these steps, pass a placeholder (e.g.
++# /tmp) instead of a real mount and use the matching skip flag where one
++# exists (e.g. --skip-taxonomy for GTDB-Tk).
++apptainer run \
++  --overlay ~/apptainer-overlay:rw \
++  --cleanenv \
++  -B "$PWD":"$PWD" \
++  -B /path/to/host/gtdbtk_data:/db/gtdb:ro \
++  -B /path/to/host/eggnog_data:/db/eggnog:ro \
++  -B /path/to/host/metabuli_data:/db/metabuli:ro \
++  --env GTDBTK_DATA_PATH=/db/gtdb \
++  --env EGGNOG_DATA_DIR=/db/eggnog \
++  --env METABULI_DB_PATH=/db/metabuli \
++  aviary_0.13.3.sif \
++  <aviary-subcommand-and-args>
++```
++
+ ## Checking installation
+ 
+ Whatever option you choose, running `aviary --help` should return the following
+diff --git a/aviary/version.py b/aviary/version.py
+index 27fb432a..3956cea4 100644
+--- a/aviary/version.py
++++ b/aviary/version.py
+@@ -18,7 +18,7 @@
+ commit_id: str | None
+ __commit_id__: str | None
+ 
+-__version__ = version = '0.13.2'
+-__version_tuple__ = version_tuple = (0, 13, 2)
++__version__ = version = '0.13.3'
++__version_tuple__ = version_tuple = (0, 13, 3)
+ 
+-__commit_id__ = commit_id = 'g775e23b40'
++__commit_id__ = commit_id = None
+diff --git a/docker/Dockerfile.in b/docker/Dockerfile.in
+index 6353818a..47448fca 100644
+--- a/docker/Dockerfile.in
++++ b/docker/Dockerfile.in
+@@ -1,11 +1,8 @@
+ # Use a lightweight base image
+ FROM debian:bullseye-slim
+-
+ # This dockerfile uses cached mounts, so to build use e.g.
+ # $ DOCKER_BUILDKIT=1 docker build .
+-
+ WORKDIR /aviary
+-
+ # Install dependencies
+ RUN apt-get update && apt-get install -y \
+     curl \
+@@ -14,58 +11,74 @@ RUN apt-get update && apt-get install -y \
+     man-db \
+     unzip \
+     && rm -rf /var/lib/apt/lists/*
+-
+ # Install Pixi (via install script)
+ RUN curl -fsSL https://pixi.sh/install.sh | bash
+-
+ # Add Pixi to PATH
+ ENV PATH="/root/.pixi/bin:${PATH}"
+ ENV PYTHONNOUSERSITE=1
+-
+ # re-add the first line when setup here - the second line enables running from arbitrary commits rather than a tag
+ RUN git clone https://github.com/rhysnewell/aviary . && git checkout vAVIARY_VERSION
+ # RUN git clone https://github.com/rhysnewell/aviary . && git checkout AVIARY_VERSION
+-
+ # We install through pip, because installing via pip install -e . causes issues for apptainer
+ # https://github.com/prefix-dev/pixi/issues/1387
+-RUN pixi run --frozen bash -c 'pip install aviary-genome==AVIARY_VERSION'
+-
++# bird-tool-utils is installed explicitly here because it is a missing pip dependency
++# that otherwise causes downstream failures
++RUN rm -rf .pixi && pixi run --frozen bash -c 'pip install aviary-genome==AVIARY_VERSION bird-tool-utils'
+ # Build all non-GPU pixi environments. Aviary workflows invoke these at runtime.
+ RUN pixi run --frozen aviary build
++# Download core databases (SingleM, CheckM2, and CheckM v1).
++# GTDB-Tk, EggNOG, and Metabuli are not included due to their size (~140GB combined).
++# Mount those databases at runtime with -v and pass their paths via --gtdb-path,
++# --eggnog-db-path, and --metabuli-db-path, or set the corresponding env vars.
++RUN mkdir -p /db/singlem && \
++    for i in $(seq 1 15); do \
++        pixi run --frozen -e singlem singlem data --output-directory /db/singlem && break || \
++        (echo "singlem data download failed (attempt $i), retrying in 10s..." && sleep 10); \
++    done && \
++    [ -n "$(ls -A /db/singlem 2>/dev/null)" ]
+ 
+-# Database paths are intentionally runtime-configurable. The databases are very
+-# large, so the default image is software-only and users can mount shared DB
+-# directories with -v and override these environment variables.
+-ENV GTDBTK_DATA_PATH=/db/gtdb \
+-    EGGNOG_DATA_DIR=/db/eggnog \
+-    SINGLEM_METAPACKAGE_PATH=/db/singlem/singlem.smpkg \
+-    CHECKM2DB=/db/checkm2/uniref100.KO.1.dmnd \
+-    METABULI_DB_PATH=/db/metabuli \
+-    TMPDIR=/tmp
++RUN mkdir -p /db/checkm2 && \
++    for i in 1 2 3 4 5; do \
++        pixi run --frozen -e checkm2 checkm2 database --download --path /db/checkm2 && break || \
++        (echo "checkm2 database download failed (attempt $i), retrying in 15s..." && rm -rf /db/checkm2/* && sleep 15); \
++    done && \
++    [ -n "$(ls -A /db/checkm2 2>/dev/null)" ] && \
++    mv /db/checkm2/CheckM2_database/*.dmnd /db/checkm2/
+ 
++RUN mkdir -p /db/checkm && \
++    for i in 1 2 3 4 5; do \
++        curl -fSL -C - https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz -o /tmp/checkm.tar.gz && break || \
++        (echo "checkm download failed (attempt $i), retrying in 15s..." && sleep 15); \
++    done && \
++    tar -xzf /tmp/checkm.tar.gz -C /db/checkm && \
++    rm /tmp/checkm.tar.gz
++
++ENV SINGLEM_METAPACKAGE_PATH=/db/singlem \
++    CHECKM2DB=/db/checkm2 \
++    CHECKM_DATA_PATH=/db/checkm/2015_01_16_v2 \
++    TMPDIR=/tmp
+ # Run some tests
+ RUN pixi run --frozen aviary --version
+ RUN pixi run --frozen aviary --help
+-
+ # # Remove all the build dependencies / image layers for a smaller image overall
+ FROM scratch
+ COPY --from=0 / /
+-
+-WORKDIR /data
++# WORKDIR is set to / (not /aviary) here to avoid pixi resolving the project root
++# ambiguously against the /aviary directory copied in from stage 0, which was
++# previously causing the shell-hook path to double up (/aviary/aviary/.pixi/)
++WORKDIR /
+ # Add Pixi to PATH
+ ENV PATH="/root/.pixi/bin:${PATH}"
+ ENV PYTHONNOUSERSITE=1
+-ENV GTDBTK_DATA_PATH=/db/gtdb \
+-    EGGNOG_DATA_DIR=/db/eggnog \
+-    SINGLEM_METAPACKAGE_PATH=/db/singlem/singlem.smpkg \
+-    CHECKM2DB=/db/checkm2/uniref100.KO.1.dmnd \
+-    METABULI_DB_PATH=/db/metabuli \
++ENV SINGLEM_METAPACKAGE_PATH=/db/singlem \
++    CHECKM2DB=/db/checkm2 \
++    CHECKM_DATA_PATH=/db/checkm/2015_01_16_v2 \
+     TMPDIR=/tmp
+-
+-RUN pixi shell-hook --frozen --no-install --manifest-path /aviary/pixi.toml | grep -v set_env_vars.sh >> /run_via_pixi.profile
++# cd into /aviary explicitly for the shell-hook call so the project root resolves correctly
++RUN cd /aviary && pixi shell-hook --frozen --no-install | grep -v set_env_vars.sh >> /run_via_pixi.profile
+ RUN echo 'source /run_via_pixi.profile' > /run_via_pixi.bash
+ RUN echo 'exec "$@"' >> /run_via_pixi.bash
+ RUN chmod +x /run_via_pixi.bash
+-
++WORKDIR /data
+ CMD ["--help"]
+-ENTRYPOINT ["bash", "/run_via_pixi.bash", "aviary"]
++ENTRYPOINT ["bash", "/run_via_pixi.bash", "aviary"]
+\ No newline at end of file
+diff --git a/docker/Dockerfile.sh b/docker/Dockerfile.sh
+new file mode 100644
+index 00000000..a1f1e405
+--- /dev/null
++++ b/docker/Dockerfile.sh
+@@ -0,0 +1,69 @@
++# Use a lightweight base image
++FROM debian:bullseye-slim
++# This dockerfile uses cached mounts, so to build use e.g.
++# $ DOCKER_BUILDKIT=1 docker build .
++WORKDIR /aviary
++# Install dependencies
++RUN apt-get update && apt-get install -y \
++    curl \
++    ca-certificates \
++    git \
++    man-db \
++    unzip \
++    && rm -rf /var/lib/apt/lists/*
++# Install Pixi (via install script)
++RUN curl -fsSL https://pixi.sh/install.sh | bash
++# Add Pixi to PATH
++ENV PATH="/root/.pixi/bin:${PATH}"
++ENV PYTHONNOUSERSITE=1
++# re-add the first line when setup here - the second line enables running from arbitrary commits rather than a tag
++RUN git clone https://github.com/rhysnewell/aviary . && git checkout v0.13.2
++# RUN git clone https://github.com/rhysnewell/aviary . && git checkout 0.13.2
++# We install through pip, because installing via pip install -e . causes issues for apptainer
++# https://github.com/prefix-dev/pixi/issues/1387
++# bird-tool-utils is installed explicitly here because it is a missing pip dependency
++# that otherwise causes downstream failures
++RUN rm -rf .pixi && pixi run --frozen bash -c 'pip install aviary-genome==0.13.2 bird-tool-utils'
++# Build all non-GPU pixi environments. Aviary workflows invoke these at runtime.
++RUN pixi run --frozen aviary build
++# Download core databases (SingleM, CheckM2, and CheckM v1).
++# GTDB-Tk, EggNOG, and Metabuli are not included due to their size (~140GB combined).
++# Mount those databases at runtime with -v and pass their paths via --gtdb-path,
++# --eggnog-db-path, and --metabuli-db-path, or set the corresponding env vars.
++RUN mkdir -p /db/singlem /db/checkm2 && \
++    pixi run --frozen -e singlem singlem data --output-directory /db/singlem && \
++    pixi run --frozen -e checkm2 checkm2 database --download --path /db/checkm2 && \
++    mv /db/checkm2/CheckM2_database/*.dmnd /db/checkm2/
++RUN mkdir -p /db/checkm && \
++    curl -fsSL https://data.ace.uq.edu.au/public/CheckM_databases/checkm_data_2015_01_16.tar.gz -o /tmp/checkm.tar.gz && \
++    tar -xzf /tmp/checkm.tar.gz -C /db/checkm && \
++    rm /tmp/checkm.tar.gz
++ENV SINGLEM_METAPACKAGE_PATH=/db/singlem \
++    CHECKM2DB=/db/checkm2 \
++    CHECKM_DATA_PATH=/db/checkm/2015_01_16_v2 \
++    TMPDIR=/tmp
++# Run some tests
++RUN pixi run --frozen aviary --version
++RUN pixi run --frozen aviary --help
++# # Remove all the build dependencies / image layers for a smaller image overall
++FROM scratch
++COPY --from=0 / /
++# WORKDIR is set to / (not /aviary) here to avoid pixi resolving the project root
++# ambiguously against the /aviary directory copied in from stage 0, which was
++# previously causing the shell-hook path to double up (/aviary/aviary/.pixi/)
++WORKDIR /
++# Add Pixi to PATH
++ENV PATH="/root/.pixi/bin:${PATH}"
++ENV PYTHONNOUSERSITE=1
++ENV SINGLEM_METAPACKAGE_PATH=/db/singlem \
++    CHECKM2DB=/db/checkm2 \
++    CHECKM_DATA_PATH=/db/checkm/2015_01_16_v2 \
++    TMPDIR=/tmp
++# cd into /aviary explicitly for the shell-hook call so the project root resolves correctly
++RUN cd /aviary && pixi shell-hook --frozen --no-install | grep -v set_env_vars.sh >> /run_via_pixi.profile
++RUN echo 'source /run_via_pixi.profile' > /run_via_pixi.bash
++RUN echo 'exec "$@"' >> /run_via_pixi.bash
++RUN chmod +x /run_via_pixi.bash
++WORKDIR /data
++CMD ["--help"]
++ENTRYPOINT ["bash", "/run_via_pixi.bash", "aviary"]
+\ No newline at end of file
+diff --git a/docker/build.sh b/docker/build.sh
+index bda7152f..562bcb78 100755
+--- a/docker/build.sh
++++ b/docker/build.sh
+@@ -1,4 +1,14 @@
+ #!/bin/bash -eo pipefail
++# The -eo pipefail above only takes effect when this script is run directly
++# as ./build.sh. If invoked as `bash ./build.sh` (e.g. via `pixi run bash
++# ./build.sh`), the shebang's flags are ignored by bash, so we set them
++# explicitly here too. We ALSO check exit codes explicitly below rather than
++# relying solely on set -e propagating through chained/multi-line commands,
++# since that chaining has proven unreliable here (e.g. under pixi run
++# wrapping, or if the build is cancelled mid-way) - this guarantees the
++# "Seems good" success message can never print unless every step actually
++# succeeded.
++set -eo pipefail
+ 
+ # To execute this script, ensure the version tag has been pushed to GitHub. Then:
+ #   pixi run bash ./build.sh
+@@ -7,24 +17,52 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ cd "$SCRIPT_DIR"
+ 
+ export AVIARY_VERSION=`aviary --version | awk '{print $NF}'`
+-export AVIARY_DOCKER_VERSION=wwood/aviary:$AVIARY_VERSION
++export AVIARY_DOCKER_VERSION=ghcr.io/snh-star/aviary:$AVIARY_VERSION
++
++fail() {
++    echo "" >&2
++    echo "BUILD FAILED: $1" >&2
++    echo "No tags were applied and nothing needs to be pushed." >&2
++    exit 1
++}
+ 
+ # Download test reads if not already present
+ if [ ! -f wgsim.1.fq.gz ]; then
+-    wget --quiet https://github.com/rhysnewell/aviary/raw/main/test/data/wgsim.1.fq.gz
++    curl -fsSL -o wgsim.1.fq.gz https://github.com/rhysnewell/aviary/raw/main/test/data/wgsim.1.fq.gz \
++        || fail "could not download wgsim.1.fq.gz"
+ fi
+ if [ ! -f wgsim.2.fq.gz ]; then
+-    wget --quiet https://github.com/rhysnewell/aviary/raw/main/test/data/wgsim.2.fq.gz
++    curl -fsSL -o wgsim.2.fq.gz https://github.com/rhysnewell/aviary/raw/main/test/data/wgsim.2.fq.gz \
++        || fail "could not download wgsim.2.fq.gz"
+ fi
+ 
+-sed "s/AVIARY_VERSION/$AVIARY_VERSION/g" Dockerfile.in > Dockerfile && \
+-DOCKER_BUILDKIT=1 docker build -t $AVIARY_DOCKER_VERSION . && \
+-docker run --rm -v `pwd`:`pwd` $AVIARY_DOCKER_VERSION assemble \
++sed "s/AVIARY_VERSION/$AVIARY_VERSION/g" Dockerfile.in > Dockerfile \
++    || fail "sed substitution into Dockerfile failed"
++
++DOCKER_BUILDKIT=1 docker build -t $AVIARY_DOCKER_VERSION . \
++    || fail "docker build did not complete successfully"
++
++docker run --rm \
++    -e GTDBTK_DATA_PATH=/tmp \
++    -e EGGNOG_DATA_DIR=/tmp \
++    -e METABULI_DB_PATH=/tmp \
++    -v `pwd`:`pwd` $AVIARY_DOCKER_VERSION assemble \
+     -1 `pwd`/wgsim.1.fq.gz \
+     -2 `pwd`/wgsim.2.fq.gz \
+     --use-megahit \
+     --skip-qc \
+     -o `pwd`/aviary_docker_test_out \
+-    -n 4 -t 4
++    -n 4 -t 4 \
++    || fail "test run (aviary assemble inside the built image) did not complete successfully"
++
++# Only reachable if build AND test run both genuinely succeeded.
++docker tag $AVIARY_DOCKER_VERSION ghcr.io/snh-star/aviary:v$AVIARY_VERSION \
++    || fail "docker tag (v$AVIARY_VERSION) failed"
++docker tag $AVIARY_DOCKER_VERSION ghcr.io/snh-star/aviary:latest \
++    || fail "docker tag (latest) failed"
+ 
+-echo "Seems good - now you just need to 'docker push $AVIARY_DOCKER_VERSION' to upload the image to Docker Hub"
++echo ""
++echo "Build and test run both succeeded - now you just need to:"
++echo "  docker push $AVIARY_DOCKER_VERSION"
++echo "  docker push ghcr.io/snh-star/aviary:v$AVIARY_VERSION"
++echo "  docker push ghcr.io/snh-star/aviary:latest"
+\ No newline at end of file

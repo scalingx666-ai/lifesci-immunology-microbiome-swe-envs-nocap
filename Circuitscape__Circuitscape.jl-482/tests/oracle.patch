@@ -1,0 +1,158 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index a3aa903e..ef0aae61 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -210,7 +210,7 @@ Set `log_transform_maps = True` to apply a log10 transform to current densities
+ 
+ ### Set Focal Node Currents to Zero
+ 
+-When `set_focal_node_currents_to_zero = True`, focal nodes will have zero current in output maps when they are activated. For pairwise mode, cumulative maps will still show currents flowing through focal regions from other pairs being activated. This helps show the importance of each focal region for connecting others (see Dickson et al. 2013). *Note: not yet implemented in Circuitscape 5.*
++When `set_focal_node_currents_to_zero = True`, focal nodes have zero current in raster current maps when they are activated. For pairwise mode, cumulative maps will still show currents flowing through focal regions from other pairs being activated. This helps show the importance of each focal region for connecting others (see Dickson et al. 2013). In one-to-all and all-to-one modes every focal node is active on each solve, so all focal cells are zeroed. Applies to raster current maps; network node currents are unaffected.
+ 
+ ## Optional Input Files
+ 
+diff --git a/src/out.jl b/src/out.jl
+index 9e4785ce..c9181fae 100644
+--- a/src/out.jl
++++ b/src/out.jl
+@@ -7,6 +7,7 @@ struct OutputFlags
+     set_null_voltages_to_nodata::Bool
+     compress_grids::Bool
+     log_transform_maps::Bool
++    set_focal_node_currents_to_zero::Bool
+ end
+ 
+ function compute_3col(resistances::Matrix{T}) where {T}
+@@ -92,6 +93,14 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+         cum_curr = output.cum.cum_curr
+         max_curr = output.cum.max_curr
+ 
++        # Issue 342: with set_focal_node_currents_to_zero the two focal nodes
++        # being solved carry no current in this pair's map, so the cumulative
++        # map shows only current that flows *through* a focal region when
++        # other pairs are active (Dickson et al. 2013).
++        if flags.outputflags.set_focal_node_currents_to_zero
++            zero_focal_cells!(cmap, nodemap, output.comp_idx)
++        end
++
+         # Process the current map
+         process_grid!(cmap, cellmap, hbmeta, log_transform = log_transform,
+                             set_null_to_nodata = set_null_currents_to_nodata)
+@@ -114,6 +123,15 @@ function write_cur_maps(name, output, component_data, finitegrounds, flags, cfg)
+    end
+ end
+ 
++# Zero every cell of `cmap` whose local node index is one of `nodes`. Focal
++# regions collapse to a single node, so this clears the whole region.
++function zero_focal_cells!(cmap, nodemap, nodes)
++    @inbounds for k in eachindex(nodemap)
++        nodemap[k] in nodes && (cmap[k] = 0)
++    end
++    cmap
++end
++
+ function write_currents(node_curr_arr, branch_curr_arr, name, cfg)
+     pref = split(cfg.output_file, ".out")[1]
+     # 1e-6 because we guarantee only 6 digits of precision on solve
+diff --git a/src/raster/advanced.jl b/src/raster/advanced.jl
+index 114d50f9..8e1d5b6f 100644
+--- a/src/raster/advanced.jl
++++ b/src/raster/advanced.jl
+@@ -229,6 +229,14 @@ function advanced_kernel(prob::AdvancedProblem{T,V,S}, flags, cfg)::Tuple{Matrix
+         end
+     end
+ 
++    # Issue 342: in one-to-all / all-to-one every focal node is active on each
++    # solve (one as source, the rest as grounds), so all of them are zeroed.
++    if is_raster && (is_onetoall || is_alltoone) &&
++            flags.outputflags.set_focal_node_currents_to_zero
++        active = V[n for n in eachindex(sources) if sources[n] != 0 || grounds[n] != 0]
++        zero_focal_cells!(outcurr, nodemap, Set(active))
++    end
++
+     if write_c_maps || write_cum_cur_map_only
+         if !is_raster
+             write_cur_maps(name, voltages, FullGraph(G, cellmap), finitegrounds, flags, cfg)
+diff --git a/src/utils.jl b/src/utils.jl
+index 2f57d85d..10cea1e1 100644
+--- a/src/utils.jl
++++ b/src/utils.jl
+@@ -34,7 +34,8 @@ function get_output_flags(cfg)
+     OutputFlags(cfg.write_volt_maps, cfg.write_cur_maps,
+                 cfg.write_cum_cur_map_only, cfg.write_max_cur_maps,
+                 cfg.set_null_currents_to_nodata, cfg.set_null_voltages_to_nodata,
+-                cfg.compress_grids, cfg.log_transform_maps)
++                cfg.compress_grids, cfg.log_transform_maps,
++                cfg.set_focal_node_currents_to_zero)
+ end
+ 
+ 
+@@ -185,7 +186,7 @@ function compute_omniscape_current(
+     # Generate advanced data
+     o = OutputFlags(
+         false, false, false, false,
+-        false, false, false, false
++        false, false, false, false, false
+     )
+ 
+     cfg = CSConfig(cs_cfg)
+diff --git a/test/internal.jl b/test/internal.jl
+index 8ca0c016..16e8b0a2 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -280,3 +280,55 @@ end
+     d = copy(good); d["max_parallel"] = "4"
+     @test Circuitscape.CSConfig(d) isa Circuitscape.CSConfig
+ end
++
++# Issue 342: set_focal_node_currents_to_zero
++@testset "set_focal_node_currents_to_zero (#342)" begin
++    dir = mktempdir()
++    hdr = "ncols 5\nnrows 5\nxllcorner 0\nyllcorner 0\ncellsize 1\nNODATA_value -9999\n"
++    write(joinpath(dir, "cell.asc"), hdr * join(fill(join(fill("1", 5), " "), 5), "\n") * "\n")
++    # Node 1 is a two-cell region; nodes 2 and 3 are single cells.
++    write(joinpath(dir, "pts.asc"), hdr *
++          "1 1 0 0 2\n0 0 0 0 0\n0 0 0 0 0\n0 0 0 0 0\n3 0 0 0 0\n")
++    focal = [(1,1), (1,2), (1,5), (5,1)]
++    d = Circuitscape.init_config()
++    d["data_type"] = "raster"; d["scenario"] = "pairwise"
++    d["habitat_file"] = joinpath(dir, "cell.asc")
++    d["point_file"] = joinpath(dir, "pts.asc")
++    d["connect_four_neighbors_only"] = "True"
++    d["write_cur_maps"] = "True"
++    read_map(name) = readdlm(joinpath(dir, name), skipstart = 6)
++
++    d["output_file"] = joinpath(dir, "plain.out")
++    r_plain = compute(d)
++    plain_pair = read_map("plain_curmap_1_2.asc")
++    plain_cum = read_map("plain_cum_curmap.asc")
++    @test all(plain_pair[i, j] > 0 for (i, j) in focal[1:3])
++
++    d["set_focal_node_currents_to_zero"] = "True"
++    d["output_file"] = joinpath(dir, "zeroed.out")
++    r_zero = compute(d)
++    zero_pair = read_map("zeroed_curmap_1_2.asc")
++    zero_cum = read_map("zeroed_cum_curmap.asc")
++
++    # Resistances are unaffected; only the maps change
++    @test r_zero ≈ r_plain
++    # The active pair (region 1, node 2) is zeroed; node 3 was not active
++    @test all(zero_pair[i, j] == 0 for (i, j) in focal[1:3])
++    @test zero_pair[5, 1] == plain_pair[5, 1]
++    # Everything else is identical
++    mask = trues(5, 5); for (i, j) in focal[1:3]; mask[i, j] = false; end
++    @test zero_pair[mask] ≈ plain_pair[mask]
++    # Every focal cell is active in some pair, so the cumulative map is
++    # strictly smaller there and identical elsewhere
++    @test all(zero_cum[i, j] < plain_cum[i, j] for (i, j) in focal)
++    mask = trues(5, 5); for (i, j) in focal; mask[i, j] = false; end
++    @test zero_cum[mask] ≈ plain_cum[mask]
++
++    # One-to-all: all focal cells are zeroed in the cumulative map
++    d["scenario"] = "one-to-all"
++    d["output_file"] = joinpath(dir, "ota.out")
++    compute(d)
++    ota_cum = read_map("ota_cum_curmap.asc")
++    @test all(ota_cum[i, j] == 0 for (i, j) in focal)
++    @test any(ota_cum .> 0)
++end

@@ -1,0 +1,483 @@
+diff --git a/docs/src/options.md b/docs/src/options.md
+index b726191d..65d9f213 100644
+--- a/docs/src/options.md
++++ b/docs/src/options.md
+@@ -158,7 +158,7 @@ The resistance file (`habitat_file`) specifies the ability of each cell in a lan
+ 
+ Most users code their data in terms of resistances (with higher values denoting greater resistance to movement). Set `habitat_map_is_resistances = False` to specify conductances instead (conductance is the reciprocal of resistance; higher values indicate greater ease of movement).
+ 
+-Zero and infinite values for conductances and resistances represent special cases. Infinite resistances are coded as NODATA values in input resistance grids, or as zero or NODATA in input conductance grids; these are treated as complete barriers and are disconnected from all other cells. For raster analyses, cells with zero resistance (infinite conductance) can be specified using a separate short-circuit region file as described below.
++Zero and infinite values for conductances and resistances represent special cases. Infinite resistances are coded as NODATA values in input resistance grids, or as zero or NODATA in input conductance grids; these are treated as complete barriers and are disconnected from all other cells. Negative values, which have no physical meaning, are treated the same way (as NODATA), and a warning reports how many cells were affected. For raster analyses, cells with zero resistance (infinite conductance) can be specified using a separate short-circuit region file as described below.
+ 
+ ## Focal Nodes (Pairwise, One-to-All, and All-to-One Modes)
+ 
+@@ -257,7 +257,7 @@ Set `use_mask = True` and provide `mask_file` to apply a raster mask. Cells with
+ 
+ ### Short-Circuit Region Map
+ 
+-Set `use_polygons = True` and provide `polygon_file` to load short-circuit regions. These act as areas of zero resistance, providing patches through which current gets a "free ride." Each region should have a unique positive integer identifier; cells within each region are merged into a single node, including non-adjacent cells (regions need not be contiguous). Non-region areas should be stored as NODATA values. The file must have the same cell size and extent as the resistance grid.
++Set `use_polygons = True` and provide `polygon_file` to load short-circuit regions. These act as areas of zero resistance, providing patches through which current gets a "free ride." Each region should have a unique positive integer identifier; cells within each region are merged into a single node, including non-adjacent cells (regions need not be contiguous). Non-region areas should be stored as NODATA values. A region may cover NODATA cells of the resistance grid: those cells become part of the region's node, but, being barriers, they are not connected to their neighbouring cells, so current enters and leaves the region only through its cells with finite resistance. The file must have the same cell size and extent as the resistance grid.
+ 
+ ### Variable Source Strengths
+ 
+diff --git a/src/io.jl b/src/io.jl
+index 754f9ca7..7b4f582a 100644
+--- a/src/io.jl
++++ b/src/io.jl
+@@ -142,6 +142,17 @@ function read_cellmap(habitat_file::String, is_res::Bool, ::Type{T};
+         copyto!(gmap, cell_map)
+         gmap[ind] .= 0
+     end
++    # Negative values (resistance or conductance) are not meaningful; like
++    # Circuitscape 4 (csio.py), treat them as null cells. They were already
++    # left out of the node map, but a polygon over one linked it with a
++    # negative weight, and null-to-nodata output did not cover it. Warn rather
++    # than throw: such cells are usually an undeclared NODATA code, and
++    # existing runs keep their results.
++    nneg = count(x -> x < 0, gmap)
++    if nneg > 0
++        @warn("$nneg cell(s) of the habitat map have negative values (other than NODATA); they are treated as NODATA (infinite resistance).")
++        map!(x -> x < 0 ? zero(T) : x, gmap, gmap)
++    end
+     gmap, rastermeta
+ end
+ 
+diff --git a/src/raster/graph.jl b/src/raster/graph.jl
+index 96f32889..3686c4b8 100644
+--- a/src/raster/graph.jl
++++ b/src/raster/graph.jl
+@@ -52,9 +52,10 @@ end
+     construct_graph(gmap, nodemap, avg_res, four_neighbors)
+ 
+ Build the symmetric weighted adjacency matrix of the raster graph. Every
+-non-zero cell of `nodemap` is a node; each node is connected to its right and
+-lower neighbours (and, unless `four_neighbors`, to its two right-hand diagonal
+-neighbours). Edge weights are the conductance between the two cells, averaged
++non-zero cell of `nodemap` is a node; each cell with positive conductance is
++connected to its right and lower neighbours (and, unless `four_neighbors`, to
++its two right-hand diagonal neighbours) that also have positive conductance,
++so a nodata cell of a polygon belongs to the polygon's node but has no edges. Edge weights are the conductance between the two cells, averaged
+ either as resistances (`avg_res`) or as conductances.
+ 
+ Edges are counted in a first pass so that the COO buffers can be allocated
+@@ -71,7 +72,7 @@ function construct_graph(gmap, nodemap::Matrix{S}, avg_res, four_neighbors) wher
+     size(nodemap) == (nrows, ncols) ||
+         throw(DimensionMismatch("gmap is $(size(gmap)) but nodemap is $(size(nodemap))"))
+ 
+-    nedges = count_graph_edges(nodemap, four_neighbors)
++    nedges = count_graph_edges(gmap, nodemap, four_neighbors)
+ 
+     I = Vector{S}(undef, 2nedges)
+     J = Vector{S}(undef, 2nedges)
+@@ -80,27 +81,27 @@ function construct_graph(gmap, nodemap::Matrix{S}, avg_res, four_neighbors) wher
+     k = 0
+     @inbounds for j = 1:ncols
+         for i = 1:nrows
++            _linked(gmap, nodemap, i, j) || continue
+             n = nodemap[i,j]
+-            n == 0 && continue
+             g = gmap[i,j]
+ 
+             # Horizontal neighbour
+-            if j != ncols && nodemap[i,j+1] != 0
++            if j != ncols && _linked(gmap, nodemap, i, j+1)
+                 k = _emit_edge!(I, J, V, k, n, nodemap[i,j+1], f1(g, gmap[i,j+1]))
+             end
+ 
+             # Vertical neighbour
+-            if i != nrows && nodemap[i+1,j] != 0
++            if i != nrows && _linked(gmap, nodemap, i+1, j)
+                 k = _emit_edge!(I, J, V, k, n, nodemap[i+1,j], f1(g, gmap[i+1,j]))
+             end
+ 
+             if !four_neighbors
+                 # Diagonal neighbours
+-                if i != nrows && j != ncols && nodemap[i+1,j+1] != 0
++                if i != nrows && j != ncols && _linked(gmap, nodemap, i+1, j+1)
+                     k = _emit_edge!(I, J, V, k, n, nodemap[i+1,j+1], f2(g, gmap[i+1,j+1]))
+                 end
+ 
+-                if i != 1 && j != ncols && nodemap[i-1,j+1] != 0
++                if i != 1 && j != ncols && _linked(gmap, nodemap, i-1, j+1)
+                     k = _emit_edge!(I, J, V, k, n, nodemap[i-1,j+1], f2(g, gmap[i-1,j+1]))
+                 end
+             end
+@@ -135,28 +136,29 @@ end
+ end
+ 
+ """
+-    count_graph_edges(nodemap, four_neighbors)
++    count_graph_edges(gmap, nodemap, four_neighbors)
+ 
+-Number of undirected edges `construct_graph` will emit for `nodemap`, using the
+-same neighbour rules, so that its output buffers can be sized exactly.
++Number of undirected edges `construct_graph` will emit for `gmap` and
++`nodemap`, using the same neighbour rules (both cells must be nodes with
++nonzero conductance), so that its output buffers can be sized exactly.
+ """
+-function count_graph_edges(nodemap, four_neighbors)
++function count_graph_edges(gmap, nodemap, four_neighbors)
+     nrows, ncols = size(nodemap)
+     n = 0
+     @inbounds for j = 1:ncols
+         for i = 1:nrows
+-            nodemap[i,j] == 0 && continue
+-            if j != ncols && nodemap[i,j+1] != 0
++            _linked(gmap, nodemap, i, j) || continue
++            if j != ncols && _linked(gmap, nodemap, i, j+1)
+                 n += 1
+             end
+-            if i != nrows && nodemap[i+1,j] != 0
++            if i != nrows && _linked(gmap, nodemap, i+1, j)
+                 n += 1
+             end
+             if !four_neighbors
+-                if i != nrows && j != ncols && nodemap[i+1,j+1] != 0
++                if i != nrows && j != ncols && _linked(gmap, nodemap, i+1, j+1)
+                     n += 1
+                 end
+-                if i != 1 && j != ncols && nodemap[i-1,j+1] != 0
++                if i != 1 && j != ncols && _linked(gmap, nodemap, i-1, j+1)
+                     n += 1
+                 end
+             end
+@@ -165,11 +167,80 @@ function count_graph_edges(nodemap, four_neighbors)
+     n
+ end
+ 
++# Whether cell (i, j) takes part in edges: it must be a node and have positive
++# conductance. A cell of a polygon has the polygon's node id even when it is
++# nodata (conductance 0); like Circuitscape 4's _neighbors_* (which link two
++# cells only when both conductances are nonzero), such a cell is not linked to
++# its neighbours, so a polygon straddling nodata does not reach across it.
++# `> 0` rather than `!= 0` matches `construct_node_map`, and keeps negative or
++# -9999 cells passed in by API callers (e.g. Omniscape) out of the graph.
++@inline _linked(gmap, nodemap, i, j) =
++    @inbounds nodemap[i,j] != 0 && gmap[i,j] > 0
++
+ res_avg(x, y) = 1 / ((1/x + 1/y) / 2)
+ cond_avg(x, y) = (x + y) / 2
+ weird_avg(x,y) = (x + y) / (2*√2)
+ weirder_avg(x, y) = 1 / (√2 * (1/x + 1/y) / 2)
+ 
++"""
++    merge_regions_with_polygons!(newpoly, polymap, point_map)
++
++Write into `newpoly` the polygon map for one-to-all and all-to-one runs with
++focal regions and polygons, as Circuitscape 4's `get_poly_map_temp` builds it:
++for each point id in ascending order, the polygons it overlaps on the running
++map and all of its own cells get a fresh id above every polygon number. Two
++regions that share a polygon therefore collapse into one node.
++
++Relabelling the whole map once per point id costs O(points × cells), which is
++seconds per call on large grids with many regions (and the call is repeated
++for every focal node when an include/exclude file is used). Instead, each
++point id's fresh label absorbs the current root of every polygon label it
++overlaps (a union-find over labels; a parent is always a later, larger label,
++so the forest has no cycles), and one final pass writes every cell's root.
++"""
++function merge_regions_with_polygons!(newpoly::AbstractMatrix{V}, polymap,
++                                      point_map) where V
++    k0 = V(maximum(polymap))
++    # (point id, polygon label) for every cell of a region lying on a polygon
++    overlaps = Tuple{V,V}[]
++    ids = V[]
++    @inbounds for i in eachindex(point_map, polymap)
++        p = point_map[i]
++        p == 0 && continue
++        push!(ids, p)
++        polymap[i] != 0 && push!(overlaps, (V(p), V(polymap[i])))
++    end
++    unique!(sort!(ids))
++    unique!(sort!(overlaps))
++    label = Dict{V,V}(p => k0 + V(n) for (n, p) in enumerate(ids))
++
++    parent = Dict{V,V}()
++    function root(x)
++        while true
++            y = get(parent, x, x)
++            y == x && return x
++            x = y
++        end
++    end
++    for (p, l) in overlaps   # ascending point id, as in get_poly_map_temp
++        r = root(l)
++        k = label[p]
++        r != k && (parent[r] = k)
++    end
++
++    @inbounds for i in eachindex(newpoly, point_map, polymap)
++        p = point_map[i]
++        if p != 0
++            newpoly[i] = root(label[p])
++        elseif polymap[i] != 0
++            newpoly[i] = isempty(parent) ? polymap[i] : root(V(polymap[i]))
++        else
++            newpoly[i] = 0
++        end
++    end
++    newpoly
++end
++
+ function create_new_polymap(gmap, polymap::Matrix{V}, points_rc,
+                 pt1 = 0, pt2 = 0, point_map = Matrix{V}(undef,0,0)) where V
+ 
+@@ -190,19 +261,7 @@ function create_new_polymap(gmap, polymap::Matrix{V}, points_rc,
+                 end
+             end
+         else
+-            k = max(maximum(polymap), maximum(point_map))
+-            for i in findall(x->x!=0,point_map)
+-                v1 = point_map[i]
+-                v2 = newpoly[i]
+-                if v2 == 0
+-                    newpoly[i] = k + v1
+-                    continue
+-                end
+-                if v1 != v2
+-                    ind = findall(x -> x == v2, newpoly)
+-                    newpoly[ind] .= v1
+-                end
+-            end
++            merge_regions_with_polygons!(newpoly, polymap, point_map)
+         end
+         return newpoly
+     end
+@@ -234,7 +293,14 @@ function create_new_polymap(gmap, polymap::Matrix{V}, points_rc,
+             # means the second region merges with the first if they share
+             # a polygon, again as in the original.
+             k += 1
+-            vals = unique(newpoly[f(x)...] for x in idx if newpoly[f(x)...] != 0)
++            # A loop, not a generator: a generator over `newpoly` captures
++            # it, and since `newpoly` is assigned on several branches it is
++            # then boxed and the function's return type becomes `Any`.
++            vals = V[]
++            for x in idx
++                v = newpoly[f(x)...]
++                v != 0 && !(v in vals) && push!(vals, v)
++            end
+             if !isempty(vals)
+                 for i in eachindex(newpoly)
+                     newpoly[i] in vals && (newpoly[i] = k)
+diff --git a/test/internal.jl b/test/internal.jl
+index 792158d4..14d976d5 100644
+--- a/test/internal.jl
++++ b/test/internal.jl
+@@ -3,6 +3,7 @@ using Circuitscape
+ using Circuitscape: compute
+ import LinearAlgebra
+ import Graphs, SparseArrays, Random
++import Logging
+ 
+ # Omniscape moving window solve test 
+ # just checking syntax, other tests should be sufficient to ensure correctness.
+@@ -134,11 +135,17 @@ let
+ 
+     r = Circuitscape.create_new_polymap(cellmap, polymap, points_rc, 0, 0, point_map)
+ 
+-    @test r == [ 1.0  2.0  0.0  0.0  0.0
+-                 0.0  0.0  0.0  0.0  0.0
+-                 12.0  0.0  0.0  2.0  0.0
+-                 1.0  0.0  0.0  0.0  0.0
+-                 1.0  0.0  0.0  0.0  2.0 ]
++    # As in Circuitscape 4's get_poly_map_temp: polymap numbers run to 9, and
++    # points 1, 2, 3, 4, 7 get ids 10..14 in turn, each absorbing the
++    # polygons it overlaps. Point 4 at (4,1) lies on polygon 1, which region
++    # 1 already absorbed, so region 1 and point 4 become one node (13);
++    # point 7 at (3,4) lies on polygon 9, absorbed by point 2, so they become
++    # one node (14).
++    @test r == [ 13.0  14.0  0.0   0.0  0.0
++                  0.0   0.0  0.0   0.0  0.0
++                 12.0   0.0  0.0  14.0  0.0
++                 13.0   0.0  0.0   0.0  0.0
++                 13.0   0.0  0.0   0.0  14.0 ]
+ end
+ 
+ @testset "create_new_polymap: focal regions over polygons" begin
+@@ -159,8 +166,9 @@ end
+                 0 0 0 0]
+ 
+     # Region 5 overlaps polygon 1 in one cell: the polygon and every cell
+-    # of the region become one node (this branch used to throw).
+-    r = Circuitscape.create_new_polymap(gmap, poly,
++    # of the region become one node (this branch used to throw). The return
++    # type must be inferred (a captured, reassigned `newpoly` made it `Any`).
++    r = @inferred Circuitscape.create_new_polymap(gmap, poly,
+             prc([(1,2), (2,2), (4,4)], [5, 5, 6]), 5, 6)
+     @test r == [3 3 0 0
+                 0 3 0 0
+@@ -185,6 +193,174 @@ end
+                 4 0 0 0]
+ end
+ 
++@testset "create_new_polymap: one-to-all point_map form" begin
++    # Mirrors Circuitscape 4's get_poly_map_temp: for each point id in turn
++    # the polygons it overlaps and all of its cells get one new id.
++    prc(cells, ids) = (first.(cells), last.(cells), ids)
++    function pmap(points_rc, n)
++        pm = zeros(Int, n, n)
++        for k in eachindex(points_rc[3])
++            pm[points_rc[1][k], points_rc[2][k]] = points_rc[3][k]
++        end
++        pm
++    end
++    gmap = ones(4, 4)
++
++    # Polygon 5 on (1,1),(1,2); region 1 on (1,2),(2,3); point 2 at (4,4).
++    # Region 1 and polygon 5 become one node (id 6), point 2 gets id 7.
++    poly = zeros(Int, 4, 4); poly[1,1] = 5; poly[1,2] = 5
++    points_rc = prc([(1,2), (2,3), (4,4)], [1, 1, 2])
++    r = Circuitscape.create_new_polymap(gmap, poly, points_rc, 0, 0, pmap(points_rc, 4))
++    @test r == [6 6 0 0
++                0 0 6 0
++                0 0 0 0
++                0 0 0 7]
++    nm = Circuitscape.construct_node_map(gmap, r)
++    @test nm[1,1] == nm[1,2] == nm[2,3]
++    @test nm[4,4] != nm[1,1]
++
++    # A polygon elsewhere whose number equals a point id must not be merged
++    # with that point's region.
++    poly = zeros(Int, 4, 4); poly[1,1] = 5; poly[1,2] = 5; poly[4,1] = 2; poly[4,2] = 2
++    points_rc = prc([(1,2), (2,2), (3,4)], [2, 2, 1])
++    r = Circuitscape.create_new_polymap(gmap, poly, points_rc, 0, 0, pmap(points_rc, 4))
++    @test r == [7 7 0 0
++                0 7 0 0
++                0 0 0 6
++                2 2 0 0]
++
++    # Two regions sharing a polygon collapse into one node.
++    poly = zeros(Int, 4, 4); poly[1,1] = 1; poly[1,2] = 1
++    points_rc = prc([(1,2), (2,2), (1,1), (4,1)], [5, 5, 6, 6])
++    r = Circuitscape.create_new_polymap(gmap, poly, points_rc, 0, 0, pmap(points_rc, 4))
++    @test r == [3 3 0 0
++                0 3 0 0
++                0 0 0 0
++                3 0 0 0]
++
++    # Single-cell points only: a point on a polygon joins it, others get
++    # their own ids (the point_file_no_polygons branch).
++    poly = zeros(Int, 4, 4); poly[1,1] = 1; poly[1,2] = 1
++    points_rc = prc([(1,2), (3,3)], [1, 2])
++    r = Circuitscape.create_new_polymap(gmap, poly, points_rc, 0, 0, pmap(points_rc, 4))
++    nm = Circuitscape.construct_node_map(gmap, r)
++    @test nm[1,1] == nm[1,2]
++    @test nm[3,3] != nm[1,1]
++end
++
++@testset "construct_graph: polygons over nodata cells" begin
++    # A polygon covering a nodata cell must not connect that cell's habitat
++    # neighbours to the polygon node (Circuitscape 4 only links two cells
++    # when both have nonzero conductance).
++    g = [0.0 1.0 1.0
++         1.0 1.0 1.0
++         1.0 1.0 1.0]
++    poly = zeros(Int, 3, 3); poly[1,1] = 1; poly[3,3] = 1
++    nm = Circuitscape.construct_node_map(g, poly)
++    @test nm[1,1] == nm[3,3] != 0
++    for avg_res in (false, true), four in (false, true)
++        A = Circuitscape.construct_graph(g, nm, avg_res, four)
++        pn = nm[1,1]
++        @test A[pn, nm[1,2]] == 0
++        @test A[pn, nm[2,1]] == 0
++        @test A[pn, nm[2,2]] ≈ (four ? 0.0 : 1 / √2)
++        @test A[pn, nm[2,3]] == 1
++        @test A[pn, nm[3,2]] == 1
++        @test SparseArrays.nnz(A) == 2 * Circuitscape.count_graph_edges(g, nm, four)
++        @test LinearAlgebra.issymmetric(A)
++    end
++    # Isolated polygon entirely over nodata: a node with no edges
++    g2 = ones(3, 3); g2[1,1] = 0
++    poly2 = zeros(Int, 3, 3); poly2[1,1] = 1
++    nm2 = Circuitscape.construct_node_map(g2, poly2)
++    @test nm2[1,1] == 0
++end
++
++@testset "read_cellmap: negative values are null" begin
++    # runtests.jl disables warnings globally; turn them back on here so that
++    # @test_logs can see the warning, and restore runtests.jl's setting after.
++    Logging.disable_logging(Logging.BelowMinLevel)
++    try
++    d = mktempdir()
++    hab = joinpath(d, "hab.asc")
++    open(hab, "w") do io
++        println(io, "ncols 3\nnrows 3\nxllcorner 0\nyllcorner 0\ncellsize 1\nNODATA_value -9999")
++        println(io, "-2 1 1\n1 -9999 1\n1 1 4")
++    end
++    for is_res in (true, false)
++        gmap, _ = @test_logs (:warn, r"1 cell\(s\) .* negative") Circuitscape.read_cellmap(hab, is_res, Float64)
++        @test gmap[1,1] == 0
++        @test gmap[2,2] == 0
++        @test gmap[3,3] == (is_res ? 0.25 : 4.0)
++        @test all(gmap .>= 0)
++    end
++    # A polygon covering the negative cell does not reach across it
++    gmap, _ = @test_logs (:warn,) Circuitscape.read_cellmap(hab, true, Float64)
++    poly = zeros(Int, 3, 3); poly[1,1] = 1; poly[3,3] = 1
++    nm = Circuitscape.construct_node_map(gmap, poly)
++    A = Circuitscape.construct_graph(gmap, nm, false, true)
++    @test A[nm[1,1], nm[1,2]] == 0
++    @test A[nm[1,1], nm[2,1]] == 0
++    # No negative cells: no warning
++    open(hab, "w") do io
++        println(io, "ncols 2\nnrows 1\nxllcorner 0\nyllcorner 0\ncellsize 1\nNODATA_value -9999")
++        println(io, "-9999 2")
++    end
++    gmap, _ = @test_logs Circuitscape.read_cellmap(hab, true, Float64)
++    @test gmap == [0.0 0.5]
++    finally
++        Logging.disable_logging(Logging.Warn)
++    end
++end
++
++@testset "construct_graph: non-positive in-memory cells inside a polygon" begin
++    # API callers (Omniscape) pass conductance arrays directly, with -9999
++    # for nodata. A polygon over such a cell must not link it either.
++    for bad in (-9999.0, -1.0, NaN)
++        g = [bad 1.0; 1.0 1.0]
++        poly = [1 0; 0 1]
++        nm = Circuitscape.construct_node_map(g, poly)
++        @test nm[1,1] == nm[2,2] != 0
++        for avg_res in (false, true), four in (false, true)
++            A = Circuitscape.construct_graph(g, nm, avg_res, four)
++            @test all(isfinite, SparseArrays.nonzeros(A))
++            @test all(>=(0), SparseArrays.nonzeros(A))
++            @test A[nm[1,1], nm[1,2]] == A[nm[1,1], nm[2,1]] == 1
++            @test SparseArrays.nnz(A) == 2 * Circuitscape.count_graph_edges(g, nm, four)
++        end
++    end
++end
++
++@testset "create_new_polymap: focal regions over polygons, randomised" begin
++    # Reference: Circuitscape 4's get_poly_map_temp / get_overlap_polymap,
++    # relabelling the running map once per point id.
++    function cs4_poly_map_temp(poly_map, point_map)
++        m = copy(poly_map)
++        k = maximum(poly_map)
++        for p in sort!(unique(point_map[point_map .!= 0]))
++            k += 1
++            cells = findall(==(p), point_map)
++            vals = unique(m[c] for c in cells if m[c] != 0)
++            for i in eachindex(m)
++                m[i] in vals && (m[i] = k)
++            end
++            m[cells] .= k
++        end
++        m
++    end
++    rng = Random.MersenneTwister(523)
++    gmap = ones(12, 12)
++    for trial in 1:300
++        poly = rand(rng, 0:6, 12, 12) .* (rand(rng, 12, 12) .< 0.3)
++        pm = rand(rng, 0:8, 12, 12) .* (rand(rng, 12, 12) .< 0.25)
++        I = findall(!iszero, pm)
++        points_rc = (getindex.(I, 1), getindex.(I, 2), pm[I])
++        length(unique(points_rc[3])) == length(points_rc[3]) && continue
++        r = @inferred Circuitscape.create_new_polymap(gmap, poly, points_rc, 0, 0, pm)
++        @test r == cs4_poly_map_temp(poly, pm)
++    end
++end
++
+ import Circuitscape: resolve_conflicts
+ 
+ @test resolve_conflicts([1.,0.,0.], [1.,0.,0.], :rmvgnd) == ([1, 0, 0], [0, 0, 0], [1, 0, 0])

@@ -1,0 +1,268 @@
+diff --git a/docs/_static/docstring_previews/trajectories.png b/docs/_static/docstring_previews/trajectories.png
+new file mode 100644
+index 000000000..97883561b
+Binary files /dev/null and b/docs/_static/docstring_previews/trajectories.png differ
+diff --git a/docs/api/plot_index.md b/docs/api/plot_index.md
+index c13be83af..da8114133 100644
+--- a/docs/api/plot_index.md
++++ b/docs/api/plot_index.md
+@@ -27,6 +27,7 @@ For most tools and for some preprocessing functions, you will find a plotting fu
+     plot.dendrogram
+     plot.catplot
+     plot.timeseries
++    plot.trajectories
+     plot.sankey_diagram
+     plot.sankey_diagram_time
+     plot.stratified_table_one
+diff --git a/docs/changelog.md b/docs/changelog.md
+index 134cb6495..ece8e6f2c 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -6,6 +6,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
+ 
+ ### 🚀 Features
+ 
++* {func}`ep.pl.trajectories <ehrapy.plot.trajectories>` plots the mean of longitudinal variables over time with a confidence band for every group of observations ([#1146](https://github.com/theislab/ehrapy/pull/1146)) @Zethson
+ * {func}`ep.pp.gradient_boosting_impute <ehrapy.preprocessing.gradient_boosting_impute>` imputes every variable with a gradient boosting model, which for longitudinal data also uses the closest observed values before and after each timepoint @Zethson
+ 
+   With every variable held out at 10% of the observed hours of all 11,988 PhysioNet 2012 patients, its RMSE on the standardized held-out values is 0.62 in 36 seconds, against 1.09 in 232 seconds for {func}`ep.pp.miss_forest_impute <ehrapy.preprocessing.miss_forest_impute>` and 0.82 for {func}`ep.pp.locf_impute <ehrapy.preprocessing.locf_impute>`.
+diff --git a/ehrapy/plot/__init__.py b/ehrapy/plot/__init__.py
+index 7943bf20e..bd95dba04 100644
+--- a/ehrapy/plot/__init__.py
++++ b/ehrapy/plot/__init__.py
+@@ -44,7 +44,7 @@
+ )
+ from ehrapy.plot._stratified_table_one import stratified_table_one
+ from ehrapy.plot._survival_analysis import cox_ph_adjusted_curves, cox_ph_forestplot, kaplan_meier, ols
+-from ehrapy.plot._timeseries import timeseries
++from ehrapy.plot._timeseries import timeseries, trajectories
+ from ehrapy.plot._variable_correlation_plot import variable_correlations, variable_dependencies
+ from ehrapy.plot.causal_inference import causal_effect, love_plot, propensity_overlap
+ from ehrapy.plot.feature_ranking._feature_importances import rank_features_supervised
+@@ -98,6 +98,7 @@
+     "kaplan_meier",
+     "ols",
+     "timeseries",
++    "trajectories",
+     "variable_correlations",
+     "variable_dependencies",
+     "causal_effect",
+diff --git a/ehrapy/plot/_timeseries.py b/ehrapy/plot/_timeseries.py
+index 347256af7..1e7355a0a 100644
+--- a/ehrapy/plot/_timeseries.py
++++ b/ehrapy/plot/_timeseries.py
+@@ -13,6 +13,7 @@
+     from collections.abc import Sequence
+ 
+     from ehrdata import EHRData
++    from fast_array_utils.types import DaskArray
+ 
+ 
+ @load_hv_extensions()
+@@ -73,13 +74,7 @@ def timeseries(
+     opts_dict["shared_axes"] = True
+     opts_dict["legend_position"] = "right"
+ 
+-    if layer is not None and layer not in edata.layers:
+-        raise KeyError(f"Layer {layer!r} not found in edata.layers. Available layers: {list(edata.layers)}")
+-    X = edata.X if layer is None else edata.layers[layer]
+-    if X.ndim != 3:
+-        source = "edata.X" if layer is None else f"Layer {layer!r}"
+-        raise ValueError(f"{source} must be 3D (n_obs, n_vars, n_time), got shape {X.shape}.")
+-
++    X = _time_series(edata, layer)
+     obs_pos, obs_labels = _resolve_axis(pd.Index(edata.obs_names), obs_names, "obs_names")
+     var_pos, var_labels = _resolve_axis(pd.Index(edata.var_names), var_names, "var_names")
+     tem_pos, tem_labels = _resolve_axis(pd.Index(edata.tem.index), tem_names, "tem_names")
+@@ -147,6 +142,109 @@ def timeseries(
+     return layout
+ 
+ 
++@load_hv_extensions()
++def trajectories(
++    edata: EHRData,
++    *,
++    var_names: str | Sequence[str] | None = None,
++    groupby: str | None = None,
++    tem_names: Any | Sequence[Any] | slice | None = None,
++    layer: str | None = None,
++    ci: float | None = 0.95,
++    xlabel: str | None = None,
++    ylabel: str | None = None,
++    width: int | None = 600,
++    height: int | None = 400,
++    title: str | None = None,
++) -> hv.Overlay | hv.Layout:
++    """Plot the mean of variables over time with a confidence band for every group of observations.
++
++    At every timepoint, the mean and its normal-approximation confidence interval are computed from the observations with a value there.
++
++    Args:
++        edata: Central data object.
++        var_names: Variable name or list of variable names in `edata.var_names` to plot, each in its own panel.
++            If `None`, all variables are plotted.
++        groupby: Column of `edata.obs` whose categories each get a trajectory.
++            If `None`, all observations form one group.
++        tem_names: Time indices to plot.
++        layer: Layer holding the 3D time series.
++            If `None`, `edata.X` is used.
++        ci: Coverage of the confidence band around the mean, or `None` for no band.
++        xlabel: The x-axis label text.
++        ylabel: The y-axis label text.
++        width: Plot width in pixels.
++        height: Plot height in pixels.
++        title: Set the title of the plot.
++
++    Returns:
++        HoloViews Overlay for a single variable, or Layout with one panel per variable.
++
++    Examples:
++        >>> import ehrdata as ed
++        >>> import ehrapy as ep
++        >>> edata = ed.dt.ehrdata_blobs(n_variables=5, n_observations=100, base_timepoints=20)
++        >>> ep.pl.trajectories(edata, var_names="feature_0", groupby="cluster")
++
++        .. image:: /_static/docstring_previews/trajectories.png
++    """
++    from scipy.stats import norm
++
++    X = _time_series(edata, layer)
++    var_pos, var_labels = _resolve_axis(pd.Index(edata.var_names), var_names, "var_names")
++    tem_pos, tem_labels = _resolve_axis(pd.Index(edata.tem.index), tem_names, "tem_names")
++    if groupby is not None and groupby not in edata.obs:
++        raise KeyError(f"{groupby!r} not found in edata.obs.")
++    groups = pd.Series("all", index=edata.obs_names) if groupby is None else edata.obs[groupby]
++
++    (mtx,) = _materialize(X[:, var_pos][:, :, tem_pos])
++    mtx = np.asarray(mtx, dtype=float)
++    numeric = pd.to_numeric(tem_labels, errors="coerce")
++    timepoints = np.arange(len(tem_labels)) if numeric.isna().any() else np.asarray(numeric)
++    z = None if ci is None else norm.ppf((1 + ci) / 2)
++
++    options = {"width": width, "height": height, "xlabel": xlabel, "ylabel": ylabel}
++    opts_dict: dict[str, Any] = {key: value for key, value in options.items() if value is not None}
++    opts_dict["legend_position"] = "right"
++
++    panels = []
++    for var_i, var_label in enumerate(var_labels):
++        elements = []
++        for group, members in groups.groupby(groups, observed=True, sort=True).indices.items():
++            values = mtx[members, var_i, :]
++            observed = ~np.isnan(values)
++            n = observed.sum(axis=0)
++            with np.errstate(invalid="ignore", divide="ignore"):
++                mean = np.where(observed, values, 0).sum(axis=0) / n
++                sd = np.sqrt(np.where(observed, (values - mean) ** 2, 0).sum(axis=0) / (n - 1))
++                half_width = np.zeros_like(mean) if z is None else z * sd / np.sqrt(n)
++            label = f"{group} (n={len(members)})"
++            if z is not None:
++                elements.append(
++                    hv.Area(
++                        (timepoints, mean - half_width, mean + half_width),
++                        kdims="time",
++                        vdims=[str(var_label), f"{var_label} upper"],
++                        label=label,
++                    ).opts(alpha=0.2, line_width=0)
++                )
++            elements.append(hv.Curve((timepoints, mean), kdims="time", vdims=str(var_label), label=label))
++        panel_title = title if title is not None else f"Mean of {var_label} over time"
++        panels.append(hv.Overlay(elements).relabel(panel_title).opts(**opts_dict))
++
++    return panels[0] if len(panels) == 1 else hv.Layout(panels).cols(1)
++
++
++def _time_series(edata: EHRData, layer: str | None) -> np.ndarray | DaskArray:
++    if layer is not None and layer not in edata.layers:
++        raise KeyError(f"Layer {layer!r} not found in edata.layers. Available layers: {list(edata.layers)}")
++    X = edata.X if layer is None else edata.layers[layer]
++    if X.ndim != 3:
++        source = "edata.X" if layer is None else f"Layer {layer!r}"
++        raise ValueError(f"{source} must be 3D (n_obs, n_vars, n_time), got shape {X.shape}.")
++    return X
++
++
+ def _resolve_axis(index: pd.Index, names: Any, axis: str) -> tuple[np.ndarray, pd.Index]:
+     n = len(index)
+ 
+diff --git a/tests/plot/test_timeseries.py b/tests/plot/test_timeseries.py
+index a9e180479..481f30980 100644
+--- a/tests/plot/test_timeseries.py
++++ b/tests/plot/test_timeseries.py
+@@ -5,6 +5,7 @@
+ 
+ hv.extension("bokeh")
+ import numpy as np
++import pandas as pd
+ import pytest
+ from ehrdata.core.constants import DEFAULT_TEM_LAYER_NAME
+ from testing.fast_array_utils import Flags
+@@ -146,3 +147,69 @@ def make_edata(X):
+ 
+     for values, expected_values in zip(curve_values(result), curve_values(expected), strict=True):
+         np.testing.assert_array_equal(values, expected_values)
++
++
++@pytest.fixture
++def trajectories_edata() -> ed.EHRData:
++    X = np.array(
++        [
++            [[1.0, 2.0, np.nan], [0.0, 0.0, 0.0]],
++            [[3.0, np.nan, np.nan], [1.0, 1.0, 1.0]],
++            [[5.0, 6.0, 7.0], [2.0, 2.0, 2.0]],
++            [[7.0, 8.0, np.nan], [3.0, 3.0, 3.0]],
++        ]
++    )
++    obs = pd.DataFrame({"group": pd.Categorical(["a", "a", "b", "b"])}, index=["0", "1", "2", "3"])
++    return ed.EHRData(X=X, obs=obs, var=pd.DataFrame(index=["v0", "v1"]))
++
++
++def _means(plot: hv.Overlay | hv.Layout) -> list[np.ndarray]:
++    return [
++        curve.dimension_values(1)
++        for curve in plot.traverse(lambda curve: curve, [hv.Curve])
++        if not isinstance(curve, hv.Area)
++    ]
++
++
++def test_trajectories_mean_and_ci(trajectories_edata):
++    plot = ep.pl.trajectories(trajectories_edata, var_names="v0", groupby="group", ci=0.95)
++
++    assert isinstance(plot, hv.Overlay)
++    means = _means(plot)
++    np.testing.assert_array_equal(means[0], [2.0, 2.0, np.nan])
++    np.testing.assert_array_equal(means[1], [6.0, 7.0, 7.0])
++    bands = plot.traverse(lambda area: (area.dimension_values(1), area.dimension_values(2)), [hv.Area])
++    half_width = 1.959963984540054 * np.sqrt(2.0) / np.sqrt(2)
++    np.testing.assert_allclose(bands[0][0][:1], [2.0 - half_width])
++    np.testing.assert_allclose(bands[1][1][:2], [6.0 + half_width, 7.0 + half_width])
++    assert np.isnan(bands[0][0][1:]).all()
++    assert np.isnan(bands[1][0][2])
++
++
++def test_trajectories_panels(trajectories_edata):
++    layout = ep.pl.trajectories(trajectories_edata)
++    without_band = ep.pl.trajectories(trajectories_edata, var_names="v1", ci=None)
++
++    assert isinstance(layout, hv.Layout)
++    assert len(layout) == 2
++    np.testing.assert_array_equal(_means(without_band)[0], [1.5, 1.5, 1.5])
++    assert not without_band.traverse(lambda area: area, [hv.Area])
++
++
++def test_trajectories_error_cases(trajectories_edata, mar_edata):
++    with pytest.raises(KeyError, match="'unknown' not found in edata.obs"):
++        ep.pl.trajectories(trajectories_edata, groupby="unknown")
++    with pytest.raises(ValueError, match="must be 3D"):
++        ep.pl.trajectories(ed.EHRData(X=mar_edata.X))
++
++
++@pytest.mark.array_type(skip=Flags.Disk | Flags.Gpu | Flags.Sparse)
++def test_trajectories_array_types(array_type, trajectories_edata):
++    expected = ep.pl.trajectories(trajectories_edata, groupby="group")
++    edata = ed.EHRData(X=array_type(trajectories_edata.X), obs=trajectories_edata.obs, var=trajectories_edata.var)
++
++    with forbid_dask_compute(allowed=1):
++        result = ep.pl.trajectories(edata, groupby="group")
++
++    for values, expected_values in zip(curve_values(result), curve_values(expected), strict=True):
++        np.testing.assert_array_equal(values, expected_values)

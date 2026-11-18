@@ -1,0 +1,225 @@
+diff --git a/src/network/advanced.jl b/src/network/advanced.jl
+index 3652e662..3a697cf5 100644
+--- a/src/network/advanced.jl
++++ b/src/network/advanced.jl
+@@ -10,7 +10,9 @@ function network_advanced(T, V, cfg)::Matrix{T}
+     advanced_data = compute_advanced_data(data, flags)
+ 
+     # Send to main kernel
+-    advanced_kernel(advanced_data, flags, cfg)
++    v , _ = advanced_kernel(advanced_data, flags, cfg)
++
++    v
+ end
+ 
+ function compute_advanced_data(data::NetworkData{T,V}, 
+diff --git a/src/raster/advanced.jl b/src/raster/advanced.jl
+index 5945ff22..9ae5deac 100644
+--- a/src/raster/advanced.jl
++++ b/src/raster/advanced.jl
+@@ -25,7 +25,9 @@ function raster_advanced(T, V, cfg)::Matrix{T}
+     advanced_data = compute_advanced_data(rasterdata, flags)
+ 
+     # Send to main kernel
+-    advanced_kernel(advanced_data, flags, cfg)
++    v, _ = advanced_kernel(advanced_data, flags, cfg)
++
++    v
+ end
+ 
+ function compute_advanced_data(data::RasData{T,V}, 
+@@ -140,7 +142,7 @@ function resolve_conflicts(sources::Vector{T},
+     sources, grounds, finitegrounds
+ end
+ 
+-function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Matrix{T} where {T,V}
++function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Tuple{Matrix{T},Matrix{T}} where {T,V}
+ 
+     # Data 
+     G = data.G
+@@ -162,6 +164,7 @@ function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Matrix{T} where {
+     is_onetoall = flags.is_onetoall
+     write_v_maps = flags.outputflags.write_volt_maps
+     write_c_maps = flags.outputflags.write_cur_maps
++    write_cum_cur_map_only = flags.outputflags.write_cum_cur_map_only
+ 
+     volt = zeros(eltype(G), size(nodemap))
+     ind = findall(x->x!=0,nodemap)
+@@ -218,7 +221,7 @@ function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Matrix{T} where {
+         end
+     end
+ 
+-    if write_c_maps
++    if write_c_maps && !write_cum_cur_map_only
+         if !is_raster
+             write_cur_maps(name, voltages, FullGraph(G, cellmap), finitegrounds, flags, cfg)
+         else
+@@ -228,14 +231,14 @@ function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Matrix{T} where {
+ 
+     if !is_raster
+         v = [collect(1:size(G, 1))  voltages]
+-        return v
++        return v, outcurr
+     end
+ 
+     scenario = cfg["scenario"]
+     if !solver_called
+         ret = Matrix{T}(undef,1,1)
+         ret[1] = -1
+-        return ret
++        return ret, outcurr
+     end
+ 
+     if is_onetoall
+@@ -244,19 +247,19 @@ function advanced_kernel(data::AdvancedData{T,V}, flags, cfg)::Matrix{T} where {
+         if val[1] ≈ 0
+             ret = Matrix{T}(undef,1,1)
+             ret[1] = -1
+-            return ret
++            return ret, outcurr
+         else
+             ret = Matrix{T}(undef,length(val),1)
+             ret[:,1] = val
+-            return ret
++            return ret, outcurr
+         end
+     elseif is_alltoone
+         ret = Matrix{T}(undef,1,1)
+         ret[1] = 0
+-        return ret
++        return ret, outcurr
+     end
+ 
+-    return volt
++    return volt, outcurr
+ end
+ 
+ function multiple_solver(cfg, a::SparseMatrixCSC{T,V}, sources, grounds, finitegrounds) where {T,V}
+diff --git a/src/raster/onetoall.jl b/src/raster/onetoall.jl
+index 3519a50c..a9160d10 100644
+--- a/src/raster/onetoall.jl
++++ b/src/raster/onetoall.jl
+@@ -59,9 +59,10 @@ function onetoall_kernel(data::RasData{T,V}, flags, cfg)::Matrix{T} where {T,V}
+     # ground_map = Matrix{eltype(a)}(0, 0)
+     s = zeros(eltype(a), size(point_map))
+     z = deepcopy(s)
++    cum = initialize_cum_maps(gmap, flags.outputflags.write_max_cur_maps)
+ 
+     point_ids = included_pairs.point_ids
+-    res = zeros(eltype(a), size(points_unique, 1))
++    res = zeros(eltype(a), size(points_unique, 1)) |> SharedArray
+     num_points_to_solve = size(points_unique, 1)
+     original_point_map = copy(point_map)
+     unique_point_map = zeros(V, size(gmap))
+@@ -71,11 +72,14 @@ function onetoall_kernel(data::RasData{T,V}, flags, cfg)::Matrix{T} where {T,V}
+         unique_point_map[f(1,ind), f(2,ind)] = f(3,ind)
+     end
+ 
+-    for i = 1:num_points_to_solve
+-        copyto!(point_map, original_point_map)
++    # @distributed for i = 1:num_points_to_solve
++    function f(i)
++        # copyto!(point_map, original_point_map)
++        point_map = copy(original_point_map)
+         str = use_variable_strengths ? strengths[i,2] : 1
+         csinfo("Solving point $i of $num_points_to_solve")
+-        copyto!(s, z)
++        # copyto!(s, z)
++        s = copy(z)
+         n = points_unique[i]
+         if use_included_pairs
+             for j = 1:num_points_to_solve
+@@ -103,7 +107,6 @@ function onetoall_kernel(data::RasData{T,V}, flags, cfg)::Matrix{T} where {T,V}
+         end
+ 
+         check_node = nodemap[points_rc[1][i], points_rc[2][i]]
+-
+         
+         policy = one_to_all ? :rmvgnd : :rmvsrc
+         sources, grounds, finite_grounds = 
+@@ -118,14 +121,26 @@ function onetoall_kernel(data::RasData{T,V}, flags, cfg)::Matrix{T} where {T,V}
+         if one_to_all
+             # v = advanced(cfg, a, source_map, ground_map; nodemap = nodemap, policy = :rmvgnd,
+             #                check_node = check_node, src = n, polymap = Polymap(newpoly), hbmeta = hbmeta)
+-            v = advanced_kernel(advanced_data, flags, cfg)
++            v, curr = advanced_kernel(advanced_data, flags, cfg)
+         else
+             # v = advanced(cfg, a, source_map, ground_map; nodemap = nodemap, policy = :rmvsrc,
+             #                check_node = check_node, src = n, polymap = Polymap(newpoly), hbmeta = hbmeta)
+-            v = advanced_kernel(advanced_data, flags, cfg)
++            v, curr = advanced_kernel(advanced_data, flags, cfg)
+         end
+         res[i] = v[1]
++
++        cum.cum_curr[mycsid()] .+= curr
++        flags.outputflags.write_max_cur_maps && (cum.max_curr[mycsid()] .= max.(cum.max_curr[mycsid()], curr))
++    end
++
++    pmap(x -> f(x), 1:num_points_to_solve)
++
++    if flags.outputflags.write_cur_maps
++        write_cum_maps(cum, gmap, cfg, hbmeta, 
++                       flags.outputflags.write_max_cur_maps, 
++                       flags.outputflags.write_cum_cur_map_only)
+     end
++
+     hcat(points_unique, res)
+ end
+ 
+diff --git a/test/input/raster/one_to_all/1/oneToAllVerify1.ini b/test/input/raster/one_to_all/1/oneToAllVerify1.ini
+index dcdbb525..7c434738 100644
+--- a/test/input/raster/one_to_all/1/oneToAllVerify1.ini
++++ b/test/input/raster/one_to_all/1/oneToAllVerify1.ini
+@@ -54,3 +54,6 @@ mask_file = None
+ data_type = raster
+ scenario = one-to-all
+ 
++parallelize = True
++max_parallel = 2
++
+diff --git a/test/input/raster/one_to_all/10/oneToAllVerify10.ini b/test/input/raster/one_to_all/10/oneToAllVerify10.ini
+index e9058795..f36d6081 100644
+--- a/test/input/raster/one_to_all/10/oneToAllVerify10.ini
++++ b/test/input/raster/one_to_all/10/oneToAllVerify10.ini
+@@ -17,7 +17,7 @@ use_included_pairs = False
+ point_file = input/raster/one_to_all/10/points_polys7.asc
+ 
+ [Output options]
+-write_cum_cur_map_only = False
++write_cum_cur_map_only = True
+ log_transform_maps = False
+ output_file = output/oneToAllVerify10.out
+ write_max_cur_maps = True
+@@ -25,7 +25,7 @@ write_volt_maps = False
+ set_null_currents_to_nodata = False
+ set_null_voltages_to_nodata = False
+ compress_grids = False
+-write_cur_maps = False
++write_cur_maps = True
+ 
+ [Short circuit regions (aka polygons)]
+ use_polygons = False
+@@ -53,4 +53,6 @@ mask_file = None
+ [Circuitscape mode]
+ data_type = raster
+ scenario = one-to-all
++parallelize = True
++max_parallel = 2
+ 
+diff --git a/test/output_verify/oneToAllVerify10_max_curmap.asc b/test/output_verify/oneToAllVerify10_max_curmap.asc
+new file mode 100644
+index 00000000..bdbda39c
+--- /dev/null
++++ b/test/output_verify/oneToAllVerify10_max_curmap.asc
+@@ -0,0 +1,11 @@
++ncols         5
++nrows         5
++xllcorner     100.0
++yllcorner     100.0
++cellsize      1e-05
++NODATA_value  -9999
++1.000000045 1.000000001 0 0.006936449992 0.007007386738 
++0 0 0 0.1625126825 0.06968719376 
++1.000000153 0.3506553281 0.3803166712 1.000000346 0.2382088228 
++1.000000077 0.3543813388 0.3226857704 0.5950395401 0.5328237357 
++1.000000045 0.3448853945 0.1143419026 0 1.000000001 

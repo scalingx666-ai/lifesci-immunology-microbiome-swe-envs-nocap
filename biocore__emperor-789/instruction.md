@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Force gradient SVG to cover the full color map and gradient ranges
+
+## Description
+
+. This solution should also be applicable to
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ad031016f940`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

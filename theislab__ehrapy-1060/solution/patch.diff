@@ -1,0 +1,116 @@
+diff --git a/ehrapy/_types.py b/ehrapy/_types.py
+index 92d24490f..a1c6d9d4c 100644
+--- a/ehrapy/_types.py
++++ b/ehrapy/_types.py
+@@ -10,7 +10,7 @@
+ from ehrapy._compat import as_dense_dask_array
+ 
+ KnownTransformer = Literal["pynndescent", "sklearn"]
+-CSBase = sp.csr_matrix | sp.csc_matrix
++CSBase = sp.csr_array | sp.csc_array
+ RNGLike = np.random.Generator | np.random.BitGenerator
+ SeedLike = int | np.integer | Sequence[int] | np.random.SeedSequence
+ AnyRandom = int | np.random.RandomState | None
+diff --git a/ehrapy/preprocessing/_imputation.py b/ehrapy/preprocessing/_imputation.py
+index e2c544cb5..69a84466d 100644
+--- a/ehrapy/preprocessing/_imputation.py
++++ b/ehrapy/preprocessing/_imputation.py
+@@ -4,7 +4,7 @@
+ from collections.abc import Iterable, Mapping, Sequence
+ from functools import singledispatch
+ from importlib.util import find_spec
+-from typing import TYPE_CHECKING, Literal
++from typing import TYPE_CHECKING, Literal, get_args
+ 
+ import numpy as np
+ import pandas as pd
+@@ -23,6 +23,8 @@
+     use_ehrdata,
+ )
+ from ehrapy._progress import spinner
++from ehrapy._types import CSBase
++from ehrapy.preprocessing._quality_control import _compute_missing_values
+ 
+ if TYPE_CHECKING:
+     from anndata import AnnData
+@@ -730,6 +732,9 @@ def _warn_imputation_threshold(
+ ) -> dict[str, int]:
+     """Warns the user if the more than $threshold percent had to be imputed.
+ 
++    Use :func:`ehrdata.harmonize_missing_values` to convert other missing value
++    symbols to `np.nan` before imputing.
++
+     Args:
+         edata: The data object to check
+         var_names: The var names which were imputed.
+@@ -739,9 +744,15 @@ def _warn_imputation_threshold(
+     try:
+         edata.var["missing_values_pct"]
+     except KeyError:
+-        from ehrapy.preprocessing import qc_metrics
++        mtx = edata.X if layer is None else edata.layers[layer]
++        if mtx.ndim == 3:
++            n_obs, n_vars, n_t = mtx.shape
++            mtx_2d = mtx.transpose(0, 2, 1).reshape(n_obs * n_t, n_vars)
++        else:
++            mtx_2d = mtx
++        missing_abs = _compute_missing_values(mtx_2d, axis=0)
++        edata.var["missing_values_pct"] = (missing_abs / mtx_2d.shape[0]) * 100
+ 
+-        qc_metrics(edata, layer=layer)
+     used_var_names = set(edata.var_names) if var_names is None else set(var_names)
+ 
+     thresholded_var_names = set(edata.var[edata.var["missing_values_pct"] > threshold].index) & set(used_var_names)
+diff --git a/ehrapy/preprocessing/_quality_control.py b/ehrapy/preprocessing/_quality_control.py
+index a0ee20f55..fe107832d 100644
+--- a/ehrapy/preprocessing/_quality_control.py
++++ b/ehrapy/preprocessing/_quality_control.py
+@@ -8,6 +8,7 @@
+ import array_api_compat
+ import numpy as np
+ import pandas as pd
++import scipy.sparse as sp
+ from ehrdata._logger import logger
+ from ehrdata.io import to_pandas
+ 
+@@ -136,6 +137,23 @@ def _(mtx: DaskArray, axis) -> np.ndarray:
+     return da.isnull(mtx).sum(axis).compute()
+ 
+ 
++@_compute_missing_values.register(sp.csr_array)
++@_compute_missing_values.register(sp.csc_array)
++def _(mtx, axis) -> np.ndarray:
++    mtx_csc = mtx.tocsc() if isinstance(mtx, sp.csr_array) else mtx
++    n_nan_per_col = np.array(
++        [np.sum(np.isnan(mtx_csc.data[mtx_csc.indptr[i] : mtx_csc.indptr[i + 1]])) for i in range(mtx.shape[1])]
++    )
++    if axis == 0:
++        return n_nan_per_col
++    else:
++        # per row
++        mtx_csr = mtx.tocsr() if isinstance(mtx, sp.csc_array) else mtx
++        return np.array(
++            [np.sum(np.isnan(mtx_csr.data[mtx_csr.indptr[i] : mtx_csr.indptr[i + 1]])) for i in range(mtx.shape[0])]
++        )
++
++
+ @singledispatch
+ def _compute_unique_values(mtx, axis):
+     _raise_array_type_not_implemented(_compute_unique_values, type(mtx))
+diff --git a/tests/preprocessing/test_imputation.py b/tests/preprocessing/test_imputation.py
+index 9482f81f1..7cd6483b0 100644
+--- a/tests/preprocessing/test_imputation.py
++++ b/tests/preprocessing/test_imputation.py
+@@ -588,7 +588,11 @@ def test_explicit_impute_error(impute_edata, edata_mini_3D_missing_values):
+         explicit_impute(edata_mini_3D_missing_values, replacement=[1, 2, 3], layer=DEFAULT_TEM_LAYER_NAME)
+ 
+ 
+-def test_warning(impute_num_edata):
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_NUMERIC)
++def test_warning(impute_num_edata, array_type):
++    impute_num_edata.X = array_type(impute_num_edata.X)
++    if isinstance(impute_num_edata.X, da.Array):
++        pytest.skip("_warn_imputation_threshold does not support Dask arrays")
+     warning_results = _warn_imputation_threshold(impute_num_edata, threshold=20, var_names=None)
+     assert warning_results == {"col1": 25, "col3": 50}
+ 
